@@ -1,0 +1,28 @@
+# Normalise line endings in the repository, not on each machine.
+#
+# Without this, Git converts LF to CRLF on checkout on Windows and back on commit,
+# which makes every file appear modified after a clone and turns a one-line change
+# into a whole-file diff. The shell scripts additionally break outright: a CRLF
+# `#!/bin/sh` line makes the kernel look for an interpreter called "/bin/sh\r".
+* text=auto eol=lf
+
+# Shell scripts must keep LF even if someone edits them on Windows.
+*.sh text eol=lf
+
+# The migration and the embedded frontend are shipped byte-for-byte; a stray CRLF
+# would end up inside the binary.
+*.sql text eol=lf
+*.js text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+
+# Windows-only helper scripts, if any are added later.
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary assets are not text and must never be converted.
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.zip binary

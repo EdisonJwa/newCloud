@@ -1,0 +1,112 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      # The PostgreSQL conformance suite is the whole point of this job: the in-memory
+      # and SQL implementations are supposed to be interchangeable, and the only way
+      # to know that is to run the same tests against both. Skipping it is how the
+      # "passes in tests, 500s in production" class of bug gets in.
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: newcloud
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+        ports:
+          - 5432:5432
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # Must satisfy go.mod, which requires 1.26 for os.Root's write methods.
+          go-version: "1.26"
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: vet
+        run: go vet ./...
+
+      - name: test (race, with PostgreSQL)
+        env:
+          TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/newcloud?sslmode=disable
+        # The race detector matters here: share download counters and session
+        # revocation are the two places where a data race would be silent in
+        # production.
+        run: go test -race -count=1 ./...
+
+      - name: build
+        run: CGO_ENABLED=0 go build -trimpath -o /tmp/newcloud ./cmd/newcloud
+
+      - name: example config parses
+        # An example config that fails validation is worse than none: operators copy
+        # it verbatim and hit a startup error with no obvious cause.
+        run: go test ./internal/config/ -run TestExampleConfig -count=1 -v
+
+  vulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+  migration-syntax:
+    # The schema is the expensive artifact to get wrong: a bad constraint surfaces
+    # months later as corrupted metadata. Apply it against a real PostgreSQL before
+    # merging, through the same applier the binary uses.
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: newcloud
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+        ports:
+          - 5432:5432
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - name: apply migrations through the binary
+        env:
+          DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/newcloud?sslmode=disable
+        run: |
+          # The applier strips the psql BEGIN/COMMIT wrapper and runs each file in its
+          # own transaction; testing it directly is stricter than piping into psql,
+          # because it exercises the dollar-quote handling too.
+          go run ./cmd/newcloud migrate
+          # Applying twice must be a no-op: that is what makes a redeploy safe.
+          go run ./cmd/newcloud migrate

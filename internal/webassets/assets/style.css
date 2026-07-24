@@ -1,0 +1,187 @@
+:root {
+  --bg: #0f1115;
+  --surface: #171a21;
+  --surface-2: #1f232c;
+  --border: #2a2f3a;
+  --text: #e6e9ef;
+  --text-dim: #9aa3b2;
+  --accent: #4c8dff;
+  --accent-dim: #2f5fb3;
+  --danger: #e5534b;
+  --ok: #3fb950;
+  --radius: 8px;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f6f7f9;
+    --surface: #ffffff;
+    --surface-2: #eef0f4;
+    --border: #d8dce3;
+    --text: #1b1f27;
+    --text-dim: #5c6473;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+button {
+  font: inherit;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+  padding: 0.45rem 0.8rem;
+  border-radius: var(--radius);
+}
+button:hover:not(:disabled) { border-color: var(--accent); }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.primary:hover:not(:disabled) { background: var(--accent-dim); }
+button.danger { color: var(--danger); }
+button.link {
+  background: none; border: none; color: var(--accent); padding: 0.2rem 0.3rem;
+}
+
+input[type="text"], input[type="password"], input[type="number"], select {
+  font: inherit;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.45rem 0.6rem;
+  width: 100%;
+}
+input:focus, select:focus, button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+label { display: block; margin-bottom: 0.9rem; }
+label > span { display: block; font-size: 0.85rem; color: var(--text-dim); margin-bottom: 0.3rem; }
+
+/* ---- layout ---- */
+
+#app { display: flex; flex-direction: column; min-height: 100%; }
+
+header.bar {
+  display: flex; align-items: center; gap: 1rem;
+  padding: 0.7rem 1.2rem;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  position: sticky; top: 0; z-index: 10;
+}
+header.bar .brand { font-weight: 650; letter-spacing: -0.01em; }
+header.bar .spacer { flex: 1; }
+header.bar .who { color: var(--text-dim); font-size: 0.9rem; }
+
+nav.tabs { display: flex; gap: 0.25rem; }
+nav.tabs button {
+  background: none; border: none; border-bottom: 2px solid transparent;
+  border-radius: 0; color: var(--text-dim); padding: 0.5rem 0.7rem;
+}
+nav.tabs button[aria-current="page"] { color: var(--text); border-bottom-color: var(--accent); }
+
+main { flex: 1; padding: 1.2rem; max-width: 1100px; width: 100%; margin: 0 auto; }
+
+/* ---- breadcrumb + toolbar ---- */
+
+.crumbs { display: flex; align-items: center; flex-wrap: wrap; gap: 0.15rem; margin-bottom: 0.9rem; font-size: 0.95rem; }
+.crumbs .sep { color: var(--text-dim); padding: 0 0.1rem; }
+
+.toolbar { display: flex; gap: 0.5rem; margin-bottom: 0.9rem; flex-wrap: wrap; align-items: center; }
+.toolbar .spacer { flex: 1; }
+
+/* ---- file table ---- */
+
+table.files { width: 100%; border-collapse: collapse; }
+table.files th {
+  text-align: left; font-size: 0.8rem; font-weight: 600;
+  color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.04em;
+  padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--border);
+}
+table.files td { padding: 0.55rem 0.6rem; border-bottom: 1px solid var(--border); }
+table.files tr:hover td { background: var(--surface); }
+table.files td.name { display: flex; align-items: center; gap: 0.5rem; }
+table.files .icon { width: 1.1rem; text-align: center; color: var(--text-dim); }
+table.files .size, table.files .when { color: var(--text-dim); font-variant-numeric: tabular-nums; white-space: nowrap; }
+table.files td.actions { text-align: right; white-space: nowrap; }
+
+.empty { padding: 2.5rem 1rem; text-align: center; color: var(--text-dim); }
+
+/* ---- drop zone ---- */
+
+#dropzone.over {
+  outline: 2px dashed var(--accent);
+  outline-offset: -8px;
+  background: var(--surface);
+}
+
+/* ---- cards ---- */
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1rem;
+  margin-bottom: 1rem;
+}
+.card h2 { margin: 0 0 0.8rem; font-size: 1rem; font-weight: 600; }
+.card .hint { color: var(--text-dim); font-size: 0.85rem; margin: 0 0 0.8rem; }
+
+.row { display: flex; gap: 0.6rem; align-items: flex-end; flex-wrap: wrap; }
+.row > * { flex: 1; min-width: 9rem; }
+.row > .fixed { flex: 0 0 auto; min-width: 0; }
+
+/* ---- modal ---- */
+
+dialog {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  padding: 1.2rem;
+  max-width: 30rem;
+  width: calc(100% - 2rem);
+}
+dialog::backdrop { background: rgba(0, 0, 0, 0.55); }
+dialog h2 { margin: 0 0 1rem; font-size: 1.05rem; }
+dialog menu { display: flex; justify-content: flex-end; gap: 0.5rem; margin: 1rem 0 0; padding: 0; }
+
+/* ---- toast ---- */
+
+#toast {
+  position: fixed; bottom: 1.2rem; left: 50%; transform: translateX(-50%);
+  background: var(--surface-2); border: 1px solid var(--border);
+  padding: 0.6rem 1rem; border-radius: var(--radius);
+  box-shadow: 0 6px 24px rgba(0,0,0,0.35);
+  opacity: 0; pointer-events: none; transition: opacity 0.15s;
+  max-width: 90vw;
+}
+#toast.show { opacity: 1; }
+#toast.error { border-color: var(--danger); color: var(--danger); }
+
+/* ---- share landing ---- */
+
+.sharebox { max-width: 32rem; margin: 8vh auto; }
+.sharebox .title { font-size: 1.3rem; font-weight: 650; margin-bottom: 0.3rem; word-break: break-word; }
+.sharebox .meta { color: var(--text-dim); margin-bottom: 1.2rem; }
+
+/* ---- progress ---- */
+
+.progress { height: 4px; background: var(--surface-2); border-radius: 2px; overflow: hidden; margin-top: 0.6rem; }
+.progress > div { height: 100%; width: 0; background: var(--accent); transition: width 0.15s; }
+
+.hidden { display: none !important; }
+.mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 0.85rem; word-break: break-all; }

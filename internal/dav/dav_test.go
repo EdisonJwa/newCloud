@@ -1,0 +1,718 @@
+package dav
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/EdisonJwa/newCloud/internal/auth"
+	"github.com/EdisonJwa/newCloud/internal/authz"
+	"github.com/EdisonJwa/newCloud/internal/blob"
+	"github.com/EdisonJwa/newCloud/internal/blob/local"
+	"github.com/EdisonJwa/newCloud/internal/config"
+	"github.com/EdisonJwa/newCloud/internal/storage/blobstore"
+	"github.com/EdisonJwa/newCloud/internal/storage/layout"
+	"github.com/EdisonJwa/newCloud/internal/store"
+	"github.com/EdisonJwa/newCloud/internal/ticket"
+)
+
+// testEnv wires a full DAV handler over an in-memory metadata store and a
+// content-addressed blob store, so the tests exercise the same path production
+// does without needing PostgreSQL or a network.
+type testEnv struct {
+	h      *Handler
+	meta   *store.Memory
+	blobs  *local.Store
+	user   store.User
+	secret string
+}
+
+func newEnv(t *testing.T) *testEnv {
+	t.Helper()
+
+	cfg := config.Default()
+	cfg.Server.PublicURL = "https://cloud.example.test"
+	cfg.Server.UserContentURL = "https://content.example.test"
+	cfg.Limits.MaxProfindChildren = 1000
+
+	meta := store.NewMemory()
+	user := meta.AddUser(store.User{Username: "alice", Email: "alice@example.test", Role: "user"})
+	if _, err := meta.EnsureRoot(context.Background(), user.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	blobs, err := local.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := blobstore.New(blobs, &resolverAdapter{r: meta.Resolver()})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	appPass := auth.NewAppPasswords(meta)
+	secret, _, err := appPass.Issue(context.Background(), user.ID, "test", "rw", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	authorizer := authz.NewService(&authzAccessor{m: meta})
+
+	h := New(cfg, meta, content, authorizer, appPass)
+	return &testEnv{h: h, meta: meta, blobs: blobs, user: user, secret: secret}
+}
+
+// resolverAdapter bridges store.Resolver onto blobstore.NodeResolver, mirroring
+// the one in cmd/newcloud so the tests build a real handler without importing the
+// main package.
+type resolverAdapter struct{ r store.Resolver }
+
+func (a *resolverAdapter) HashFor(ctx context.Context, owner, p string) (blob.Hash, bool, error) {
+	h, ok, err := a.r.HashFor(ctx, owner, p)
+	return blob.Hash(h), ok, err
+}
+
+func (a *resolverAdapter) Record(ctx context.Context, owner, p string, h blob.Hash, isDir bool) error {
+	return a.r.Record(ctx, owner, p, [32]byte(h), isDir)
+}
+
+func (a *resolverAdapter) Forget(ctx context.Context, owner, p string) error {
+	return a.r.Forget(ctx, owner, p)
+}
+
+func (a *resolverAdapter) IsDir(ctx context.Context, owner, p string) (bool, bool, error) {
+	return a.r.IsDir(ctx, owner, p)
+}
+
+func (a *resolverAdapter) Children(ctx context.Context, owner, dir string, limit int) ([]layout.Node, error) {
+	nodes, err := a.r.Children(ctx, owner, dir, limit)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]layout.Node, 0, len(nodes))
+	for _, n := range nodes {
+		out = append(out, layout.Node{Owner: owner, Path: n.Path, IsDir: n.IsDir, Size: n.Size})
+	}
+	return out, nil
+}
+
+// authzAccessor adapts the metadata store to authz.Accessor.
+type authzAccessor struct{ m *store.Memory }
+
+func (a *authzAccessor) LoadNode(id uuid.UUID) (authz.Node, error) {
+	var n store.Node
+	err := a.m.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+		got, err := tx.Node(ctx, id)
+		n = got
+		return err
+	})
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return authz.Node{}, authz.ErrNotFound
+		}
+		return authz.Node{}, err
+	}
+	return authz.Node{ID: n.ID, OwnerID: n.OwnerID, ParentID: n.ParentID}, nil
+}
+
+func (a *authzAccessor) OwnerGroupPerm(actorID, nodeID uuid.UUID) (authz.Perm, bool, error) {
+	return 0, false, nil
+}
+
+func (a *authzAccessor) ShareForActor(actorID, nodeID uuid.UUID) (*authz.ShareGrant, error) {
+	return nil, nil
+}
+
+// do issues a request with Basic auth.
+func (e *testEnv) do(t *testing.T, method, path string, body io.Reader, headers map[string]string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(method, path, body)
+	req.SetBasicAuth("alice", e.secret)
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	rec := httptest.NewRecorder()
+	e.h.ServeHTTP(rec, req)
+	return rec
+}
+
+func (e *testEnv) davPath(rel string) string {
+	return "https://cloud.example.test/dav/alice/" + strings.TrimPrefix(rel, "/")
+}
+
+func TestOptionsNeedsNoAuth(t *testing.T) {
+	e := newEnv(t)
+	req := httptest.NewRequest(http.MethodOptions, e.davPath(""), nil)
+	rec := httptest.NewRecorder()
+	e.h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("OPTIONS should succeed without credentials, got %d", rec.Code)
+	}
+	if got := rec.Header().Get("DAV"); got != "1, 2" {
+		t.Fatalf("DAV header: want \"1, 2\", got %q", got)
+	}
+	if rec.Header().Get("MS-Author-Via") != "DAV" {
+		t.Fatal("MS-Author-Via is required for Windows Explorer")
+	}
+}
+
+func TestUnauthenticatedGetsBasicChallenge(t *testing.T) {
+	e := newEnv(t)
+	req := httptest.NewRequest("PROPFIND", e.davPath(""), nil)
+	rec := httptest.NewRecorder()
+	e.h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("want 401, got %d", rec.Code)
+	}
+	// Without the challenge, Windows and macOS clients give up instead of
+	// prompting, which looks like "the server is broken".
+	if !strings.Contains(rec.Header().Get("WWW-Authenticate"), "Basic") {
+		t.Fatalf("missing Basic challenge: %q", rec.Header().Get("WWW-Authenticate"))
+	}
+}
+
+func TestBadCredentialGetsChallenge(t *testing.T) {
+	e := newEnv(t)
+	req := httptest.NewRequest("PROPFIND", e.davPath(""), nil)
+	req.SetBasicAuth("alice", "wc_wrong")
+	rec := httptest.NewRecorder()
+	e.h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("want 401, got %d", rec.Code)
+	}
+}
+
+func TestMkcolThenPropfind(t *testing.T) {
+	e := newEnv(t)
+
+	rec := e.do(t, "MKCOL", e.davPath("docs"), nil, nil)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("MKCOL: want 201, got %d", rec.Code)
+	}
+
+	rec = e.do(t, "PROPFIND", e.davPath(""), nil, map[string]string{"Depth": "1"})
+	if rec.Code != http.StatusMultiStatus {
+		t.Fatalf("PROPFIND: want 207, got %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "docs") {
+		t.Fatalf("PROPFIND should list the new directory:\n%s", body)
+	}
+	if !strings.Contains(body, "<D:collection/>") {
+		t.Fatal("directory should be reported as a collection")
+	}
+}
+
+func TestMkcolConflict(t *testing.T) {
+	e := newEnv(t)
+	if rec := e.do(t, "MKCOL", e.davPath("docs"), nil, nil); rec.Code != http.StatusCreated {
+		t.Fatalf("first MKCOL: %d", rec.Code)
+	}
+	// RFC 4918 §9.3.1: creating an existing resource is 405, not 409.
+	if rec := e.do(t, "MKCOL", e.davPath("docs"), nil, nil); rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("second MKCOL: want 405, got %d", rec.Code)
+	}
+}
+
+func TestPutGetRoundTrip(t *testing.T) {
+	e := newEnv(t)
+	content := "hello webdav"
+
+	rec := e.do(t, http.MethodPut, e.davPath("a.txt"), strings.NewReader(content),
+		map[string]string{"Content-Type": "text/plain"})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("PUT: want 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	etag := rec.Header().Get("ETag")
+	if etag == "" {
+		t.Fatal("PUT must return an ETag")
+	}
+
+	rec = e.do(t, http.MethodGet, e.davPath("a.txt"), nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET: want 200, got %d", rec.Code)
+	}
+	if got := rec.Body.String(); got != content {
+		t.Fatalf("content mismatch: %q", got)
+	}
+	if rec.Header().Get("ETag") != etag {
+		t.Fatal("ETag changed between PUT and GET")
+	}
+}
+
+// TestPutRecordsBlobID guards the metadata link a WebDAV write must establish.
+//
+// This was a real production defect: blobIDFor was a stub returning the zero UUID,
+// which PostgreSQL rejects on the nodes.blob_id foreign key. The in-memory store
+// accepts a zero UUID happily, so every DAV test passed while every real upload
+// failed with a 404 the client could not explain. The assertion has to look at the
+// stored node, not just at the HTTP response.
+func TestPutRecordsBlobID(t *testing.T) {
+	e := newEnv(t)
+
+	rec := e.do(t, http.MethodPut, e.davPath("withblob.txt"),
+		strings.NewReader("content addressed"), map[string]string{"Content-Type": "text/plain"})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("PUT: want 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var node store.Node
+	err := e.meta.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+		nodes, rerr := e.meta.Resolve(ctx, e.user.ID, "withblob.txt")
+		if rerr != nil {
+			return rerr
+		}
+		node = nodes[len(nodes)-1]
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if node.BlobID == nil || *node.BlobID == uuid.Nil {
+		t.Fatal("a file written over WebDAV must reference its blob row; " +
+			"the zero UUID is rejected by the nodes.blob_id foreign key in production")
+	}
+
+}
+
+func TestPutIntoMissingDirectoryFails(t *testing.T) {
+	e := newEnv(t)
+	rec := e.do(t, http.MethodPut, e.davPath("nope/a.txt"), strings.NewReader("x"), nil)
+	// RFC 4918 §9.7.1: PUT does not create intermediate collections.
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("want 409, got %d", rec.Code)
+	}
+}
+
+func TestPutOverwritesAndKeepsVersion(t *testing.T) {
+	e := newEnv(t)
+	e.do(t, http.MethodPut, e.davPath("a.txt"), strings.NewReader("v1"), nil)
+	rec := e.do(t, http.MethodPut, e.davPath("a.txt"), strings.NewReader("v2 is longer"), nil)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("overwrite: want 201, got %d", rec.Code)
+	}
+
+	rec = e.do(t, http.MethodGet, e.davPath("a.txt"), nil, nil)
+	if got := rec.Body.String(); got != "v2 is longer" {
+		t.Fatalf("content after overwrite: %q", got)
+	}
+}
+
+// TestRangeRequest covers resume and video seeking. Getting this wrong makes every
+// large download restart from zero.
+func TestRangeRequest(t *testing.T) {
+	e := newEnv(t)
+	payload := strings.Repeat("0123456789", 100)
+	e.do(t, http.MethodPut, e.davPath("big.txt"), strings.NewReader(payload), nil)
+
+	rec := e.do(t, http.MethodGet, e.davPath("big.txt"), nil, map[string]string{"Range": "bytes=10-19"})
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("want 206, got %d", rec.Code)
+	}
+	if got := rec.Body.String(); got != "0123456789" {
+		t.Fatalf("range body: %q", got)
+	}
+	if cr := rec.Header().Get("Content-Range"); cr != "bytes 10-19/1000" {
+		t.Fatalf("Content-Range: %q", cr)
+	}
+}
+
+func TestSuffixRange(t *testing.T) {
+	e := newEnv(t)
+	e.do(t, http.MethodPut, e.davPath("f.txt"), strings.NewReader("0123456789"), nil)
+
+	rec := e.do(t, http.MethodGet, e.davPath("f.txt"), nil, map[string]string{"Range": "bytes=-3"})
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("want 206, got %d", rec.Code)
+	}
+	if got := rec.Body.String(); got != "789" {
+		t.Fatalf("suffix range: %q", got)
+	}
+}
+
+func TestIfNoneMatchReturns304(t *testing.T) {
+	e := newEnv(t)
+	rec := e.do(t, http.MethodPut, e.davPath("a.txt"), strings.NewReader("x"), nil)
+	etag := rec.Header().Get("ETag")
+
+	rec = e.do(t, http.MethodGet, e.davPath("a.txt"), nil, map[string]string{"If-None-Match": etag})
+	if rec.Code != http.StatusNotModified {
+		t.Fatalf("want 304, got %d", rec.Code)
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatal("304 must have no body")
+	}
+}
+
+func TestHeadHasNoBody(t *testing.T) {
+	e := newEnv(t)
+	e.do(t, http.MethodPut, e.davPath("a.txt"), strings.NewReader("content"), nil)
+
+	rec := e.do(t, http.MethodHead, e.davPath("a.txt"), nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d", rec.Code)
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatal("HEAD must not return a body")
+	}
+	if rec.Header().Get("Content-Length") != "7" {
+		t.Fatalf("Content-Length: %q", rec.Header().Get("Content-Length"))
+	}
+}
+
+func TestDeleteMovesToTrash(t *testing.T) {
+	e := newEnv(t)
+	e.do(t, http.MethodPut, e.davPath("a.txt"), strings.NewReader("x"), nil)
+
+	rec := e.do(t, http.MethodDelete, e.davPath("a.txt"), nil, nil)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("DELETE: want 204, got %d", rec.Code)
+	}
+	rec = e.do(t, http.MethodGet, e.davPath("a.txt"), nil, nil)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("deleted file should be 404, got %d", rec.Code)
+	}
+}
+
+func TestDeleteRootRefused(t *testing.T) {
+	e := newEnv(t)
+	if rec := e.do(t, http.MethodDelete, e.davPath(""), nil, nil); rec.Code == http.StatusNoContent {
+		t.Fatal("deleting the namespace root must be refused")
+	}
+}
+
+func TestMoveFile(t *testing.T) {
+	e := newEnv(t)
+	e.do(t, "MKCOL", e.davPath("dir"), nil, nil)
+	e.do(t, http.MethodPut, e.davPath("a.txt"), strings.NewReader("payload"), nil)
+
+	rec := e.do(t, "MOVE", e.davPath("a.txt"), nil, map[string]string{
+		"Destination": "https://cloud.example.test/dav/alice/dir/b.txt",
+	})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("MOVE: want 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	if rec := e.do(t, http.MethodGet, e.davPath("dir/b.txt"), nil, nil); rec.Code != http.StatusOK {
+		t.Fatalf("moved file should be readable, got %d", rec.Code)
+	}
+	if rec := e.do(t, http.MethodGet, e.davPath("a.txt"), nil, nil); rec.Code != http.StatusNotFound {
+		t.Fatal("source should be gone after MOVE")
+	}
+}
+
+func TestMoveWithoutOverwriteRefuses(t *testing.T) {
+	e := newEnv(t)
+	e.do(t, http.MethodPut, e.davPath("a.txt"), strings.NewReader("a"), nil)
+	e.do(t, http.MethodPut, e.davPath("b.txt"), strings.NewReader("b"), nil)
+
+	rec := e.do(t, "MOVE", e.davPath("a.txt"), nil, map[string]string{
+		"Destination": "https://cloud.example.test/dav/alice/b.txt",
+		"Overwrite":   "F",
+	})
+	if rec.Code != http.StatusPreconditionFailed {
+		t.Fatalf("want 412, got %d", rec.Code)
+	}
+}
+
+func TestCopyFile(t *testing.T) {
+	e := newEnv(t)
+	e.do(t, http.MethodPut, e.davPath("a.txt"), strings.NewReader("payload"), nil)
+
+	rec := e.do(t, "COPY", e.davPath("a.txt"), nil, map[string]string{
+		"Destination": "https://cloud.example.test/dav/alice/copy.txt",
+	})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("COPY: want 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	rec = e.do(t, http.MethodGet, e.davPath("copy.txt"), nil, nil)
+	if rec.Body.String() != "payload" {
+		t.Fatalf("copied content: %q", rec.Body.String())
+	}
+	// The original must survive a COPY.
+	if rec := e.do(t, http.MethodGet, e.davPath("a.txt"), nil, nil); rec.Code != http.StatusOK {
+		t.Fatal("COPY must not remove the source")
+	}
+}
+
+func TestLockUnlock(t *testing.T) {
+	e := newEnv(t)
+	e.do(t, http.MethodPut, e.davPath("doc.docx"), strings.NewReader("x"), nil)
+
+	body := `<?xml version="1.0"?><D:lockinfo xmlns:D="DAV:">
+		<D:lockscope><D:exclusive/></D:lockscope>
+		<D:locktype><D:write/></D:locktype>
+		<D:owner><D:href>alice</D:href></D:owner></D:lockinfo>`
+
+	rec := e.do(t, "LOCK", e.davPath("doc.docx"), strings.NewReader(body),
+		map[string]string{"Timeout": "Second-600"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("LOCK: want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	token := rec.Header().Get("Lock-Token")
+	if token == "" {
+		t.Fatal("LOCK must return a Lock-Token header")
+	}
+	if !strings.Contains(rec.Body.String(), "opaquelocktoken:") {
+		t.Fatal("body should contain the lock token")
+	}
+
+	// A second exclusive lock must fail.
+	rec = e.do(t, "LOCK", e.davPath("doc.docx"), strings.NewReader(body), nil)
+	if rec.Code != http.StatusLocked {
+		t.Fatalf("second LOCK: want 423, got %d", rec.Code)
+	}
+
+	// Unlock with the token.
+	rec = e.do(t, "UNLOCK", e.davPath("doc.docx"), nil, map[string]string{"Lock-Token": token})
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("UNLOCK: want 204, got %d", rec.Code)
+	}
+
+	// Now a new lock succeeds.
+	rec = e.do(t, "LOCK", e.davPath("doc.docx"), strings.NewReader(body), nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("LOCK after unlock: want 200, got %d", rec.Code)
+	}
+}
+
+func TestUnlockWithWrongToken(t *testing.T) {
+	e := newEnv(t)
+	e.do(t, http.MethodPut, e.davPath("d.txt"), strings.NewReader("x"), nil)
+	body := `<?xml version="1.0"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>`
+	e.do(t, "LOCK", e.davPath("d.txt"), strings.NewReader(body), nil)
+
+	rec := e.do(t, "UNLOCK", e.davPath("d.txt"), nil,
+		map[string]string{"Lock-Token": "<opaquelocktoken:not-mine>"})
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("want 409 for a foreign token, got %d", rec.Code)
+	}
+}
+
+func TestProppatchPersistsDeadProperty(t *testing.T) {
+	e := newEnv(t)
+	e.do(t, http.MethodPut, e.davPath("a.txt"), strings.NewReader("x"), nil)
+
+	body := `<?xml version="1.0"?><D:propertyupdate xmlns:D="DAV:" xmlns:Z="urn:example:">
+		<D:set><D:prop><Z:color>blue</Z:color></D:prop></D:set></D:propertyupdate>`
+
+	rec := e.do(t, "PROPPATCH", e.davPath("a.txt"), strings.NewReader(body), nil)
+	if rec.Code != http.StatusMultiStatus {
+		t.Fatalf("PROPPATCH: want 207, got %d", rec.Code)
+	}
+
+	// The value must survive into the metadata store.
+	var found bool
+	_ = e.meta.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+		props, err := tx.DeadProps(ctx, mustResolve(t, e, "a.txt"))
+		if err != nil {
+			return err
+		}
+		for _, p := range props {
+			if p.Name == "color" && p.Value == "blue" {
+				found = true
+			}
+		}
+		return nil
+	})
+	_ = found
+	if !found {
+		t.Fatal("dead property was not persisted")
+	}
+}
+
+// TestProppatchRejectsReservedProperty: letting a client write getcontentlength
+// would let it lie about size, breaking every caching client.
+func TestProppatchRejectsReservedProperty(t *testing.T) {
+	e := newEnv(t)
+	e.do(t, http.MethodPut, e.davPath("a.txt"), strings.NewReader("x"), nil)
+
+	body := `<?xml version="1.0"?><D:propertyupdate xmlns:D="DAV:">
+		<D:set><D:prop><D:getcontentlength>999999</D:getcontentlength></D:prop></D:set></D:propertyupdate>`
+	rec := e.do(t, "PROPPATCH", e.davPath("a.txt"), strings.NewReader(body), nil)
+	if rec.Code != http.StatusMultiStatus {
+		t.Fatalf("want 207, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "403") {
+		t.Fatal("reserved property must be reported as forbidden")
+	}
+}
+
+func TestPropfindDepthZeroIsSingleEntry(t *testing.T) {
+	e := newEnv(t)
+	e.do(t, "MKCOL", e.davPath("d"), nil, nil)
+	e.do(t, http.MethodPut, e.davPath("d/a.txt"), strings.NewReader("x"), nil)
+
+	rec := e.do(t, "PROPFIND", e.davPath("d"), nil, map[string]string{"Depth": "0"})
+	if rec.Code != http.StatusMultiStatus {
+		t.Fatalf("want 207, got %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "a.txt") {
+		t.Fatal("Depth: 0 must not include children")
+	}
+}
+
+func TestPropfindInfinityRefused(t *testing.T) {
+	e := newEnv(t)
+	rec := e.do(t, "PROPFIND", e.davPath(""), nil, map[string]string{"Depth": "infinity"})
+	// Unlimited depth is the cheapest DoS a client can request.
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("want 403, got %d", rec.Code)
+	}
+}
+
+func TestPropfindEscapesXML(t *testing.T) {
+	e := newEnv(t)
+	// A name with XML metacharacters must not break the response.
+	name := "a&b.txt"
+	e.do(t, http.MethodPut, e.davPath(name), strings.NewReader("x"), nil)
+
+	rec := e.do(t, "PROPFIND", e.davPath(""), nil, map[string]string{"Depth": "1"})
+	body := rec.Body.String()
+	if strings.Contains(body, "<c>") {
+		t.Fatal("name was not XML-escaped")
+	}
+	if !strings.Contains(body, "&amp;") {
+		t.Fatalf("expected escaped ampersand in body:\n%s", body)
+	}
+}
+
+func TestContentDispositionEncodesNonASCII(t *testing.T) {
+	e := newEnv(t)
+	name := "会议纪要.docx"
+	e.do(t, http.MethodPut, e.davPath(name), strings.NewReader("x"), nil)
+
+	rec := e.do(t, http.MethodGet, e.davPath(name), nil, nil)
+	cd := rec.Header().Get("Content-Disposition")
+	// RFC 5987 is required; without it every browser shows mojibake.
+	if !strings.Contains(cd, "filename*=UTF-8''") {
+		t.Fatalf("missing RFC 5987 filename: %q", cd)
+	}
+}
+
+// TestCorruptBlobIsNotReportedAs404: when the metadata says a file exists but the
+// bytes are gone, the response must be an error. Reporting 404 would disguise data
+// loss as "you deleted it"; an empty 200 would look like a zero-byte file and let
+// a client overwrite the record.
+func TestCorruptBlobIsNotReportedAs404(t *testing.T) {
+	e := newEnv(t)
+	e.do(t, http.MethodPut, e.davPath("a.txt"), strings.NewReader("data"), nil)
+
+	hash, ok, err := e.meta.Resolver().HashFor(context.Background(), e.user.ID.String(), "a.txt")
+	if err != nil || !ok {
+		t.Fatalf("resolve hash: ok=%v err=%v", ok, err)
+	}
+	if err := e.blobs.Delete(context.Background(), blob.Hash(hash)); err != nil {
+		t.Fatalf("delete blob bytes: %v", err)
+	}
+
+	rec := e.do(t, http.MethodGet, e.davPath("a.txt"), nil, nil)
+	if rec.Code == http.StatusOK {
+		t.Fatalf("missing bytes must not return 200; body=%q", rec.Body.String())
+	}
+}
+func TestUnsupportedMethod(t *testing.T) {
+	e := newEnv(t)
+	rec := e.do(t, "PATCH", e.davPath("a.txt"), nil, nil)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("want 405, got %d", rec.Code)
+	}
+	if rec.Header().Get("Allow") == "" {
+		t.Fatal("405 must advertise Allow")
+	}
+}
+
+func TestRangeParsing(t *testing.T) {
+	cases := []struct {
+		header string
+		size   int64
+		start  int64
+		end    int64
+		ok     bool
+	}{
+		{"bytes=0-9", 100, 0, 9, true},
+		{"bytes=90-", 100, 90, 99, true},
+		{"bytes=-10", 100, 90, 99, true},
+		{"bytes=0-999", 100, 0, 99, true},   // clamped
+		{"bytes=100-", 100, 0, 0, false},    // past the end
+		{"bytes=5-2", 100, 0, 0, false},     // inverted
+		{"bytes=0-1,5-6", 100, 0, 0, false}, // multipart unsupported
+		{"items=0-1", 100, 0, 0, false},     // wrong unit
+	}
+	for _, c := range cases {
+		start, end, ok := parseSingleRange(c.header, c.size)
+		if ok != c.ok {
+			t.Fatalf("%q: ok=%v want %v", c.header, ok, c.ok)
+			continue
+		}
+		if !ok {
+			continue
+		}
+		if start != c.start || end != c.end {
+			t.Fatalf("%q: got %d-%d, want %d-%d", c.header, start, end, c.start, c.end)
+		}
+	}
+}
+
+func TestLockTokenFormat(t *testing.T) {
+	tok := newLockToken()
+	if !strings.HasPrefix(tok, "opaquelocktoken:") {
+		t.Fatalf("token must be an opaquelocktoken, got %q", tok)
+	}
+	if len(tok) < len("opaquelocktoken:")+16 {
+		t.Fatal("token is too short to be unguessable")
+	}
+	if a, b := newLockToken(), newLockToken(); a == b {
+		t.Fatal("tokens must be unique")
+	}
+}
+
+func TestRequestedTimeoutIsClamped(t *testing.T) {
+	h := &Handler{now: time.Now}
+	cases := map[string]time.Duration{
+		"Infinite":      24 * time.Hour,
+		"Second-600":    10 * time.Minute,
+		"Second-999999": 24 * time.Hour,
+		"garbage":       30 * time.Minute,
+		"":              30 * time.Minute,
+	}
+	for header, want := range cases {
+		req := httptest.NewRequest("LOCK", "/", nil)
+		if header != "" {
+			req.Header.Set("Timeout", header)
+		}
+		if got := h.requestedTimeout(req); got != want {
+			t.Fatalf("%q: want %v, got %v", header, want, got)
+		}
+	}
+}
+
+func mustResolve(t *testing.T, e *testEnv, rel string) uuid.UUID {
+	t.Helper()
+	// Resolve is a Store-level operation and starts its own transaction, so it
+	// must not be called from inside one.
+	nodes, err := e.meta.Resolve(context.Background(), e.user.ID, rel)
+	if err != nil {
+		t.Fatalf("resolve %q: %v", rel, err)
+	}
+	return nodes[len(nodes)-1].ID
+}
+
+var _ = bytes.MinRead
+var _ = sha256.Sum256
+var _ = ticket.PurposeSession

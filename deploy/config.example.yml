@@ -1,0 +1,87 @@
+server:
+  # The authenticated application shell. This origin holds session cookies.
+  public_url: "https://cloud.example.com"
+  # User content lives on a different origin so a stored-XSS payload in an
+  # uploaded file cannot reach the session cookie or the app's DOM.
+  usercontent_url: "https://usercontent.example.com"
+
+auth:
+  # Pocket ID base URL.
+  issuer: "https://id.example.com"
+  client_id: "newcloud"
+  client_secret_file: "/run/secrets/oidc_client_secret"
+  # groups is mandatory: Pocket ID only releases group membership when the
+  # scope is requested, and roles are derived from group names.
+  scopes: ["openid", "profile", "email", "groups"]
+  group_role_map:
+    "cloud-admins": admin
+    "cloud-users": user
+  session_ttl: "12h"
+  # Every 256-bit token (session, app password, share, download grant) is indexed by
+  # an HMAC keyed with this secret, so rotating it invalidates all of them at once.
+  # Generate with: openssl rand -base64 48
+  # At least 32 bytes; the process refuses to start with a short one.
+  session_secret: "REPLACE-WITH-32-BYTES-OF-RANDOM"
+  # Break-glass stays off unless you explicitly need it. If enabled, allowed_cidrs
+  # is mandatory: an unrestricted local admin is an internet-reachable root login.
+  allow_local_admin: false
+  local_admin:
+    username: "breakglass"
+    password_argon2_file: "/etc/newcloud/breakglass.pass"
+    allowed_cidrs: ["10.0.0.0/8"]
+
+storage:
+  # Two independent choices:
+  #   backend  where the bytes physically live   (local | s3)
+  #   layout   how they are arranged there       (blob | tree)
+  #
+  # blob: <root>/ab/cd/<sha256>. Directory tree lives only in PostgreSQL.
+  #       Deduplicates, versions cost only their differences. Not inspectable
+  #       with ls. Best for 40 TiB with many users and repeated content.
+  #
+  # tree: <root>/<owner>/<path as the user sees it>. Inspectable with ls,
+  #       rsync-friendly, but no deduplication and each version is a full copy.
+  #
+  # This is a deployment decision, not a per-user toggle: switching after data
+  # exists requires a migration. See docs/0003-storage-layout.md.
+  backend: "local"
+  layout: "blob"
+  local:
+    # blob layout: sharded content store; tmp/ lives under this root so
+    #              publishing a blob is a rename(2).
+    # tree layout: the user-visible tree itself.
+    root: "/var/lib/newcloud/blobs"
+  s3:
+    endpoint: "https://minio.example.com"
+    bucket: "newcloud"
+    region: "us-east-1"
+
+limits:
+  max_file_bytes: 1099511627776        # 1 TiB hard cap
+  default_file_quota_bytes: 10737418240 # 10 GiB default per-user soft cap
+  max_propfind_children: 100000        # protects a single huge directory
+  upload_chunk_bytes: 268435456        # 256 MiB chunks
+
+audit:
+  retention_days: 365
+
+# Mail delivers share recipient verification codes. It is required for email shares:
+# without it the server still accepts the invitation and generates the code, but can only
+# log that it could not send it. Leave enabled: false if you only use link and request
+# shares.
+mail:
+  enabled: false
+  host: "smtp.example.com"
+  port: 587
+  username: "newcloud"
+  # Prefer password_file in a container: a mounted secret never appears in
+  # `docker inspect` or a process listing.
+  password_file: "/run/secrets/smtp_password"
+  from: "newcloud <no-reply@example.com>"
+  # start_tls is what most relays on 587 expect. implicit_tls is for 465.
+  start_tls: true
+  implicit_tls: false
+  # Only for a relay with a self-signed certificate on a private network: it removes the
+  # only protection against an active attacker on that path, and the server warns at
+  # startup when it is on.
+  insecure_skip_verify: false

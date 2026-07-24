@@ -1,0 +1,17 @@
+# Compiled binary
+/newcloud
+bin/
+*.exe
+# Windows leaves these behind when a running binary is replaced by a rebuild.
+*.exe~
+*~
+
+# Local run artifacts
+testdata-run/
+r8/
+*.log
+
+# Secrets: never commit these
+*.pass
+config.yml
+!deploy/config.example.yml

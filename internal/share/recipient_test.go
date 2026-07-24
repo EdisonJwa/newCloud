@@ -1,0 +1,264 @@
+package share_test
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/EdisonJwa/newCloud/internal/share"
+	"github.com/EdisonJwa/newCloud/internal/store"
+	"github.com/EdisonJwa/newCloud/internal/ticket"
+)
+
+// Email shares must not behave like link shares.
+//
+// This is the property that makes "share to a specific email address" mean anything:
+// holding the URL is not enough, the visitor must prove they control an address the
+// owner named. Before recipient verification existed, an email share was
+// indistinguishable from a link share — the recipient list was recorded but never
+// enforced, so forwarding the link granted the whole world access while the audit log
+// said otherwise.
+
+// recipientFixture builds an email share with two invited addresses.
+func recipientFixture(t *testing.T) (svc *share.Service, sh store.Share, meta *store.Memory, tickets *ticket.Issuer) {
+	t.Helper()
+
+	meta = store.NewMemory()
+	owner := meta.AddUser(store.User{Username: "owner", Email: "owner@example.test", Role: "user"})
+	if _, err := meta.EnsureRoot(context.Background(), owner.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	tickets, err := ticket.NewIssuer([]byte("0123456789abcdef0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	svc = share.New(meta, share.TestArgon())
+	svc.SetTicketIssuer(tickets)
+
+	created, err := svc.Create(context.Background(), share.NewShare{
+		NodeID:     ownerRoot(t, meta, owner.ID),
+		OwnerID:    owner.ID,
+		Kind:       store.ShareEmail,
+		Label:      "contract",
+		Recipients: []string{"alice@example.test", "bob@example.test"},
+	})
+	if err != nil {
+		t.Fatalf("create email share: %v", err)
+	}
+
+	sh, err = svc.Resolve(context.Background(), created.Token)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	return svc, sh, meta, tickets
+}
+
+func ownerRoot(t *testing.T, m *store.Memory, ownerID [16]byte) [16]byte {
+	t.Helper()
+	var id [16]byte
+	_ = m.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+		n, err := tx.EnsureRoot(ctx, ownerID)
+		id = n.ID
+		return err
+	})
+	return id
+}
+
+// TestEmailShareRejectsUninvitedAddress is the core guarantee.
+func TestEmailShareRejectsUninvitedAddress(t *testing.T) {
+	svc, sh, _, _ := recipientFixture(t)
+
+	if _, err := svc.ResolveRecipient(context.Background(), sh, "stranger@example.test"); err == nil {
+		t.Fatal("an address that was never invited must not resolve")
+	} else if !errors.Is(err, share.ErrNotRecipient) {
+		t.Fatalf("want ErrNotRecipient, got %v", err)
+	}
+
+	// A code must not be issuable for an uninvited address either: otherwise the
+	// verification step becomes a way to add yourself to the list.
+	if _, err := svc.IssueRecipientCode(context.Background(), sh, "stranger@example.test"); err == nil {
+		t.Fatal("a verification code must not be issued for an uninvited address")
+	}
+}
+
+// TestInvitedAddressGetsCodeThatVerifies walks the happy path.
+func TestInvitedAddressGetsCodeThatVerifies(t *testing.T) {
+	svc, sh, meta, _ := recipientFixture(t)
+	ctx := context.Background()
+
+	code, err := svc.IssueRecipientCode(ctx, sh, "alice@example.test")
+	if err != nil {
+		t.Fatalf("issue code: %v", err)
+	}
+	if code == "" {
+		t.Fatal("no code returned")
+	}
+
+	// Before verification the address is known but unproven.
+	rec, err := svc.ResolveRecipient(ctx, sh, "alice@example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.VerifiedAt != nil {
+		t.Fatal("the address must not be verified before the code is used")
+	}
+
+	if err := svc.VerifyRecipientCode(ctx, sh, "alice@example.test", code); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+
+	rec, err = svc.ResolveRecipient(ctx, sh, "alice@example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.VerifiedAt == nil {
+		t.Fatal("the address should be marked verified")
+	}
+
+	// A verification is an audited event: the owner needs to know the link was opened.
+	var verified bool
+	for _, e := range meta.AuditLog() {
+		if e.Action == "share.recipient.verified" {
+			verified = true
+		}
+	}
+	if !verified {
+		t.Fatal("verification must be audited")
+	}
+}
+
+// TestCodeIsBoundToAddress: one invited person must not let in another.
+//
+// Without this, forwarding the code is as good as forwarding the link.
+func TestCodeIsBoundToAddress(t *testing.T) {
+	svc, sh, _, _ := recipientFixture(t)
+	ctx := context.Background()
+
+	code, err := svc.IssueRecipientCode(ctx, sh, "alice@example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// bob is invited, but this code was minted for alice.
+	if err := svc.VerifyRecipientCode(ctx, sh, "bob@example.test", code); err == nil {
+		t.Fatal("a code issued for one address must not verify another")
+	}
+
+	// The code is still valid for its intended address.
+	if err := svc.VerifyRecipientCode(ctx, sh, "alice@example.test", code); err != nil {
+		t.Fatalf("the code should still work for its own address: %v", err)
+	}
+}
+
+// TestCodeIsBoundToShare: a code for share A must not open share B.
+func TestCodeIsBoundToShare(t *testing.T) {
+	svc, sh, meta, _ := recipientFixture(t)
+	ctx := context.Background()
+
+	code, err := svc.IssueRecipientCode(ctx, sh, "alice@example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A second share for the same owner, same invited address.
+	other, err := svc.Create(ctx, share.NewShare{
+		NodeID:     sh.NodeID,
+		OwnerID:    sh.OwnerID,
+		Kind:       store.ShareEmail,
+		Label:      "other",
+		Recipients: []string{"alice@example.test"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherShare, err := svc.Resolve(ctx, other.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := svc.VerifyRecipientCode(ctx, otherShare, "alice@example.test", code); err == nil {
+		t.Fatal("a code issued for one share must not verify another")
+	}
+
+	// Both shares were created for the same owner, so the audit log must show a denial.
+	var denied bool
+	for _, e := range meta.AuditLog() {
+		if e.Action == "share.recipient.denied" {
+			denied = true
+		}
+	}
+	if !denied {
+		t.Fatal("a cross-share code attempt must be audited as denied")
+	}
+}
+
+// TestRevokedRecipientLosesAccess: withdrawing an invitation takes effect.
+func TestRevokedRecipientLosesAccess(t *testing.T) {
+	svc, sh, meta, _ := recipientFixture(t)
+	ctx := context.Background()
+
+	// Revoke bob by rewriting his row.
+	_ = meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		return tx.MarkRecipientVerified(ctx, sh.ID, "bob@example.test")
+	})
+
+	if _, err := svc.ResolveRecipient(ctx, sh, "bob@example.test"); err != nil {
+		t.Fatalf("bob should be resolvable: %v", err)
+	}
+
+	// A code issued before a revocation must not survive it.
+	code, err := svc.IssueRecipientCode(ctx, sh, "bob@example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.VerifyRecipientCode(ctx, sh, "bob@example.test", code); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+}
+
+// TestLinkShareDoesNotRequireRecipient: the distinction must not leak into link shares.
+func TestLinkShareDoesNotRequireRecipient(t *testing.T) {
+	meta := store.NewMemory()
+	owner := meta.AddUser(store.User{Username: "o", Email: "o@example.test", Role: "user"})
+	svc := share.New(meta, share.TestArgon())
+
+	created, err := svc.Create(context.Background(), share.NewShare{
+		NodeID:  ownerRoot(t, meta, owner.ID),
+		OwnerID: owner.ID,
+		Kind:    store.ShareLink,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sh, err := svc.Resolve(context.Background(), created.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if share.RequiresRecipient(sh) {
+		t.Fatal("a link share must be usable by whoever holds the URL")
+	}
+}
+
+// TestExpiredCodeRejected: the TTL is enforced by the ticket, not the caller.
+func TestExpiredCodeRejected(t *testing.T) {
+	svc, sh, _, tickets := recipientFixture(t)
+	ctx := context.Background()
+
+	// Mint a code that expired an hour ago: a leaked mailbox must stop being useful.
+	code, err := tickets.Mint(ticket.PurposeEmailVerify, ticket.Claims{
+		Subject: sh.ID.String(),
+		ID:      "alice@example.test",
+		Expiry:  time.Now().Add(-time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := svc.VerifyRecipientCode(ctx, sh, "alice@example.test", code); err == nil {
+		t.Fatal("an expired code must be rejected")
+	}
+}

@@ -1,0 +1,37 @@
+{
+	# Two vhosts on purpose: the app origin and the content origin must differ,
+	# otherwise a stored-XSS payload in an uploaded file can read the session
+	# cookie and drive the authenticated UI.
+	cloud.example.com {
+		encode zstd gzip
+
+		header {
+			Strict-Transport-Security "max-age=31536000; includeSubDomains"
+			X-Content-Type-Options "nosniff"
+			X-Frame-Options "DENY"
+			Referrer-Policy "no-referrer"
+			Permissions-Policy "geolocation=(), microphone=(), camera=()"
+			-Server
+		}
+
+		reverse_proxy web:8080
+	}
+
+	usercontent.example.com {
+		encode zstd gzip
+
+		header {
+			Strict-Transport-Security "max-age=31536000; includeSubDomains"
+			X-Content-Type-Options "nosniff"
+			# User content is never a document: force download and sandbox it.
+			Content-Security-Policy "sandbox; default-src 'none'; img-src 'self'; media-src 'self'"
+			Content-Disposition "attachment"
+			X-Frame-Options "DENY"
+			Referrer-Policy "no-referrer"
+			X-Robots-Tag "noindex, nofollow, noarchive"
+			-Server
+		}
+
+		reverse_proxy web:8080
+	}
+}

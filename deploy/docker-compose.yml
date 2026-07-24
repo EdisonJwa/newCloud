@@ -1,0 +1,91 @@
+# newcloud — single-host deployment.
+#
+# Two decisions in this file are not stylistic:
+#
+#   * /var/lib/newcloud is mounted as ONE bind mount. blobs/ and blobs/tmp/ must
+#     share a filesystem or publishing a blob degrades from rename(2) to copying
+#     the whole file. At 40 TiB that is not a slowdown, it is an outage.
+#   * postgres data and blobs are separated into different mount points so a
+#     restic snapshot of blobs does not fight the database for IO. Put them on
+#     different physical disks in production.
+
+name: newcloud
+
+services:
+  web:
+    image: newcloud:latest
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    environment:
+      NEWCLOUD_CONFIG: /etc/newcloud/config.yml
+      DATABASE_URL: postgres://newcloud:${PG_PASSWORD}@postgres:5432/newcloud?sslmode=disable
+      PGHOST: postgres
+      PGUSER: newcloud
+      PGPASSWORD: ${PG_PASSWORD}
+      PGDATABASE: newcloud
+    volumes:
+      - /etc/newcloud:/etc/newcloud:ro
+      - /var/lib/newcloud:/var/lib/newcloud
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/newcloud", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    command:
+      - postgres
+      - -c
+      - wal_level=replica
+      - -c
+      - archive_mode=on
+      # Archive to a path that is NOT on the same disk as the data directory.
+      - -c
+      - archive_command=test ! -f /archive/%f && cp %p /archive/%f
+      - -c
+      - max_connections=100
+      - -c
+      - shared_buffers=1GB
+      - -c
+      - work_mem=32MB
+      - -c
+      - maintenance_work_mem=512MB
+    environment:
+      POSTGRES_DB: newcloud
+      POSTGRES_USER: newcloud
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+    volumes:
+      - /var/lib/newcloud-pg:/var/lib/postgresql/data
+      - /mnt/wal-archive:/archive        # separate disk, ideally off-host
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U newcloud -d newcloud"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - web
+
+volumes:
+  caddy_data:
+  caddy_config:
