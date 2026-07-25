@@ -6,8 +6,8 @@ import (
 	"io"
 	"net/http"
 	"path"
-	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -32,13 +32,26 @@ type fileJSON struct {
 	ModifiedAt string `json:"modified_at"`
 	CreatedAt  string `json:"created_at"`
 	Trashed    bool   `json:"trashed,omitempty"`
+	// Preview tells the client which renderer to use, or omits the field when the file
+	// downloads instead. It is advisory: the download endpoint re-checks the type and the
+	// bytes, so a stale value cannot make the server inline something it refuses.
+	Preview string `json:"preview,omitempty"`
 }
 
 func toFileJSON(n store.Node, rel string) fileJSON {
+	preview := ""
+	if !n.IsDir() {
+		preview = string(previewKindForNode(n.Name, n.Mime))
+	}
 	return fileJSON{
-		ID: n.ID.String(), Name: n.Name,
-		Path: path.Join("/", rel), Kind: string(n.Kind), Size: n.Size,
-		Mime: n.Mime, ETag: n.ETag,
+		Preview:    preview,
+		ID:         n.ID.String(),
+		Name:       n.Name,
+		Path:       path.Join("/", rel),
+		Kind:       string(n.Kind),
+		Size:       n.Size,
+		Mime:       n.Mime,
+		ETag:       n.ETag,
 		ModifiedAt: n.ModifiedAt.UTC().Format("2006-01-02T15:04:05Z07:00"),
 		CreatedAt:  n.CreatedAt.UTC().Format("2006-01-02T15:04:05Z07:00"),
 		Trashed:    n.TrashedAt != nil,
@@ -305,26 +318,72 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rc.Close()
 
-	w.Header().Set("Content-Type", contentTypeFor(node))
-	w.Header().Set("Content-Disposition", contentDisposition(node.Name))
-	w.Header().Set("Content-Length", strconv.FormatInt(node.Size, 10))
+	// Inline rendering is opt-in. The default stays a download, so a client that predates
+	// this feature keeps the behaviour it had.
+	inline := previewFromHeader(r)
+	kind := previewNone
+	if inline {
+		kind = previewKindForNode(node.Name, node.Mime)
+
+		// The headers are claims. Read the first bytes and check what the file actually
+		// starts with: a client may declare image/png, name it .png, and send HTML, and no
+		// header can tell you otherwise.
+		if kind != previewNone {
+			head := make([]byte, sniffableBytes)
+			n, rerr := io.ReadFull(rc, head)
+			if rerr != nil && rerr != io.EOF && rerr != io.ErrUnexpectedEOF {
+				s.writeStoreError(w, rerr)
+				return
+			}
+			if looksLikeActiveContent(head[:n]) {
+				kind = previewNone
+			}
+			// Rewind regardless: ServeContent re-reads from the start, and a reader left
+			// mid-stream would serve the file truncated.
+			if _, serr := rc.Seek(0, io.SeekStart); serr != nil {
+				s.writeStoreError(w, serr)
+				return
+			}
+		}
+
+		if kind == previewNone {
+			// Asked for a preview of something this server will not render in place.
+			// Answering with an attachment is the honest outcome: the file arrives, and the
+			// UI shows "no preview for this type".
+			inline = false
+		}
+	}
+
+	if !inline {
+		w.Header().Set("Content-Type", contentTypeFor(node))
+		w.Header().Set("Content-Disposition", contentDisposition(node.Name))
+	} else {
+		previewHeaders(w, node.Name, node.Mime, kind)
+	}
+
 	w.Header().Set("ETag", node.ETag)
 	w.Header().Set("Accept-Ranges", "bytes")
 
-	if _, err := io.Copy(w, rc); err != nil {
-		// The client disconnected or the disk failed; headers are already sent so
-		// the best we can do is log it.
-		s.deps.Log.Warn("download interrupted", "path", rel, "error", err)
-		return
-	}
+	// ServeContent handles Range, If-Range, If-None-Match and If-Modified-Since against
+	// the seekable reader. The previous code advertised Accept-Ranges but streamed
+	// io.Copy, so a video could not seek and a resumed download restarted from zero.
+	//
+	// The modtime is zero because the metadata layer's timestamps are not stable enough to
+	// serve as validators here; the ETag, which is derived from the content address, does
+	// that job correctly.
+	http.ServeContent(w, r, node.Name, time.Time{}, rc)
 
 	bytes := node.Size
 	_ = s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
+		meta := map[string]any{"name": node.Name}
+		if inline {
+			meta["inline"] = string(kind)
+		}
 		return tx.Audit(ctx, store.AuditEntry{
 			ActorKind: "user", ActorUserID: actor.Ptr(), ActorEmail: actor.Email(),
 			ActorIP: clientIP(r), UserAgent: r.UserAgent(),
 			Action: "file.read", TargetKind: "node", TargetID: node.ID.String(),
-			Result: "ok", Bytes: &bytes, Metadata: map[string]any{"name": node.Name},
+			Result: "ok", Bytes: &bytes, Metadata: meta,
 		})
 	})
 }

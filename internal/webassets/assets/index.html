@@ -5,15 +5,23 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="referrer" content="same-origin">
   <meta name="robots" content="noindex, nofollow, noarchive">
+  <meta name="color-scheme" content="light dark">
   <title>newcloud</title>
   <link rel="stylesheet" href="/assets/style.css">
 </head>
 <body>
+  <!-- The shell is intentionally almost empty.
+       Every view is built by the script from data, so there is no markup here that could
+       get out of step with the API, and nothing user-controlled is ever parsed as HTML. -->
   <div id="app">
+    <aside class="sidebar" id="sidebar"></aside>
     <header class="bar" id="bar"></header>
     <main id="main"></main>
   </div>
+
+  <div id="dropzone"><div class="box">Drop files to upload</div></div>
   <div id="toast" role="status" aria-live="polite"></div>
+
   <script src="/assets/app.js" defer></script>
 </body>
 </html>

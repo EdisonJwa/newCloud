@@ -393,13 +393,21 @@ func seed(base string) (seedResult, error) {
 	cbResp.Body.Close()
 
 	// Directories and files.
-	for _, d := range []string{"合同", "设计稿", "archive"} {
+	for _, d := range []string{"合同", "设计稿", "图片", "archive"} {
 		_, _ = postJSON(client, base+"/api/files/mkdir", map[string]any{"path": d})
 	}
 
+	// Sample files that actually render.
+	//
+	// A placeholder "PDF" that is not a PDF makes the preview look broken rather than the
+	// data look fake: the browser shows its cannot-display icon and the visitor concludes
+	// the product is at fault. Every entry below is a real, small file of its type.
 	files := []struct{ dir, name, body string }{
-		{"", "README.txt", "这是一个 newcloud 演示实例。\n\n所有文件都存在本地磁盘的内容寻址存储里，\n目录树只存在于 PostgreSQL。\n"},
-		{"合同", "采购合同-2026.pdf", "%PDF-1.4 (演示用占位内容，不是真的 PDF)\n"},
+		{"", "README.txt", demoReadme},
+		{"", "报告.md", demoMarkdown},
+		{"", "数据.csv", demoCSV},
+		{"图片", "示例图.png", demoPNG()},
+		{"合同", "采购合同-2026.pdf", demoPDF()},
 		{"设计稿", "首页-v3.fig", "figma-binary-placeholder\n"},
 		{"archive", "2025-年度总结.txt", "占位内容\n"},
 	}
