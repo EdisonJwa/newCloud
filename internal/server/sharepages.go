@@ -27,7 +27,22 @@ const sharePageTimeout = time.Hour
 // Anonymous by design. Every failure — unknown token, revoked, expired, exhausted,
 // wrong password — renders the same page, so a visitor cannot use it to discover
 // whether a token ever existed.
+//
+// Two consumers share this URL:
+//
+//	a browser     navigates here and needs the HTML shell, which then fetches JSON
+//	a program     calls it directly and wants the JSON
+//
+// The Accept header distinguishes them. Without that split, opening a share link in a
+// browser showed raw JSON, because the shell is only served as the router's fallback for
+// paths no handler claims — and this path is claimed.
 func (s *Server) handleSharePage(w http.ResponseWriter, r *http.Request) {
+	// A browser navigation sends Accept: text/html; fetch() and API clients do not.
+	if wantsHTML(r) {
+		s.serveAppShell(w, r)
+		return
+	}
+
 	token := chiURLParam(r, "token")
 
 	sh, err := s.deps.Shares.Resolve(r.Context(), token)

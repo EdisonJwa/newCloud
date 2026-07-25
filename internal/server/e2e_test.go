@@ -442,8 +442,14 @@ func TestRequestShareIsUploadOnly(t *testing.T) {
 		strings.NewReader(`{"path":"inbox"}`), map[string]string{"Content-Type": "application/json"})
 	resp.Body.Close()
 
+	// The payload is exactly what the bundled frontend sends, hide_contents included.
+	//
+	// That field is redundant — the service forces it on for request shares — but sending
+	// it is what the client does, and the API rejects unknown fields. Omitting it from the
+	// request struct therefore broke "create a drop box" from the UI with a 400 while this
+	// test passed, because the test only ever checked the response.
 	resp = h.do(http.MethodPost, "/api/shares/",
-		strings.NewReader(`{"path":"inbox","kind":"request"}`),
+		strings.NewReader(`{"path":"inbox","kind":"request","hide_contents":true}`),
 		map[string]string{"Content-Type": "application/json"})
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create request share: %d %s", resp.StatusCode, readBody(resp))

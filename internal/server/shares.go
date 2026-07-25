@@ -76,6 +76,11 @@ func (s *Server) handleShareCreate(w http.ResponseWriter, r *http.Request) {
 		MaxUploads   *int     `json:"max_uploads"`
 		Permissions  []string `json:"permissions"`
 		Recipients   []string `json:"recipients"`
+		// HideContents is accepted but not trusted: the service forces it on for request
+		// shares. It is in the struct anyway because the client sends it, and
+		// decodeJSON rejects unknown fields — omitting it here made every "create a drop
+		// box" request fail with 400 from the bundled frontend.
+		HideContents bool `json:"hide_contents"`
 	}
 	if !decodeJSON(w, r, &body) {
 		return

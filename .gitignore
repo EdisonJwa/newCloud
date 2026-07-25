@@ -9,6 +9,10 @@ bin/
 # Local run artifacts
 testdata-run/
 r8/
+# State written by `go run ./tools/demo`: a config with a throwaway secret, blobs,
+# the compiled binary and the app log.
+demo-run/
+shots/
 *.log
 
 # Secrets: never commit these
