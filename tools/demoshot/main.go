@@ -137,7 +137,7 @@ func run() error {
 	// ---- Shares tab ----
 	fmt.Println("capturing the shares tab…")
 	if _, err := evalString(cdp, `(() => {
-		const b = [...document.querySelectorAll('nav.tabs button')].find(x => x.textContent.trim() === 'Shares');
+		const b = [...document.querySelectorAll('nav.primary button')].find(x => x.textContent.trim() === 'Shares');
 		if (b) b.click(); return 'ok';
 	})()`); err != nil {
 		return err
@@ -150,34 +150,71 @@ func run() error {
 	// ---- A folder inside the tree ----
 	fmt.Println("capturing a subfolder…")
 	if _, err := evalString(cdp, `(() => {
-		const b = [...document.querySelectorAll('nav.tabs button')].find(x => x.textContent.trim() === 'Files');
+		const b = [...document.querySelectorAll('nav.primary button')].find(x => x.textContent.trim() === 'Files');
 		if (b) b.click(); return 'ok';
 	})()`); err != nil {
 		return err
 	}
 	time.Sleep(1200 * time.Millisecond)
+	// The image folder, so the thumbnails are actually exercised by a frame: a thumbnail
+	// that renders in an API test and not in the table is the failure worth catching.
 	if _, err := evalString(cdp, `(() => {
-		const links = [...document.querySelectorAll('table.files button.link')];
-		const dir = links.find(b => b.textContent.trim() === '合同');
+		const labels = [...document.querySelectorAll('table.files span.label')];
+		const dir = labels.find(b => b.textContent.trim() === '图片');
 		if (dir) dir.click(); return 'ok';
 	})()`); err != nil {
 		return err
 	}
-	time.Sleep(1400 * time.Millisecond)
+	time.Sleep(1600 * time.Millisecond)
 	if err := shoot(cdp, filepath.Join(*outDir, "folder.png")); err != nil {
+		return err
+	}
+
+	// ---- Activity ----
+	//
+	// The audit timeline is the view a person opens to ask "who downloaded my file", so it
+	// is worth a frame of its own rather than being covered by the file list.
+	fmt.Println("capturing the activity timeline…")
+	if _, err := evalString(cdp, `(() => {
+		const b = [...document.querySelectorAll('nav.primary button')].find(x => x.textContent.trim() === 'Activity');
+		if (b) b.click(); return 'ok';
+	})()`); err != nil {
+		return err
+	}
+	time.Sleep(1600 * time.Millisecond)
+	if err := shoot(cdp, filepath.Join(*outDir, "activity.png")); err != nil {
 		return err
 	}
 
 	// ---- App passwords ----
 	fmt.Println("capturing app passwords…")
 	if _, err := evalString(cdp, `(() => {
-		const b = [...document.querySelectorAll('nav.tabs button')].find(x => x.textContent.trim() === 'App passwords');
+		const b = [...document.querySelectorAll('nav.primary button')].find(x => x.textContent.trim() === 'Access');
 		if (b) b.click(); return 'ok';
 	})()`); err != nil {
 		return err
 	}
 	time.Sleep(1400 * time.Millisecond)
 	if err := shoot(cdp, filepath.Join(*outDir, "apppasswords.png")); err != nil {
+		return err
+	}
+
+	// ---- Dark palette ----
+	//
+	// Dark mode here is a separate set of colours rather than an inversion, so it needs its
+	// own frame: warming the palette is exactly the kind of change that looks fine in a
+	// stylesheet and wrong on screen.
+	fmt.Println("capturing the dark palette…")
+	if err := cdp.Call("Emulation.setEmulatedMedia", map[string]any{
+		"features": []map[string]string{{"name": "prefers-color-scheme", "value": "dark"}},
+	}); err != nil {
+		return err
+	}
+	if _, err := evalString(cdp, jsShowFiles); err != nil {
+		return err
+	}
+	time.Sleep(1400 * time.Millisecond)
+	if err := shoot(cdp, filepath.Join(*outDir, "files-dark.png")); err != nil {
 		return err
 	}
 
@@ -188,6 +225,13 @@ func run() error {
 func navigate(cdp *wsConn, target string) error {
 	return cdp.Call("Page.navigate", map[string]any{"url": target})
 }
+
+// jsShowFiles switches the sidebar back to the file list.
+const jsShowFiles = `(() => {
+	const b = [...document.querySelectorAll('nav.primary button')].find(x => x.textContent.trim() === 'Files');
+	if (b) b.click();
+	return 'ok';
+})()`
 
 func shoot(cdp *wsConn, path string) error {
 	raw, err := cdp.CallWithResult("Page.captureScreenshot", map[string]any{

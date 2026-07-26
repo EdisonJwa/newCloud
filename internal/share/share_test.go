@@ -183,7 +183,7 @@ func TestRevokedShareIsNotResolved(t *testing.T) {
 	f := newFixture(t)
 	c := f.create(t, NewShare{Kind: store.ShareLink})
 
-	if err := f.svc.Revoke(context.Background(), c.Share.ID, f.owner.ID); err != nil {
+	if err := f.svc.Revoke(context.Background(), c.Share.ID, f.owner.ID, f.owner.Email); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.svc.Resolve(context.Background(), c.Token); !errors.Is(err, store.ErrShareRevoked) {

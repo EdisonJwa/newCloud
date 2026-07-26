@@ -73,8 +73,11 @@ func New(meta store.Store, params ArgonParams) *Service {
 
 // NewShare describes a share to create.
 type NewShare struct {
-	NodeID          uuid.UUID
-	OwnerID         uuid.UUID
+	NodeID  uuid.UUID
+	OwnerID uuid.UUID
+	// OwnerEmail is recorded on the create event. Audit rows carry the actor address at the
+	// time of the event, so reading it back by joining users would rewrite history.
+	OwnerEmail      string
 	Kind            store.ShareKind
 	Label           string
 	Password        string
@@ -169,7 +172,7 @@ func (s *Service) Create(ctx context.Context, in NewShare) (Created, error) {
 		}
 
 		return tx.Audit(ctx, store.AuditEntry{
-			ActorKind: "user", ActorUserID: &in.OwnerID,
+			ActorKind: "user", ActorUserID: &in.OwnerID, ActorEmail: in.OwnerEmail,
 			Action: "share.create", TargetKind: "share", TargetID: c.ID.String(),
 			Result: "ok",
 			Metadata: map[string]any{
@@ -326,13 +329,13 @@ type DownloadMeta struct {
 }
 
 // Revoke withdraws a share.
-func (s *Service) Revoke(ctx context.Context, shareID, actorID uuid.UUID) error {
+func (s *Service) Revoke(ctx context.Context, shareID uuid.UUID, actorID uuid.UUID, actorEmail string) error {
 	return s.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
 		if err := tx.RevokeShare(ctx, shareID); err != nil {
 			return err
 		}
 		return tx.Audit(ctx, store.AuditEntry{
-			ActorKind: "user", ActorUserID: &actorID,
+			ActorKind: "user", ActorUserID: &actorID, ActorEmail: actorEmail,
 			Action: "share.revoke", TargetKind: "share", TargetID: shareID.String(),
 			Result: "ok",
 		})

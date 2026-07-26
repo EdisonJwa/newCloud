@@ -26,6 +26,7 @@ import (
 	"github.com/EdisonJwa/newCloud/internal/share"
 	"github.com/EdisonJwa/newCloud/internal/storage/layout"
 	"github.com/EdisonJwa/newCloud/internal/store"
+	"github.com/EdisonJwa/newCloud/internal/thumbnail"
 	"github.com/EdisonJwa/newCloud/internal/ticket"
 	"github.com/EdisonJwa/newCloud/internal/webassets"
 )
@@ -46,7 +47,10 @@ type Deps struct {
 	// Mailer delivers recipient verification codes. Nil means no transport is
 	// configured: email shares still exist, but the server logs a warning each time a
 	// code is generated rather than pretending it was sent.
-	Mailer  mail.Sender
+	Mailer mail.Sender
+	// Thumbs renders image previews. Nil disables the endpoint, which then answers 415 and
+	// the client falls back to a type badge.
+	Thumbs  *thumbnail.Generator
 	Log     *slog.Logger
 	Version string
 }
@@ -60,7 +64,8 @@ type Server struct {
 	dav http.Handler
 	// ui serves the embedded browser client. Nil disables the SPA, which is useful
 	// for an API-only deployment and for tests that assert on 404s.
-	ui *webassets.Handler
+	ui     *webassets.Handler
+	thumbs *thumbnail.Generator
 }
 
 // New builds the server but does not start listening.
@@ -78,7 +83,12 @@ func New(deps Deps) (*Server, error) {
 		deps.Log = slog.Default()
 	}
 
-	s := &Server{deps: deps, started: time.Now()}
+	thumbs := deps.Thumbs
+	if thumbs == nil {
+		thumbs = thumbnail.New()
+	}
+
+	s := &Server{deps: deps, started: time.Now(), thumbs: thumbs}
 	if deps.AppPass != nil {
 		s.dav = dav.New(deps.Config, deps.Meta, deps.Content, deps.Authz, deps.AppPass).WithLogger(deps.Log)
 	}
@@ -143,6 +153,7 @@ func (s *Server) Handler() http.Handler {
 				r.Delete("/", s.handleDelete)
 				r.Get("/trash", s.handleTrashList)
 				r.Post("/restore", s.handleRestore)
+				r.Get("/thumbnail", s.handleThumbnail)
 				r.Get("/versions", s.handleVersions)
 				r.Post("/restore-version", s.handleRestoreVersion)
 			})
@@ -157,6 +168,8 @@ func (s *Server) Handler() http.Handler {
 			// The audit log: read-only, exportable. Inside the authenticated group
 			// because it needs a session, unlike the share pages.
 			r.Get("/audit", s.handleAuditExport)
+			// The view feeds a screen; the export above produces a file.
+			r.Get("/audit/events", s.handleAuditList)
 
 			r.Route("/apppasswords", func(r chi.Router) {
 				r.Get("/", s.handleAppPasswordList)

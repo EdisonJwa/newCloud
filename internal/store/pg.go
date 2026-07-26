@@ -589,6 +589,17 @@ func limitArg(limit int) any {
 	return limit
 }
 
+// offsetArg clamps a negative offset to zero.
+//
+// PostgreSQL accepts OFFSET 0 but not a negative value, and callers compute offsets from
+// page numbers, so a bad one should read from the start rather than fail the query.
+func offsetArg(offset int) int {
+	if offset < 0 {
+		return 0
+	}
+	return offset
+}
+
 func nullableString(s string) *string {
 	if s == "" {
 		return nil

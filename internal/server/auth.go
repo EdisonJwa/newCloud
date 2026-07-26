@@ -155,9 +155,20 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 		if claims, verr := s.deps.Sessions.Verify(r.Context(), c.Value); verr == nil {
 			_ = s.deps.Sessions.Revoke(r.Context(), claims.ID)
 			_ = s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
+				// The session ticket carries the subject but not the address, so it is read
+				// here. It goes into the row rather than being joined at read time: an audit
+				// log must show the address as it was at the event, not whatever it has been
+				// changed to since.
+				email := ""
+				if uid := parseUUID(claims.Subject); uid != uuid.Nil {
+					if u, uerr := tx.UserByID(ctx, uid); uerr == nil {
+						email = u.Email
+					}
+				}
 				return tx.Audit(ctx, store.AuditEntry{
 					ActorKind: "user", ActorUserID: ptrUUID(parseUUID(claims.Subject)),
-					ActorIP: clientIP(r), UserAgent: r.UserAgent(),
+					ActorEmail: email,
+					ActorIP:    clientIP(r), UserAgent: r.UserAgent(),
 					Action: "auth.logout", TargetKind: "session", TargetID: claims.ID,
 					Result: "ok",
 				})

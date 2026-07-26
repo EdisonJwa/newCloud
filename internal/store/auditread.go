@@ -38,6 +38,13 @@ type AuditFilter struct {
 	// Limit caps the number of rows. Zero means "the caller's default", which the
 	// exporter sets; an unbounded export is how a query takes down a database.
 	Limit int
+	// Offset skips matching rows before applying Limit. It exists for paging the live view,
+	// where the reader walks backwards through history.
+	//
+	// Paging by offset is only correct because the sort is by id and the table is
+	// append-only: a new event shifts the window by one, which is the expected behaviour for
+	// someone reading recent history. It would not be correct for a stable snapshot.
+	Offset int
 	// Descending orders newest first. Exports use ascending so the file reads
 	// chronologically; the live view uses descending.
 	Descending bool

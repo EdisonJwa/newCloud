@@ -37,6 +37,14 @@ func (m *Memory) ReadAudit(ctx context.Context, f AuditFilter) ([]AuditRow, erro
 			out[i], out[j] = out[j], out[i]
 		}
 	}
+
+	// Offset before Limit: the two compose as "skip, then take", matching SQL.
+	if f.Offset > 0 {
+		if f.Offset >= len(out) {
+			return nil, nil
+		}
+		out = out[f.Offset:]
+	}
 	if f.Limit > 0 && len(out) > f.Limit {
 		out = out[:f.Limit]
 	}

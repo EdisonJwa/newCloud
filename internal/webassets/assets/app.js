@@ -10,9 +10,9 @@
 //  1. User data reaches the DOM through textContent, never innerHTML. File names, share
 //     labels and addresses come from other people; injecting one into markup is stored
 //     XSS on the session of whoever browses the directory.
-//  2. The server decides what may be previewed. The client never infers "this is an
-//     image" from an extension — it reads the `preview` field the API returns, and the
-//     download endpoint re-checks the type and the bytes regardless.
+//  2. The server decides what may be previewed and thumbnailed. The client reads the
+//     `preview` field the API returns; it never infers "this is an image" from an
+//     extension and then disagrees with the server about it.
 
 (() => {
   "use strict";
@@ -21,18 +21,29 @@
 
   const state = {
     me: null,
+    view: "files", // files | shares | trash | audit | credentials
     path: "",
     entries: [],
-    view: "files", // files | shares | trash | credentials
     layout: "list", // list | grid
     filter: "",
+    // Audit state is kept separate so switching tabs does not lose a half-set filter.
+    audit: {
+      events: [],
+      offset: 0,
+      total: 0,
+      hasMore: false,
+      actions: [],
+      action: "",
+      result: "",
+      since: "",
+      loading: false,
+    },
   };
 
   const $ = (sel) => document.querySelector(sel);
 
   // ---------- DOM helper ----------
 
-  // el builds an element. Text always goes through textContent.
   function el(tag, opts = {}, children = []) {
     const node = document.createElement(tag);
     for (const [key, value] of Object.entries(opts)) {
@@ -55,27 +66,29 @@
     while (node.firstChild) node.removeChild(node.firstChild);
   }
 
-  // icon returns an inline SVG. Icons are drawn here rather than loaded as a font or a
+  // icon returns an inline SVG. Icons are drawn here rather than loaded as a font or
   // sprite because the CSP allows no external resources and the set is small.
-  function icon(name, size = 16) {
+  function icon(name, size = 15) {
     const paths = {
-      search: "M11 11l3.5 3.5M7.5 12.5a5 5 0 100-10 5 5 0 000 10z",
-      files: "M3 4.5A1.5 1.5 0 014.5 3h2.9l1.3 1.6H13A1.5 1.5 0 0114.5 6v7A1.5 1.5 0 0113 14.5H4.5A1.5 1.5 0 013 13V4.5z",
-      shares: "M6.5 9.5l4-3M6.5 7.5l4 3M5 10a2 2 0 110-4 2 2 0 010 4zm7 5a2 2 0 110-4 2 2 0 010 4zm0-8a2 2 0 110-4 2 2 0 010 4z",
-      trash: "M4 5.5h9M6.5 5.5V4a1 1 0 011-1h2a1 1 0 011 1v1.5M5.5 5.5l.5 8a1 1 0 001 1h3a1 1 0 001-1l.5-8",
-      key: "M9.5 6.5a2.5 2.5 0 11-1.8 4.2L4 14.5H2.5V13l3.8-3.7A2.5 2.5 0 019.5 6.5z",
-      upload: "M8 11V3m0 0L5 6m3-3l3 3M3 11v2a1 1 0 001 1h8a1 1 0 001-1v-2",
-      folderPlus: "M3 4.5A1.5 1.5 0 014.5 3h2.9l1.3 1.6H13A1.5 1.5 0 0114.5 6v7A1.5 1.5 0 0113 14.5H4.5A1.5 1.5 0 013 13V4.5zM8 7.5v4M6 9.5h4",
+      search: "M10.5 10.5l3.5 3.5M7.5 12.5a5 5 0 100-10 5 5 0 000 10z",
+      files: "M3 4.5A1.5 1.5 0 014.5 3h2.4l1.2 1.5H13A1 1 0 0114 5.5v7.5a1 1 0 01-1 1H4a1 1 0 01-1-1V4.5z",
+      shares: "M6 9.5l4.5-3.5M6 7l4.5 3.5M4 9.5a1.75 1.75 0 110-3.5 1.75 1.75 0 010 3.5zm8 4.5a1.75 1.75 0 110-3.5 1.75 1.75 0 010 3.5zm0-8a1.75 1.75 0 110-3.5 1.75 1.75 0 010 3.5z",
+      trash: "M3.5 5h9M6 5V3.8a.8.8 0 01.8-.8h2.4a.8.8 0 01.8.8V5M5 5l.4 8a.9.9 0 00.9.9h3.4a.9.9 0 00.9-.9L11 5",
+      key: "M9.5 6.5a2.5 2.5 0 11-1.7 4.3L4.5 14H3v-1.5l3.8-3.3a2.5 2.5 0 012.7-2.7z",
+      pulse: "M1.5 8h3l1.5-4 2.5 8 1.5-4h3.5",
+      upload: "M8 11V3m0 0L5 6m3-3l3 3M2.5 11.5v1.5a1 1 0 001 1h9a1 1 0 001-1v-1.5",
+      folderPlus: "M3 4.5A1.5 1.5 0 014.5 3h2.4l1.2 1.5H13A1 1 0 0114 5.5v7.5a1 1 0 01-1 1H4a1 1 0 01-1-1V4.5zM8 7.5v3.5M6.25 9.25h3.5",
       refresh: "M13.5 8a5.5 5.5 0 11-1.6-3.9M13.5 2v3h-3",
-      list: "M3 4.5h10M3 8h10M3 11.5h10",
-      grid: "M3 3.5h4v4H3zM9 3.5h4v4H9zM3 8.5h4v4H3zM9 8.5h4v4H9z",
-      download: "M8 3v8m0 0l3-3m-3 3L5 8M3 13h10",
+      list: "M2.5 4h11M2.5 8h11M2.5 12h11",
+      grid: "M2.5 2.5h4.5v4.5H2.5zM9 2.5h4.5v4.5H9zM2.5 9h4.5v4.5H2.5zM9 9h4.5v4.5H9z",
+      download: "M8 2.5v8m0 0l3-3m-3 3l-3-3M2.5 13.5h11",
       close: "M4 4l8 8M12 4l-8 8",
-      eye: "M1.5 8s2.4-4 6.5-4 6.5 4 6.5 4-2.4 4-6.5 4S1.5 8 1.5 8zM8 10a2 2 0 100-4 2 2 0 000 4z",
-      image: "M3 4.5h10v7H3zM3 9.5l3-2.5 3 2.5 2-1.5 2 1.5M10 6.5a.75.75 0 100-1.5.75.75 0 000 1.5z",
-      video: "M3 5.5h7v5H3zM10 7.5l3-1.5v4l-3-1.5",
-      audio: "M9 3v6.5M9 9.5a1.75 1.75 0 11-3.5 0 1.75 1.75 0 013.5 0zM9 3l3 1",
+      image: "M2.5 3.5h11v9h-11zM2.5 10l3.5-3 3 3 2-1.5 2.5 2",
+      video: "M2.5 5h8v6h-8zM10.5 7.5l3-1.5v4l-3-1.5",
+      audio: "M9.5 2.5v7M9.5 9.5a1.75 1.75 0 11-3.5 0 1.75 1.75 0 013.5 0z",
       doc: "M4 2.5h5l3 3v8H4zM9 2.5v3h3",
+      user: "M8 8a2.5 2.5 0 100-5 2.5 2.5 0 000 5zm-4.5 5.5a4.5 4.5 0 019 0",
+      clock: "M8 14A6 6 0 108 2a6 6 0 000 12zM8 4.5V8l2.5 1.5",
     };
     const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
     svg.setAttribute("width", size);
@@ -83,7 +96,7 @@
     svg.setAttribute("viewBox", "0 0 16 16");
     svg.setAttribute("fill", "none");
     svg.setAttribute("stroke", "currentColor");
-    svg.setAttribute("stroke-width", "1.4");
+    svg.setAttribute("stroke-width", "1.3");
     svg.setAttribute("stroke-linecap", "round");
     svg.setAttribute("stroke-linejoin", "round");
     svg.setAttribute("aria-hidden", "true");
@@ -115,9 +128,7 @@
 
     const resp = await fetch("/api" + path, opts);
 
-    if (resp.status === 401) {
-      throw new APIError(401, "unauthenticated", "not signed in");
-    }
+    if (resp.status === 401) throw new APIError(401, "unauthenticated", "not signed in");
     if (resp.status === 204) return null;
 
     const text = await resp.text();
@@ -141,12 +152,12 @@
   function toast(message, kind = "info") {
     const node = $("#toast");
     clear(node);
-    node.append(el("span", { class: "dot" }), el("span", { text: message }));
+    node.append(el("span", { text: message }));
     node.className = "show" + (kind === "error" ? " error" : "");
     clearTimeout(toastTimer);
     toastTimer = setTimeout(() => {
       node.className = "";
-    }, kind === "error" ? 6000 : 2800);
+    }, kind === "error" ? 6000 : 2600);
   }
 
   function fail(err) {
@@ -172,10 +183,23 @@
     const then = new Date(iso);
     const seconds = (Date.now() - then.getTime()) / 1000;
     if (seconds < 60) return "just now";
-    if (seconds < 3600) return `${Math.floor(seconds / 60)} min ago`;
-    if (seconds < 86400) return `${Math.floor(seconds / 3600)} h ago`;
-    if (seconds < 86400 * 7) return `${Math.floor(seconds / 86400)} d ago`;
-    return then.toLocaleDateString();
+    if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+    if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+    if (seconds < 86400 * 7) return `${Math.floor(seconds / 86400)}d ago`;
+    return then.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  }
+
+  function clockOf(iso) {
+    return new Date(iso).toLocaleTimeString(undefined, {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    });
+  }
+
+  function dayOf(iso) {
+    return new Date(iso).toLocaleDateString(undefined, { month: "short", day: "numeric" });
   }
 
   function joinPath(dir, name) {
@@ -188,11 +212,6 @@
     return name.slice(idx + 1);
   }
 
-  // typeClass maps a node to the CSS class of its badge.
-  //
-  // It reads the server's `preview` field first: the client must not decide on its own
-  // that a file is an image, because the server is the thing that will refuse to render
-  // it inline and the two views have to agree.
   function typeClass(entry) {
     if (entry.kind === "dir") return "dir";
     switch (entry.preview) {
@@ -224,25 +243,34 @@
     return entry.kind !== "dir" && entry.preview === "image";
   }
 
-  // previewURL is the inline endpoint. The server re-checks the type and sniffs the bytes,
-  // so this URL is a request, not a permission.
+  // filePath is the entry's absolute path, falling back to the current directory for
+  // listings that do not fill it in.
+  function filePath(entry) {
+    return entry.path || joinPath(state.path, entry.name);
+  }
+
   function previewURL(entry) {
-    const path = entry.path || joinPath(state.path, entry.name);
-    return `/api/files/download?inline=1&path=${encodeURIComponent(path)}`;
+    return `/api/files/download?inline=1&path=${encodeURIComponent(filePath(entry))}`;
   }
 
   function downloadURL(entry) {
-    const path = entry.path || joinPath(state.path, entry.name);
-    return `/api/files/download?path=${encodeURIComponent(path)}`;
+    return `/api/files/download?path=${encodeURIComponent(filePath(entry))}`;
+  }
+
+  // thumbnailURL is the resized image. The browser falls back to the type badge when the
+  // server answers 415, so this is always safe to set.
+  function thumbnailURL(entry) {
+    return `/api/files/thumbnail?path=${encodeURIComponent(filePath(entry))}`;
   }
 
   // ---------- chrome: sidebar ----------
 
   const NAV = [
-    { key: "files", label: "Files", icon: "files", load: () => loadFiles() },
-    { key: "shares", label: "Shares", icon: "shares", load: () => loadShares() },
-    { key: "trash", label: "Trash", icon: "trash", load: () => loadTrash() },
-    { key: "credentials", label: "App passwords", icon: "key", load: () => loadCredentials() },
+    { key: "files", label: "Files", icon: "files" },
+    { key: "shares", label: "Shares", icon: "shares" },
+    { key: "trash", label: "Trash", icon: "trash" },
+    { key: "audit", label: "Activity", icon: "pulse" },
+    { key: "credentials", label: "Access", icon: "key" },
   ];
 
   function renderSidebar() {
@@ -250,81 +278,144 @@
     clear(bar);
 
     bar.append(
-      el("div", { class: "logo" }, [
+      el("div", { class: "brand" }, [
         el("span", { class: "mark" }),
         el("span", { class: "word", text: "newcloud" }),
       ]),
     );
 
-    const tabs = el("nav", { class: "tabs" });
+    const nav = el("nav", { class: "primary" });
     for (const item of NAV) {
-      tabs.append(
+      nav.append(
         el(
           "button",
           {
             "aria-current": state.view === item.key ? "page" : null,
+            title: item.label,
             onclick: () => switchTo(item.key),
           },
-          [el("span", { class: "icon" }, [icon(item.icon)]), el("span", { text: item.label })],
+          [
+            el("span", { class: "icon" }, [icon(item.icon)]),
+            el("span", { class: "label", text: item.label }),
+          ],
         ),
       );
     }
-    bar.append(tabs);
+    bar.append(nav);
 
-    bar.append(
-      el("div", { class: "sidebar-footer" }, [
-        el("div", { text: state.me ? state.me.username : "" }),
-      ]),
-    );
+    bar.append(el("div", { class: "side-sep" }));
+
+    if (state.me) {
+      bar.append(
+        el("div", { class: "side-foot" }, [
+          el("span", { class: "avatar", text: (state.me.username || "?").slice(0, 1) }),
+          el("span", { text: state.me.username }),
+        ]),
+      );
+    }
   }
 
-  // ---------- chrome: header ----------
+  // ---------- chrome: topbar ----------
 
   function renderHeader() {
     const bar = $("#bar");
     clear(bar);
 
-    const search = el("input", {
-      type: "search",
-      placeholder: "Search this folder",
-      value: state.filter,
-      "aria-label": "Search this folder",
-      oninput: (e) => {
-        state.filter = e.target.value;
-        renderCurrentView();
-      },
-    });
-
-    bar.append(
-      el("div", { class: "search" }, [search, el("span", { class: "icon" }, [icon("search", 15)])]),
-    );
-
+    bar.append(renderCrumbs());
     bar.append(el("span", { class: "spacer" }));
 
-    if (state.me) {
-      const initial = (state.me.username || "?").slice(0, 1);
+    if (state.view === "files") {
+      const search = el("input", {
+        type: "search",
+        placeholder: "Filter this folder",
+        value: state.filter,
+        "aria-label": "Filter this folder",
+        oninput: (e) => {
+          state.filter = e.target.value;
+          renderMain();
+        },
+      });
       bar.append(
-        el("div", { class: "account" }, [
-          el("span", { class: "avatar", text: initial }),
-          el("span", { class: "who", text: state.me.username }),
-          el(
-            "button",
-            {
-              class: "btn ghost",
-              onclick: async () => {
-                try {
-                  await api("POST", "/auth/logout");
-                } catch {
-                  /* the cookie is gone either way */
-                }
-                location.href = "/api/auth/login";
-              },
-            },
-            ["Sign out"],
-          ),
+        el("div", { class: "search" }, [
+          search,
+          el("span", { class: "icon" }, [icon("search", 13)]),
         ]),
       );
     }
+
+    if (state.me) {
+      bar.append(
+        el(
+          "button",
+          {
+            class: "btn ghost",
+            title: "Sign out",
+            onclick: async () => {
+              try {
+                await api("POST", "/auth/logout");
+              } catch {
+                /* the cookie is gone either way */
+              }
+              location.href = "/api/auth/login";
+            },
+          },
+          [icon("user", 14), el("span", { text: state.me.username })],
+        ),
+      );
+    }
+  }
+
+  function renderCrumbs() {
+    const box = el("div", { class: "crumb-bar" });
+
+    switch (state.view) {
+      case "shares":
+        box.append(el("button", { class: "here", text: "Shared links" }));
+        return box;
+      case "trash":
+        box.append(el("button", { class: "here", text: "Trash" }));
+        return box;
+      case "audit":
+        box.append(el("button", { class: "here", text: "Activity" }));
+        return box;
+      case "credentials":
+        box.append(el("button", { class: "here", text: "App passwords" }));
+        return box;
+    }
+
+    box.append(
+      el("button", {
+        class: state.path ? "" : "here",
+        text: "Home",
+        onclick: () => {
+          state.path = "";
+          state.filter = "";
+          loadFiles();
+        },
+      }),
+    );
+
+    if (!state.path) return box;
+
+    let acc = "";
+    const segments = state.path.split("/");
+    segments.forEach((seg, index) => {
+      acc = acc ? `${acc}/${seg}` : seg;
+      const target = acc;
+      box.append(el("span", { class: "sep", text: "/" }));
+      box.append(
+        el("button", {
+          class: index === segments.length - 1 ? "here" : "",
+          text: seg,
+          onclick: () => {
+            state.path = target;
+            state.filter = "";
+            loadFiles();
+          },
+        }),
+      );
+    });
+    return box;
   }
 
   // ---------- files ----------
@@ -335,45 +426,9 @@
     return state.entries.filter((e) => e.name.toLowerCase().includes(q));
   }
 
-  function renderCrumbs() {
-    const crumbs = el("div", { class: "crumbs" });
-    crumbs.append(
-      el("button", {
-        text: "Home",
-        onclick: () => {
-          state.path = "";
-          state.filter = "";
-          loadFiles();
-        },
-      }),
-    );
-
-    if (!state.path) return crumbs;
-
-    let acc = "";
-    for (const seg of state.path.split("/")) {
-      acc = acc ? `${acc}/${seg}` : seg;
-      const target = acc;
-      crumbs.append(el("span", { class: "sep", text: "/" }));
-      crumbs.append(
-        el("button", {
-          text: seg,
-          onclick: () => {
-            state.path = target;
-            state.filter = "";
-            loadFiles();
-          },
-        }),
-      );
-    }
-    return crumbs;
-  }
-
   function renderFiles() {
     const main = $("#main");
     clear(main);
-
-    main.append(renderCrumbs());
 
     const fileInput = el("input", {
       type: "file",
@@ -382,71 +437,82 @@
       onchange: (e) => uploadFiles(e.target.files),
     });
 
-    const head = el("div", { class: "page-head" }, [
-      el("button", { class: "btn primary", onclick: () => fileInput.click() }, [
-        icon("upload"),
-        el("span", { text: "Upload" }),
+    main.append(
+      el("div", { class: "toolbar" }, [
+        el("button", { class: "btn primary", onclick: () => fileInput.click() }, [
+          icon("upload", 14),
+          el("span", { text: "Upload" }),
+        ]),
+        el("button", { class: "btn", onclick: () => promptNewFolder() }, [
+          icon("folderPlus", 14),
+          el("span", { text: "New folder" }),
+        ]),
+        fileInput,
+        el("span", { class: "spacer" }),
+        el("span", { class: "count num", text: countLabel() }),
+        el("div", { class: "seg" }, [
+          el(
+            "button",
+            {
+              "aria-pressed": state.layout === "list" ? "true" : "false",
+              title: "List",
+              onclick: () => setLayout("list"),
+            },
+            [icon("list", 13)],
+          ),
+          el(
+            "button",
+            {
+              "aria-pressed": state.layout === "grid" ? "true" : "false",
+              title: "Grid",
+              onclick: () => setLayout("grid"),
+            },
+            [icon("grid", 13)],
+          ),
+        ]),
+        el("button", { class: "btn ghost icon-only", title: "Refresh", onclick: () => loadFiles() }, [
+          icon("refresh", 14),
+        ]),
       ]),
-      el("button", { class: "btn", onclick: () => promptNewFolder() }, [
-        icon("folderPlus"),
-        el("span", { text: "New folder" }),
-      ]),
-      fileInput,
-      el("span", { class: "spacer" }),
-      el(
-        "button",
-        {
-          class: "btn ghost icon-only",
-          title: state.layout === "list" ? "Switch to grid" : "Switch to list",
-          "aria-label": state.layout === "list" ? "Switch to grid" : "Switch to list",
-          onclick: () => {
-            state.layout = state.layout === "list" ? "grid" : "list";
-            renderCurrentView();
-            renderHeader();
-          },
-        },
-        [icon(state.layout === "list" ? "grid" : "list")],
-      ),
-      el(
-        "button",
-        {
-          class: "btn ghost icon-only",
-          title: "Refresh",
-          "aria-label": "Refresh",
-          onclick: () => loadFiles(),
-        },
-        [icon("refresh")],
-      ),
-    ]);
-    main.append(head);
+    );
 
-    const progress = el("div", { class: "progress hidden" }, [el("div")]);
-    main.append(progress);
+    main.append(el("div", { class: "progress hidden" }, [el("div")]));
 
     const entries = visibleEntries();
 
     if (entries.length === 0) {
       main.append(
-        el("div", { class: "empty" }, [
-          el("div", { class: "glyph" }, [icon(state.filter ? "search" : "files", 32)]),
-          el("div", {
-            class: "title",
-            text: state.filter ? "Nothing matches" : "This folder is empty",
-          }),
-          el("div", {
-            class: "hint",
-            text: state.filter ? "Try a different search." : "Drop files here, or use Upload.",
-          }),
-        ]),
+        emptyState(
+          state.filter ? "search" : "files",
+          state.filter ? "Nothing matches" : "This folder is empty",
+          state.filter ? "Try a different filter." : "Drop files anywhere, or use Upload.",
+        ),
       );
       return;
     }
 
-    if (state.layout === "grid") {
-      main.append(renderGrid(entries));
-    } else {
-      main.append(renderTable(entries));
-    }
+    main.append(state.layout === "grid" ? renderGrid(entries) : renderTable(entries));
+  }
+
+  function countLabel() {
+    const total = state.entries.length;
+    const shown = visibleEntries().length;
+    if (total === 0) return "";
+    if (shown !== total) return `${shown} / ${total}`;
+    return `${total} item${total === 1 ? "" : "s"}`;
+  }
+
+  function setLayout(layout) {
+    state.layout = layout;
+    renderFiles();
+  }
+
+  function emptyState(glyph, title, hint) {
+    return el("div", { class: "empty" }, [
+      el("div", { class: "glyph" }, [icon(glyph, 26)]),
+      el("div", { class: "title", text: title }),
+      el("div", { class: "hint", text: hint }),
+    ]);
   }
 
   function renderTable(entries) {
@@ -469,23 +535,29 @@
     return el("div", { class: "table-wrap" }, [table]);
   }
 
+  // fileGlyph is the leading square of a row or tile: a thumbnail when the server says the
+  // file is an image, otherwise a badge with the extension.
+  function fileGlyph(entry) {
+    if (isImage(entry)) {
+      return el("img", {
+        class: "thumb",
+        src: thumbnailURL(entry),
+        alt: "",
+        loading: "lazy",
+        // A failed thumbnail must not leave a hole: the badge is the designed fallback.
+        onerror: (e) => {
+          e.target.replaceWith(el("span", { class: `ftype ${typeClass(entry)}` }, [badgeGlyph(entry)]));
+        },
+      });
+    }
+    if (entry.kind === "dir") {
+      return el("span", { class: "ftype dir" }, [icon("files", 13)]);
+    }
+    return el("span", { class: `ftype ${typeClass(entry)}` }, [badgeGlyph(entry)]);
+  }
+
   function renderRow(entry) {
     const isDir = entry.kind === "dir";
-
-    const glyph = isImage(entry)
-      ? el("img", {
-          class: "thumb",
-          src: previewURL(entry),
-          alt: "",
-          loading: "lazy",
-          // A broken thumbnail must not leave a hole: fall back to the badge.
-          onerror: (e) => {
-            const span = el("span", { class: `ftype ${typeClass(entry)}`, text: badgeGlyph(entry) });
-            e.target.replaceWith(span);
-          },
-        })
-      : el("span", { class: `ftype ${typeClass(entry)}` },
-          isDir ? [icon("files", 15)] : [badgeGlyph(entry)]);
 
     const label = el("span", {
       class: "label" + (isDir ? " dir" : ""),
@@ -498,19 +570,19 @@
     if (!isDir) {
       if (entry.preview) {
         actions.append(
-          el("button", {
-            class: "row-action",
-            text: "Preview",
-            onclick: () => openPreview(entry),
-          }),
+          el("button", { class: "row-action", text: "Preview", onclick: () => openPreview(entry) }),
         );
       }
       actions.append(
         el("button", { class: "row-action", text: "Download", onclick: () => downloadFile(entry) }),
       );
     }
-    actions.append(el("button", { class: "row-action", text: "Share", onclick: () => openShareDialog(entry) }));
-    actions.append(el("button", { class: "row-action", text: "Rename", onclick: () => promptRename(entry) }));
+    actions.append(
+      el("button", { class: "row-action", text: "Share", onclick: () => openShareDialog(entry) }),
+    );
+    actions.append(
+      el("button", { class: "row-action", text: "Rename", onclick: () => promptRename(entry) }),
+    );
     actions.append(
       el("button", {
         class: "row-action danger",
@@ -520,8 +592,8 @@
     );
 
     return el("tr", {}, [
-      el("td", { class: "name" }, [glyph, label]),
-      el("td", { class: "size", text: isDir ? "—" : humanSize(entry.size) }),
+      el("td", { class: "name" }, [fileGlyph(entry), label]),
+      el("td", { class: "size num", text: isDir ? "—" : humanSize(entry.size) }),
       el("td", { class: "when", text: humanTime(entry.modified_at) }),
       actions,
     ]);
@@ -533,41 +605,50 @@
       const isDir = entry.kind === "dir";
 
       let preview;
-      if (isDir) {
-        preview = el("div", { class: "preview dir" }, [el("span", { class: "glyph" }, [icon("files", 30)])]);
-      } else if (isImage(entry)) {
+      if (isImage(entry)) {
         preview = el("div", { class: "preview" }, [
           el("img", {
-            src: previewURL(entry),
+            src: thumbnailURL(entry),
             alt: "",
             loading: "lazy",
             onerror: (e) => {
-              e.target.replaceWith(el("span", { class: "glyph" }, [icon("doc", 30)]));
+              e.target.replaceWith(el("span", { class: "glyph" }, [icon("doc", 24)]));
             },
           }),
         ]);
       } else {
-        const glyphName =
-          entry.preview === "video" ? "video" : entry.preview === "audio" ? "audio" : "doc";
-        preview = el("div", { class: "preview" }, [el("span", { class: "glyph" }, [icon(glyphName, 30)])]);
+        const glyphName = isDir
+          ? "files"
+          : entry.preview === "video"
+            ? "video"
+            : entry.preview === "audio"
+              ? "audio"
+              : "doc";
+        preview = el("div", { class: "preview" + (isDir ? " dir" : "") }, [
+          el("span", { class: "glyph" }, [icon(glyphName, 24)]),
+        ]);
       }
 
       grid.append(
-        el("div", {
-          class: "tile",
-          title: entry.name,
-          onclick: () => openEntry(entry),
-          oncontextmenu: (e) => {
-            e.preventDefault();
-            openShareDialog(entry);
+        el(
+          "div",
+          {
+            class: "tile",
+            title: entry.name,
+            onclick: () => openEntry(entry),
+            oncontextmenu: (e) => {
+              e.preventDefault();
+              openShareDialog(entry);
+            },
           },
-        }, [
-          preview,
-          el("div", { class: "meta" }, [
-            el("div", { class: "n", text: entry.name }),
-            el("div", { class: "s", text: isDir ? "Folder" : humanSize(entry.size) }),
-          ]),
-        ]),
+          [
+            preview,
+            el("div", { class: "meta" }, [
+              el("div", { class: "n", text: entry.name }),
+              el("div", { class: "s", text: isDir ? "dir" : humanSize(entry.size) }),
+            ]),
+          ],
+        ),
       );
     }
     return grid;
@@ -577,7 +658,7 @@
   // everything else downloads. That is what a person expects from a file manager.
   function openEntry(entry) {
     if (entry.kind === "dir") {
-      state.path = joinPath(state.path, entry.name);
+      state.path = filePath(entry);
       state.filter = "";
       loadFiles();
       return;
@@ -593,7 +674,8 @@
     try {
       const data = await api("GET", `/files/?path=${encodeURIComponent(state.path)}`);
       state.entries = data.children || [];
-      renderCurrentView();
+      renderHeader();
+      renderMain();
     } catch (err) {
       fail(err);
     }
@@ -618,7 +700,6 @@
   function openPreview(entry) {
     const kind = entry.preview;
     const url = previewURL(entry);
-
     const body = el("div", { class: "preview-body" });
 
     switch (kind) {
@@ -629,7 +710,7 @@
             alt: entry.name,
             onerror: () => {
               clear(body);
-              body.append(unsupported(entry, "This image could not be displayed."));
+              body.append(unsupportedNote("This image could not be displayed."));
             },
           }),
         );
@@ -644,7 +725,7 @@
             preload: "metadata",
             onerror: () => {
               clear(body);
-              body.append(unsupported(entry, "This video format is not supported by the browser."));
+              body.append(unsupportedNote("This video format is not supported by the browser."));
             },
           }),
         );
@@ -658,7 +739,7 @@
             preload: "metadata",
             onerror: () => {
               clear(body);
-              body.append(unsupported(entry, "This audio format is not supported by the browser."));
+              body.append(unsupportedNote("This audio format is not supported by the browser."));
             },
           }),
         );
@@ -668,29 +749,29 @@
         // The browser's own viewer, in a plain frame.
         //
         // No `sandbox` attribute: Chrome refuses to instantiate its PDF plugin inside a
-        // sandboxed frame, and the file then renders as a broken-page icon. The response
-        // already carries `sandbox` in its CSP, which is the layer that matters — it applies
-        // to whatever the frame loads, and this frame loads exactly one URL on our origin.
+        // sandboxed frame and shows a broken-page icon instead. The response already carries
+        // `sandbox` in its CSP, which applies to whatever the frame loads, and this frame
+        // loads one URL on this origin.
         body.append(el("iframe", { src: url, title: entry.name }));
         break;
 
       case "text":
         body.append(el("pre", { text: "Loading…" }));
-        loadTextPreview(url, entry, body);
+        loadTextPreview(url, body);
         break;
 
       default:
-        body.append(unsupported(entry, "No preview for this file type."));
+        body.append(unsupportedNote("No preview for this file type."));
     }
 
     const dialog = el("dialog", { class: "preview" }, [
       el("div", { class: "preview-head" }, [
-        el("span", { class: `ftype ${typeClass(entry)}`, text: badgeGlyph(entry) }),
+        fileGlyph(entry),
         el("span", { class: "title", text: entry.name, title: entry.name }),
-        el("span", { class: "sub", text: humanSize(entry.size) }),
+        el("span", { class: "sub num", text: humanSize(entry.size) }),
         el("span", { class: "spacer" }),
         el("button", { class: "btn ghost", onclick: () => downloadFile(entry) }, [
-          icon("download"),
+          icon("download", 14),
           el("span", { text: "Download" }),
         ]),
         el(
@@ -701,7 +782,7 @@
             title: "Close",
             onclick: () => dialog.close(),
           },
-          [icon("close")],
+          [icon("close", 14)],
         ),
       ]),
       body,
@@ -710,8 +791,7 @@
     showDialog(dialog);
   }
 
-  // unsupported is the "cannot render this" panel.
-  function unsupported(entry, message) {
+  function unsupportedNote(message) {
     return el("div", { class: "unsupported" }, [
       el("strong", { text: "Preview unavailable" }),
       el("span", { text: message }),
@@ -720,58 +800,82 @@
 
   // loadTextPreview fetches the bytes and inserts them as text.
   //
-  // textContent, not innerHTML: a .html file previewed here is shown as source, and if it
-  // were parsed the browser would execute it. The server also refuses to inline HTML, so
-  // this is the second of two independent defences.
-  async function loadTextPreview(url, entry, container) {
+  // textContent, not innerHTML: a .html file previewed here is shown as source, and parsing
+  // it would execute it. The server also refuses to inline HTML, so this is the second of
+  // two independent defences.
+  async function loadTextPreview(url, container) {
     try {
       const resp = await fetch(url, { credentials: "same-origin" });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const text = await resp.text();
       clear(container);
-      container.append(el("pre", { text: text }));
+      container.append(el("pre", { text }));
     } catch (err) {
       clear(container);
-      container.append(unsupported(entry, `Could not load the file: ${err.message}`));
+      container.append(unsupportedNote(`Could not load the file: ${err.message}`));
     }
   }
 
   // ---------- uploads ----------
 
-  async function uploadFiles(fileList) {
+  // uploadQueue keeps one upload running at a time so the progress bar means something.
+  // Uploading in parallel would make "3 of 7" meaningless and hammer a small server.
+  let uploading = false;
+
+  async function uploadFiles(fileList, targetPath) {
     if (!fileList || fileList.length === 0) return;
+    if (uploading) {
+      toast("An upload is already running", "error");
+      return;
+    }
+
+    const dest = targetPath == null ? state.path : targetPath;
+    uploading = true;
+
     const progress = $("#main .progress");
     const bar = progress && progress.firstElementChild;
     const total = fileList.length;
     let done = 0;
+    let failed = 0;
+
+    if (progress) progress.classList.remove("hidden");
 
     for (const file of fileList) {
       const form = new FormData();
-      form.append("path", state.path);
+      form.append("path", dest);
       form.append("file", file);
 
       try {
-        if (progress) progress.classList.remove("hidden");
-        if (bar) bar.style.width = `${Math.round((done / total) * 100)}%`;
-
         await api("POST", "/files/upload", form);
         done++;
-        if (bar) bar.style.width = `${Math.round((done / total) * 100)}%`;
       } catch (err) {
-        fail(err);
-        break;
+        failed++;
+        // Keep going: one rejected file should not discard the rest of a multi-file drop.
+        toast(`${file.name}: ${err.message || "failed"}`, "error");
       }
+      if (bar) bar.style.width = `${Math.round(((done + failed) / total) * 100)}%`;
+    }
+
+    uploading = false;
+    if (progress) {
+      setTimeout(() => {
+        progress.classList.add("hidden");
+        if (bar) bar.style.width = "0";
+      }, 350);
     }
 
     if (done > 0) {
-      toast(done === 1 ? `Uploaded ${done} file` : `Uploaded ${done} files`);
+      toast(
+        failed > 0
+          ? `Uploaded ${done}, ${failed} failed`
+          : done === 1
+            ? "Uploaded 1 file"
+            : `Uploaded ${done} files`,
+        failed > 0 ? "error" : "info",
+      );
     }
-    setTimeout(() => {
-      if (progress) progress.classList.add("hidden");
-      if (bar) bar.style.width = "0";
-    }, 400);
 
-    await loadFiles();
+    if (dest === state.path) await loadFiles();
   }
 
   // ---------- dialogs ----------
@@ -787,7 +891,6 @@
     dialog.showModal();
   }
 
-  // formDialog builds a modal with fields and a submit handler.
   function formDialog({ title, body, fields = [], confirm, danger, onSubmit, extra, confirmLabel }) {
     const form = el("form", { method: "dialog" });
     const values = {};
@@ -821,7 +924,9 @@
         });
       }
       values[field.name] = input;
-      bodyWrap.append(el("label", { class: "field" }, [el("span", { text: field.label }), input]));
+      bodyWrap.append(
+        el("label", { class: "field" }, [el("span", { class: "micro", text: field.label }), input]),
+      );
     }
     form.append(bodyWrap);
 
@@ -867,7 +972,7 @@
   function promptNewFolder() {
     formDialog({
       title: "New folder",
-      fields: [{ name: "name", label: "Folder name", type: "text" }],
+      fields: [{ name: "name", label: "Name", type: "text" }],
       confirmLabel: "Create",
       onSubmit: async (v) => {
         if (!v.name) throw new Error("a folder needs a name");
@@ -886,10 +991,7 @@
       confirmLabel: "Rename",
       onSubmit: async (v) => {
         if (!v.name || v.name === entry.name) return;
-        await api("POST", "/files/rename", {
-          path: joinPath(state.path, entry.name),
-          name: v.name,
-        });
+        await api("POST", "/files/rename", { path: filePath(entry), name: v.name });
         toast("Renamed");
         await loadFiles();
       },
@@ -904,7 +1006,7 @@
       confirm: "Delete",
       danger: true,
       onSubmit: async () => {
-        await api("DELETE", `/files/?path=${encodeURIComponent(joinPath(state.path, entry.name))}`);
+        await api("DELETE", `/files/?path=${encodeURIComponent(filePath(entry))}`);
         toast("Moved to trash");
         await loadFiles();
       },
@@ -912,26 +1014,26 @@
   }
 
   function openShareDialog(entry) {
-    const path = joinPath(state.path, entry.name);
+    const path = filePath(entry);
     const isDir = entry.kind === "dir";
-
-    const kindField = {
-      name: "kind",
-      label: "Type",
-      type: "select",
-      options: [
-        { value: "link", label: "Link — anyone with the URL can download" },
-        ...(isDir ? [{ value: "request", label: "Request — others can upload into this folder" }] : []),
-      ],
-    };
 
     formDialog({
       title: `Share ${entry.name}`,
       fields: [
-        kindField,
+        {
+          name: "kind",
+          label: "Type",
+          type: "select",
+          options: [
+            { value: "link", label: "Link — anyone with the URL can download" },
+            ...(isDir
+              ? [{ value: "request", label: "Request — others can upload into this folder" }]
+              : []),
+          ],
+        },
         { name: "password", label: "Password (optional)", type: "password" },
         { name: "expires_hours", label: "Expires in hours (optional)", type: "number", min: "0" },
-        { name: "max_uses", label: "Maximum downloads (optional)", type: "number", min: "0" },
+        { name: "max_uses", label: "Maximum uses (optional)", type: "number", min: "0" },
       ],
       confirmLabel: "Create link",
       onSubmit: async (v) => {
@@ -958,7 +1060,7 @@
             body: "Copied to the clipboard. The token is not shown again.",
             fields: [],
             confirm: "Done",
-            extra: el("div", { class: "mono", text: url }),
+            extra: el("div", { class: "copybox", text: url }),
             onSubmit: async () => {},
           });
         } else {
@@ -976,23 +1078,21 @@
     clear(main);
 
     main.append(
-      el("div", { class: "page-head" }, [el("h1", { class: "page-title", text: "Shares" })]),
-    );
-    main.append(
-      el("p", {
-        class: "hint",
-        text: "Links you have created. A password is never shown again — only whether one is set.",
-        style: "color:var(--text-secondary);margin:0 0 16px;font-size:13px",
-      }),
+      el("div", { class: "toolbar" }, [
+        el("span", { class: "micro", text: "Links you have created" }),
+        el("span", { class: "spacer" }),
+        el("span", { class: "count num", text: `${state.entries.length} total` }),
+        el(
+          "button",
+          { class: "btn ghost icon-only", title: "Refresh", onclick: () => loadShares() },
+          [icon("refresh", 14)],
+        ),
+      ]),
     );
 
     if (state.entries.length === 0) {
       main.append(
-        el("div", { class: "empty" }, [
-          el("div", { class: "glyph" }, [icon("shares", 32)]),
-          el("div", { class: "title", text: "No shares yet" }),
-          el("div", { class: "hint", text: "Open a file and choose Share to create a link." }),
-        ]),
+        emptyState("shares", "No shares yet", "Open a file and choose Share to create a link."),
       );
       return;
     }
@@ -1002,7 +1102,7 @@
       el("thead", {}, [
         el("tr", {}, [
           el("th", { text: "Target" }),
-          el("th", { text: "Type" }),
+          el("th", { text: "Kind" }),
           el("th", { class: "num", text: "Uses" }),
           el("th", { text: "Expires" }),
           el("th", { text: "" }),
@@ -1017,33 +1117,47 @@
           ? `${share.upload_count}${share.max_uploads ? " / " + share.max_uploads : ""}`
           : `${share.download_count}${share.max_downloads ? " / " + share.max_downloads : ""}`;
 
-      const actions = el("td", { class: "actions" });
-      actions.append(
-        el("button", {
-          class: "row-action danger",
-          text: "Revoke",
-          onclick: async () => {
-            try {
-              await api("DELETE", `/shares/${share.id}`);
-              toast("Share revoked");
-              loadShares();
-            } catch (err) {
-              fail(err);
-            }
-          },
-        }),
-      );
-
       body.append(
         el("tr", {}, [
-          el("td", { text: share.node_path || share.label || "—" }),
-          el("td", { text: share.kind }),
-          el("td", { class: "size", text: uses }),
+          el("td", { class: "name" }, [
+            el("span", {
+              class: "label",
+              text: share.node_path || share.label || "—",
+              onclick: () => {
+                const url = `${location.origin}/s/${share.token}`;
+                navigator.clipboard.writeText(url).then(
+                  () => toast("Link copied"),
+                  () => toast(url),
+                );
+              },
+            }),
+          ]),
+          el("td", {}, [
+            el("span", {
+              class: "pill" + (share.kind === "request" ? " accent" : ""),
+              text: share.kind,
+            }),
+          ]),
+          el("td", { class: "size num", text: uses }),
           el("td", {
             class: "when",
-            text: share.expires_at ? new Date(share.expires_at).toLocaleString() : "never",
+            text: share.expires_at ? new Date(share.expires_at).toLocaleDateString() : "never",
           }),
-          actions,
+          el("td", { class: "actions" }, [
+            el("button", {
+              class: "row-action danger",
+              text: "Revoke",
+              onclick: async () => {
+                try {
+                  await api("DELETE", `/shares/${share.id}`);
+                  toast("Share revoked");
+                  loadShares();
+                } catch (err) {
+                  fail(err);
+                }
+              },
+            }),
+          ]),
         ]),
       );
     }
@@ -1055,7 +1169,8 @@
     try {
       const data = await api("GET", "/shares/");
       state.entries = data.items || [];
-      renderCurrentView();
+      renderHeader();
+      renderMain();
     } catch (err) {
       fail(err);
     }
@@ -1067,15 +1182,17 @@
     const main = $("#main");
     clear(main);
 
-    main.append(el("div", { class: "page-head" }, [el("h1", { class: "page-title", text: "Trash" })]));
+    main.append(
+      el("div", { class: "toolbar" }, [
+        el("span", { class: "micro", text: "Deleted files, restorable" }),
+        el("span", { class: "spacer" }),
+        el("span", { class: "count num", text: `${state.entries.length} total` }),
+      ]),
+    );
 
     if (state.entries.length === 0) {
       main.append(
-        el("div", { class: "empty" }, [
-          el("div", { class: "glyph" }, [icon("trash", 32)]),
-          el("div", { class: "title", text: "Trash is empty" }),
-          el("div", { class: "hint", text: "Deleted files appear here and can be restored." }),
-        ]),
+        emptyState("trash", "Trash is empty", "Deleted files appear here and can be restored."),
       );
       return;
     }
@@ -1095,10 +1212,10 @@
       body.append(
         el("tr", {}, [
           el("td", { class: "name" }, [
-            el("span", { class: `ftype ${typeClass(entry)}`, text: badgeGlyph(entry) }),
+            fileGlyph(entry),
             el("span", { class: "label", text: entry.name }),
           ]),
-          el("td", { class: "size", text: entry.kind === "dir" ? "—" : humanSize(entry.size) }),
+          el("td", { class: "size num", text: entry.kind === "dir" ? "—" : humanSize(entry.size) }),
           el("td", { class: "actions" }, [
             el("button", {
               class: "row-action",
@@ -1125,9 +1242,231 @@
     try {
       const data = await api("GET", "/files/trash");
       state.entries = data.items || [];
-      renderCurrentView();
+      renderHeader();
+      renderMain();
     } catch (err) {
       fail(err);
+    }
+  }
+
+  // ---------- audit ----------
+
+  // personLabel turns an actor into something readable. Anonymous events are the common
+  // case in a share audit and must not render as a blank column.
+  function personLabel(ev) {
+    if (ev.actor_email) return ev.actor_email;
+    if (ev.actor_kind === "anonymous" || !ev.actor_kind) return "anonymous";
+    if (ev.actor_kind === "system") return "system";
+    return ev.actor_kind;
+  }
+
+  // describeTarget renders what the event happened to, in the terms a person used.
+  function describeTarget(ev) {
+    const name = ev.metadata && (ev.metadata.name || ev.metadata.path);
+    if (name) return String(name);
+    if (ev.share_id) return `share ${ev.share_id.slice(0, 8)}`;
+    if (ev.target_id) return ev.target_id.slice(0, 8);
+    return "";
+  }
+
+  function renderAudit() {
+    const main = $("#main");
+    clear(main);
+
+    const a = state.audit;
+
+    const actionSelect = el("select", {
+      "aria-label": "Filter by action",
+      onchange: (e) => {
+        a.action = e.target.value;
+        reloadAudit();
+      },
+    });
+    actionSelect.append(el("option", { value: "", text: "All actions" }));
+    for (const action of a.actions) {
+      const opt = el("option", { value: action, text: action });
+      if (action === a.action) opt.selected = true;
+      actionSelect.append(opt);
+    }
+
+    const resultSelect = el("select", {
+      "aria-label": "Filter by result",
+      onchange: (e) => {
+        a.result = e.target.value;
+        reloadAudit();
+      },
+    });
+    for (const [value, label] of [
+      ["", "Any result"],
+      ["ok", "Allowed"],
+      ["denied", "Refused"],
+    ]) {
+      const opt = el("option", { value, text: label });
+      if (value === a.result) opt.selected = true;
+      resultSelect.append(opt);
+    }
+
+    const sinceSelect = el("select", {
+      "aria-label": "Filter by time",
+      onchange: (e) => {
+        a.since = e.target.value;
+        reloadAudit();
+      },
+    });
+    for (const [value, label] of [
+      ["", "All time"],
+      ["1h", "Last hour"],
+      ["24h", "Last 24 hours"],
+      ["7d", "Last 7 days"],
+      ["30d", "Last 30 days"],
+    ]) {
+      const opt = el("option", { value, text: label });
+      if (value === a.since) opt.selected = true;
+      sinceSelect.append(opt);
+    }
+
+    main.append(
+      el("div", { class: "audit-toolbar" }, [
+        actionSelect,
+        resultSelect,
+        sinceSelect,
+        el("span", { class: "spacer" }),
+        el("span", { class: "count num", text: a.total ? `${a.total} events` : "" }),
+        el(
+          "button",
+          {
+            class: "btn ghost",
+            title: "Download the full log as CSV",
+            onclick: () => {
+              const q = new URLSearchParams({ format: "csv" });
+              if (a.action) q.set("actions", a.action);
+              if (a.result) q.set("result", a.result);
+              const since = sinceISO(a.since);
+              if (since) q.set("since", since);
+              location.href = `/api/audit?${q.toString()}`;
+            },
+          },
+          [icon("download", 14), el("span", { text: "Export CSV" })],
+        ),
+        el(
+          "button",
+          { class: "btn ghost icon-only", title: "Refresh", onclick: () => reloadAudit() },
+          [icon("refresh", 14)],
+        ),
+      ]),
+    );
+
+    if (a.events.length === 0) {
+      main.append(
+        emptyState(
+          "pulse",
+          a.loading ? "Loading…" : "No activity",
+          a.action || a.result || a.since
+            ? "Nothing matches these filters."
+            : "Events appear here as files are touched.",
+        ),
+      );
+      return;
+    }
+
+    const timeline = el("div", { class: "timeline" });
+    let lastDay = "";
+
+    for (const ev of a.events) {
+      const day = dayOf(ev.ts);
+      if (day !== lastDay) {
+        lastDay = day;
+        timeline.append(el("div", { class: "audit-day", text: day }));
+      }
+
+      const target = describeTarget(ev);
+      const meta = el("div", { class: "meta" });
+      if (ev.actor_ip) meta.append(el("span", {}, [el("span", { class: "v", text: ev.actor_ip })]));
+      if (ev.bytes)
+        meta.append(el("span", {}, [el("span", { class: "v", text: humanSize(ev.bytes) })]));
+      if (ev.share_id)
+        meta.append(
+          el("span", {}, [el("span", { class: "v", text: `share ${ev.share_id.slice(0, 8)}` })]),
+        );
+
+      timeline.append(
+        el("div", { class: `event ${ev.result === "denied" ? "denied" : "ok"}` }, [
+          el("div", { class: "when" }, [
+            el("span", { class: "day", text: clockOf(ev.ts) }),
+            ev.result === "denied" ? "refused" : "allowed",
+          ]),
+          el("div", { class: "rail" }, [el("span", { class: "dot" })]),
+          el("div", { class: "body" }, [
+            el("div", { class: "headline" }, [
+              el("span", { class: "action", text: ev.action }),
+              target ? el("span", { class: "target", text: target, title: target }) : null,
+              el("span", { class: "who", text: personLabel(ev) }),
+            ]),
+            meta.childNodes.length > 0 ? meta : null,
+          ]),
+        ]),
+      );
+    }
+
+    main.append(timeline);
+
+    if (a.hasMore) {
+      main.append(
+        el("div", { class: "audit-foot" }, [
+          el("button", {
+            class: "btn",
+            text: "Load older events",
+            onclick: async () => {
+              state.audit.offset += state.audit.events.length;
+              await loadAudit(true);
+            },
+          }),
+        ]),
+      );
+    } else {
+      main.append(el("div", { class: "audit-foot" }, [el("span", { text: "End of the log" })]));
+    }
+  }
+
+  // sinceISO converts a relative window into an absolute timestamp.
+  function sinceISO(choice) {
+    if (!choice) return "";
+    const seconds = { "1h": 3600, "24h": 86400, "7d": 604800, "30d": 2592000 }[choice];
+    if (!seconds) return "";
+    return new Date(Date.now() - seconds * 1000).toISOString();
+  }
+
+  function reloadAudit() {
+    state.audit.events = [];
+    state.audit.offset = 0;
+    loadAudit(false);
+  }
+
+  async function loadAudit(append) {
+    const a = state.audit;
+    if (a.loading) return;
+    a.loading = true;
+
+    const q = new URLSearchParams();
+    q.set("offset", String(append ? a.offset : 0));
+    if (a.action) q.set("actions", a.action);
+    if (a.result) q.set("result", a.result);
+    const since = sinceISO(a.since);
+    if (since) q.set("since", since);
+
+    try {
+      const data = await api("GET", `/audit/events?${q.toString()}`);
+      a.events = append ? a.events.concat(data.events || []) : data.events || [];
+      a.total = data.total || 0;
+      a.hasMore = !!data.has_more;
+      a.actions = data.actions || [];
+      if (!append) a.offset = 0;
+    } catch (err) {
+      fail(err);
+    } finally {
+      a.loading = false;
+      renderHeader();
+      renderMain();
     }
   }
 
@@ -1138,21 +1477,30 @@
     clear(main);
 
     main.append(
-      el("div", { class: "page-head" }, [el("h1", { class: "page-title", text: "App passwords" })]),
+      el("div", { class: "toolbar" }, [
+        el("span", { class: "micro", text: "WebDAV and API access" }),
+        el("span", { class: "spacer" }),
+        el("button", { class: "btn primary", onclick: () => createAppPassword() }, [
+          icon("key", 14),
+          el("span", { text: "New password" }),
+        ]),
+      ]),
     );
 
     main.append(
-      el("div", { class: "card" }, [
-        el("h2", { text: "WebDAV access" }),
-        el("p", {
-          class: "hint",
-          text:
-            "Use an app password instead of your browser login when connecting a WebDAV client, " +
-            "rclone, or a mounted drive. Each one can be revoked on its own.",
-        }),
-        el("button", { class: "btn primary", onclick: () => createAppPassword() }, [
-          icon("key"),
-          el("span", { text: "New app password" }),
+      el("div", { style: "padding:16px" }, [
+        el("div", { class: "card" }, [
+          el("h2", { text: "Connecting a client" }),
+          el("p", {
+            class: "hint",
+            text:
+              "Use an app password instead of your browser session for WebDAV, rclone or a mounted " +
+              "drive. Each one can be revoked on its own, and a leaked one does not end your browser login.",
+          }),
+          el("div", {
+            class: "copybox",
+            text: `${location.origin}/dav/${state.me ? state.me.username : "you"}/`,
+          }),
         ]),
       ]),
     );
@@ -1174,8 +1522,8 @@
     for (const cred of state.entries) {
       body.append(
         el("tr", {}, [
-          el("td", { text: cred.label || "—" }),
-          el("td", { text: cred.scope }),
+          el("td", { class: "name" }, [el("span", { class: "label", text: cred.label || "—" })]),
+          el("td", {}, [el("span", { class: "pill", text: cred.scope })]),
           el("td", { class: "when", text: cred.last_used ? humanTime(cred.last_used) : "never" }),
           el("td", { class: "actions" }, [
             el("button", {
@@ -1196,15 +1544,15 @@
       );
     }
     table.append(body);
-
-    main.append(el("div", { class: "table-wrap", style: "margin-top:16px" }, [table]));
+    main.append(el("div", { class: "table-wrap" }, [table]));
   }
 
   async function loadCredentials() {
     try {
       const data = await api("GET", "/apppasswords/");
       state.entries = data.items || [];
-      renderCurrentView();
+      renderHeader();
+      renderMain();
     } catch (err) {
       fail(err);
     }
@@ -1233,7 +1581,7 @@
           body: "It cannot be shown again. Use your username with this value as the password.",
           fields: [],
           confirm: "Done",
-          extra: el("div", { class: "mono", text: created.secret || "" }),
+          extra: el("div", { class: "copybox", text: created.secret || "" }),
           onSubmit: async () => {
             await loadCredentials();
           },
@@ -1247,11 +1595,8 @@
   async function renderShareLanding(token) {
     const root = $("#app");
     clear(root);
-    // The landing page is its own screen: no sidebar, no header.
-    //
     // .share-page positions itself fixed, which takes it out of the #app grid (that grid
     // exists for the signed-in shell and would otherwise give this page the sidebar width).
-    // Nothing needs overriding here.
 
     let info;
     try {
@@ -1310,8 +1655,8 @@
         if (e.key === "Enter") submit();
       });
       body.append(
-        el("label", { class: "field" }, [el("span", { text: "Password" }), input]),
-        el("button", { class: "btn primary", text: "Continue", onclick: submit, style: "width:100%" }),
+        el("label", { class: "field" }, [el("span", { class: "micro", text: "Password" }), input]),
+        el("button", { class: "btn primary", text: "Continue", onclick: submit }),
       );
     } else if (info.requires_email) {
       head.append(el("div", { class: "meta", text: "This link is limited to specific addresses." }));
@@ -1320,13 +1665,16 @@
       const code = el("input", { type: "text", placeholder: "6-digit code from the email" });
 
       body.append(
-        el("label", { class: "field" }, [el("span", { text: "Your email" }), email]),
+        el("label", { class: "field" }, [
+          el("span", { class: "micro", text: "Your email" }),
+          email,
+        ]),
         el(
           "button",
           {
             class: "btn",
             text: "Send me a code",
-            style: "width:100%;margin-bottom:16px",
+            style: "width:100%;margin-bottom:14px",
             onclick: async () => {
               try {
                 await fetch(`/s/${encodeURIComponent(token)}/recipient`, {
@@ -1341,11 +1689,10 @@
             },
           },
         ),
-        el("label", { class: "field" }, [el("span", { text: "Code" }), code]),
+        el("label", { class: "field" }, [el("span", { class: "micro", text: "Code" }), code]),
         el("button", {
           class: "btn primary",
           text: "Open",
-          style: "width:100%",
           onclick: async () => {
             try {
               const resp = await fetch(`/s/${encodeURIComponent(token)}/recipient/verify`, {
@@ -1378,7 +1725,6 @@
       const button = el("button", {
         class: "btn primary",
         text: "Upload",
-        style: "width:100%",
         onclick: async () => {
           if (!input.files.length) return;
           const form = new FormData();
@@ -1400,7 +1746,10 @@
         },
       });
 
-      body.append(el("label", { class: "field" }, [el("span", { text: "File" }), input]), button);
+      body.append(
+        el("label", { class: "field" }, [el("span", { class: "micro", text: "File" }), input]),
+        button,
+      );
     } else if (!info.can_read) {
       body.append(el("p", { class: "hint", text: "This link cannot be downloaded." }));
     } else {
@@ -1408,7 +1757,6 @@
         el("button", {
           class: "btn primary",
           text: "Download",
-          style: "width:100%",
           onclick: () => {
             location.href = `/s/${encodeURIComponent(token)}/download`;
           },
@@ -1419,21 +1767,16 @@
         const list = el("div", { class: "share-list" });
         for (const child of info.children) {
           const row = el("div", { class: "row" }, [
-            el("span", { class: `ftype ${typeClass(child)}`, text: badgeGlyph(child) }),
             el("span", { class: "name", text: child.name }),
-            el("span", {
-              class: "size",
-              text: child.kind === "dir" ? "" : humanSize(child.size),
-            }),
+            el("span", { class: "size", text: child.kind === "dir" ? "" : humanSize(child.size) }),
           ]);
           if (child.kind !== "dir") {
             row.append(
-              el("span", { class: "size" }, [
-                el("a", {
-                  href: `/s/${encodeURIComponent(token)}/download?name=${encodeURIComponent(child.name)}`,
-                  text: "Download",
-                }),
-              ]),
+              el("a", {
+                href: `/s/${encodeURIComponent(token)}/download?name=${encodeURIComponent(child.name)}`,
+                text: "Download",
+                style: "font-size:11.5px",
+              }),
             );
           }
           list.append(row);
@@ -1443,7 +1786,16 @@
     }
 
     card.append(body);
-    card.append(el("div", { class: "foot", text: "Shared with newcloud" }));
+    card.append(
+      el("div", { class: "foot" }, [
+        el("span", { text: "newcloud" }),
+        el("span", {
+          text: info.expires_at
+            ? `expires ${new Date(info.expires_at).toLocaleDateString()}`
+            : "",
+        }),
+      ]),
+    );
     root.append(el("div", { class: "share-page" }, [card]));
   }
 
@@ -1463,6 +1815,9 @@
       case "trash":
         loadTrash();
         break;
+      case "audit":
+        reloadAudit();
+        break;
       case "credentials":
         loadCredentials();
         break;
@@ -1471,16 +1826,18 @@
     }
   }
 
-  // renderCurrentView re-renders without re-fetching. Search and the list/grid toggle use
-  // it, and it must not reset scroll position by hitting the network.
-  function renderCurrentView() {
-    renderSidebar();
+  // renderMain draws the current view from state without re-fetching. Search and the
+  // list/grid toggle use it, and it must not reset scroll position by hitting the network.
+  function renderMain() {
     switch (state.view) {
       case "shares":
         renderShares();
         break;
       case "trash":
         renderTrash();
+        break;
+      case "audit":
+        renderAudit();
         break;
       case "credentials":
         renderCredentials();
@@ -1492,33 +1849,54 @@
 
   // ---------- drag and drop ----------
 
+  // Drag and drop uploads to the current folder from anywhere on the page.
+  //
+  // The depth counter is necessary: dragleave fires when the pointer crosses into a child
+  // element, so a naive listener flickers the overlay off the moment the pointer moves over
+  // the file table. Counting enters and leaves keeps it steady until the pointer leaves the
+  // window.
   function installDragAndDrop() {
     const zone = $("#dropzone");
+    const target = $("#drop-target");
     let depth = 0;
 
+    const carriesFiles = (e) =>
+      e.dataTransfer && Array.from(e.dataTransfer.types || []).includes("Files");
+
     window.addEventListener("dragenter", (e) => {
-      if (!e.dataTransfer || !e.dataTransfer.types.includes("Files")) return;
+      if (!carriesFiles(e)) return;
       e.preventDefault();
       depth++;
-      if (state.view === "files") zone.classList.add("active");
+      if (state.view !== "files") return;
+      if (target) target.textContent = state.path ? `into /${state.path}` : "into your home folder";
+      zone.classList.add("active");
     });
+
     window.addEventListener("dragover", (e) => {
-      if (!e.dataTransfer || !e.dataTransfer.types.includes("Files")) return;
+      if (!carriesFiles(e)) return;
+      // Without this the browser opens the file instead of firing drop.
       e.preventDefault();
+      e.dataTransfer.dropEffect = "copy";
     });
-    window.addEventListener("dragleave", () => {
-      if (--depth <= 0) {
+
+    window.addEventListener("dragleave", (e) => {
+      if (!carriesFiles(e)) return;
+      depth--;
+      if (depth <= 0) {
         depth = 0;
         zone.classList.remove("active");
       }
     });
+
     window.addEventListener("drop", (e) => {
-      if (!e.dataTransfer || !e.dataTransfer.types.includes("Files")) return;
+      if (!carriesFiles(e)) return;
       e.preventDefault();
       depth = 0;
       zone.classList.remove("active");
       if (state.view !== "files") return;
-      if (e.dataTransfer.files.length) uploadFiles(e.dataTransfer.files);
+      if (e.dataTransfer.files && e.dataTransfer.files.length) {
+        uploadFiles(e.dataTransfer.files);
+      }
     });
   }
 
@@ -1546,7 +1924,6 @@
     renderSidebar();
     renderHeader();
 
-    // Honour a deep link such as /?path=docs.
     const params = new URLSearchParams(location.search);
     if (params.get("path")) state.path = params.get("path").replace(/^\/+|\/+$/g, "");
 

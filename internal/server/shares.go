@@ -129,7 +129,7 @@ func (s *Server) handleShareCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	created, err := s.deps.Shares.Create(r.Context(), share.NewShare{
-		NodeID: node.ID, OwnerID: actor.ID(), Kind: kind,
+		NodeID: node.ID, OwnerID: actor.ID(), OwnerEmail: actor.Email(), Kind: kind,
 		Label: body.Label, Password: body.Password, TTL: ttl,
 		MaxDownloads: body.MaxDownloads, MaxUploads: body.MaxUploads,
 		Permissions: body.Permissions, Recipients: body.Recipients,
@@ -241,7 +241,7 @@ func (s *Server) handleShareRevoke(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.deps.Shares.Revoke(r.Context(), shareID, actor.ID()); err != nil {
+	if err := s.deps.Shares.Revoke(r.Context(), shareID, actor.ID(), actor.Email()); err != nil {
 		s.writeStoreError(w, err)
 		return
 	}

@@ -145,7 +145,10 @@ func parseAuditFilter(r *http.Request) (store.AuditFilter, error) {
 		}
 		f.Until = &t
 	}
-	if v := q.Get("actions"); v != "" {
+	// Accept both spellings: the export documents "actions", and a person writing a query by
+	// hand reaches for the singular. Rejecting one of them produces an empty export with no
+	// explanation, which is the worst possible answer.
+	if v := firstNonEmpty(q.Get("actions"), q.Get("action")); v != "" {
 		for _, a := range strings.Split(v, ",") {
 			if a = strings.TrimSpace(a); a != "" {
 				f.Actions = append(f.Actions, a)
@@ -290,4 +293,15 @@ func writeAuditCSV(w http.ResponseWriter, rows []store.AuditRow) {
 			hex.EncodeToString(r.PrevHash), hex.EncodeToString(r.Hash),
 		})
 	}
+}
+
+// firstNonEmpty returns the first non-empty string, for query parameters that have an
+// alias.
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }

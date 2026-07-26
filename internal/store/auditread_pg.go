@@ -28,9 +28,9 @@ func (s *PG) ReadAudit(ctx context.Context, f AuditFilter) ([]AuditRow, error) {
 		FROM audit.events
 		%s
 		ORDER BY id %s
-		LIMIT $%d`, where, order, len(args)+1)
+		LIMIT $%d OFFSET $%d`, where, order, len(args)+1, len(args)+2)
 
-	args = append(args, limitArg(f.Limit))
+	args = append(args, limitArg(f.Limit), offsetArg(f.Offset))
 
 	rows, err := s.pool.Query(ctx, q, args...)
 	if err != nil {
