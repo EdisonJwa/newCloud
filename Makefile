@@ -1,4 +1,4 @@
-.PHONY: test test-race build lint fmt clean race vuln check devidp e2e uicheck example-config
+.PHONY: test test-race build lint fmt clean race vuln check devidp e2e uicheck dropcheck example-config
 
 GO ?= go
 
@@ -47,6 +47,13 @@ e2e:
 
 uicheck:
 	$(GO) run ./tools/uicheck -app http://127.0.0.1:18500 -public-host 127.0.0.1:18600
+
+# Verify drag-and-drop upload in a real browser against a running instance.
+#
+# It needs the demo (or any instance) plus Chrome, so it is not part of `check`: a CI image
+# without a browser would fail it for the wrong reason.
+dropcheck:
+	$(GO) run ./tools/demoshot -base https://localhost:8443 -out demo-run/dropcheck -test-drop
 
 # Full pre-commit check.
 check: lint example-config race

@@ -32,6 +32,11 @@ var (
 	base   = flag.String("base", "https://localhost:8443", "demo base URL")
 	idpURL = flag.String("idp", "http://127.0.0.1:19200", "fake IdP URL")
 	outDir = flag.String("out", "shots", "directory for the PNGs")
+	// testDrop drives a real drag-and-drop upload and reports whether it worked, instead of
+	// capturing screenshots. It lives here because this tool already knows how to start
+	// Chrome and sign in, and the drop path cannot be tested from the DOM: a DataTransfer
+	// built in JavaScript carries no OS files.
+	testDrop = flag.Bool("test-drop", false, "verify drag-and-drop upload, then exit")
 )
 
 func main() {
@@ -122,6 +127,11 @@ func run() error {
 		return err
 	}
 	time.Sleep(2200 * time.Millisecond)
+
+	// ---- Optional: verify a real drag-and-drop upload ----
+	if *testDrop {
+		return checkDropUpload(cdp)
+	}
 
 	url, _ := evalString(cdp, "location.href")
 	if strings.Contains(url, "auth") {
@@ -232,6 +242,80 @@ const jsShowFiles = `(() => {
 	if (b) b.click();
 	return 'ok';
 })()`
+
+// checkDropUpload drives a real drag-and-drop upload and reports whether it worked.
+//
+// This cannot be done from the DOM: a DataTransfer constructed in JavaScript carries no OS
+// files, so dispatching a synthetic `drop` proves only that the listener runs. The DevTools
+// protocol can dispatch a drag naming a real path, which Chrome turns into a File the page
+// can read — the closest thing available to a user dragging from Explorer.
+func checkDropUpload(cdp *wsConn) error {
+	dir, err := os.MkdirTemp("", "newcloud-drop-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+
+	source := filepath.Join(dir, "dropped-file.txt")
+	if err := os.WriteFile(source, []byte("uploaded by dragging\n"), 0o644); err != nil {
+		return err
+	}
+
+	countRows := func() int {
+		out, cerr := evalString(cdp, `(() => String(document.querySelectorAll('table.files tbody tr').length))()`)
+		if cerr != nil {
+			return -1
+		}
+		n := 0
+		fmt.Sscanf(out, "%d", &n)
+		return n
+	}
+
+	// Start from the file list, so the count is about the root folder.
+	if _, err := evalString(cdp, jsShowFiles); err != nil {
+		return err
+	}
+	time.Sleep(1400 * time.Millisecond)
+
+	before := countRows()
+	if before < 0 {
+		return fmt.Errorf("could not read the file list")
+	}
+	fmt.Printf("rows before the drop: %d\n", before)
+
+	data := map[string]any{
+		"items":              []map[string]any{},
+		"files":              []string{source},
+		"dragOperationsMask": 1, // copy
+	}
+
+	for _, kind := range []string{"dragEnter", "dragOver", "drop"} {
+		if err := cdp.Call("Input.dispatchDragEvent", map[string]any{
+			"type": kind, "x": 420, "y": 320, "data": data,
+		}); err != nil {
+			return fmt.Errorf("%s: %w", kind, err)
+		}
+		time.Sleep(260 * time.Millisecond)
+	}
+
+	// The upload is an ordinary POST; poll the listing until it appears.
+	deadline := time.Now().Add(15 * time.Second)
+	after := before
+	for time.Now().Before(deadline) {
+		time.Sleep(600 * time.Millisecond)
+		after = countRows()
+		if after > before {
+			break
+		}
+	}
+
+	if after <= before {
+		return fmt.Errorf("the drop added no file (rows stayed at %d)", before)
+	}
+	fmt.Printf("rows after the drop:  %d\n", after)
+	fmt.Println("OK: drag and drop uploaded the file")
+	return nil
+}
 
 func shoot(cdp *wsConn, path string) error {
 	raw, err := cdp.CallWithResult("Page.captureScreenshot", map[string]any{
