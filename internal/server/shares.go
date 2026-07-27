@@ -22,7 +22,9 @@ import (
 // It never contains the token: the owner already has the link, and re-exposing
 // tokens through the API would put working credentials in every list response.
 type shareJSON struct {
-	ID            string     `json:"id"`
+	ID string `json:"id"`
+	// NodeID lets the file inspector answer "is this file shared, and by which links".
+	NodeID        string     `json:"node_id"`
 	Kind          string     `json:"kind"`
 	Label         string     `json:"label"`
 	URL           string     `json:"url,omitempty"`
@@ -251,7 +253,7 @@ func (s *Server) handleShareRevoke(w http.ResponseWriter, r *http.Request) {
 // toShareJSON builds the owner-facing view.
 func (s *Server) toShareJSON(ctx context.Context, sh store.Share) shareJSON {
 	out := shareJSON{
-		ID: sh.ID.String(), Kind: string(sh.Kind), Label: sh.Label,
+		ID: sh.ID.String(), NodeID: sh.NodeID.String(), Kind: string(sh.Kind), Label: sh.Label,
 		HasPassword: sh.NeedsPassword(), ExpiresAt: sh.ExpiresAt,
 		MaxDownloads: sh.MaxDownloads, DownloadCount: sh.DownloadCount,
 		MaxUploads: sh.MaxUploads, UploadCount: sh.UploadCount,

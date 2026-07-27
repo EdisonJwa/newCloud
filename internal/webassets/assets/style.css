@@ -1,24 +1,22 @@
 /* newcloud — interface
  *
- * Design direction: a tool, not a dashboard.
+ * Structure, not skin.
  *
- * The previous pass had the generic look that generated interfaces converge on: rounded
- * everything, a blue accent, soft shadows on every surface, and a card for each idea. It
- * reads as a template. This file deliberately goes the other way.
+ * The layout is three columns with different jobs, rather than three stacked bands:
  *
- * What gives it character:
+ *   rail      身份与导航。可收成 56px 图标条，因为浏览文件时导航不该占 216px。
+ *   content   列表或网格。表头与工具栏合并为一行，省掉一条横带。
+ *   inspector 所选对象的全部信息：预览、属性、版本、关联分享、操作。
  *
- *  - A warm neutral base instead of blue-grey. The palette is paper and ink, not chrome.
- *  - One saturated accent, used only for links and selection. No gradients anywhere.
- *  - Square-ish geometry: 4px radii, 1px rules as structure rather than shadows. Borders
- *    are hairlines, not boxes with depth.
- *  - Type carries the hierarchy: a real scale, tabular numbers for sizes and counts, and
- *    uppercase micro-labels for section headers.
- *  - Dense rows. This is a file manager used dozens of times a day; whitespace costs a
- *    scroll per screen.
+ * 关键的结构决定是 inspector 常驻。文件管理器最常见的问题是「点一下跳走」：想看文件大小
+ * 或谁分享过它，就要开弹窗、记住、关掉、再回去。把详情放在右侧固定列，选中即显示，列表
+ * 不被遮挡，位置也不跳。
  *
- * Dark mode is a separate palette, not an inversion: warm charcoal rather than black, and a
- * desaturated accent, because a saturated blue on near-black vibrates.
+ * 交互随之改变：单击选中（右侧显示详情），双击或回车才打开。这是文件管理器的通行约定，
+ * 也让误点打开不再发生。
+ *
+ * 视觉上：暖纸色与墨色，细线做结构，颜色只用于含义（选中、危险、拒绝）。深色是独立配色，
+ * 不是反色。
  */
 
 /* ---------- tokens ---------- */
@@ -26,7 +24,6 @@
 :root {
   color-scheme: light dark;
 
-  /* Paper: a warm off-white, so surfaces read as a document rather than a screen. */
   --bg: #faf8f5;
   --bg-elevated: #fffefc;
   --bg-sunken: #f2efe9;
@@ -39,14 +36,11 @@
   --ink-soft: #55504a;
   --ink-faint: #8b8480;
 
-  /* Ink blue: the one saturated colour, reserved for links and selection. */
   --accent: #1f4fd8;
   --accent-hover: #1740b3;
   --accent-wash: #eeeefb;
   --accent-line: #c3c9f0;
 
-  /* A warm signal for destructive and denied, kept away from the accent's hue so a delete
-   * action never looks like a link. */
   --flag: #b8341f;
   --flag-wash: #fbece8;
   --ok: #1d6b43;
@@ -55,8 +49,9 @@
   --radius: 4px;
   --radius-lg: 6px;
 
-  --sidebar: 216px;
-  --topbar: 52px;
+  --rail: 216px;
+  --rail-collapsed: 56px;
+  --inspector: 322px;
 
   --font: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
     "Helvetica Neue", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
@@ -67,7 +62,6 @@
 
 @media (prefers-color-scheme: dark) {
   :root {
-    /* Warm charcoal, not #000: pure black next to warm text looks like a terminal. */
     --bg: #16150f;
     --bg-elevated: #1d1c16;
     --bg-sunken: #121109;
@@ -104,6 +98,7 @@ html,
 body {
   margin: 0;
   height: 100%;
+  overflow: hidden;
 }
 
 body {
@@ -134,7 +129,7 @@ textarea {
 
 :focus-visible {
   outline: 2px solid var(--accent);
-  outline-offset: 1px;
+  outline-offset: -2px;
 }
 
 ::selection {
@@ -146,8 +141,6 @@ textarea {
   display: none !important;
 }
 
-/* Micro-label: the uppercase rule above a section. Used instead of a heavier heading, which
- * would compete with the data. */
 .micro {
   font-size: 10px;
   font-weight: 600;
@@ -156,142 +149,164 @@ textarea {
   color: var(--ink-faint);
 }
 
-/* Numbers must line up in a column, or a totals row is unreadable. */
 .num {
   font-variant-numeric: tabular-nums;
 }
 
-/* ---------- shell ---------- */
+/* ---------- three-column shell ---------- */
 
 #app {
   display: grid;
-  grid-template-columns: var(--sidebar) 1fr;
-  grid-template-rows: var(--topbar) 1fr;
-  grid-template-areas:
-    "side top"
-    "side main";
+  grid-template-columns: var(--rail) minmax(0, 1fr) var(--inspector);
   height: 100%;
+  transition: grid-template-columns 0.18s var(--ease);
 }
 
-/* ---------- sidebar ---------- */
+body.rail-collapsed #app {
+  grid-template-columns: var(--rail-collapsed) minmax(0, 1fr) var(--inspector);
+}
 
-aside.sidebar {
-  grid-area: side;
+body.inspector-closed #app {
+  grid-template-columns: var(--rail) minmax(0, 1fr) 0;
+}
+
+body.rail-collapsed.inspector-closed #app {
+  grid-template-columns: var(--rail-collapsed) minmax(0, 1fr) 0;
+}
+
+/* ---------- rail ---------- */
+
+aside.rail {
   background: var(--bg-sunken);
   border-right: 1px solid var(--line);
-  padding: 0 0 12px;
   display: flex;
   flex-direction: column;
-  overflow-y: auto;
+  min-width: 0;
+  overflow: hidden;
 }
 
-.brand {
+.rail-head {
   display: flex;
   align-items: center;
   gap: 9px;
-  height: var(--topbar);
-  padding: 0 16px;
+  height: 52px;
+  padding: 0 14px;
   border-bottom: 1px solid var(--line);
   flex: none;
 }
 
-/* The mark is drawn, not an image: two stacked slabs, which reads as storage without
- * resorting to a cloud icon. */
-.brand .mark {
+/* The mark: two stacked slabs, which reads as storage without a cloud icon. */
+.rail-head .mark {
   width: 16px;
   height: 16px;
   flex: none;
   position: relative;
 }
-.brand .mark::before,
-.brand .mark::after {
+.rail-head .mark::before,
+.rail-head .mark::after {
   content: "";
   position: absolute;
   left: 0;
   right: 0;
   height: 6px;
-  background: var(--ink);
   border-radius: 1px;
+  background: var(--ink);
 }
-.brand .mark::before {
+.rail-head .mark::before {
   top: 0;
 }
-.brand .mark::after {
+.rail-head .mark::after {
   bottom: 0;
   background: var(--accent);
 }
 
-.brand .word {
+.rail-head .word {
   font-size: 14px;
   font-weight: 650;
   letter-spacing: -0.02em;
+  white-space: nowrap;
 }
 
-nav.primary {
+.rail-nav {
   display: flex;
   flex-direction: column;
-  padding: 10px 8px 0;
+  padding: 8px 6px;
+  gap: 1px;
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 
-nav.primary button {
+.rail-nav button {
   display: flex;
   align-items: center;
-  gap: 9px;
-  width: 100%;
-  padding: 6px 8px;
+  gap: 10px;
+  padding: 7px 8px;
   background: none;
   border: none;
-  border-radius: var(--radius);
+  border-left: 2px solid transparent;
+  border-radius: 0;
   color: var(--ink-soft);
   font-size: 13px;
   font-weight: 500;
   text-align: left;
   cursor: pointer;
-  /* The active row is marked by a rule on the left, not a filled pill: a pill is the single
-   * most template-looking element a sidebar can have. */
-  border-left: 2px solid transparent;
-  margin-left: -2px;
-  transition: color 0.1s var(--ease);
+  white-space: nowrap;
+  min-width: 0;
+  transition: color 0.1s var(--ease), background 0.1s var(--ease);
 }
-nav.primary button:hover {
+.rail-nav button:hover {
   color: var(--ink);
   background: var(--bg-inset);
 }
-nav.primary button[aria-current="page"] {
+.rail-nav button[aria-current="page"] {
   color: var(--ink);
   font-weight: 600;
   border-left-color: var(--accent);
-  background: none;
 }
-nav.primary button .icon {
+.rail-nav button .icon {
   display: flex;
   flex: none;
-  opacity: 0.6;
+  opacity: 0.65;
 }
-nav.primary button[aria-current="page"] .icon {
+.rail-nav button[aria-current="page"] .icon {
   opacity: 1;
   color: var(--accent);
 }
-
-.side-sep {
-  height: 1px;
-  background: var(--line);
-  margin: 12px 16px;
+.rail-nav button .label {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-.side-label {
-  padding: 0 16px 6px;
+/* Collapsed: icons only, centred, label hidden. The title attribute carries the name. */
+body.rail-collapsed .rail-head {
+  justify-content: center;
+  padding: 0;
+}
+body.rail-collapsed .rail-head .word,
+body.rail-collapsed .rail-nav button .label,
+body.rail-collapsed .rail-foot .who {
+  display: none;
+}
+body.rail-collapsed .rail-nav button {
+  justify-content: center;
+  padding: 8px 0;
+}
+body.rail-collapsed .rail-foot {
+  justify-content: center;
+  padding: 10px 0;
 }
 
-.side-foot {
-  margin-top: auto;
-  padding: 12px 16px 0;
+.rail-foot {
   border-top: 1px solid var(--line);
-  font-size: 11.5px;
-  color: var(--ink-faint);
+  padding: 8px 10px;
   display: flex;
   align-items: center;
   gap: 8px;
+  font-size: 11.5px;
+  color: var(--ink-faint);
+  flex: none;
+  min-width: 0;
 }
 
 .avatar {
@@ -309,34 +324,86 @@ nav.primary button[aria-current="page"] .icon {
   flex: none;
 }
 
-/* ---------- topbar ---------- */
-
-header.topbar {
-  grid-area: top;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 0 16px;
-  background: var(--bg-elevated);
-  border-bottom: 1px solid var(--line);
-  position: sticky;
-  top: 0;
-  z-index: 20;
+.rail-foot .who {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-header.topbar .spacer {
+/* ---------- content ---------- */
+
+main.content {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+/* One row: breadcrumbs, search, view switch. The old design spent a whole extra band on
+ * two buttons; this puts everything a row needs in the row. */
+.content-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 52px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-elevated);
+  flex: none;
+  min-width: 0;
+}
+
+.content-head .spacer {
   flex: 1;
+  min-width: 8px;
+}
+
+.crumbs {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  min-width: 0;
+  overflow: hidden;
+}
+.crumbs button {
+  background: none;
+  border: none;
+  padding: 3px 6px;
+  border-radius: var(--radius);
+  color: var(--ink-soft);
+  cursor: pointer;
+  font-size: 13px;
+  white-space: nowrap;
+  max-width: 22ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.crumbs button:hover {
+  background: var(--bg-inset);
+  color: var(--ink);
+}
+.crumbs button.here {
+  color: var(--ink);
+  font-weight: 650;
+}
+.crumbs .sep {
+  color: var(--ink-faint);
+  user-select: none;
+  font-size: 11px;
+  flex: none;
 }
 
 .search {
   position: relative;
-  flex: 0 1 300px;
+  flex: 0 1 210px;
+  min-width: 96px;
 }
 .search input {
   width: 100%;
-  padding: 5px 9px 5px 28px;
+  padding: 5px 9px 5px 27px;
   background: var(--bg-sunken);
-  border: 1px solid var(--line);
+  border: 1px solid transparent;
   border-radius: var(--radius);
   font-size: 12.5px;
 }
@@ -357,68 +424,6 @@ header.topbar .spacer {
   color: var(--ink-faint);
   pointer-events: none;
   display: flex;
-}
-
-.crumb-bar {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-  font-size: 12.5px;
-  min-width: 0;
-  overflow: hidden;
-}
-.crumb-bar button {
-  background: none;
-  border: none;
-  padding: 2px 5px;
-  border-radius: var(--radius);
-  color: var(--ink-soft);
-  cursor: pointer;
-  font-size: 12.5px;
-  white-space: nowrap;
-}
-.crumb-bar button:hover {
-  background: var(--bg-inset);
-  color: var(--ink);
-}
-.crumb-bar button.here {
-  color: var(--ink);
-  font-weight: 600;
-}
-.crumb-bar .sep {
-  color: var(--ink-faint);
-  user-select: none;
-  font-size: 11px;
-}
-
-/* ---------- main ---------- */
-
-main {
-  grid-area: main;
-  overflow-y: auto;
-  min-width: 0;
-  padding: 0 0 80px;
-}
-
-.toolbar {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 10px 16px;
-  border-bottom: 1px solid var(--line);
-  background: var(--bg-elevated);
-  position: sticky;
-  top: 0;
-  z-index: 10;
-  flex-wrap: wrap;
-}
-.toolbar .spacer {
-  flex: 1;
-}
-.toolbar .count {
-  font-size: 12px;
-  color: var(--ink-faint);
-  padding-right: 4px;
 }
 
 /* ---------- buttons ---------- */
@@ -456,7 +461,6 @@ button.btn.primary:hover:not(:disabled) {
 }
 @media (prefers-color-scheme: dark) {
   button.btn.primary {
-    background: var(--ink);
     color: #16150f;
   }
   button.btn.primary:hover:not(:disabled) {
@@ -487,31 +491,17 @@ button.btn.danger:hover:not(:disabled) {
 button.icon-only {
   padding: 5px;
 }
-
-button.row-action {
-  background: none;
-  border: none;
-  padding: 2px 6px;
-  border-radius: var(--radius);
-  color: var(--ink-faint);
-  font-size: 12px;
-  cursor: pointer;
-}
-button.row-action:hover {
-  background: var(--bg-inset);
-  color: var(--ink);
-}
-button.row-action.danger:hover {
-  background: var(--flag-wash);
-  color: var(--flag);
+button.small {
+  padding: 3px 7px;
+  font-size: 11.5px;
 }
 
-/* A list/grid toggle: two buttons in a joined strip, not a rounded switch. */
 .seg {
   display: inline-flex;
   border: 1px solid var(--line-strong);
   border-radius: var(--radius);
   overflow: hidden;
+  flex: none;
 }
 .seg button {
   background: var(--bg-elevated);
@@ -530,10 +520,12 @@ button.row-action.danger:hover {
   color: var(--ink);
 }
 
-/* ---------- file table ---------- */
+/* ---------- file area ---------- */
 
-.table-wrap {
-  background: var(--bg-elevated);
+.scroll {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
 }
 
 table.files {
@@ -551,9 +543,10 @@ table.files thead th {
   padding: 7px 12px;
   border-bottom: 1px solid var(--line-strong);
   white-space: nowrap;
-  background: var(--bg-elevated);
+  background: var(--bg);
   position: sticky;
   top: 0;
+  z-index: 2;
 }
 table.files thead th.num {
   text-align: right;
@@ -566,13 +559,16 @@ table.files tbody tr {
 table.files tbody tr:hover {
   background: var(--bg-sunken);
 }
+/* Selection is a left rule plus a wash: a full highlight would fight the hover state and
+ * make a shift-range look like a different kind of row. */
 table.files tbody tr.selected {
   background: var(--accent-wash);
+  box-shadow: inset 2px 0 0 var(--accent);
 }
 
 table.files td {
   padding: 0 12px;
-  height: 38px;
+  height: 36px;
   vertical-align: middle;
 }
 
@@ -581,19 +577,13 @@ td.name {
   align-items: center;
   gap: 10px;
   min-width: 0;
-  height: 38px;
+  height: 36px;
 }
 td.name .label {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  cursor: pointer;
   font-size: 13px;
-}
-td.name .label:hover {
-  color: var(--accent);
-  text-decoration: underline;
-  text-underline-offset: 2px;
 }
 td.name .label.dir {
   font-weight: 600;
@@ -610,16 +600,14 @@ td.size {
   text-align: right;
 }
 
-td.actions {
-  text-align: right;
+td.kind {
+  color: var(--ink-faint);
+  font-size: 11.5px;
   white-space: nowrap;
-  width: 1%;
 }
 
-/* ---------- file badge ---------- */
-
-/* A square with the extension in it. Deliberately flat and near-monochrome: colour is
- * reserved for meaning (selection, danger, failure), not decoration. */
+/* A file badge: the extension in a flat square. Directories and previewable media get the
+ * accent's line colour so the eye finds them without reading the text. */
 .ftype {
   width: 26px;
   height: 26px;
@@ -636,8 +624,6 @@ td.actions {
   border: 1px solid var(--line);
   overflow: hidden;
 }
-/* Directories and previewable images get the accent's wash, so the eye finds them without
- * reading the extension. */
 .ftype.dir,
 .ftype.img,
 .ftype.vid {
@@ -660,21 +646,25 @@ td.actions {
 
 .grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(146px, 1fr));
   gap: 1px;
   background: var(--line);
-  border-bottom: 1px solid var(--line);
 }
 
 .tile {
   background: var(--bg-elevated);
-  cursor: pointer;
+  cursor: default;
   display: flex;
   flex-direction: column;
+  position: relative;
   transition: background 0.1s var(--ease);
 }
 .tile:hover {
   background: var(--bg-sunken);
+}
+.tile.selected {
+  background: var(--accent-wash);
+  box-shadow: inset 0 0 0 2px var(--accent);
 }
 
 .tile .preview {
@@ -700,12 +690,8 @@ td.actions {
 }
 
 .tile .meta {
-  padding: 7px 9px;
+  padding: 6px 8px;
   min-width: 0;
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 8px;
 }
 .tile .meta .n {
   font-size: 12px;
@@ -717,13 +703,326 @@ td.actions {
   font-size: 10.5px;
   color: var(--ink-faint);
   font-variant-numeric: tabular-nums;
+}
+
+/* ---------- inspector ---------- */
+
+aside.inspector {
+  background: var(--bg-elevated);
+  border-left: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+}
+
+body.inspector-closed aside.inspector {
+  display: none;
+}
+
+.inspector-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 52px;
+  padding: 0 10px 0 12px;
+  border-bottom: 1px solid var(--line);
   flex: none;
+}
+
+.inspector-head .title {
+  font-size: 12.5px;
+  font-weight: 650;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+
+.inspector-body {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+/* The preview stage: fixed height so the panel does not reflow as you arrow through a
+ * folder. A file that cannot be previewed keeps the same space and says why. */
+.stage {
+  height: 178px;
+  background: var(--bg-sunken);
+  border-bottom: 1px solid var(--line);
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  position: relative;
+}
+.stage img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  display: block;
+}
+.stage .glyph {
+  color: var(--ink-faint);
+  display: flex;
+}
+.stage .note {
+  font-size: 11.5px;
+  color: var(--ink-faint);
+  text-align: center;
+  padding: 0 16px;
+  line-height: 1.5;
+}
+
+/* Text files fill the well with a snippet rather than an icon. */
+.stage.text-stage {
+  display: block;
+  padding: 10px 12px;
+}
+.stage.text-stage pre {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  line-height: 1.55;
+  color: var(--ink-soft);
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow: hidden;
+  max-height: 100%;
+  tab-size: 2;
+}
+.stage .open-hint {
+  position: absolute;
+  inset: auto 0 0 0;
+  padding: 5px 8px;
+  background: linear-gradient(transparent, rgba(0, 0, 0, 0.55));
+  color: #fff;
+  font-size: 11px;
+  text-align: center;
+  opacity: 0;
+  transition: opacity 0.12s var(--ease);
+  cursor: pointer;
+}
+.stage:hover .open-hint {
+  opacity: 1;
+}
+
+.inspector-file {
+  padding: 11px 12px;
+  border-bottom: 1px solid var(--line);
+}
+.inspector-file .name {
+  font-size: 13px;
+  font-weight: 650;
+  word-break: break-word;
+  line-height: 1.35;
+}
+.inspector-file .path {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--ink-faint);
+  font-family: var(--mono);
+  word-break: break-all;
+}
+
+/* Properties as a definition list with a fixed label column: two aligned columns read as
+ * data, whereas a form layout reads as something to fill in. */
+.props {
+  padding: 6px 12px 10px;
+  border-bottom: 1px solid var(--line);
+}
+.props dl {
+  margin: 0;
+  display: grid;
+  grid-template-columns: 74px minmax(0, 1fr);
+}
+.props dt {
+  font-size: 11.5px;
+  color: var(--ink-faint);
+  padding: 4px 0;
+}
+.props dd {
+  margin: 0;
+  font-size: 12px;
+  padding: 4px 0;
+  word-break: break-word;
+  font-variant-numeric: tabular-nums;
+}
+.props dd.mono {
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.inspector-section {
+  border-bottom: 1px solid var(--line);
+}
+.inspector-section > summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 9px 12px;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+.inspector-section > summary::-webkit-details-marker {
+  display: none;
+}
+.inspector-section > summary .micro {
+  flex: 1;
+}
+.inspector-section > summary .count {
+  font-size: 10.5px;
+  color: var(--ink-faint);
+  font-variant-numeric: tabular-nums;
+}
+.inspector-section > summary .chev {
+  color: var(--ink-faint);
+  display: flex;
+  transition: transform 0.14s var(--ease);
+}
+.inspector-section[open] > summary .chev {
+  transform: rotate(90deg);
+}
+.inspector-section .section-body {
+  padding: 0 12px 10px;
+}
+
+.inspector-actions {
+  padding: 10px 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  border-bottom: 1px solid var(--line);
+}
+
+/* A version row: number, size, date, and a restore action that only appears on hover, so
+ * the list stays quiet. */
+.version-row,
+.share-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 0;
+  border-bottom: 1px solid var(--line);
+  font-size: 11.5px;
+}
+.version-row:last-child,
+.share-row:last-child {
+  border-bottom: none;
+}
+.version-row .vno {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--ink-faint);
+  flex: none;
+  width: 24px;
+}
+.version-row .vmeta {
+  flex: 1;
+  min-width: 0;
+  color: var(--ink-soft);
+  font-variant-numeric: tabular-nums;
+}
+.version-row .act {
+  opacity: 0;
+  transition: opacity 0.1s var(--ease);
+}
+.version-row:hover .act {
+  opacity: 1;
+}
+
+.share-row .used {
+  color: var(--ink-faint);
+  font-variant-numeric: tabular-nums;
+  flex: none;
+}
+
+.note-empty {
+  font-size: 11.5px;
+  color: var(--ink-faint);
+  padding: 2px 0 4px;
+  line-height: 1.5;
+}
+
+/* ---------- inspector empty state ---------- */
+
+.inspector-empty {
+  padding: 44px 20px;
+  text-align: center;
+  color: var(--ink-faint);
+}
+.inspector-empty .glyph {
+  display: flex;
+  justify-content: center;
+  margin-bottom: 10px;
+  opacity: 0.4;
+}
+.inspector-empty .title {
+  font-size: 12.5px;
+  color: var(--ink-soft);
+  font-weight: 600;
+  margin-bottom: 3px;
+}
+.inspector-empty .hint {
+  font-size: 11.5px;
+  line-height: 1.55;
+}
+
+/* ---------- multi-select bar ---------- */
+
+/* A floating bar at the bottom of the content column, only when more than one row is
+ * selected. It overlays rather than pushing the list, so selecting does not reflow the
+ * thing being selected. */
+.selection-bar {
+  position: absolute;
+  bottom: 18px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  background: var(--ink);
+  color: var(--bg-elevated);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 10px 30px -8px rgba(20, 18, 14, 0.5);
+  font-size: 12.5px;
+  z-index: 30;
+  white-space: nowrap;
+}
+.selection-bar button {
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  color: inherit;
+  border-radius: var(--radius);
+  padding: 3px 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.selection-bar button:hover {
+  background: rgba(255, 255, 255, 0.14);
+}
+.selection-bar button.strong {
+  background: #fff;
+  color: #16150f;
+  border-color: #fff;
+  font-weight: 600;
+}
+
+.content-body {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 /* ---------- empty ---------- */
 
 .empty {
-  padding: 72px 24px;
+  padding: 64px 24px;
   text-align: center;
   color: var(--ink-faint);
 }
@@ -765,7 +1064,7 @@ td.actions {
 #dropzone .box {
   border: 1px dashed var(--accent);
   border-radius: var(--radius-lg);
-  padding: 32px 48px;
+  padding: 30px 46px;
   background: var(--bg-elevated);
   text-align: center;
   color: var(--accent);
@@ -880,7 +1179,6 @@ dialog menu {
   border-radius: 0 0 var(--radius-lg) var(--radius-lg);
 }
 
-/* A value the user must copy: monospace, selectable, never silently truncated. */
 .copybox {
   font-family: var(--mono);
   font-size: 11.5px;
@@ -980,41 +1278,33 @@ dialog.preview {
 
 /* ---------- audit ---------- */
 
-/* The audit view is a timeline, not a table: events are read in sequence, and the sequence
- * is the point. A left rule with a marker per event carries that better than columns. */
 .audit-toolbar {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 10px 16px;
+  padding: 8px 14px;
   border-bottom: 1px solid var(--line);
   background: var(--bg-elevated);
-  position: sticky;
-  top: 0;
-  z-index: 10;
   flex-wrap: wrap;
+  flex: none;
 }
 .audit-toolbar select,
 .audit-toolbar input {
   width: auto;
-  min-width: 118px;
+  min-width: 112px;
   font-size: 12px;
   padding: 4px 7px;
 }
 
 .timeline {
-  padding: 0 16px;
+  padding: 0 14px;
 }
 
 .event {
   display: grid;
-  grid-template-columns: 92px 18px 1fr;
-  gap: 0 10px;
-  position: relative;
+  grid-template-columns: 86px 16px 1fr;
+  gap: 0 9px;
 }
-
-/* The vertical rule runs the height of the row and is drawn by the marker column, so the
- * line stays continuous between events. */
 .event .rail {
   position: relative;
   display: flex;
@@ -1065,7 +1355,7 @@ dialog.preview {
 }
 
 .event .body {
-  padding: 6px 0 10px;
+  padding: 6px 8px 10px;
   border-bottom: 1px solid var(--line);
   min-width: 0;
 }
@@ -1085,7 +1375,6 @@ dialog.preview {
   font-weight: 650;
   font-family: var(--mono);
   font-size: 11.5px;
-  letter-spacing: -0.01em;
 }
 .event.denied .action {
   color: var(--flag);
@@ -1095,12 +1384,9 @@ dialog.preview {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  /* A hard cap keeps a long path from pushing the actor off the row. It must be wide
-   * enough for ordinary names: at 42ch a 14-character name was being clipped mid-word
-   * with no visible ellipsis, which reads as data loss rather than truncation. */
   max-width: 60ch;
   min-width: 0;
-}'
+}
 .event .who {
   font-size: 11.5px;
   color: var(--ink-faint);
@@ -1117,18 +1403,13 @@ dialog.preview {
   color: var(--ink-soft);
   font-family: var(--mono);
 }
-
-/* A refused event is worth seeing at a glance: a wash rather than a border, so the
- * timeline rule stays unbroken. */
 .event.denied .body {
   background: var(--flag-wash);
-  margin-left: -8px;
-  padding-left: 8px;
-  padding-right: 8px;
+  border-radius: var(--radius);
 }
 
 .audit-day {
-  padding: 16px 0 4px 120px;
+  padding: 16px 0 4px 112px;
   font-size: 10px;
   font-weight: 600;
   letter-spacing: 0.09em;
@@ -1184,6 +1465,7 @@ dialog.preview {
   height: 2px;
   background: var(--line);
   overflow: hidden;
+  flex: none;
 }
 .progress > div {
   height: 100%;
@@ -1321,79 +1603,116 @@ dialog.preview {
 
 /* ---------- responsive ---------- */
 
-@media (max-width: 860px) {
+/* Below 1180px the inspector becomes an overlay: three columns no longer fit without
+ * squeezing the file names, which are the reason the screen exists. */
+@media (max-width: 1180px) {
   #app {
-    grid-template-columns: 1fr;
-    grid-template-rows: auto var(--topbar) 1fr;
-    grid-template-areas:
-      "side"
-      "top"
-      "main";
+    grid-template-columns: var(--rail) minmax(0, 1fr) 0;
   }
-  aside.sidebar {
+  body.rail-collapsed #app {
+    grid-template-columns: var(--rail-collapsed) minmax(0, 1fr) 0;
+  }
+  body.inspector-open aside.inspector {
+    position: fixed;
+    right: 0;
+    top: 0;
+    bottom: 0;
+    width: min(340px, 88vw);
+    z-index: 60;
+    box-shadow: -12px 0 40px -12px rgba(20, 18, 14, 0.35);
+  }
+  body.inspector-open::after {
+    content: "";
+    position: fixed;
+    inset: 0;
+    background: rgba(20, 18, 14, 0.28);
+    z-index: 55;
+  }
+}
+
+/* Below 760px the rail becomes a top strip and labels return, because an icon rail on a
+ * phone is a puzzle rather than a shortcut. */
+@media (max-width: 760px) {
+  #app,
+  body.rail-collapsed #app,
+  body.inspector-closed #app,
+  body.rail-collapsed.inspector-closed #app {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+  aside.rail {
     flex-direction: row;
     align-items: center;
-    padding: 0 8px;
     border-right: none;
     border-bottom: 1px solid var(--line);
     overflow-x: auto;
   }
-  .brand {
-    height: 42px;
+  .rail-head {
+    height: 44px;
     border-bottom: none;
-    padding: 0 8px;
+    padding: 0 10px;
   }
-  .brand .word {
+  .rail-head .word {
     display: none;
   }
-  nav.primary {
+  .rail-nav {
     flex-direction: row;
     padding: 0;
-    gap: 2px;
+    gap: 0;
+    overflow: visible;
   }
-  nav.primary button {
+  .rail-nav button,
+  body.rail-collapsed .rail-nav button {
     border-left: none;
     border-bottom: 2px solid transparent;
-    margin-left: 0;
-    padding: 4px 8px;
+    padding: 4px 9px;
+    justify-content: flex-start;
   }
-  nav.primary button[aria-current="page"] {
+  .rail-nav button[aria-current="page"] {
     border-left-color: transparent;
     border-bottom-color: var(--accent);
   }
-  nav.primary button .label {
+  .rail-nav button .label,
+  body.rail-collapsed .rail-nav button .label {
     display: none;
   }
-  .side-sep,
-  .side-label,
-  .side-foot {
-    display: none;
-  }
-  header.topbar {
+  .rail-foot {
+    border-top: none;
+    border-left: 1px solid var(--line);
     padding: 0 10px;
+    height: 44px;
+  }
+  .rail-foot .who {
+    display: none;
+  }
+  .content-head {
+    height: auto;
+    padding: 8px 10px;
+    flex-wrap: wrap;
+    gap: 6px;
   }
   .search {
-    flex: 1;
+    flex: 1 1 120px;
   }
-  .audit-toolbar,
-  .toolbar {
+  table.files .kind,
+  table.files .when {
+    display: none;
+  }
+  .audit-toolbar {
     padding: 8px 10px;
   }
   .timeline {
     padding: 0 10px;
   }
   .event {
-    grid-template-columns: 62px 14px 1fr;
+    grid-template-columns: 56px 14px 1fr;
     gap: 0 7px;
   }
   .audit-day {
-    padding-left: 83px;
-  }
-  table.files .when {
-    display: none;
+    padding-left: 77px;
   }
   .grid {
-    grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(114px, 1fr));
   }
   dialog.preview {
     width: 100vw;

@@ -10,13 +10,14 @@
   <link rel="stylesheet" href="/assets/style.css">
 </head>
 <body>
-  <!-- The shell is intentionally almost empty.
-       Every view is built by the script from data, so there is no markup here that could
-       get out of step with the API, and nothing user-controlled is ever parsed as HTML. -->
+  <!-- Three columns with different jobs: navigation, content, and the inspector.
+       The shell is almost empty because every view is built by the script from data, so
+       nothing here can get out of step with the API and nothing user-controlled is ever
+       parsed as HTML. -->
   <div id="app">
-    <aside class="sidebar" id="sidebar"></aside>
-    <header class="topbar" id="bar"></header>
-    <main id="main"></main>
+    <aside class="rail" id="rail"></aside>
+    <main class="content" id="content"></main>
+    <aside class="inspector" id="inspector"></aside>
   </div>
 
   <div id="dropzone">

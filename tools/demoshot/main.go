@@ -144,10 +144,39 @@ func run() error {
 		return err
 	}
 
+	// ---- A selected file, showing the inspector ----
+	//
+	// Selection is the interaction the layout is built around: one click fills the right
+	// column with details, versions and shares. A screenshot of the list alone would not
+	// show that the column does anything.
+	fmt.Println("capturing the details panel…")
+	if _, err := evalString(cdp, `(() => {
+		const rows = [...document.querySelectorAll('table.files tbody tr')];
+		const row = rows.find(r => r.textContent.includes('README'));
+		if (!row) return 'none';
+		row.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+		return 'ok';
+	})()`); err != nil {
+		return err
+	}
+	time.Sleep(1600 * time.Millisecond)
+	if err := shoot(cdp, filepath.Join(*outDir, "selected.png")); err != nil {
+		return err
+	}
+
+	// ---- Interactions ----
+	//
+	// The layout is built around selection and the keyboard; a screenshot cannot prove they
+	// work, so they are asserted.
+	fmt.Println("checking selection and keyboard…")
+	if err := checkInteractions(cdp); err != nil {
+		return err
+	}
+
 	// ---- Shares tab ----
 	fmt.Println("capturing the shares tab…")
 	if _, err := evalString(cdp, `(() => {
-		const b = [...document.querySelectorAll('nav.primary button')].find(x => x.textContent.trim() === 'Shares');
+		const b = [...document.querySelectorAll('.rail-nav button')].find(x => x.textContent.trim() === 'Shares');
 		if (b) b.click(); return 'ok';
 	})()`); err != nil {
 		return err
@@ -160,7 +189,7 @@ func run() error {
 	// ---- A folder inside the tree ----
 	fmt.Println("capturing a subfolder…")
 	if _, err := evalString(cdp, `(() => {
-		const b = [...document.querySelectorAll('nav.primary button')].find(x => x.textContent.trim() === 'Files');
+		const b = [...document.querySelectorAll('.rail-nav button')].find(x => x.textContent.trim() === 'Files');
 		if (b) b.click(); return 'ok';
 	})()`); err != nil {
 		return err
@@ -186,7 +215,7 @@ func run() error {
 	// is worth a frame of its own rather than being covered by the file list.
 	fmt.Println("capturing the activity timeline…")
 	if _, err := evalString(cdp, `(() => {
-		const b = [...document.querySelectorAll('nav.primary button')].find(x => x.textContent.trim() === 'Activity');
+		const b = [...document.querySelectorAll('.rail-nav button')].find(x => x.textContent.trim() === 'Activity');
 		if (b) b.click(); return 'ok';
 	})()`); err != nil {
 		return err
@@ -199,7 +228,7 @@ func run() error {
 	// ---- App passwords ----
 	fmt.Println("capturing app passwords…")
 	if _, err := evalString(cdp, `(() => {
-		const b = [...document.querySelectorAll('nav.primary button')].find(x => x.textContent.trim() === 'Access');
+		const b = [...document.querySelectorAll('.rail-nav button')].find(x => x.textContent.trim() === 'Access');
 		if (b) b.click(); return 'ok';
 	})()`); err != nil {
 		return err
@@ -238,7 +267,7 @@ func navigate(cdp *wsConn, target string) error {
 
 // jsShowFiles switches the sidebar back to the file list.
 const jsShowFiles = `(() => {
-	const b = [...document.querySelectorAll('nav.primary button')].find(x => x.textContent.trim() === 'Files');
+	const b = [...document.querySelectorAll('.rail-nav button')].find(x => x.textContent.trim() === 'Files');
 	if (b) b.click();
 	return 'ok';
 })()`
@@ -314,6 +343,67 @@ func checkDropUpload(cdp *wsConn) error {
 	}
 	fmt.Printf("rows after the drop:  %d\n", after)
 	fmt.Println("OK: drag and drop uploaded the file")
+	return nil
+}
+
+// checkInteractions asserts the behaviours a screenshot cannot show.
+//
+// The layout exists to support select-then-inspect and keyboard navigation. If either is
+// broken the design is decorative, so both are checked against the live DOM.
+func checkInteractions(cdp *wsConn) error {
+	// Single click selects and fills the inspector.
+	if _, err := evalString(cdp, `(() => {
+		const row = [...document.querySelectorAll('table.files tbody tr')].find(r => r.textContent.includes('README'));
+		if (!row) return 'no-row';
+		row.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+		return 'ok';
+	})()`); err != nil {
+		return err
+	}
+	time.Sleep(1400 * time.Millisecond)
+
+	sel, err := evalString(cdp, `(() => String(document.querySelectorAll('table.files tbody tr.selected').length))()`)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(sel) != "1" {
+		return fmt.Errorf("single click did not select exactly one row (got %q)", sel)
+	}
+
+	// The inspector must show that file's details, not a placeholder.
+	title, err := evalString(cdp, `(() => {
+		const n = document.querySelector('.inspector-file .name');
+		return n ? n.textContent.trim() : '';
+	})()`)
+	if err != nil {
+		return err
+	}
+	if !strings.Contains(title, "README") {
+		return fmt.Errorf("the inspector did not follow the selection (title %q)", title)
+	}
+	fmt.Println("  selection fills the inspector")
+
+	// Arrow keys move the selection without a mouse.
+	if _, err := evalString(cdp, `(() => {
+		document.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+		return 'ok';
+	})()`); err != nil {
+		return err
+	}
+	time.Sleep(900 * time.Millisecond)
+
+	moved, err := evalString(cdp, `(() => {
+		const n = document.querySelector('.inspector-file .name');
+		return n ? n.textContent.trim() : '';
+	})()`)
+	if err != nil {
+		return err
+	}
+	if moved == title {
+		return fmt.Errorf("ArrowDown did not move the selection (still %q)", moved)
+	}
+	fmt.Printf("  keyboard moves the selection (%q -> %q)\n", title, moved)
+
 	return nil
 }
 

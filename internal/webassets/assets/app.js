@@ -5,7 +5,7 @@
 // contains exactly the code that was reviewed, with no transitive dependencies to audit
 // and no build step to reproduce.
 //
-// Two rules hold everywhere in this file and are worth stating once:
+// Two rules hold everywhere in this file:
 //
 //  1. User data reaches the DOM through textContent, never innerHTML. File names, share
 //     labels and addresses come from other people; injecting one into markup is stored
@@ -13,6 +13,11 @@
 //  2. The server decides what may be previewed and thumbnailed. The client reads the
 //     `preview` field the API returns; it never infers "this is an image" from an
 //     extension and then disagrees with the server about it.
+//
+// The interaction model is the file-manager convention: single click selects and fills the
+// inspector, double click (or Enter) opens. That is what removes the "click and get thrown
+// somewhere" problem, and it is why the selection state below is real state rather than a
+// transient CSS class.
 
 (() => {
   "use strict";
@@ -21,12 +26,18 @@
 
   const state = {
     me: null,
-    view: "files", // files | shares | trash | audit | credentials
+    view: "files", // files | shares | trash | audit | access
     path: "",
     entries: [],
     layout: "list", // list | grid
     filter: "",
-    // Audit state is kept separate so switching tabs does not lose a half-set filter.
+    // Selection is a set of paths. A range needs the anchor to extend from.
+    selected: new Set(),
+    anchor: null,
+    railCollapsed: false,
+    inspectorClosed: false,
+    // Cached detail for the inspected file: versions and the shares pointing at it.
+    detail: { path: null, versions: null, shares: null, loading: false },
     audit: {
       events: [],
       offset: 0,
@@ -83,12 +94,15 @@
       grid: "M2.5 2.5h4.5v4.5H2.5zM9 2.5h4.5v4.5H9zM2.5 9h4.5v4.5H2.5zM9 9h4.5v4.5H9z",
       download: "M8 2.5v8m0 0l3-3m-3 3l-3-3M2.5 13.5h11",
       close: "M4 4l8 8M12 4l-8 8",
-      image: "M2.5 3.5h11v9h-11zM2.5 10l3.5-3 3 3 2-1.5 2.5 2",
-      video: "M2.5 5h8v6h-8zM10.5 7.5l3-1.5v4l-3-1.5",
-      audio: "M9.5 2.5v7M9.5 9.5a1.75 1.75 0 11-3.5 0 1.75 1.75 0 013.5 0z",
       doc: "M4 2.5h5l3 3v8H4zM9 2.5v3h3",
       user: "M8 8a2.5 2.5 0 100-5 2.5 2.5 0 000 5zm-4.5 5.5a4.5 4.5 0 019 0",
-      clock: "M8 14A6 6 0 108 2a6 6 0 000 12zM8 4.5V8l2.5 1.5",
+      sidebar: "M2.5 3.5h11v9h-11zM6 3.5v9",
+      panel: "M2.5 3.5h11v9h-11zM10 3.5v9",
+      chevron: "M6 3l4 5-4 5",
+      open: "M6 3.5H3.5v9h9V10M9.5 2.5H13v3.5M13 2.5L7.5 8",
+      eye: "M1.5 8s2.4-4 6.5-4 6.5 4 6.5 4-2.4 4-6.5 4S1.5 8 1.5 8zM8 10a2 2 0 100-4 2 2 0 000 4z",
+      history: "M2.5 8a5.5 5.5 0 101.6-3.9M2.5 2v3h3M8 5v3.2l2 1.2",
+      link: "M6.5 9.5l3-3M5.5 11a2.5 2.5 0 01-3.5-3.5l2-2a2.5 2.5 0 013.5 0M10.5 5a2.5 2.5 0 013.5 3.5l-2 2a2.5 2.5 0 01-3.5 0",
     };
     const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
     svg.setAttribute("width", size);
@@ -189,6 +203,17 @@
     return then.toLocaleDateString(undefined, { month: "short", day: "numeric" });
   }
 
+  function fullTime(iso) {
+    if (!iso) return "";
+    return new Date(iso).toLocaleString(undefined, {
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  }
+
   function clockOf(iso) {
     return new Date(iso).toLocaleTimeString(undefined, {
       hour: "2-digit",
@@ -225,8 +250,6 @@
   }
 
   function badgeGlyph(entry) {
-    // A folder gets an icon, not a badge: it has no extension, and the literal "FILE" on a
-    // directory is simply wrong.
     if (entry.kind === "dir") return "";
     switch (entry.preview) {
       case "image": return "IMG";
@@ -239,12 +262,23 @@
     return (ext || "FILE").slice(0, 4);
   }
 
+  function kindLabel(entry) {
+    if (entry.kind === "dir") return "folder";
+    switch (entry.preview) {
+      case "image": return "image";
+      case "video": return "video";
+      case "audio": return "audio";
+      case "pdf": return "PDF";
+      case "text": return "text";
+    }
+    const ext = extensionOf(entry.name);
+    return ext ? `${ext} file` : "file";
+  }
+
   function isImage(entry) {
     return entry.kind !== "dir" && entry.preview === "image";
   }
 
-  // filePath is the entry's absolute path, falling back to the current directory for
-  // listings that do not fill it in.
   function filePath(entry) {
     return entry.path || joinPath(state.path, entry.name);
   }
@@ -257,34 +291,95 @@
     return `/api/files/download?path=${encodeURIComponent(filePath(entry))}`;
   }
 
-  // thumbnailURL is the resized image. The browser falls back to the type badge when the
-  // server answers 415, so this is always safe to set.
-  function thumbnailURL(entry) {
-    return `/api/files/thumbnail?path=${encodeURIComponent(filePath(entry))}`;
+  function thumbnailURL(entry, size) {
+    // The endpoint takes no size today; the parameter is accepted by the browser's cache
+    // key so a future size change does not reuse a stale entry.
+    const suffix = size ? `&s=${size}` : "";
+    return `/api/files/thumbnail?path=${encodeURIComponent(filePath(entry))}${suffix}`;
   }
 
-  // ---------- chrome: sidebar ----------
+  // ---------- selection ----------
+
+  function selectedEntries() {
+    return state.entries.filter((e) => state.selected.has(filePath(e)));
+  }
+
+  function selectOnly(entry) {
+    state.selected.clear();
+    if (entry) {
+      const p = filePath(entry);
+      state.selected.add(p);
+      state.anchor = p;
+    } else {
+      state.anchor = null;
+    }
+  }
+
+  function toggleSelect(entry) {
+    const p = filePath(entry);
+    if (state.selected.has(p)) state.selected.delete(p);
+    else state.selected.add(p);
+    state.anchor = p;
+  }
+
+  // extendSelection implements shift-click over the visible order, which is what a person
+  // sees, not the underlying array.
+  function extendSelection(entry) {
+    const list = visibleEntries();
+    const to = list.findIndex((e) => filePath(e) === filePath(entry));
+    const from = list.findIndex((e) => filePath(e) === state.anchor);
+    if (to < 0 || from < 0) {
+      selectOnly(entry);
+      return;
+    }
+    const [lo, hi] = from <= to ? [from, to] : [to, from];
+    state.selected.clear();
+    for (let i = lo; i <= hi; i++) state.selected.add(filePath(list[i]));
+  }
+
+  function selectAll() {
+    state.selected.clear();
+    for (const entry of visibleEntries()) state.selected.add(filePath(entry));
+    state.anchor = state.anchor || null;
+    renderMain();
+    renderInspector();
+  }
+
+  function clearSelection() {
+    state.selected.clear();
+    state.anchor = null;
+    renderMain();
+    renderInspector();
+  }
+
+  function inspectedEntry() {
+    if (state.selected.size !== 1) return null;
+    const only = [...state.selected][0];
+    return state.entries.find((e) => filePath(e) === only) || null;
+  }
+
+  // ---------- rail ----------
 
   const NAV = [
     { key: "files", label: "Files", icon: "files" },
     { key: "shares", label: "Shares", icon: "shares" },
     { key: "trash", label: "Trash", icon: "trash" },
     { key: "audit", label: "Activity", icon: "pulse" },
-    { key: "credentials", label: "Access", icon: "key" },
+    { key: "access", label: "Access", icon: "key" },
   ];
 
-  function renderSidebar() {
-    const bar = $("#sidebar");
-    clear(bar);
+  function renderRail() {
+    const rail = $("#rail");
+    clear(rail);
 
-    bar.append(
-      el("div", { class: "brand" }, [
+    rail.append(
+      el("div", { class: "rail-head" }, [
         el("span", { class: "mark" }),
         el("span", { class: "word", text: "newcloud" }),
       ]),
     );
 
-    const nav = el("nav", { class: "primary" });
+    const nav = el("nav", { class: "rail-nav" });
     for (const item of NAV) {
       nav.append(
         el(
@@ -301,124 +396,52 @@
         ),
       );
     }
-    bar.append(nav);
-
-    bar.append(el("div", { class: "side-sep" }));
-
-    if (state.me) {
-      bar.append(
-        el("div", { class: "side-foot" }, [
-          el("span", { class: "avatar", text: (state.me.username || "?").slice(0, 1) }),
-          el("span", { text: state.me.username }),
-        ]),
-      );
-    }
-  }
-
-  // ---------- chrome: topbar ----------
-
-  function renderHeader() {
-    const bar = $("#bar");
-    clear(bar);
-
-    bar.append(renderCrumbs());
-    bar.append(el("span", { class: "spacer" }));
-
-    if (state.view === "files") {
-      const search = el("input", {
-        type: "search",
-        placeholder: "Filter this folder",
-        value: state.filter,
-        "aria-label": "Filter this folder",
-        oninput: (e) => {
-          state.filter = e.target.value;
-          renderMain();
-        },
-      });
-      bar.append(
-        el("div", { class: "search" }, [
-          search,
-          el("span", { class: "icon" }, [icon("search", 13)]),
-        ]),
-      );
-    }
-
-    if (state.me) {
-      bar.append(
-        el(
-          "button",
-          {
-            class: "btn ghost",
-            title: "Sign out",
-            onclick: async () => {
-              try {
-                await api("POST", "/auth/logout");
-              } catch {
-                /* the cookie is gone either way */
-              }
-              location.href = "/api/auth/login";
-            },
-          },
-          [icon("user", 14), el("span", { text: state.me.username })],
-        ),
-      );
-    }
-  }
-
-  function renderCrumbs() {
-    const box = el("div", { class: "crumb-bar" });
-
-    switch (state.view) {
-      case "shares":
-        box.append(el("button", { class: "here", text: "Shared links" }));
-        return box;
-      case "trash":
-        box.append(el("button", { class: "here", text: "Trash" }));
-        return box;
-      case "audit":
-        box.append(el("button", { class: "here", text: "Activity" }));
-        return box;
-      case "credentials":
-        box.append(el("button", { class: "here", text: "App passwords" }));
-        return box;
-    }
-
-    box.append(
-      el("button", {
-        class: state.path ? "" : "here",
-        text: "Home",
-        onclick: () => {
-          state.path = "";
-          state.filter = "";
-          loadFiles();
-        },
-      }),
-    );
-
-    if (!state.path) return box;
-
-    let acc = "";
-    const segments = state.path.split("/");
-    segments.forEach((seg, index) => {
-      acc = acc ? `${acc}/${seg}` : seg;
-      const target = acc;
-      box.append(el("span", { class: "sep", text: "/" }));
-      box.append(
-        el("button", {
-          class: index === segments.length - 1 ? "here" : "",
-          text: seg,
+    // The rail toggle belongs with navigation, not in the content header: it is a
+    // preference about the chrome, not an action on the files.
+    nav.append(
+      el(
+        "button",
+        {
+          title: state.railCollapsed ? "Expand sidebar" : "Collapse sidebar",
           onclick: () => {
-            state.path = target;
-            state.filter = "";
-            loadFiles();
+            state.railCollapsed = !state.railCollapsed;
+            document.body.classList.toggle("rail-collapsed", state.railCollapsed);
+            renderRail();
           },
-        }),
+        },
+        [el("span", { class: "icon" }, [icon("sidebar")]), el("span", { class: "label", text: "Collapse" })],
+      ),
+    );
+    rail.append(nav);
+
+    if (state.me) {
+      rail.append(
+        el("div", { class: "rail-foot" }, [
+          el("span", { class: "avatar", text: (state.me.username || "?").slice(0, 1) }),
+          el("span", { class: "who", text: state.me.username }),
+          el(
+            "button",
+            {
+              class: "btn ghost icon-only",
+              title: "Sign out",
+              style: "margin-left:auto",
+              onclick: async () => {
+                try {
+                  await api("POST", "/auth/logout");
+                } catch {
+                  /* the cookie is gone either way */
+                }
+                location.href = "/api/auth/login";
+              },
+            },
+            [icon("user", 13)],
+          ),
+        ]),
       );
-    });
-    return box;
+    }
   }
 
-  // ---------- files ----------
+  // ---------- content ----------
 
   function visibleEntries() {
     const q = state.filter.trim().toLowerCase();
@@ -426,30 +449,81 @@
     return state.entries.filter((e) => e.name.toLowerCase().includes(q));
   }
 
-  function renderFiles() {
-    const main = $("#main");
-    clear(main);
+  function renderContent() {
+    const content = $("#content");
+    clear(content);
 
-    const fileInput = el("input", {
-      type: "file",
-      multiple: true,
-      class: "hidden",
-      onchange: (e) => uploadFiles(e.target.files),
-    });
+    content.append(renderContentHead());
 
-    main.append(
-      el("div", { class: "toolbar" }, [
+    const progress = el("div", { class: "progress hidden" }, [el("div")]);
+    content.append(progress);
+
+    const body = el("div", { class: "content-body" });
+    content.append(body);
+
+    switch (state.view) {
+      case "files":
+        body.append(renderFiles());
+        break;
+      case "shares":
+        body.append(renderShares());
+        break;
+      case "trash":
+        body.append(renderTrash());
+        break;
+      case "audit":
+        body.append(renderAudit());
+        break;
+      case "access":
+        body.append(renderAccess());
+        break;
+    }
+  }
+
+  function renderContentHead() {
+    const head = el("div", { class: "content-head" });
+
+    head.append(renderCrumbs());
+
+    if (state.view === "files") {
+      // Upload and new-folder live in the head rather than a separate toolbar band: they
+      // are the folder's two verbs, and a whole extra row for two buttons cost more than it
+      // explained.
+      const fileInput = el("input", {
+        type: "file",
+        multiple: true,
+        class: "hidden",
+        onchange: (e) => uploadFiles(e.target.files),
+      });
+      head.append(
         el("button", { class: "btn primary", onclick: () => fileInput.click() }, [
-          icon("upload", 14),
+          icon("upload", 13),
           el("span", { text: "Upload" }),
         ]),
-        el("button", { class: "btn", onclick: () => promptNewFolder() }, [
+        el("button", { class: "btn ghost icon-only", title: "New folder", onclick: () => promptNewFolder() }, [
           icon("folderPlus", 14),
-          el("span", { text: "New folder" }),
         ]),
         fileInput,
-        el("span", { class: "spacer" }),
-        el("span", { class: "count num", text: countLabel() }),
+      );
+
+      const search = el("input", {
+        type: "search",
+        placeholder: "Filter",
+        value: state.filter,
+        "aria-label": "Filter this folder",
+        oninput: (e) => {
+          state.filter = e.target.value;
+          renderMain();
+        },
+      });
+      head.append(
+        el("div", { class: "search" }, [search, el("span", { class: "icon" }, [icon("search", 13)])]),
+      );
+
+      head.append(el("span", { class: "spacer" }));
+
+      head.append(
+        el("span", { class: "micro num", text: countLabel() }),
         el("div", { class: "seg" }, [
           el(
             "button",
@@ -470,41 +544,106 @@
             [icon("grid", 13)],
           ),
         ]),
-        el("button", { class: "btn ghost icon-only", title: "Refresh", onclick: () => loadFiles() }, [
-          icon("refresh", 14),
-        ]),
-      ]),
-    );
-
-    main.append(el("div", { class: "progress hidden" }, [el("div")]));
-
-    const entries = visibleEntries();
-
-    if (entries.length === 0) {
-      main.append(
-        emptyState(
-          state.filter ? "search" : "files",
-          state.filter ? "Nothing matches" : "This folder is empty",
-          state.filter ? "Try a different filter." : "Drop files anywhere, or use Upload.",
-        ),
       );
-      return;
+    } else {
+      head.append(el("span", { class: "spacer" }));
     }
 
-    main.append(state.layout === "grid" ? renderGrid(entries) : renderTable(entries));
+    if (state.view !== "files") {
+      head.append(el("span", { class: "micro num", text: countLabel() }));
+    }
+
+    head.append(
+      el(
+        "button",
+        {
+          class: "btn ghost icon-only",
+          title: state.inspectorClosed ? "Show details panel" : "Hide details panel",
+          style: state.inspectorClosed ? "opacity:0.55" : "",
+          onclick: () => {
+            state.inspectorClosed = !state.inspectorClosed;
+            document.body.classList.toggle("inspector-closed", state.inspectorClosed);
+            renderContent();
+            renderInspector();
+          },
+        },
+        [icon("panel", 14)],
+      ),
+    );
+
+    return head;
+  }
+
+  function renderCrumbs() {
+    const box = el("div", { class: "crumbs" });
+
+    const titles = { shares: "Shared links", trash: "Trash", audit: "Activity", access: "App passwords" };
+    if (titles[state.view]) {
+      box.append(el("button", { class: "here", text: titles[state.view] }));
+      return box;
+    }
+
+    box.append(
+      el("button", {
+        class: state.path ? "" : "here",
+        text: "Home",
+        onclick: () => navigate(""),
+      }),
+    );
+
+    if (!state.path) return box;
+
+    let acc = "";
+    const segments = state.path.split("/");
+    segments.forEach((seg, index) => {
+      acc = acc ? `${acc}/${seg}` : seg;
+      const target = acc;
+      box.append(el("span", { class: "sep", text: "/" }));
+      box.append(
+        el("button", {
+          class: index === segments.length - 1 ? "here" : "",
+          text: seg,
+          title: seg,
+          onclick: () => navigate(target),
+        }),
+      );
+    });
+    return box;
   }
 
   function countLabel() {
-    const total = state.entries.length;
-    const shown = visibleEntries().length;
-    if (total === 0) return "";
-    if (shown !== total) return `${shown} / ${total}`;
-    return `${total} item${total === 1 ? "" : "s"}`;
+    switch (state.view) {
+      case "files": {
+        const total = state.entries.length;
+        const shown = visibleEntries().length;
+        if (total === 0) return "";
+        if (shown !== total) return `${shown}/${total}`;
+        return `${total} item${total === 1 ? "" : "s"}`;
+      }
+      case "shares":
+        return `${state.entries.length} link${state.entries.length === 1 ? "" : "s"}`;
+      case "trash":
+        return `${state.entries.length} item${state.entries.length === 1 ? "" : "s"}`;
+      case "audit":
+        return state.audit.total ? `${state.audit.total} events` : "";
+      case "access":
+        return `${state.entries.length} password${state.entries.length === 1 ? "" : "s"}`;
+    }
+    return "";
   }
 
   function setLayout(layout) {
     state.layout = layout;
-    renderFiles();
+    renderContent();
+  }
+
+  function navigate(path) {
+    state.path = path;
+    state.filter = "";
+    state.selected.clear();
+    state.anchor = null;
+    state.detail = { path: null, versions: null, shares: null, loading: false };
+    loadFiles();
   }
 
   function emptyState(glyph, title, hint) {
@@ -515,24 +654,24 @@
     ]);
   }
 
-  function renderTable(entries) {
-    const table = el("table", { class: "files" });
-    table.append(
-      el("thead", {}, [
-        el("tr", {}, [
-          el("th", { text: "Name" }),
-          el("th", { class: "num", text: "Size" }),
-          el("th", { text: "Modified" }),
-          el("th", { text: "" }),
-        ]),
-      ]),
-    );
+  function renderFiles() {
+    const entries = visibleEntries();
 
-    const body = el("tbody");
-    for (const entry of entries) body.append(renderRow(entry));
-    table.append(body);
+    const wrap = el("div", { class: "scroll" });
 
-    return el("div", { class: "table-wrap" }, [table]);
+    if (entries.length === 0) {
+      wrap.append(
+        emptyState(
+          state.filter ? "search" : "files",
+          state.filter ? "Nothing matches" : "This folder is empty",
+          state.filter ? "Try a different filter." : "Drop files anywhere, or use Upload.",
+        ),
+      );
+      return wrap;
+    }
+
+    wrap.append(state.layout === "grid" ? renderGrid(entries) : renderTable(entries));
+    return wrap;
   }
 
   // fileGlyph is the leading square of a row or tile: a thumbnail when the server says the
@@ -544,7 +683,7 @@
         src: thumbnailURL(entry),
         alt: "",
         loading: "lazy",
-        // A failed thumbnail must not leave a hole: the badge is the designed fallback.
+        // A failed thumbnail must not leave a hole; the badge is the designed fallback.
         onerror: (e) => {
           e.target.replaceWith(el("span", { class: `ftype ${typeClass(entry)}` }, [badgeGlyph(entry)]));
         },
@@ -556,53 +695,75 @@
     return el("span", { class: `ftype ${typeClass(entry)}` }, [badgeGlyph(entry)]);
   }
 
+  function renderTable(entries) {
+    const table = el("table", { class: "files" });
+    table.append(
+      el("thead", {}, [
+        el("tr", {}, [
+          el("th", { text: "Name" }),
+          el("th", { text: "Kind" }),
+          el("th", { class: "num", text: "Size" }),
+          el("th", { text: "Modified" }),
+        ]),
+      ]),
+    );
+
+    const body = el("tbody");
+    for (const entry of entries) body.append(renderRow(entry));
+    table.append(body);
+
+    return el("div", { class: "table-wrap" }, [table]);
+  }
+
   function renderRow(entry) {
     const isDir = entry.kind === "dir";
+    const path = filePath(entry);
+    const selected = state.selected.has(path);
 
-    const label = el("span", {
-      class: "label" + (isDir ? " dir" : ""),
-      text: entry.name,
-      title: entry.name,
-      onclick: () => openEntry(entry),
-    });
+    const row = el(
+      "tr",
+      {
+        class: selected ? "selected" : "",
+        dataset: { path },
+        // Single click selects; double click opens. The event detail tells a real double
+        // click from a synthetic one.
+        onclick: (e) => onRowClick(e, entry),
+        ondblclick: () => openEntry(entry),
+        oncontextmenu: (e) => {
+          e.preventDefault();
+          if (!state.selected.has(path)) selectOnly(entry);
+          openShareDialog(entry);
+        },
+      },
+      [
+        el("td", { class: "name" }, [fileGlyph(entry), el("span", { class: "label" + (isDir ? " dir" : ""), text: entry.name, title: entry.name })]),
+        el("td", { class: "kind", text: kindLabel(entry) }),
+        el("td", { class: "size num", text: isDir ? "—" : humanSize(entry.size) }),
+        el("td", { class: "when", text: humanTime(entry.modified_at) }),
+      ],
+    );
+    return row;
+  }
 
-    const actions = el("td", { class: "actions" });
-    if (!isDir) {
-      if (entry.preview) {
-        actions.append(
-          el("button", { class: "row-action", text: "Preview", onclick: () => openPreview(entry) }),
-        );
-      }
-      actions.append(
-        el("button", { class: "row-action", text: "Download", onclick: () => downloadFile(entry) }),
-      );
+  function onRowClick(e, entry) {
+    if (e.shiftKey) {
+      extendSelection(entry);
+    } else if (e.metaKey || e.ctrlKey) {
+      toggleSelect(entry);
+    } else {
+      selectOnly(entry);
     }
-    actions.append(
-      el("button", { class: "row-action", text: "Share", onclick: () => openShareDialog(entry) }),
-    );
-    actions.append(
-      el("button", { class: "row-action", text: "Rename", onclick: () => promptRename(entry) }),
-    );
-    actions.append(
-      el("button", {
-        class: "row-action danger",
-        text: "Delete",
-        onclick: () => confirmDelete(entry),
-      }),
-    );
-
-    return el("tr", {}, [
-      el("td", { class: "name" }, [fileGlyph(entry), label]),
-      el("td", { class: "size num", text: isDir ? "—" : humanSize(entry.size) }),
-      el("td", { class: "when", text: humanTime(entry.modified_at) }),
-      actions,
-    ]);
+    renderMain();
+    renderInspector();
+    loadDetailIfNeeded();
   }
 
   function renderGrid(entries) {
     const grid = el("div", { class: "grid" });
     for (const entry of entries) {
       const isDir = entry.kind === "dir";
+      const path = filePath(entry);
+      const selected = state.selected.has(path);
 
       let preview;
       if (isImage(entry)) {
@@ -620,9 +781,9 @@
         const glyphName = isDir
           ? "files"
           : entry.preview === "video"
-            ? "video"
-            : entry.preview === "audio"
-              ? "audio"
+            ? "download"
+            : entry.preview === "text"
+              ? "doc"
               : "doc";
         preview = el("div", { class: "preview" + (isDir ? " dir" : "") }, [
           el("span", { class: "glyph" }, [icon(glyphName, 24)]),
@@ -633,11 +794,13 @@
         el(
           "div",
           {
-            class: "tile",
+            class: "tile" + (selected ? " selected" : ""),
             title: entry.name,
-            onclick: () => openEntry(entry),
+            onclick: (e) => onRowClick(e, entry),
+            ondblclick: () => openEntry(entry),
             oncontextmenu: (e) => {
               e.preventDefault();
+              if (!state.selected.has(path)) selectOnly(entry);
               openShareDialog(entry);
             },
           },
@@ -654,13 +817,11 @@
     return grid;
   }
 
-  // openEntry is the click behaviour: folders navigate, previewable files preview,
-  // everything else downloads. That is what a person expects from a file manager.
+  // openEntry opens a file: folders navigate, previewable files preview, everything else
+  // downloads. Called on double click and on Enter, never on a single click.
   function openEntry(entry) {
     if (entry.kind === "dir") {
-      state.path = filePath(entry);
-      state.filter = "";
-      loadFiles();
+      navigate(filePath(entry));
       return;
     }
     if (entry.preview) {
@@ -674,8 +835,9 @@
     try {
       const data = await api("GET", `/files/?path=${encodeURIComponent(state.path)}`);
       state.entries = data.children || [];
-      renderHeader();
-      renderMain();
+      renderRail();
+      renderContent();
+      renderInspector();
     } catch (err) {
       fail(err);
     }
@@ -688,15 +850,393 @@
     link.remove();
   }
 
+  // ---------- inspector ----------
+
+  // renderInspector is the other half of the layout: it always shows something useful.
+  //
+  // With nothing selected it shows the folder itself — name, counts, total size — rather
+  // than an empty panel, because a blank column would be worse than no column.
+  function renderInspector() {
+    const panel = $("#inspector");
+    clear(panel);
+
+    if (state.inspectorClosed) return;
+
+    switch (state.view) {
+      case "files":
+        panel.append(renderFileInspector());
+        break;
+      case "shares":
+        panel.append(renderSimpleInspector("Shares", "Links you have created", "Each link can be limited by password, expiry and use count. Revoke one here; the original URL cannot be shown again, because only its hash is stored."));
+        break;
+      case "trash":
+        panel.append(renderSimpleInspector("Trash", "Restorable files", "Deleted files keep their content. Restoring puts them back at the original path; if that path is taken, the operation is refused rather than overwriting."));
+        break;
+      case "audit":
+        panel.append(renderAuditInspector());
+        break;
+      case "access":
+        panel.append(renderSimpleInspector("Access", "App passwords", "Each password is a separate credential. Revoking one does not end your browser session, which is the point of using them for WebDAV."));
+        break;
+    }
+  }
+
+  function renderSimpleInspector(title, heading, body) {
+    return el("div", {}, [
+      el("div", { class: "inspector-head" }, [el("span", { class: "title", text: title })]),
+      el("div", { class: "inspector-body" }, [
+        el("div", { style: "padding:14px" }, [
+          el("div", { class: "micro", style: "margin-bottom:6px", text: heading }),
+          el("div", { class: "note-empty", text: body }),
+        ]),
+      ]),
+    ]);
+  }
+
+  function renderFileInspector() {
+    const frag = document.createDocumentFragment();
+
+    const entry = inspectedEntry();
+
+    frag.append(
+      el("div", { class: "inspector-head" }, [
+        el("span", { class: "title", text: entry ? "Details" : "This folder" }),
+        entry
+          ? el("button", { class: "btn ghost icon-only", title: "Close selection", onclick: () => clearSelection() }, [icon("close", 13)])
+          : null,
+      ]),
+    );
+
+    const body = el("div", { class: "inspector-body" });
+
+    if (!entry) {
+      body.append(renderFolderSummary());
+      frag.append(body);
+      return frag;
+    }
+
+    body.append(renderStage(entry));
+    body.append(
+      el("div", { class: "inspector-file" }, [
+        el("div", { class: "name", text: entry.name }),
+        el("div", { class: "path", text: "/" + filePath(entry) }),
+      ]),
+    );
+
+    body.append(renderProps(entry));
+    body.append(renderActions(entry));
+
+    if (entry.kind !== "dir") {
+      body.append(renderVersionsSection(entry));
+      body.append(renderSharesSection(entry));
+    }
+
+    frag.append(body);
+    return frag;
+  }
+
+  // renderStage is the preview well. It shows the image when the server allows one, a glyph
+  // otherwise, and an explicit reason when a preview exists but cannot be shown here.
+  function renderStage(entry) {
+    const stage = el("div", { class: "stage" });
+
+    if (isImage(entry)) {
+      stage.append(
+        el("img", {
+          src: previewURL(entry),
+          alt: "",
+          onerror: () => {
+            clear(stage);
+            stage.append(el("span", { class: "glyph" }, [icon("doc", 26)]));
+            stage.append(el("div", { class: "note", text: "Preview unavailable" }));
+          },
+        }),
+      );
+    } else if (entry.kind === "dir") {
+      stage.append(el("span", { class: "glyph" }, [icon("files", 26)]));
+    } else if (entry.preview === "text") {
+      // Text has a preview but no thumbnail, so an icon would waste the well. Show the
+      // first lines instead: it answers "which file is this" without opening it, and the
+      // bytes still go through textContent.
+      stage.classList.add("text-stage");
+      const pre = el("pre", { text: "" });
+      stage.append(pre);
+      fetchTextHead(entry, pre);
+    } else if (entry.preview) {
+      stage.append(el("span", { class: "glyph" }, [icon("doc", 26)]));
+    } else {
+      stage.append(el("div", { class: "note", text: "No inline preview for this type" }));
+    }
+
+    if (entry.kind !== "dir" && entry.preview) {
+      stage.append(
+        el("div", {
+          class: "open-hint",
+          text: "Open preview",
+          onclick: () => openPreview(entry),
+        }),
+      );
+    }
+
+    return stage;
+  }
+
+  // fetchTextHead loads the beginning of a text file into the preview well.
+  //
+  // Only the first few kilobytes: the point is recognition, not reading, and a 5 MB log
+  // should not be pulled across the network for a 178-pixel panel. The response is the
+  // same inline endpoint, so the server's type and content checks apply unchanged.
+  async function fetchTextHead(entry, pre) {
+    try {
+      const resp = await fetch(previewURL(entry), { credentials: "same-origin" });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const text = await resp.text();
+      // A fixed number of lines rather than a byte count: the well is measured in lines, so
+      // counting lines is what keeps it from looking cut off mid-sentence.
+      const lines = text.split("\n").slice(0, 9);
+      pre.textContent = lines.join("\n");
+    } catch {
+      pre.textContent = "Could not load a preview.";
+    }
+  }
+
+  function renderProps(entry) {    const dl = el("dl");
+    const add = (key, value, mono) => {
+      dl.append(el("dt", { text: key }));
+      dl.append(el("dd", { class: mono ? "mono" : "", text: value }));
+    };
+
+    add("Kind", kindLabel(entry));
+    if (entry.kind !== "dir") add("Size", humanSize(entry.size));
+    add("Modified", fullTime(entry.modified_at));
+    if (entry.mime) add("Type", entry.mime, true);
+    if (entry.kind !== "dir" && entry.preview) {
+      add("Preview", entry.preview === "pdf" ? "PDF viewer" : entry.preview);
+    }
+
+    return el("div", { class: "props" }, [dl]);
+  }
+
+  function renderActions(entry) {
+    const row = el("div", { class: "inspector-actions" });
+
+    if (entry.kind !== "dir" && entry.preview) {
+      row.append(
+        el("button", { class: "btn small", onclick: () => openPreview(entry) }, [icon("eye", 13), el("span", { text: "Open" })]),
+      );
+    }
+    if (entry.kind !== "dir") {
+      row.append(
+        el("button", { class: "btn small", onclick: () => downloadFile(entry) }, [icon("download", 13), el("span", { text: "Download" })]),
+      );
+    }
+    row.append(
+      el("button", { class: "btn small", onclick: () => openShareDialog(entry) }, [icon("link", 13), el("span", { text: "Share" })]),
+    );
+    row.append(
+      el("button", { class: "btn small", onclick: () => promptRename(entry) }, [el("span", { text: "Rename" })]),
+    );
+    row.append(
+      el("button", { class: "btn small danger", onclick: () => confirmDelete(entry) }, [el("span", { text: "Delete" })]),
+    );
+
+    return row;
+  }
+
+  // renderFolderSummary fills the inspector when nothing is selected.
+  function renderFolderSummary() {
+    const wrap = el("div", {});
+
+    const files = state.entries.filter((e) => e.kind !== "dir");
+    const dirs = state.entries.filter((e) => e.kind === "dir");
+    const total = files.reduce((sum, e) => sum + (e.size || 0), 0);
+
+    wrap.append(
+      el("div", { class: "inspector-file" }, [
+        el("div", { class: "name", text: state.path ? state.path.split("/").pop() : "Home" }),
+        el("div", { class: "path", text: "/" + state.path }),
+      ]),
+    );
+
+    const dl = el("dl");
+    dl.append(el("dt", { text: "Files" }), el("dd", { text: String(files.length) }));
+    dl.append(el("dt", { text: "Folders" }), el("dd", { text: String(dirs.length) }));
+    dl.append(el("dt", { text: "Total size" }), el("dd", { text: humanSize(total) }));
+    wrap.append(el("div", { class: "props" }, [dl]));
+
+    wrap.append(
+      el("div", { class: "inspector-empty" }, [
+        el("div", { class: "glyph" }, [icon("eye", 22)]),
+        el("div", { class: "title", text: "Nothing selected" }),
+        el("div", {
+          class: "hint",
+          text: "Select a file to see its details, version history and shares. Double-click or press Enter to open.",
+        }),
+      ]),
+    );
+
+    return wrap;
+  }
+
+  // renderVersionsSection lists the stored versions of a file.
+  //
+  // The data has existed since the DAV layer was written and the interface never showed it;
+  // a version you cannot see is a version you cannot use.
+  function renderVersionsSection(entry) {
+    const section = el("details", { class: "inspector-section" });
+    const bodyWrap = el("div", { class: "section-body" });
+
+    const loading = state.detail.path !== filePath(entry) || state.detail.versions == null;
+
+    section.append(
+      el("summary", {}, [
+        el("span", { class: "chev" }, [icon("chevron", 11)]),
+        el("span", { class: "micro", text: "Version history" }),
+        el("span", { class: "count", text: loading ? "…" : String(state.detail.versions.length) }),
+      ]),
+    );
+
+    if (loading) {
+      bodyWrap.append(el("div", { class: "note-empty", text: "Loading…" }));
+    } else if (state.detail.versions.length === 0) {
+      bodyWrap.append(
+        el("div", { class: "note-empty", text: "No earlier versions. A new version is stored each time the file is overwritten." }),
+      );
+    } else {
+      for (const v of state.detail.versions) {
+        bodyWrap.append(
+          el("div", { class: "version-row" }, [
+            el("span", { class: "vno", text: `v${v.version}` }),
+            el("span", { class: "vmeta", text: `${humanSize(v.size)} · ${humanTime(v.created_at)}` }),
+            el("button", {
+              class: "row-action act",
+              text: "Restore",
+              onclick: () => restoreVersion(entry, v),
+            }),
+          ]),
+        );
+      }
+    }
+
+    section.append(bodyWrap);
+    return section;
+  }
+
+  // renderSharesSection lists the links pointing at this file.
+  function renderSharesSection(entry) {
+    const section = el("details", { class: "inspector-section" });
+    const bodyWrap = el("div", { class: "section-body" });
+
+    const path = filePath(entry);
+    const loading = state.detail.path !== path || state.detail.shares == null;
+    const shares = state.detail.shares || [];
+
+    section.append(
+      el("summary", {}, [
+        el("span", { class: "chev" }, [icon("chevron", 11)]),
+        el("span", { class: "micro", text: "Shared by" }),
+        el("span", { class: "count", text: loading ? "…" : String(shares.length) }),
+      ]),
+    );
+
+    if (loading) {
+      bodyWrap.append(el("div", { class: "note-empty", text: "Loading…" }));
+    } else if (shares.length === 0) {
+      bodyWrap.append(el("div", { class: "note-empty", text: "Not shared. Use Share to create a link." }));
+    } else {
+      for (const s of shares) {
+        const used =
+          s.kind === "request"
+            ? `${s.upload_count}${s.max_uploads ? "/" + s.max_uploads : ""} in`
+            : `${s.download_count}${s.max_downloads ? "/" + s.max_downloads : ""} out`;
+        bodyWrap.append(
+          el("div", { class: "share-row" }, [
+            el("span", { class: "pill" + (s.kind === "request" ? " accent" : ""), text: s.kind }),
+            el("span", { class: "used", text: used }),
+            // No copy action. Only the token's hash is stored, so the URL cannot be
+            // reconstructed — offering a button that could never work is worse than saying
+            // why it is absent.
+            el("span", { class: "note-empty", text: "link not recoverable" }),
+            el("button", {
+              class: "row-action danger",
+              text: "Revoke",
+              onclick: async () => {
+                try {
+                  await api("DELETE", `/shares/${s.id}`);
+                  toast("Share revoked");
+                  reloadDetail(entry);
+                  if (state.view === "shares") loadShares();
+                } catch (err) {
+                  fail(err);
+                }
+              },
+            }),
+          ]),
+        );
+      }
+    }
+
+    section.append(bodyWrap);
+    return section;
+  }
+
+  // loadDetailIfNeeded fetches versions and shares for the single selected file.
+  //
+  // Both are small and both are needed the moment a row is selected, so they load together
+  // rather than waiting for a section to be expanded — an expanded-but-empty section reads
+  // as a bug.
+  async function loadDetailIfNeeded() {
+    const entry = inspectedEntry();
+    if (!entry || entry.kind === "dir") return;
+
+    const path = filePath(entry);
+    if (state.detail.path === path && state.detail.versions != null) return;
+
+    state.detail = { path, versions: null, shares: null, loading: true };
+
+    const [versions, shares] = await Promise.all([
+      api("GET", `/files/versions?path=${encodeURIComponent(path)}`).catch(() => ({ versions: [] })),
+      api("GET", "/shares/").catch(() => ({ items: [] })),
+    ]);
+
+    // The selection may have moved while these were in flight; discard stale results rather
+    // than showing another file's history.
+    if (state.detail.path !== path) return;
+
+    state.detail = {
+      path,
+      versions: versions.versions || [],
+      // Only the links pointing at this node.
+      shares: (shares.items || []).filter((s) => s.node_id === entry.id),
+      loading: false,
+    };
+    renderInspector();
+  }
+
+  function reloadDetail(entry) {
+    state.detail = { path: null, versions: null, shares: null, loading: false };
+    renderInspector();
+    loadDetailIfNeeded();
+  }
+
+  async function restoreVersion(entry, version) {
+    try {
+      await api("POST", "/files/restore-version", {
+        path: filePath(entry),
+        version: version.version,
+      });
+      toast(`Restored v${version.version}`);
+      await loadFiles();
+      reloadDetail(entry);
+    } catch (err) {
+      fail(err);
+    }
+  }
+
   // ---------- preview ----------
 
   let activeDialog = null;
 
-  // openPreview renders a file in a modal.
-  //
-  // Each branch builds a specific element with a known-safe attribute set. Nothing here
-  // interpolates a filename into markup; the title is textContent, and the URL is the API
-  // endpoint, which decides for itself whether to render inline.
   function openPreview(entry) {
     const kind = entry.preview;
     const url = previewURL(entry);
@@ -746,12 +1286,9 @@
         break;
 
       case "pdf":
-        // The browser's own viewer, in a plain frame.
-        //
-        // No `sandbox` attribute: Chrome refuses to instantiate its PDF plugin inside a
-        // sandboxed frame and shows a broken-page icon instead. The response already carries
-        // `sandbox` in its CSP, which applies to whatever the frame loads, and this frame
-        // loads one URL on this origin.
+        // No sandbox attribute: Chrome refuses to instantiate its PDF plugin inside a
+        // sandboxed frame and shows a broken-page icon instead. The response carries
+        // `sandbox` in its CSP, which applies to whatever the frame loads.
         body.append(el("iframe", { src: url, title: entry.name }));
         break;
 
@@ -776,12 +1313,7 @@
         ]),
         el(
           "button",
-          {
-            class: "btn ghost icon-only",
-            "aria-label": "Close",
-            title: "Close",
-            onclick: () => dialog.close(),
-          },
+          { class: "btn ghost icon-only", "aria-label": "Close", title: "Close", onclick: () => dialog.close() },
           [icon("close", 14)],
         ),
       ]),
@@ -818,8 +1350,6 @@
 
   // ---------- uploads ----------
 
-  // uploadQueue keeps one upload running at a time so the progress bar means something.
-  // Uploading in parallel would make "3 of 7" meaningless and hammer a small server.
   let uploading = false;
 
   async function uploadFiles(fileList, targetPath) {
@@ -832,7 +1362,7 @@
     const dest = targetPath == null ? state.path : targetPath;
     uploading = true;
 
-    const progress = $("#main .progress");
+    const progress = $("#content .progress");
     const bar = progress && progress.firstElementChild;
     const total = fileList.length;
     let done = 0;
@@ -850,7 +1380,6 @@
         done++;
       } catch (err) {
         failed++;
-        // Keep going: one rejected file should not discard the rest of a multi-file drop.
         toast(`${file.name}: ${err.message || "failed"}`, "error");
       }
       if (bar) bar.style.width = `${Math.round(((done + failed) / total) * 100)}%`;
@@ -999,15 +1528,23 @@
   }
 
   function confirmDelete(entry) {
+    const entries = state.selected.size > 1 ? selectedEntries() : [entry];
+    const what = entries.length === 1 ? entries[0].name : `${entries.length} items`;
+
     formDialog({
-      title: `Delete ${entry.name}?`,
-      body: "It moves to the trash and can be restored from there.",
+      title: `Delete ${what}?`,
+      body: entries.length === 1
+        ? "It moves to the trash and can be restored from there."
+        : "They move to the trash and can be restored from there.",
       fields: [],
       confirm: "Delete",
       danger: true,
       onSubmit: async () => {
-        await api("DELETE", `/files/?path=${encodeURIComponent(filePath(entry))}`);
-        toast("Moved to trash");
+        for (const target of entries) {
+          await api("DELETE", `/files/?path=${encodeURIComponent(filePath(target))}`);
+        }
+        toast(entries.length === 1 ? "Moved to trash" : `Moved ${entries.length} items to trash`);
+        clearSelection();
         await loadFiles();
       },
     });
@@ -1066,35 +1603,19 @@
         } else {
           toast("Share created");
         }
-        await loadFiles();
+        reloadDetail(entry);
       },
     });
   }
 
-  // ---------- shares ----------
+  // ---------- shares view ----------
 
   function renderShares() {
-    const main = $("#main");
-    clear(main);
-
-    main.append(
-      el("div", { class: "toolbar" }, [
-        el("span", { class: "micro", text: "Links you have created" }),
-        el("span", { class: "spacer" }),
-        el("span", { class: "count num", text: `${state.entries.length} total` }),
-        el(
-          "button",
-          { class: "btn ghost icon-only", title: "Refresh", onclick: () => loadShares() },
-          [icon("refresh", 14)],
-        ),
-      ]),
-    );
+    const wrap = el("div", { class: "scroll" });
 
     if (state.entries.length === 0) {
-      main.append(
-        emptyState("shares", "No shares yet", "Open a file and choose Share to create a link."),
-      );
-      return;
+      wrap.append(emptyState("shares", "No shares yet", "Open a file and choose Share to create a link."));
+      return wrap;
     }
 
     const table = el("table", { class: "files" });
@@ -1123,6 +1644,7 @@
             el("span", {
               class: "label",
               text: share.node_path || share.label || "—",
+              title: "Copy this link",
               onclick: () => {
                 const url = `${location.origin}/s/${share.token}`;
                 navigator.clipboard.writeText(url).then(
@@ -1132,18 +1654,12 @@
               },
             }),
           ]),
-          el("td", {}, [
-            el("span", {
-              class: "pill" + (share.kind === "request" ? " accent" : ""),
-              text: share.kind,
-            }),
+          el("td", { class: "kind" }, [
+            el("span", { class: "pill" + (share.kind === "request" ? " accent" : ""), text: share.kind }),
           ]),
           el("td", { class: "size num", text: uses }),
-          el("td", {
-            class: "when",
-            text: share.expires_at ? new Date(share.expires_at).toLocaleDateString() : "never",
-          }),
-          el("td", { class: "actions" }, [
+          el("td", { class: "when", text: share.expires_at ? new Date(share.expires_at).toLocaleDateString() : "never" }),
+          el("td", { class: "actions", style: "text-align:right" }, [
             el("button", {
               class: "row-action danger",
               text: "Revoke",
@@ -1162,39 +1678,29 @@
       );
     }
     table.append(body);
-    main.append(el("div", { class: "table-wrap" }, [table]));
+    wrap.append(el("div", { class: "table-wrap" }, [table]));
+    return wrap;
   }
 
   async function loadShares() {
     try {
       const data = await api("GET", "/shares/");
       state.entries = data.items || [];
-      renderHeader();
-      renderMain();
+      renderContent();
+      renderInspector();
     } catch (err) {
       fail(err);
     }
   }
 
-  // ---------- trash ----------
+  // ---------- trash view ----------
 
   function renderTrash() {
-    const main = $("#main");
-    clear(main);
-
-    main.append(
-      el("div", { class: "toolbar" }, [
-        el("span", { class: "micro", text: "Deleted files, restorable" }),
-        el("span", { class: "spacer" }),
-        el("span", { class: "count num", text: `${state.entries.length} total` }),
-      ]),
-    );
+    const wrap = el("div", { class: "scroll" });
 
     if (state.entries.length === 0) {
-      main.append(
-        emptyState("trash", "Trash is empty", "Deleted files appear here and can be restored."),
-      );
-      return;
+      wrap.append(emptyState("trash", "Trash is empty", "Deleted files appear here and can be restored."));
+      return wrap;
     }
 
     const table = el("table", { class: "files" });
@@ -1202,6 +1708,7 @@
       el("thead", {}, [
         el("tr", {}, [
           el("th", { text: "Name" }),
+          el("th", { text: "Kind" }),
           el("th", { class: "num", text: "Size" }),
           el("th", { text: "" }),
         ]),
@@ -1211,12 +1718,10 @@
     for (const entry of state.entries) {
       body.append(
         el("tr", {}, [
-          el("td", { class: "name" }, [
-            fileGlyph(entry),
-            el("span", { class: "label", text: entry.name }),
-          ]),
+          el("td", { class: "name" }, [fileGlyph(entry), el("span", { class: "label", text: entry.name })]),
+          el("td", { class: "kind", text: kindLabel(entry) }),
           el("td", { class: "size num", text: entry.kind === "dir" ? "—" : humanSize(entry.size) }),
-          el("td", { class: "actions" }, [
+          el("td", { class: "actions", style: "text-align:right" }, [
             el("button", {
               class: "row-action",
               text: "Restore",
@@ -1235,32 +1740,31 @@
       );
     }
     table.append(body);
-    main.append(el("div", { class: "table-wrap" }, [table]));
+    wrap.append(el("div", { class: "table-wrap" }, [table]));
+    return wrap;
   }
 
   async function loadTrash() {
     try {
       const data = await api("GET", "/files/trash");
       state.entries = data.items || [];
-      renderHeader();
-      renderMain();
+      renderContent();
+      renderInspector();
     } catch (err) {
       fail(err);
     }
   }
 
-  // ---------- audit ----------
+  // ---------- audit view ----------
 
-  // personLabel turns an actor into something readable. Anonymous events are the common
-  // case in a share audit and must not render as a blank column.
   function personLabel(ev) {
     if (ev.actor_email) return ev.actor_email;
+    if (ev.share_id) return "via link";
     if (ev.actor_kind === "anonymous" || !ev.actor_kind) return "anonymous";
     if (ev.actor_kind === "system") return "system";
     return ev.actor_kind;
   }
 
-  // describeTarget renders what the event happened to, in the terms a person used.
   function describeTarget(ev) {
     const name = ev.metadata && (ev.metadata.name || ev.metadata.path);
     if (name) return String(name);
@@ -1270,9 +1774,7 @@
   }
 
   function renderAudit() {
-    const main = $("#main");
-    clear(main);
-
+    const wrap = el("div", { style: "display:flex;flex-direction:column;min-height:0;flex:1" });
     const a = state.audit;
 
     const actionSelect = el("select", {
@@ -1325,17 +1827,16 @@
       sinceSelect.append(opt);
     }
 
-    main.append(
+    wrap.append(
       el("div", { class: "audit-toolbar" }, [
         actionSelect,
         resultSelect,
         sinceSelect,
-        el("span", { class: "spacer" }),
-        el("span", { class: "count num", text: a.total ? `${a.total} events` : "" }),
+        el("span", { class: "spacer", style: "flex:1" }),
         el(
           "button",
           {
-            class: "btn ghost",
+            class: "btn ghost small",
             title: "Download the full log as CSV",
             onclick: () => {
               const q = new URLSearchParams({ format: "csv" });
@@ -1346,27 +1847,24 @@
               location.href = `/api/audit?${q.toString()}`;
             },
           },
-          [icon("download", 14), el("span", { text: "Export CSV" })],
+          [icon("download", 13), el("span", { text: "Export" })],
         ),
-        el(
-          "button",
-          { class: "btn ghost icon-only", title: "Refresh", onclick: () => reloadAudit() },
-          [icon("refresh", 14)],
-        ),
+        el("button", { class: "btn ghost icon-only", title: "Refresh", onclick: () => reloadAudit() }, [icon("refresh", 14)]),
       ]),
     );
 
+    const scroll = el("div", { class: "scroll" });
+
     if (a.events.length === 0) {
-      main.append(
+      scroll.append(
         emptyState(
           "pulse",
           a.loading ? "Loading…" : "No activity",
-          a.action || a.result || a.since
-            ? "Nothing matches these filters."
-            : "Events appear here as files are touched.",
+          a.action || a.result || a.since ? "Nothing matches these filters." : "Events appear here as files are touched.",
         ),
       );
-      return;
+      wrap.append(scroll);
+      return wrap;
     }
 
     const timeline = el("div", { class: "timeline" });
@@ -1382,12 +1880,8 @@
       const target = describeTarget(ev);
       const meta = el("div", { class: "meta" });
       if (ev.actor_ip) meta.append(el("span", {}, [el("span", { class: "v", text: ev.actor_ip })]));
-      if (ev.bytes)
-        meta.append(el("span", {}, [el("span", { class: "v", text: humanSize(ev.bytes) })]));
-      if (ev.share_id)
-        meta.append(
-          el("span", {}, [el("span", { class: "v", text: `share ${ev.share_id.slice(0, 8)}` })]),
-        );
+      if (ev.bytes) meta.append(el("span", {}, [el("span", { class: "v", text: humanSize(ev.bytes) })]));
+      if (ev.share_id) meta.append(el("span", {}, [el("span", { class: "v", text: `share ${ev.share_id.slice(0, 8)}` })]));
 
       timeline.append(
         el("div", { class: `event ${ev.result === "denied" ? "denied" : "ok"}` }, [
@@ -1408,10 +1902,10 @@
       );
     }
 
-    main.append(timeline);
+    scroll.append(timeline);
 
     if (a.hasMore) {
-      main.append(
+      scroll.append(
         el("div", { class: "audit-foot" }, [
           el("button", {
             class: "btn",
@@ -1424,11 +1918,43 @@
         ]),
       );
     } else {
-      main.append(el("div", { class: "audit-foot" }, [el("span", { text: "End of the log" })]));
+      scroll.append(el("div", { class: "audit-foot" }, [el("span", { text: "End of the log" })]));
     }
+
+    wrap.append(scroll);
+    return wrap;
   }
 
-  // sinceISO converts a relative window into an absolute timestamp.
+  function renderAuditInspector() {
+    const a = state.audit;
+    const denied = a.events.filter((e) => e.result === "denied").length;
+
+    const dl = el("dl");
+    dl.append(el("dt", { text: "Events" }), el("dd", { text: String(a.total) }));
+    dl.append(el("dt", { text: "Refused" }), el("dd", { text: String(denied) }));
+    dl.append(el("dt", { text: "Showing" }), el("dd", { text: String(a.events.length) }));
+
+    return el("div", {}, [
+      el("div", { class: "inspector-head" }, [el("span", { class: "title", text: "Reading the log" })]),
+      el("div", { class: "inspector-body" }, [
+        el("div", { class: "props" }, [dl]),
+        el("div", { style: "padding:12px 14px" }, [
+          el("div", { class: "micro", style: "margin-bottom:6px", text: "Scope" }),
+          el("div", {
+            class: "note-empty",
+            text:
+              "You see what you did, plus everything that happened to your own files and links — including downloads by anonymous visitors and refused attempts. Administrators see the whole instance.",
+          }),
+          el("div", { class: "micro", style: "margin:12px 0 6px", text: "Integrity" }),
+          el("div", {
+            class: "note-empty",
+            text: "Rows are hash-chained in the order written. An edited or removed row breaks the chain, which is what the export verifies.",
+          }),
+        ]),
+      ]),
+    ]);
+  }
+
   function sinceISO(choice) {
     if (!choice) return "";
     const seconds = { "1h": 3600, "24h": 86400, "7d": 604800, "30d": 2592000 }[choice];
@@ -1465,47 +1991,41 @@
       fail(err);
     } finally {
       a.loading = false;
-      renderHeader();
-      renderMain();
+      renderContent();
+      renderInspector();
     }
   }
 
-  // ---------- app passwords ----------
+  // ---------- access view ----------
 
-  function renderCredentials() {
-    const main = $("#main");
-    clear(main);
+  function renderAccess() {
+    const wrap = el("div", { class: "scroll" });
 
-    main.append(
-      el("div", { class: "toolbar" }, [
-        el("span", { class: "micro", text: "WebDAV and API access" }),
-        el("span", { class: "spacer" }),
-        el("button", { class: "btn primary", onclick: () => createAppPassword() }, [
-          icon("key", 14),
-          el("span", { text: "New password" }),
-        ]),
-      ]),
-    );
-
-    main.append(
-      el("div", { style: "padding:16px" }, [
+    wrap.append(
+      el("div", { style: "padding:14px" }, [
         el("div", { class: "card" }, [
           el("h2", { text: "Connecting a client" }),
           el("p", {
             class: "hint",
             text:
-              "Use an app password instead of your browser session for WebDAV, rclone or a mounted " +
-              "drive. Each one can be revoked on its own, and a leaked one does not end your browser login.",
+              "Use an app password instead of your browser session for WebDAV, rclone or a mounted drive. " +
+              "Each one can be revoked on its own, so a leaked credential does not end your browser login.",
           }),
           el("div", {
             class: "copybox",
             text: `${location.origin}/dav/${state.me ? state.me.username : "you"}/`,
           }),
+          el("div", { style: "margin-top:12px" }, [
+            el("button", { class: "btn primary", onclick: () => createAppPassword() }, [
+              icon("key", 14),
+              el("span", { text: "New app password" }),
+            ]),
+          ]),
         ]),
       ]),
     );
 
-    if (state.entries.length === 0) return;
+    if (state.entries.length === 0) return wrap;
 
     const table = el("table", { class: "files" });
     table.append(
@@ -1523,9 +2043,9 @@
       body.append(
         el("tr", {}, [
           el("td", { class: "name" }, [el("span", { class: "label", text: cred.label || "—" })]),
-          el("td", {}, [el("span", { class: "pill", text: cred.scope })]),
+          el("td", { class: "kind" }, [el("span", { class: "pill", text: cred.scope })]),
           el("td", { class: "when", text: cred.last_used ? humanTime(cred.last_used) : "never" }),
-          el("td", { class: "actions" }, [
+          el("td", { class: "actions", style: "text-align:right" }, [
             el("button", {
               class: "row-action danger",
               text: "Revoke",
@@ -1544,15 +2064,16 @@
       );
     }
     table.append(body);
-    main.append(el("div", { class: "table-wrap" }, [table]));
+    wrap.append(el("div", { class: "table-wrap" }, [table]));
+    return wrap;
   }
 
   async function loadCredentials() {
     try {
       const data = await api("GET", "/apppasswords/");
       state.entries = data.items || [];
-      renderHeader();
-      renderMain();
+      renderContent();
+      renderInspector();
     } catch (err) {
       fail(err);
     }
@@ -1590,19 +2111,17 @@
     });
   }
 
-  // ---------- share landing page ----------
+  // ---------- share landing ----------
 
   async function renderShareLanding(token) {
     const root = $("#app");
     clear(root);
     // .share-page positions itself fixed, which takes it out of the #app grid (that grid
-    // exists for the signed-in shell and would otherwise give this page the sidebar width).
+    // exists for the signed-in shell and would otherwise give this page the rail's width).
 
     let info;
     try {
-      const resp = await fetch(`/s/${encodeURIComponent(token)}`, {
-        headers: { Accept: "application/json" },
-      });
+      const resp = await fetch(`/s/${encodeURIComponent(token)}`, { headers: { Accept: "application/json" } });
       if (!resp.ok) throw new Error("not available");
       info = await resp.json();
     } catch {
@@ -1612,10 +2131,7 @@
             el("div", { class: "head" }, [
               el("div", { class: "mark" }),
               el("div", { class: "title", text: "Link not available" }),
-              el("div", {
-                class: "meta",
-                text: "It may have expired, been revoked, or reached its usage limit.",
-              }),
+              el("div", { class: "meta", text: "It may have expired, been revoked, or reached its usage limit." }),
             ]),
           ]),
         ]),
@@ -1665,30 +2181,24 @@
       const code = el("input", { type: "text", placeholder: "6-digit code from the email" });
 
       body.append(
-        el("label", { class: "field" }, [
-          el("span", { class: "micro", text: "Your email" }),
-          email,
-        ]),
-        el(
-          "button",
-          {
-            class: "btn",
-            text: "Send me a code",
-            style: "width:100%;margin-bottom:14px",
-            onclick: async () => {
-              try {
-                await fetch(`/s/${encodeURIComponent(token)}/recipient`, {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ email: email.value.trim() }),
-                });
-                toast("If that address was invited, a code is on its way");
-              } catch {
-                toast("Could not send a code", "error");
-              }
-            },
+        el("label", { class: "field" }, [el("span", { class: "micro", text: "Your email" }), email]),
+        el("button", {
+          class: "btn",
+          text: "Send me a code",
+          style: "width:100%;margin-bottom:14px",
+          onclick: async () => {
+            try {
+              await fetch(`/s/${encodeURIComponent(token)}/recipient`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ email: email.value.trim() }),
+              });
+              toast("If that address was invited, a code is on its way");
+            } catch {
+              toast("Could not send a code", "error");
+            }
           },
-        ),
+        }),
         el("label", { class: "field" }, [el("span", { class: "micro", text: "Code" }), code]),
         el("button", {
           class: "btn primary",
@@ -1731,10 +2241,7 @@
           form.append("file", input.files[0]);
           button.disabled = true;
           try {
-            const resp = await fetch(`/s/${encodeURIComponent(token)}/upload`, {
-              method: "POST",
-              body: form,
-            });
+            const resp = await fetch(`/s/${encodeURIComponent(token)}/upload`, { method: "POST", body: form });
             const payload = await resp.json().catch(() => ({}));
             if (!resp.ok) throw new Error(payload.message || "upload failed");
             toast(`Sent ${payload.name || "file"}`);
@@ -1746,10 +2253,7 @@
         },
       });
 
-      body.append(
-        el("label", { class: "field" }, [el("span", { class: "micro", text: "File" }), input]),
-        button,
-      );
+      body.append(el("label", { class: "field" }, [el("span", { class: "micro", text: "File" }), input]), button);
     } else if (!info.can_read) {
       body.append(el("p", { class: "hint", text: "This link cannot be downloaded." }));
     } else {
@@ -1789,11 +2293,7 @@
     card.append(
       el("div", { class: "foot" }, [
         el("span", { text: "newcloud" }),
-        el("span", {
-          text: info.expires_at
-            ? `expires ${new Date(info.expires_at).toLocaleDateString()}`
-            : "",
-        }),
+        el("span", { text: info.expires_at ? `expires ${new Date(info.expires_at).toLocaleDateString()}` : "" }),
       ]),
     );
     root.append(el("div", { class: "share-page" }, [card]));
@@ -1805,8 +2305,12 @@
     state.view = view;
     state.entries = [];
     state.filter = "";
-    renderSidebar();
-    renderHeader();
+    state.selected.clear();
+    state.anchor = null;
+    state.detail = { path: null, versions: null, shares: null, loading: false };
+    renderRail();
+    renderContent();
+    renderInspector();
 
     switch (view) {
       case "shares":
@@ -1818,7 +2322,7 @@
       case "audit":
         reloadAudit();
         break;
-      case "credentials":
+      case "access":
         loadCredentials();
         break;
       default:
@@ -1826,25 +2330,102 @@
     }
   }
 
-  // renderMain draws the current view from state without re-fetching. Search and the
-  // list/grid toggle use it, and it must not reset scroll position by hitting the network.
+  // renderMain redraws the content column from state without re-fetching. Selection and the
+  // filter use it, and it must not reset scroll by hitting the network.
   function renderMain() {
-    switch (state.view) {
-      case "shares":
-        renderShares();
-        break;
-      case "trash":
-        renderTrash();
-        break;
-      case "audit":
-        renderAudit();
-        break;
-      case "credentials":
-        renderCredentials();
-        break;
-      default:
-        renderFiles();
-    }
+    renderContent();
+  }
+
+  // ---------- keyboard ----------
+
+  // A file manager is used from the keyboard more than from the mouse, and the previous
+  // version ignored it entirely. These are the bindings people expect.
+  function installKeyboard() {
+    document.addEventListener("keydown", (e) => {
+      // Never steal a key from a text field or an open dialog.
+      const tag = (e.target && e.target.tagName) || "";
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+      if (document.querySelector("dialog[open]")) return;
+      if (state.view !== "files") return;
+
+      const list = visibleEntries();
+      if (list.length === 0) return;
+
+      const current = inspectedEntry();
+      const index = current ? list.findIndex((x) => filePath(x) === filePath(current)) : -1;
+
+      const focus = (i) => {
+        if (i < 0 || i >= list.length) return;
+        selectOnly(list[i]);
+        renderContent();
+        renderInspector();
+        loadDetailIfNeeded();
+        scrollIntoView(list[i]);
+      };
+
+      switch (e.key) {
+        case "ArrowDown":
+          e.preventDefault();
+          focus(index < 0 ? 0 : Math.min(index + 1, list.length - 1));
+          break;
+        case "ArrowUp":
+          e.preventDefault();
+          focus(index < 0 ? list.length - 1 : Math.max(index - 1, 0));
+          break;
+        case "Home":
+          e.preventDefault();
+          focus(0);
+          break;
+        case "End":
+          e.preventDefault();
+          focus(list.length - 1);
+          break;
+        case "Enter":
+          e.preventDefault();
+          if (current) openEntry(current);
+          break;
+        case "Backspace":
+          e.preventDefault();
+          if (state.path) navigate(state.path.split("/").slice(0, -1).join("/"));
+          break;
+        case "Escape":
+          if (state.selected.size > 0) {
+            e.preventDefault();
+            clearSelection();
+          }
+          break;
+        case "a":
+          if (e.metaKey || e.ctrlKey) {
+            e.preventDefault();
+            selectAll();
+          }
+          break;
+        case "Delete":
+          if (current) {
+            e.preventDefault();
+            confirmDelete(current);
+          }
+          break;
+        case "F2":
+          if (current) {
+            e.preventDefault();
+            promptRename(current);
+          }
+          break;
+        case " ":
+          if (current) {
+            e.preventDefault();
+            if (current.preview) openPreview(current);
+          }
+          break;
+      }
+    });
+  }
+
+  function scrollIntoView(entry) {
+    const path = filePath(entry);
+    const node = document.querySelector(`tr[data-path="${CSS.escape(path)}"]`);
+    if (node && node.scrollIntoView) node.scrollIntoView({ block: "nearest" });
   }
 
   // ---------- drag and drop ----------
@@ -1853,7 +2434,7 @@
   //
   // The depth counter is necessary: dragleave fires when the pointer crosses into a child
   // element, so a naive listener flickers the overlay off the moment the pointer moves over
-  // the file table. Counting enters and leaves keeps it steady until the pointer leaves the
+  // the table. Counting enters and leaves keeps it steady until the pointer leaves the
   // window.
   function installDragAndDrop() {
     const zone = $("#dropzone");
@@ -1874,7 +2455,6 @@
 
     window.addEventListener("dragover", (e) => {
       if (!carriesFiles(e)) return;
-      // Without this the browser opens the file instead of firing drop.
       e.preventDefault();
       e.dataTransfer.dropEffect = "copy";
     });
@@ -1903,7 +2483,6 @@
   // ---------- boot ----------
 
   async function boot() {
-    // A /s/<token> URL is the anonymous share page: no session, no shell.
     const shareMatch = location.pathname.match(/^\/s\/([^/]+)\/?$/);
     if (shareMatch) {
       await renderShareLanding(shareMatch[1]);
@@ -1921,8 +2500,10 @@
     }
 
     installDragAndDrop();
-    renderSidebar();
-    renderHeader();
+    installKeyboard();
+    renderRail();
+    renderContent();
+    renderInspector();
 
     const params = new URLSearchParams(location.search);
     if (params.get("path")) state.path = params.get("path").replace(/^\/+|\/+$/g, "");
