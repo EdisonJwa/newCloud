@@ -67,7 +67,11 @@ func TestShareLinkServesHTMLToABrowser(t *testing.T) {
 		t.Fatalf("the response is not an HTML document: %.120s", body)
 	}
 	// The shell must reference the embedded client, or the page renders nothing.
-	if !strings.Contains(body, "/assets/app.js") {
+	//
+	// The bundle name carries a content hash, so the check is on the shape of the reference
+	// rather than on a fixed filename: pinning "app.js" here only tied the test to the build
+	// tool's output naming.
+	if !strings.Contains(body, `/assets/`) || !strings.Contains(body, `.js"`) {
 		t.Fatalf("the shell does not load the client script: %.200s", body)
 	}
 }

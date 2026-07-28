@@ -77,7 +77,10 @@ type NewShare struct {
 	OwnerID uuid.UUID
 	// OwnerEmail is recorded on the create event. Audit rows carry the actor address at the
 	// time of the event, so reading it back by joining users would rewrite history.
-	OwnerEmail      string
+	OwnerEmail string
+	// NodePath is the resolved path of the shared object, recorded on the audit row. Without
+	// it the log says "share.create 18711bd6", which nobody can act on later.
+	NodePath        string
 	Kind            store.ShareKind
 	Label           string
 	Password        string
@@ -180,6 +183,9 @@ func (s *Service) Create(ctx context.Context, in NewShare) (Created, error) {
 				"permissions":  perms,
 				"has_password": len(passwordHash) > 0,
 				"expires_at":   expires,
+				// The path is what makes this row readable later. Without it the audit log
+				// says "share.create 18711bd6", which is a fact nobody can act on.
+				"path": nodePath(in),
 			},
 		})
 	})
@@ -340,6 +346,15 @@ func (s *Service) Revoke(ctx context.Context, shareID uuid.UUID, actorID uuid.UU
 			Result: "ok",
 		})
 	})
+}
+
+// nodePath returns the human-readable target of a share for the audit trail.
+//
+// It deliberately does not touch the database: the caller already resolved the path to
+// authorise the request, and re-resolving here would add a query to every share creation just
+// to improve a log line.
+func nodePath(in NewShare) string {
+	return in.NodePath
 }
 
 // ValidateRecipient ensures an address is syntactically usable.

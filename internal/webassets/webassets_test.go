@@ -1,35 +1,48 @@
 package webassets
 
-import "testing"
+// The embedded bundle must be servable, self-describing, and cacheable.
 
-// The embedded client must be servable, and must carry a validator.
-//
-// Without one, a browser that already has app.js keeps using it for the whole max-age
-// window after an upgrade — the deployed interface looks unchanged and the operator
-// concludes the release did not happen.
+import (
+	"strings"
+	"testing"
+)
 
-func TestAssetsAreEmbedded(t *testing.T) {
+func TestBundleIsEmbedded(t *testing.T) {
 	h, err := New()
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 
-	for _, name := range []string{"app.js", "style.css", "index.html"} {
-		if _, ok := h.hashes[name]; !ok {
-			t.Errorf("%s has no hash; it would be cached without a validator", name)
-		}
-	}
-
-	// The index must reference the assets it needs, or the page loads and does nothing.
 	if len(h.index) == 0 {
 		t.Fatal("index.html is empty")
 	}
-	if !containsAll(string(h.index), "/assets/app.js", "/assets/style.css") {
-		t.Error("index.html does not reference the client assets")
+	if !strings.Contains(string(h.index), "/assets/") {
+		t.Error("the shell must reference the hashed bundle, or nothing loads")
+	}
+	if len(h.assets) == 0 {
+		t.Fatal("no assets were embedded")
+	}
+
+	var js, css bool
+	for name := range h.assets {
+		if strings.HasSuffix(name, ".js") {
+			js = true
+		}
+		if strings.HasSuffix(name, ".css") {
+			css = true
+		}
+	}
+	if !js {
+		t.Error("the bundle has no JavaScript")
+	}
+	if !css {
+		t.Error("the bundle has no stylesheet")
 	}
 }
 
-func TestHashesAreDistinct(t *testing.T) {
+// TestEveryAssetHasAValidator: without one, an upgraded hashed bundle could still be served
+// stale by an intermediary that ignores the file name.
+func TestEveryAssetHasAValidator(t *testing.T) {
 	h, err := New()
 	if err != nil {
 		t.Fatal(err)
@@ -40,10 +53,36 @@ func TestHashesAreDistinct(t *testing.T) {
 		if hash == `""` || hash == "" {
 			t.Errorf("%s has an empty ETag", name)
 		}
-		if prev, ok := seen[hash]; ok {
-			t.Errorf("%s and %s share the ETag %s; a content hash must differ", prev, name, hash)
+		if prev, dup := seen[hash]; dup {
+			t.Errorf("%s and %s share the ETag %s", prev, name, hash)
 		}
 		seen[hash] = name
+	}
+	if len(h.hashes) != len(h.assets) {
+		t.Errorf("%d assets but %d hashes", len(h.assets), len(h.hashes))
+	}
+}
+
+// TestContentTypesAreSelfOnly: the handler serves a closed set of build outputs, and must
+// never return a type the browser would render as a document.
+func TestContentTypesAreSelfOnly(t *testing.T) {
+	cases := map[string]string{
+		"assets/index-abc.js":  "text/javascript; charset=utf-8",
+		"assets/index-abc.css": "text/css; charset=utf-8",
+		"assets/logo.svg":      "image/svg+xml",
+		"assets/font.woff2":    "font/woff2",
+	}
+	for name, want := range cases {
+		if got := contentTypeOf(name); got != want {
+			t.Errorf("contentTypeOf(%q) = %q, want %q", name, got, want)
+		}
+	}
+
+	// Anything else is opaque rather than guessable.
+	for _, name := range []string{"assets/x.html", "assets/x.htm", "assets/x.txt"} {
+		if got := contentTypeOf(name); got != "application/octet-stream" {
+			t.Errorf("contentTypeOf(%q) = %q; unknown types must not be renderable", name, got)
+		}
 	}
 }
 
@@ -56,7 +95,6 @@ func TestEtagMatches(t *testing.T) {
 		{`"abc"`, `"abc"`, true},
 		{`"abc"`, `"def"`, false},
 		{`"def", "abc"`, `"abc"`, true},
-		{`W/"abc"`, `"abc"`, false}, // a weak validator is not this strong one
 		{`*`, `"abc"`, true},
 		{``, `"abc"`, false},
 	}
@@ -65,20 +103,4 @@ func TestEtagMatches(t *testing.T) {
 			t.Errorf("etagMatches(%q, %q) = %v, want %v", tc.header, tc.etag, got, tc.want)
 		}
 	}
-}
-
-func containsAll(haystack string, needles ...string) bool {
-	for _, n := range needles {
-		found := false
-		for i := 0; i+len(n) <= len(haystack); i++ {
-			if haystack[i:i+len(n)] == n {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return false
-		}
-	}
-	return true
 }

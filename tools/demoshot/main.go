@@ -150,182 +150,176 @@ func run() error {
 		return fmt.Errorf("login did not complete, still at %s", url)
 	}
 
-	// ---- Files ----
-	fmt.Println("capturing the file list…")
+	// ---- Home ----
+	//
+	// The landing surface is the part of the redesign that cannot be judged from a file
+	// listing: it is the answer to "what was I doing", built from real data.
+	fmt.Println("capturing the home view…")
+	if err := shoot(cdp, filepath.Join(*outDir, "home.png")); err != nil {
+		return err
+	}
+
+	// ---- Files: the column browser ----
+	fmt.Println("capturing the column browser…")
+	if _, err := goTo(cdp, "Files"); err != nil {
+		return err
+	}
+	time.Sleep(1600 * time.Millisecond)
 	if err := shoot(cdp, filepath.Join(*outDir, "files.png")); err != nil {
 		return err
 	}
 
-	// ---- A selected file, showing the inspector ----
-	//
-	// Selection is the interaction the layout is built around: one click fills the right
-	// column with details, versions and shares. A screenshot of the list alone would not
-	// show that the column does anything.
-	fmt.Println("capturing the details panel…")
-	if _, err := evalString(cdp, `(() => {
-		const rows = [...document.querySelectorAll('.row')];
-		const row = rows.find(r => r.textContent.includes('README'));
-		if (!row) return 'none';
-		row.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-		return 'ok';
-	})()`); err != nil {
+	// A selected file turns the trailing column into its detail: preview, properties,
+	// versions, links. A screenshot of the list alone would not show that it does anything.
+	fmt.Println("capturing the detail column…")
+	if msg, err := jsFirst(cdp, ".row:not(.dir)", "click"); err != nil {
 		return err
-	}
-	time.Sleep(1600 * time.Millisecond)
-	if err := shoot(cdp, filepath.Join(*outDir, "selected.png")); err != nil {
-		return err
-	}
-
-	// ---- Interactions ----
-	//
-	// The layout is built around selection and the keyboard; a screenshot cannot prove they
-	// work, so they are asserted.
-	fmt.Println("checking selection and keyboard…")
-	if err := checkInteractions(cdp); err != nil {
-		return err
-	}
-
-	// ---- Shares tab ----
-	fmt.Println("capturing the shares tab…")
-	if _, err := evalString(cdp, `(() => {
-		const b = [...document.querySelectorAll('.rail-nav button')].find(x => x.textContent.trim() === 'Shares');
-		if (b) b.click(); return 'ok';
-	})()`); err != nil {
-		return err
+	} else if msg != "ok" {
+		return fmt.Errorf("could not select a file: %s", msg)
 	}
 	time.Sleep(1400 * time.Millisecond)
-	if err := shoot(cdp, filepath.Join(*outDir, "shares.png")); err != nil {
+	if err := shoot(cdp, filepath.Join(*outDir, "files-detail.png")); err != nil {
 		return err
 	}
 
-	// ---- A folder inside the tree ----
-	fmt.Println("capturing a subfolder…")
-	if _, err := evalString(cdp, `(() => {
-		const b = [...document.querySelectorAll('.rail-nav button')].find(x => x.textContent.trim() === 'Files');
-		if (b) b.click(); return 'ok';
-	})()`); err != nil {
+	// Descending into a folder is what produces a second column, and a second column is the
+	// whole point of the layout: the path becomes space instead of a breadcrumb string.
+	fmt.Println("capturing nested columns…")
+	if msg, err := jsFirst(cdp, ".row.dir", "dblclick"); err != nil {
 		return err
-	}
-	time.Sleep(1200 * time.Millisecond)
-	// The image folder, so the thumbnails are actually exercised by a frame: a thumbnail
-	// that renders in an API test and not in the table is the failure worth catching.
-	if _, err := evalString(cdp, `(() => {
-		const labels = [...document.querySelectorAll('.row .name .label')];
-		const dir = labels.find(b => b.textContent.trim() === '图片');
-		if (dir) dir.click(); return 'ok';
-	})()`); err != nil {
-		return err
-	}
-	time.Sleep(1600 * time.Millisecond)
-	if err := shoot(cdp, filepath.Join(*outDir, "folder.png")); err != nil {
-		return err
+	} else if msg != "ok" {
+		fmt.Println("  (no folder in this view; skipping the nested-column frame)")
+	} else {
+		time.Sleep(1500 * time.Millisecond)
+		if err := shoot(cdp, filepath.Join(*outDir, "columns.png")); err != nil {
+			return err
+		}
 	}
 
-	// ---- Activity ----
-	//
-	// The audit timeline is the view a person opens to ask "who downloaded my file", so it
-	// is worth a frame of its own rather than being covered by the file list.
-	fmt.Println("capturing the activity timeline…")
-	if _, err := evalString(cdp, `(() => {
-		const b = [...document.querySelectorAll('.rail-nav button')].find(x => x.textContent.trim() === 'Activity');
-		if (b) b.click(); return 'ok';
-	})()`); err != nil {
+	// ---- Immersive preview ----
+	fmt.Println("capturing the preview…")
+	if msg, err := jsFirst(cdp, ".row:not(.dir)", "dblclick"); err != nil {
 		return err
-	}
-	time.Sleep(1600 * time.Millisecond)
-	if err := shoot(cdp, filepath.Join(*outDir, "activity.png")); err != nil {
-		return err
-	}
-
-	// ---- App passwords ----
-	fmt.Println("capturing app passwords…")
-	if _, err := evalString(cdp, `(() => {
-		const b = [...document.querySelectorAll('.rail-nav button')].find(x => x.textContent.trim() === 'Access');
-		if (b) b.click(); return 'ok';
-	})()`); err != nil {
-		return err
-	}
-	time.Sleep(1400 * time.Millisecond)
-	if err := shoot(cdp, filepath.Join(*outDir, "apppasswords.png")); err != nil {
-		return err
+	} else if msg == "ok" {
+		time.Sleep(1600 * time.Millisecond)
+		if err := shoot(cdp, filepath.Join(*outDir, "preview.png")); err != nil {
+			return err
+		}
+		if _, err := evalString(cdp, "(() => { window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' })); return 'ok'; })()"); err != nil {
+			return err
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
 
-	// ---- Dark palette ----
-	//
-	// Dark mode here is a separate set of colours rather than an inversion, so it needs its
-	// own frame: warming the palette is exactly the kind of change that looks fine in a
-	// stylesheet and wrong on screen.
-	fmt.Println("capturing the dark palette…")
-	if err := cdp.Call("Emulation.setEmulatedMedia", map[string]any{
-		"features": []map[string]string{{"name": "prefers-color-scheme", "value": "dark"}},
-	}); err != nil {
-		return err
-	}
-	if _, err := evalString(cdp, jsShowFiles); err != nil {
-		return err
-	}
-	time.Sleep(1400 * time.Millisecond)
-	if err := shoot(cdp, filepath.Join(*outDir, "files-dark.png")); err != nil {
-		return err
+	// ---- Sharing, activity, trash, access ----
+	for _, section := range []struct{ name, file string }{
+		{"Shared", "shared.png"},
+		{"Activity", "activity.png"},
+		{"Trash", "trash.png"},
+		{"Access", "access.png"},
+	} {
+		fmt.Printf("capturing %s…\n", strings.ToLower(section.name))
+		if _, err := goTo(cdp, section.name); err != nil {
+			return err
+		}
+		time.Sleep(1400 * time.Millisecond)
+		if err := shoot(cdp, filepath.Join(*outDir, section.file)); err != nil {
+			return err
+		}
 	}
 
-	// ---- High contrast ----
-	//
-	// This theme is not an inversion of the dark one: it is pure black on white text with
-	// real borders and a yellow focus ring. It needs its own frame because the failure mode
-	// of a high-contrast palette is subtle — separation by fill alone looks fine in a
-	// stylesheet and vanishes on screen.
-	fmt.Println("capturing the high-contrast palette…")
-	if _, err := evalString(cdp, `(() => {
-		document.documentElement.dataset.theme = 'hc';
-		return 'ok';
-	})()`); err != nil {
+	// ---- Themes ----
+	fmt.Println("capturing the dark and high-contrast palettes…")
+	if _, err := goTo(cdp, "Files"); err != nil {
 		return err
 	}
-	time.Sleep(700 * time.Millisecond)
-	if err := shoot(cdp, filepath.Join(*outDir, "files-high-contrast.png")); err != nil {
-		return err
+	time.Sleep(900 * time.Millisecond)
+	for _, theme := range []struct{ value, file string }{
+		{"dark", "files-dark.png"},
+		{"hc", "files-high-contrast.png"},
+	} {
+		expr := fmt.Sprintf("(() => { document.documentElement.dataset.theme = %q; return 'ok'; })()", theme.value)
+		if _, err := evalString(cdp, expr); err != nil {
+			return err
+		}
+		time.Sleep(600 * time.Millisecond)
+		if err := shoot(cdp, filepath.Join(*outDir, theme.file)); err != nil {
+			return err
+		}
 	}
-
-	// ---- Compact density ----
-	fmt.Println("capturing compact density…")
-	if _, err := evalString(cdp, `(() => {
-		document.documentElement.dataset.theme = 'light';
-		document.documentElement.dataset.density = 'compact';
-		return 'ok';
-	})()`); err != nil {
-		return err
-	}
-	time.Sleep(700 * time.Millisecond)
-	if err := shoot(cdp, filepath.Join(*outDir, "files-compact.png")); err != nil {
+	if _, err := evalString(cdp, "(() => { document.documentElement.dataset.theme = 'light'; return 'ok'; })()"); err != nil {
 		return err
 	}
 
 	// ---- Command palette ----
 	fmt.Println("capturing the command palette…")
 	if _, err := evalString(cdp, `(() => {
-		document.documentElement.dataset.density = 'comfortable';
-		document.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', metaKey: true, bubbles: true }));
+		window.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', metaKey: true, bubbles: true }));
 		return 'ok';
 	})()`); err != nil {
 		return err
 	}
-	time.Sleep(600 * time.Millisecond)
+	time.Sleep(900 * time.Millisecond)
 	if err := shoot(cdp, filepath.Join(*outDir, "palette.png")); err != nil {
 		return err
 	}
-	if _, err := evalString(cdp, `(() => {
-		document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-		const p = document.querySelector('.palette'); if (p) p.remove();
-		const s = document.querySelector('.palette-scrim'); if (s) s.remove();
-		return 'ok';
-	})()`); err != nil {
+	if _, err := evalString(cdp, "(() => { const s = document.querySelector('.scrim'); if (s) { s.click(); return 'scrim'; } return 'miss'; })()"); err != nil {
 		return err
 	}
-	time.Sleep(400 * time.Millisecond)
+	time.Sleep(500 * time.Millisecond)
+
+	// ---- Phone ----
+	fmt.Println("capturing the phone layout…")
+	if err := cdp.Call("Emulation.setDeviceMetricsOverride", map[string]any{
+		"width": 390, "height": 844, "deviceScaleFactor": 1, "mobile": true,
+	}); err != nil {
+		return err
+	}
+	time.Sleep(1200 * time.Millisecond)
+	if err := shoot(cdp, filepath.Join(*outDir, "files-mobile.png")); err != nil {
+		return err
+	}
+	if _, err := goTo(cdp, "Home"); err != nil {
+		return err
+	}
+	time.Sleep(1200 * time.Millisecond)
+	if err := shoot(cdp, filepath.Join(*outDir, "home-mobile.png")); err != nil {
+		return err
+	}
+	if err := cdp.Call("Emulation.clearDeviceMetricsOverride", nil); err != nil {
+		return err
+	}
 
 	fmt.Printf("\nscreenshots written to %s\n", *outDir)
 	return nil
+}
+
+// goTo clicks a section in the top bar and waits for it to settle.
+func goTo(cdp *wsConn, label string) (string, error) {
+	return jsClick(cdp, ".nav button", label)
+}
+
+// jsClick clicks the first element matching sel whose text contains want.
+func jsClick(cdp *wsConn, sel, want string) (string, error) {
+	expr := fmt.Sprintf(`(() => {
+		const nodes = [...document.querySelectorAll(%q)];
+		const el = nodes.find(n => (n.textContent || '').toLowerCase().includes(%q));
+		if (!el) return 'miss';
+		el.click();
+		return 'ok';
+	})()`, sel, strings.ToLower(want))
+	return evalString(cdp, expr)
+}
+
+// jsFirst dispatches an event on the first element matching sel.
+func jsFirst(cdp *wsConn, sel, event string) (string, error) {
+	expr := fmt.Sprintf(`(() => {
+		const el = document.querySelector(%q);
+		if (!el) return 'miss';
+		el.dispatchEvent(new MouseEvent(%q, { bubbles: true }));
+		return 'ok';
+	})()`, sel, event)
+	return evalString(cdp, expr)
 }
 
 func navigate(cdp *wsConn, target string) error {

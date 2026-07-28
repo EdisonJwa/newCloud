@@ -131,7 +131,7 @@ func (s *Server) handleShareCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	created, err := s.deps.Shares.Create(r.Context(), share.NewShare{
-		NodeID: node.ID, OwnerID: actor.ID(), OwnerEmail: actor.Email(), Kind: kind,
+		NodeID: node.ID, OwnerID: actor.ID(), OwnerEmail: actor.Email(), NodePath: strings.TrimPrefix(body.Path, "/"), Kind: kind,
 		Label: body.Label, Password: body.Password, TTL: ttl,
 		MaxDownloads: body.MaxDownloads, MaxUploads: body.MaxUploads,
 		Permissions: body.Permissions, Recipients: body.Recipients,

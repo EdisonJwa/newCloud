@@ -15,6 +15,11 @@ demo-run/
 shots/
 *.log
 
+# The browser client: dependencies are not committed, but the build output is, because the Go
+# embed directive needs it for a plain `go build` to work.
+web/node_modules/
+web/dist/
+
 # Secrets: never commit these
 *.pass
 config.yml
