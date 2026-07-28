@@ -36,6 +36,12 @@ type fileJSON struct {
 	// downloads instead. It is advisory: the download endpoint re-checks the type and the
 	// bytes, so a stale value cannot make the server inline something it refuses.
 	Preview string `json:"preview,omitempty"`
+
+	// ShareCount and HasVersions make the audit capability visible without opening anything:
+	// a row says at a glance whether the object is shared and whether history exists.
+	// Omitted when zero, which is the common case and needs no ink.
+	ShareCount  int  `json:"share_count,omitempty"`
+	HasVersions bool `json:"has_versions,omitempty"`
 }
 
 func toFileJSON(n store.Node, rel string) fileJSON {
@@ -98,9 +104,16 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	markers := s.nodeMarkers(r.Context(), actor.ID(), children)
+
 	out := make([]fileJSON, 0, len(children))
 	for _, c := range children {
-		out = append(out, toFileJSON(c, path.Join(rel, c.Name)))
+		item := toFileJSON(c, path.Join(rel, c.Name))
+		if m, ok := markers[c.ID]; ok {
+			item.ShareCount = m.ShareCount
+			item.HasVersions = m.HasVersions
+		}
+		out = append(out, item)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{

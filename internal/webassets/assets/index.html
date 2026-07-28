@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="referrer" content="same-origin">
   <meta name="robots" content="noindex, nofollow, noarchive">
   <meta name="color-scheme" content="light dark">
@@ -10,17 +10,29 @@
   <link rel="stylesheet" href="/assets/style.css">
 </head>
 <body>
-  <!-- Three columns with different jobs: navigation, content, and the inspector.
-       The shell is almost empty because every view is built by the script from data, so
-       nothing here can get out of step with the API and nothing user-controlled is ever
-       parsed as HTML. -->
+  <!-- The shell is almost empty on purpose: every view is built by the script from data, so
+       nothing here can drift out of step with the API, and nothing user-controlled is ever
+       parsed as HTML.
+
+       Column count is adaptive. #app declares two; the third (the details panel) is added by
+       the script only while an object is selected, and CSS decides whether that column sits
+       beside the content or overlays it.
+
+       #live is the polite live region: every toast also announces itself here, because a
+       visual-only confirmation is a silent failure for a screen reader. -->
   <div id="app">
     <aside class="rail" id="rail"></aside>
-    <main class="content" id="content"></main>
+
+    <main class="content">
+      <header class="content-head" id="head"></header>
+      <div id="body" class="content-body-host"></div>
+      <footer class="statusbar" id="status" aria-live="off"></footer>
+    </main>
+
     <aside class="inspector" id="inspector"></aside>
   </div>
 
-  <div id="dropzone">
+  <div id="dropzone" aria-hidden="true">
     <div class="box">
       Drop to upload
       <span class="sub" id="drop-target"></span>
@@ -28,6 +40,7 @@
   </div>
 
   <div id="toast" role="status" aria-live="polite"></div>
+  <div id="live" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
 
   <script src="/assets/app.js" defer></script>
 </body>

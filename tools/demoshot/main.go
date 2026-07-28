@@ -37,6 +37,9 @@ var (
 	// Chrome and sign in, and the drop path cannot be tested from the DOM: a DataTransfer
 	// built in JavaScript carries no OS files.
 	testDrop = flag.Bool("test-drop", false, "verify drag-and-drop upload, then exit")
+	// eval runs one expression after sign-in and prints the result. Layout bugs are easier to
+	// settle by measuring the live DOM than by reasoning about the cascade.
+	evalExpr = flag.String("eval", "", "evaluate this JS after sign-in and print the result")
 )
 
 func main() {
@@ -133,6 +136,15 @@ func run() error {
 		return checkDropUpload(cdp)
 	}
 
+	if *evalExpr != "" {
+		out, err := evalString(cdp, *evalExpr)
+		if err != nil {
+			return err
+		}
+		fmt.Println(out)
+		return nil
+	}
+
 	url, _ := evalString(cdp, "location.href")
 	if strings.Contains(url, "auth") {
 		return fmt.Errorf("login did not complete, still at %s", url)
@@ -151,7 +163,7 @@ func run() error {
 	// show that the column does anything.
 	fmt.Println("capturing the details panel…")
 	if _, err := evalString(cdp, `(() => {
-		const rows = [...document.querySelectorAll('table.files tbody tr')];
+		const rows = [...document.querySelectorAll('.row')];
 		const row = rows.find(r => r.textContent.includes('README'));
 		if (!row) return 'none';
 		row.dispatchEvent(new MouseEvent('click', { bubbles: true }));
@@ -198,7 +210,7 @@ func run() error {
 	// The image folder, so the thumbnails are actually exercised by a frame: a thumbnail
 	// that renders in an API test and not in the table is the failure worth catching.
 	if _, err := evalString(cdp, `(() => {
-		const labels = [...document.querySelectorAll('table.files span.label')];
+		const labels = [...document.querySelectorAll('.row .name .label')];
 		const dir = labels.find(b => b.textContent.trim() === '图片');
 		if (dir) dir.click(); return 'ok';
 	})()`); err != nil {
@@ -257,6 +269,61 @@ func run() error {
 		return err
 	}
 
+	// ---- High contrast ----
+	//
+	// This theme is not an inversion of the dark one: it is pure black on white text with
+	// real borders and a yellow focus ring. It needs its own frame because the failure mode
+	// of a high-contrast palette is subtle — separation by fill alone looks fine in a
+	// stylesheet and vanishes on screen.
+	fmt.Println("capturing the high-contrast palette…")
+	if _, err := evalString(cdp, `(() => {
+		document.documentElement.dataset.theme = 'hc';
+		return 'ok';
+	})()`); err != nil {
+		return err
+	}
+	time.Sleep(700 * time.Millisecond)
+	if err := shoot(cdp, filepath.Join(*outDir, "files-high-contrast.png")); err != nil {
+		return err
+	}
+
+	// ---- Compact density ----
+	fmt.Println("capturing compact density…")
+	if _, err := evalString(cdp, `(() => {
+		document.documentElement.dataset.theme = 'light';
+		document.documentElement.dataset.density = 'compact';
+		return 'ok';
+	})()`); err != nil {
+		return err
+	}
+	time.Sleep(700 * time.Millisecond)
+	if err := shoot(cdp, filepath.Join(*outDir, "files-compact.png")); err != nil {
+		return err
+	}
+
+	// ---- Command palette ----
+	fmt.Println("capturing the command palette…")
+	if _, err := evalString(cdp, `(() => {
+		document.documentElement.dataset.density = 'comfortable';
+		document.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', metaKey: true, bubbles: true }));
+		return 'ok';
+	})()`); err != nil {
+		return err
+	}
+	time.Sleep(600 * time.Millisecond)
+	if err := shoot(cdp, filepath.Join(*outDir, "palette.png")); err != nil {
+		return err
+	}
+	if _, err := evalString(cdp, `(() => {
+		document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+		const p = document.querySelector('.palette'); if (p) p.remove();
+		const s = document.querySelector('.palette-scrim'); if (s) s.remove();
+		return 'ok';
+	})()`); err != nil {
+		return err
+	}
+	time.Sleep(400 * time.Millisecond)
+
 	fmt.Printf("\nscreenshots written to %s\n", *outDir)
 	return nil
 }
@@ -291,7 +358,7 @@ func checkDropUpload(cdp *wsConn) error {
 	}
 
 	countRows := func() int {
-		out, cerr := evalString(cdp, `(() => String(document.querySelectorAll('table.files tbody tr').length))()`)
+		out, cerr := evalString(cdp, `(() => String(document.querySelectorAll('.row').length))()`)
 		if cerr != nil {
 			return -1
 		}
@@ -353,7 +420,7 @@ func checkDropUpload(cdp *wsConn) error {
 func checkInteractions(cdp *wsConn) error {
 	// Single click selects and fills the inspector.
 	if _, err := evalString(cdp, `(() => {
-		const row = [...document.querySelectorAll('table.files tbody tr')].find(r => r.textContent.includes('README'));
+		const row = [...document.querySelectorAll('.row')].find(r => r.textContent.includes('README'));
 		if (!row) return 'no-row';
 		row.dispatchEvent(new MouseEvent('click', { bubbles: true }));
 		return 'ok';
@@ -362,7 +429,7 @@ func checkInteractions(cdp *wsConn) error {
 	}
 	time.Sleep(1400 * time.Millisecond)
 
-	sel, err := evalString(cdp, `(() => String(document.querySelectorAll('table.files tbody tr.selected').length))()`)
+	sel, err := evalString(cdp, `(() => String(document.querySelectorAll('.row[aria-selected="true"]').length))()`)
 	if err != nil {
 		return err
 	}
@@ -384,8 +451,17 @@ func checkInteractions(cdp *wsConn) error {
 	fmt.Println("  selection fills the inspector")
 
 	// Arrow keys move the selection without a mouse.
+	//
+	// The event is dispatched on the focused element, because the keys are handled by the
+	// listbox rather than by the document. Dispatching on document would test nothing: it
+	// does not propagate downward, and a handler that never ran would look like a pass.
 	if _, err := evalString(cdp, `(() => {
-		document.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+		const target = document.activeElement && document.activeElement.matches('[role="listbox"]')
+			? document.activeElement
+			: document.querySelector('[role="listbox"]');
+		if (!target) return 'no-listbox';
+		target.focus();
+		target.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
 		return 'ok';
 	})()`); err != nil {
 		return err
