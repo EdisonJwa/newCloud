@@ -1799,7 +1799,10 @@ dialog .foot {
   padding: 22px 22px 16px;
   border-block-end: 1px solid var(--line);
 }
+/* display:block matters: this is a <span>, and width/height do not apply to inline boxes, so
+ * the absolutely positioned slabs had nothing to size against and the mark was invisible. */
 .landcard .head .mark {
+  display: block;
   width: 20px;
   height: 20px;
   position: relative;

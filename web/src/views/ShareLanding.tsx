@@ -49,7 +49,7 @@ export function ShareLanding({ token }: { token: string }) {
             <h1>{t("share.notAvailable")}</h1>
             <p>{t("share.notAvailableHint")}</p>
           </div>
-          <div className="foot">{t("share.sharedWith")}</div>
+          <div className="foot">{t("app.name")}</div>
         </div>
       </div>
     );
@@ -223,7 +223,7 @@ export function ShareLanding({ token }: { token: string }) {
           )}
         </div>
 
-        <div className="foot">{t("share.sharedWith")}</div>
+        <div className="foot">{t("app.name")}</div>
       </div>
     </div>
   );
