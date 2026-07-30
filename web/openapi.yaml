@@ -77,6 +77,31 @@ paths:
                 properties:
                   items: { type: array, items: { $ref: "#/components/schemas/FileNode" } }
 
+  /api/files/search:
+    get:
+      summary: Name search across the tree
+      description: |
+        Matches node names only, not contents. Queries shorter than two characters return
+        nothing rather than the whole library.
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, query]
+                properties:
+                  query: { type: string }
+                  items: { type: array, items: { $ref: "#/components/schemas/FileNode" } }
   /api/files/trash:
     get:
       summary: Trashed nodes

@@ -86,6 +86,10 @@ jobs:
       - name: typecheck
         working-directory: web
         run: pnpm typecheck
+      - name: contrast meets WCAG AA
+        # The colour claim is measured, not asserted by eye.
+        working-directory: web
+        run: pnpm contrast
       - name: generated API types are current
         # Regenerating from openapi.yaml and diffing is the only way to know the committed
         # output still describes the spec. A stale client type is worse than none.

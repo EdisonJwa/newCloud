@@ -28,6 +28,7 @@ export function Palette({ commands, onClose, onOpenPath }: Props) {
   const { t } = useI18n();
   const [query, setQuery] = useState("");
   const [files, setFiles] = useState<FileNode[]>([]);
+  const [hits, setHits] = useState<FileNode[] | null>(null);
   const [active, setActive] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLUListElement>(null);
@@ -51,12 +52,39 @@ export function Palette({ commands, onClose, onOpenPath }: Props) {
       .catch(() => setFiles([]));
   }, []);
 
+  // Debounced server search. The timeout keeps a fast typist from issuing one request per
+  // keystroke, and the cleanup cancels a response that arrives after the query moved on.
+  useEffect(() => {
+    const term = query.trim();
+    if (term.length < 2) {
+      setHits(null);
+      return;
+    }
+    let live = true;
+    const timer = window.setTimeout(() => {
+      api
+        .search(term, 12)
+        .then((res) => {
+          if (live) setHits(res.items ?? []);
+        })
+        .catch(() => {
+          if (live) setHits([]);
+        });
+    }, 160);
+    return () => {
+      live = false;
+      window.clearTimeout(timer);
+    };
+  }, [query]);
+
   const items = useMemo(() => {
     const needle = query.trim().toLowerCase();
     const commandHits = commands.filter((c) => !needle || c.label.toLowerCase().includes(needle));
-    const fileHits = files
-      .filter((f) => !needle || f.name.toLowerCase().includes(needle) || f.path.toLowerCase().includes(needle))
-      .slice(0, 8);
+    // With a query, the server's answer replaces the recent list: recent files are a
+    // pre-query convenience, not a search result.
+    const source = hits ?? files;
+    const fileHits = (hits ? source : source.filter((f) => !needle || f.name.toLowerCase().includes(needle)))
+      .slice(0, 10);
     return [
       ...commandHits.map((c) => ({ kind: t("palette.commands"), label: c.label, hint: c.hint, run: c.run })),
       ...fileHits.map((f) => ({
@@ -66,7 +94,7 @@ export function Palette({ commands, onClose, onOpenPath }: Props) {
         run: () => onOpenPath(f.path),
       })),
     ];
-  }, [query, commands, files, t, onOpenPath]);
+  }, [query, commands, files, hits, t, onOpenPath]);
 
   useEffect(() => {
     setActive(0);

@@ -10,6 +10,7 @@
     "preview": "vite preview",
     "typecheck": "tsc -b --noEmit",
     "gen:api": "openapi-typescript openapi.yaml -o src/api-types.ts",
+    "contrast": "node scripts/contrast.mjs",
     "gen:api:check": "openapi-typescript openapi.yaml -o src/api-types.ts && git diff --exit-code -- src/api-types.ts"
   },
   "dependencies": {

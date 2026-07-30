@@ -146,6 +146,7 @@ func (s *Server) Handler() http.Handler {
 			r.Route("/files", func(r chi.Router) {
 				r.Get("/", s.handleList)
 				r.Get("/recent", s.handleRecent)
+				r.Get("/search", s.handleSearch)
 				r.Post("/mkdir", s.handleMkdir)
 				r.Post("/upload", s.handleUpload)
 				r.Get("/download", s.handleDownload)

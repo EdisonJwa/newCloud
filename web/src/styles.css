@@ -25,10 +25,11 @@
 
   --line: #e4e6ea;
   --line-strong: #cbcfd6;
+  --line-control: #7c838d;
 
   --ink: #0e0f12;
   --ink-2: #4a4f57;
-  --ink-3: #838a94;
+  --ink-3: #676e78;
   --ink-inv: #ffffff;
 
   --accent: #0b6e4f;
@@ -80,10 +81,11 @@
 
   --line: #24272d;
   --line-strong: #363a42;
+  --line-control: #6a717b;
 
   --ink: #f0f2f4;
   --ink-2: #a8aeb8;
-  --ink-3: #6f7682;
+  --ink-3: #8b93a0;
   --ink-inv: #0a0b0d;
 
   --accent: #4ade80;
@@ -121,6 +123,7 @@
 
   --line: #ffffff;
   --line-strong: #ffffff;
+  --line-control: #ffffff;
 
   --ink: #ffffff;
   --ink-2: #ffffff;
@@ -370,7 +373,7 @@ a:hover {
   min-height: 30px;
   padding: 4px 11px;
   background: var(--surface);
-  border: 1px solid var(--line-strong);
+  border: 1px solid var(--line-control);
   border-radius: var(--r-2);
   font-size: 12.5px;
   font-weight: 500;
@@ -442,7 +445,7 @@ select.pick {
   padding-inline: 6px;
   font-size: 11.5px;
   background: var(--surface);
-  border: 1px solid var(--line);
+  border: 1px solid var(--line-control);
   border-radius: var(--r-2);
   flex: none;
 }
@@ -1289,7 +1292,7 @@ select.pick {
   min-height: 26px;
   font-size: 11.5px;
   padding: 3px 6px;
-  border: 1px solid var(--line);
+  border: 1px solid var(--line-control);
   border-radius: var(--r-2);
   background: var(--surface);
 }
@@ -1561,7 +1564,7 @@ dialog .foot {
   min-height: 30px;
   padding: 5px 9px;
   background: var(--surface);
-  border: 1px solid var(--line-strong);
+  border: 1px solid var(--line-control);
   border-radius: var(--r-2);
   font-size: 12.5px;
 }
@@ -2000,7 +2003,7 @@ dialog .foot {
  * and aria-pressed on each carries that to a screen reader. */
 .seg {
   display: inline-flex;
-  border: 1px solid var(--line-strong);
+  border: 1px solid var(--line-control);
   border-radius: var(--r-2);
   overflow: hidden;
   flex: none;

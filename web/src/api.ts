@@ -93,6 +93,13 @@ export const api = {
   list: (path: string) => request<Listing>("GET", `/files/${q({ path })}`),
   trash: () => request<{ items: FileNode[] }>("GET", "/files/trash"),
   recent: (limit = 12) => request<{ items: FileNode[] }>("GET", `/files/recent?limit=${limit}`),
+  // Name search across the tree. The server returns nothing below two characters, so the
+  // client does not have to duplicate that rule to avoid noise — but it still debounces.
+  search: (query: string, limit = 12) =>
+    request<{ items: FileNode[]; query: string }>(
+      "GET",
+      `/files/search?q=${encodeURIComponent(query)}&limit=${limit}`,
+    ),
   versions: (path: string) => request<VersionsResponse>("GET", `/files/versions${q({ path })}`),
   restoreVersion: (path: string, version: number) =>
     request<void>("POST", "/files/restore-version", { path, version }),

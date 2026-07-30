@@ -368,6 +368,27 @@ func run() error {
 	if err := shoot(cdp, filepath.Join(*outDir, "palette.png")); err != nil {
 		return err
 	}
+
+	// Type into the palette, so the frame shows server search results rather than the list of
+	// recently touched files. A React-controlled input ignores a plain value assignment: the
+	// native setter has to be used and an input event dispatched, or nothing happens.
+	fmt.Println("capturing a search…")
+	if msg, err := evalString(cdp, `(() => {
+		const input = document.querySelector('.palette input');
+		if (!input) return 'miss';
+		const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+		setter.call(input, '合同');
+		input.dispatchEvent(new Event('input', { bubbles: true }));
+		return 'ok';
+	})()`); err != nil {
+		return err
+	} else if msg != "ok" {
+		return fmt.Errorf("could not type into the palette: %s", msg)
+	}
+	time.Sleep(1200 * time.Millisecond)
+	if err := shoot(cdp, filepath.Join(*outDir, "palette-search.png")); err != nil {
+		return err
+	}
 	if _, err := evalString(cdp, "(() => { const s = document.querySelector('.scrim'); if (s) { s.click(); return 'scrim'; } return 'miss'; })()"); err != nil {
 		return err
 	}

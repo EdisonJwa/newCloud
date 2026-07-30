@@ -32,6 +32,7 @@ api:
 # Client checks. Mirrors the `web` job in CI so a local `make webcheck` means the same thing.
 webcheck:
 	cd web && pnpm typecheck
+	cd web && pnpm contrast
 	cd web && pnpm gen:api:check
 
 build: web
