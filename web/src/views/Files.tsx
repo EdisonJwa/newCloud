@@ -13,6 +13,7 @@
 import {
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type DragEvent,
@@ -30,6 +31,64 @@ interface Props {
   /** Bumped by the shell when something outside this view changed the tree. */
   reloadKey: number;
   onPathChange: (path: string) => void;
+}
+
+type ViewMode = "rows" | "grid";
+type SortKey = "name" | "size" | "modified";
+interface Sort {
+  key: SortKey;
+  dir: "asc" | "desc";
+}
+
+function readStored(key: string): string | null {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function writeStored(key: string, value: string): void {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    /* private mode: the preference simply does not persist */
+  }
+}
+
+function readSort(): Sort {
+  const raw = readStored("wc.sort");
+  if (raw) {
+    const [key, dir] = raw.split(":");
+    if ((key === "name" || key === "size" || key === "modified") && (dir === "asc" || dir === "desc")) {
+      return { key, dir };
+    }
+  }
+  return { key: "name", dir: "asc" };
+}
+
+// arrange filters and orders one column.
+//
+// Directories stay grouped first whatever the sort: they are the navigation, and a size sort
+// that buries folders under every large file would break the one thing the column view is for.
+function arrange(entries: FileNode[], needle: string, sort: Sort): FileNode[] {
+  const query = needle.trim().toLowerCase();
+  const rows = query ? entries.filter((e) => e.name.toLowerCase().includes(query)) : entries.slice();
+  rows.sort((a, b) => {
+    if ((a.kind === "dir") !== (b.kind === "dir")) return a.kind === "dir" ? -1 : 1;
+    let cmp = 0;
+    if (sort.key === "name") {
+      cmp = a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" });
+    } else if (sort.key === "size") {
+      cmp = a.size - b.size;
+    } else {
+      cmp = a.modified_at.localeCompare(b.modified_at);
+    }
+    // A stable tie-break keeps equal keys from reshuffling between renders.
+    if (cmp === 0) cmp = a.name.localeCompare(b.name);
+    return sort.dir === "asc" ? cmp : -cmp;
+  });
+  return rows;
 }
 
 /** Path helpers. The API addresses nodes by a slash-separated relative path. */
@@ -54,6 +113,11 @@ export function Files({ initialPath = "", reloadKey, onPathChange }: Props) {
   const [sel, setSel] = useState<{ level: number; entry: FileNode } | null>(null);
   const [focusLevel, setFocusLevel] = useState(0);
   const [filter, setFilter] = useState("");
+  const [view, setView] = useState<ViewMode>(() => (readStored("wc.view") === "grid" ? "grid" : "rows"));
+  const [sort, setSort] = useState<Sort>(readSort);
+  // picked holds ids in the deepest column. Selection in an ancestor column is a peek, not a
+  // multi-selection, because bulk operations need one unambiguous target directory.
+  const [picked, setPicked] = useState<string[]>([]);
   const [viewer, setViewer] = useState<{ entries: FileNode[]; index: number } | null>(null);
   const [dialog, setDialog] = useState<
     | { kind: "mkdir" }
@@ -151,7 +215,55 @@ export function Files({ initialPath = "", reloadKey, onPathChange }: Props) {
   const select = useCallback((level: number, entry: FileNode) => {
     setSel({ level, entry });
     setFocusLevel(level);
+    setPicked(level === dirs.length - 1 ? [entry.id] : []);
+  }, [dirs.length]);
+
+  // onPick implements the click modifiers people expect from a file manager: shift extends a
+  // range from the anchor, the platform modifier toggles one row, a plain click replaces.
+  const onPick = useCallback(
+    (level: number, entry: FileNode, e: React.MouseEvent) => {
+      setFocusLevel(level);
+      if (level !== dirs.length - 1) {
+        setSel({ level, entry });
+        setPicked([]);
+        return;
+      }
+
+      const rows = arrange(listings[dirs[level] ?? ""] ?? [], filter, sort);
+
+      if (e.shiftKey && sel && sel.level === level) {
+        const from = rows.findIndex((x) => x.id === sel.entry.id);
+        const to = rows.findIndex((x) => x.id === entry.id);
+        if (from >= 0 && to >= 0) {
+          const [lo, hi] = from < to ? [from, to] : [to, from];
+          setPicked(rows.slice(lo, hi + 1).map((x) => x.id));
+          return;
+        }
+      }
+
+      if (e.metaKey || e.ctrlKey) {
+        setPicked((prev) => (prev.includes(entry.id) ? prev.filter((id) => id !== entry.id) : [...prev, entry.id]));
+        setSel({ level, entry });
+        return;
+      }
+
+      setPicked([entry.id]);
+      setSel({ level, entry });
+    },
+    [dirs, listings, filter, sort, sel],
+  );
+
+  const clearPicked = useCallback(() => {
+    setPicked([]);
+    setSel(null);
   }, []);
+
+  // pickedEntries resolves the ids against the deepest listing, so a stale id (a file deleted
+  // in another tab) simply drops out instead of producing an empty entry.
+  const pickedEntries = useMemo(
+    () => (listings[deepest] ?? []).filter((e) => picked.includes(e.id)),
+    [listings, deepest, picked],
+  );
 
   const open = useCallback(
     (level: number, entry: FileNode) => {
@@ -219,7 +331,7 @@ export function Files({ initialPath = "", reloadKey, onPathChange }: Props) {
 
   const onColumnKey = (e: KeyboardEvent<HTMLDivElement>, level: number) => {
     const dir = dirs[level] ?? "";
-    const entries = filtered(listings[dir] ?? [], level === dirs.length - 1 ? filter : "");
+    const entries = arrange(listings[dir] ?? [], level === dirs.length - 1 ? filter : "", sort);
     const at = sel && sel.level === level ? entries.findIndex((x) => x.id === sel.entry.id) : -1;
     const move = (next: number) => {
       const entry = entries[Math.max(0, Math.min(next, entries.length - 1))];
@@ -267,11 +379,34 @@ export function Files({ initialPath = "", reloadKey, onPathChange }: Props) {
         }
         return;
       case "Delete":
-        if (sel) {
-          e.preventDefault();
+        e.preventDefault();
+        if (pickedEntries.length > 0) {
+          setDialog({ kind: "delete", entries: pickedEntries });
+        } else if (sel) {
           setDialog({ kind: "delete", entries: [sel.entry] });
         }
         return;
+      case "a":
+        if ((e.metaKey || e.ctrlKey) && level === dirs.length - 1) {
+          e.preventDefault();
+          setPicked(entries.map((x) => x.id));
+        }
+        return;
+      case "Escape":
+        if (picked.length > 0) {
+          e.preventDefault();
+          clearPicked();
+        }
+        return;
+      case " ": {
+        // Space toggles the focused row, which is how a keyboard user builds a selection.
+        if (level !== dirs.length - 1 || !sel || sel.level !== level) return;
+        e.preventDefault();
+        setPicked((prev) =>
+          prev.includes(sel.entry.id) ? prev.filter((id) => id !== sel.entry.id) : [...prev, sel.entry.id],
+        );
+        return;
+      }
     }
   };
 
@@ -300,7 +435,66 @@ export function Files({ initialPath = "", reloadKey, onPathChange }: Props) {
             {upload.done}/{upload.total}
           </span>
         ) : null}
+        {picked.length > 1 ? (
+          <div className="selection-bar" role="status">
+            <span className="mono">{t("files.selected", { n: picked.length })}</span>
+            <button
+              type="button"
+              className="btn sm danger"
+              onClick={() => setDialog({ kind: "delete", entries: pickedEntries })}
+            >
+              <Icon name="trash" size={12} />
+              {t("detail.delete")}
+            </button>
+            <button type="button" className="btn sm ghost" onClick={clearPicked}>
+              {t("files.clearSelection")}
+            </button>
+          </div>
+        ) : null}
         <span className="spacer" />
+        <div className="seg" role="group" aria-label={t("files.view.label")}>
+          <button
+            type="button"
+            aria-pressed={view === "rows"}
+            aria-label={t("files.view.rows")}
+            title={t("files.view.rows")}
+            onClick={() => {
+              setView("rows");
+              writeStored("wc.view", "rows");
+            }}
+          >
+            <Icon name="rows" size={13} />
+          </button>
+          <button
+            type="button"
+            aria-pressed={view === "grid"}
+            aria-label={t("files.view.grid")}
+            title={t("files.view.grid")}
+            onClick={() => {
+              setView("grid");
+              writeStored("wc.view", "grid");
+            }}
+          >
+            <Icon name="grid" size={13} />
+          </button>
+        </div>
+        <select
+          className="pick"
+          value={`${sort.key}:${sort.dir}`}
+          aria-label={t("files.sort.label")}
+          onChange={(e) => {
+            const [key, dir] = e.target.value.split(":");
+            const next: Sort = { key: key as SortKey, dir: dir as "asc" | "desc" };
+            setSort(next);
+            writeStored("wc.sort", e.target.value);
+          }}
+        >
+          <option value="name:asc">{t("files.sort.nameAsc")}</option>
+          <option value="name:desc">{t("files.sort.nameDesc")}</option>
+          <option value="modified:desc">{t("files.sort.newest")}</option>
+          <option value="size:desc">{t("files.sort.largest")}</option>
+          <option value="size:asc">{t("files.sort.smallest")}</option>
+        </select>
         <div className="searchbox">
           <span className="icon">
             <Icon name="search" size={13} />
@@ -342,9 +536,10 @@ export function Files({ initialPath = "", reloadKey, onPathChange }: Props) {
         >
           <div className="collist">
             {dirs.map((dir, level) => {
-            const entries = filtered(listings[dir] ?? [], level === dirs.length - 1 ? filter : "");
             const isLast = level === dirs.length - 1;
+            const entries = arrange(listings[dir] ?? [], isLast ? filter : "", sort);
             const loadingHere = loading[dir] && listings[dir] === undefined;
+            const asGrid = isLast && view === "grid";
 
             return (
               <div key={dir || "/"} className={`col${isLast ? " active" : ""}`}>
@@ -359,16 +554,18 @@ export function Files({ initialPath = "", reloadKey, onPathChange }: Props) {
                   </span>
                   <span className="count">{entries.length}</span>
                 </div>
-                <div className="colsub" aria-hidden="true">
-                  <span>{t("files.name")}</span>
-                  <span>{t("files.size")}</span>
-                </div>
+                {asGrid ? null : (
+                  <div className="colsub" aria-hidden="true">
+                    <span>{t("files.name")}</span>
+                    <span>{t("files.size")}</span>
+                  </div>
+                )}
 
                 <div
                   ref={(node) => {
                     colRefs.current[level] = node;
                   }}
-                  className="colbody"
+                  className={asGrid ? "colbody colgrid" : "colbody"}
                   role="listbox"
                   tabIndex={0}
                   aria-label={level === 0 ? t("nav.files") : leafOf(dir)}
@@ -407,7 +604,36 @@ export function Files({ initialPath = "", reloadKey, onPathChange }: Props) {
                     )
                   ) : null}
 
-                  {entries.map((entry) => {
+                  {asGrid
+                    ? entries.map((entry) => {
+                        const chosen = picked.includes(entry.id);
+                        return (
+                          <div
+                            key={entry.id}
+                            id={`row-${level}-${entry.id}`}
+                            role="option"
+                            aria-selected={chosen}
+                            className={`tile${entry.kind === "dir" ? " dir" : ""}`}
+                            onClick={(e) => onPick(level, entry, e)}
+                            onDoubleClick={() => open(level, entry)}
+                          >
+                            <span className="tileart">
+                              {entry.preview === "image" ? (
+                                <img src={thumbnailURL(entry.path)} alt="" loading="lazy" />
+                              ) : (
+                                <Icon name={entry.kind === "dir" ? "files" : "doc"} size={18} />
+                              )}
+                            </span>
+                            <span className="tilename" title={entry.name}>
+                              {entry.name}
+                            </span>
+                            <span className="tilesize">
+                              {entry.kind === "dir" ? "—" : fmt.size(entry.size)}
+                            </span>
+                          </div>
+                        );
+                      })
+                    : entries.map((entry) => {
                     const selected = sel?.level === level && sel.entry.id === entry.id;
                     return (
                       <div
@@ -416,7 +642,7 @@ export function Files({ initialPath = "", reloadKey, onPathChange }: Props) {
                         role="option"
                         aria-selected={selected}
                         className={`row${entry.kind === "dir" ? " dir" : ""}`}
-                        onClick={() => select(level, entry)}
+                        onClick={(e) => onPick(level, entry, e)}
                         onDoubleClick={() => open(level, entry)}
                         onKeyDown={(e) => {
                           if (e.key === "Enter") open(level, entry);
@@ -452,7 +678,7 @@ export function Files({ initialPath = "", reloadKey, onPathChange }: Props) {
             })}
           </div>
 
-          {sel ? (
+          {sel && picked.length <= 1 ? (
             <Detail
               key={sel.entry.id}
               entry={sel.entry}
@@ -735,11 +961,6 @@ function Stage({ entry }: { entry: FileNode }) {
 
 /* ---------- helpers ---------- */
 
-function filtered(entries: FileNode[], filter: string): FileNode[] {
-  const needle = filter.trim().toLowerCase();
-  if (!needle) return entries;
-  return entries.filter((e) => e.name.toLowerCase().includes(needle));
-}
 
 function isDenied(message: string): boolean {
   const lower = message.toLowerCase();

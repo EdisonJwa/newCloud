@@ -65,6 +65,42 @@ jobs:
         # it verbatim and hit a startup error with no obvious cause.
         run: go test ./internal/config/ -run TestExampleConfig -count=1 -v
 
+  web:
+    # The browser client is TypeScript that ships as bytes inside the Go binary, so it is
+    # checked like any other build artifact: it must typecheck, it must build, and the
+    # generated API types must not drift from openapi.yaml.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: install
+        working-directory: web
+        run: pnpm install --frozen-lockfile
+      - name: typecheck
+        working-directory: web
+        run: pnpm typecheck
+      - name: generated API types are current
+        # Regenerating from openapi.yaml and diffing is the only way to know the committed
+        # output still describes the spec. A stale client type is worse than none.
+        working-directory: web
+        run: pnpm gen:api:check
+      - name: build
+        working-directory: web
+        run: pnpm build
+      - name: committed bundle matches source
+        run: |
+          if ! git diff --quiet -- internal/webassets/dist; then
+            echo "internal/webassets/dist is stale; run 'make web' and commit the result"
+            git diff --stat -- internal/webassets/dist
+            exit 1
+          fi
   vulncheck:
     runs-on: ubuntu-latest
     steps:

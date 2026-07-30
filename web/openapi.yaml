@@ -1,0 +1,558 @@
+openapi: 3.1.0
+info:
+  title: newcloud
+  version: "1"
+  description: |
+    The REST surface the browser client uses.
+
+    This document is the single source of truth for the client's types: `src/api-types.ts` is
+    generated from it and `src/types.ts` only aliases the generated names. Hand-writing the
+    types beside a hand-written client is how a client drifts from its server without anyone
+    noticing — the compiler keeps agreeing with the wrong shape.
+
+    Denials are reported as 404, never 403: the server does not reveal whether an object
+    exists to a caller who may not see it. Clients must not special-case 403.
+
+servers:
+  - url: ""
+
+paths:
+  /api/auth/me:
+    get:
+      summary: The signed-in user
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Me" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+
+  /api/auth/logout:
+    post:
+      summary: End the session
+      responses:
+        "204": { description: ended }
+
+  /api/files/:
+    get:
+      summary: List one directory
+      parameters:
+        - name: path
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Listing" }
+        "404": { $ref: "#/components/responses/NotFoundResult" }
+    delete:
+      summary: Move a file or directory to the trash
+      parameters:
+        - name: path
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "204": { description: trashed }
+        "404": { $ref: "#/components/responses/NotFoundResult" }
+
+  /api/files/recent:
+    get:
+      summary: Recently modified files, newest first
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 60, default: 12 }
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/FileNode" } }
+
+  /api/files/trash:
+    get:
+      summary: Trashed nodes
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/FileNode" } }
+
+  /api/files/versions:
+    get:
+      summary: Stored versions of one file
+      parameters:
+        - name: path
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/VersionsResponse" }
+
+  /api/files/restore-version:
+    post:
+      summary: Make an older version current
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path, version]
+              properties:
+                path: { type: string }
+                version: { type: integer }
+      responses:
+        "204": { description: restored }
+
+  /api/files/restore:
+    post:
+      summary: Restore from the trash
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id: { type: string }
+      responses:
+        "204": { description: restored }
+
+  /api/files/mkdir:
+    post:
+      summary: Create a directory
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path]
+              properties:
+                path: { type: string }
+      responses:
+        "201": { description: created }
+
+  /api/files/rename:
+    post:
+      summary: Rename in place
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path, name]
+              properties:
+                path: { type: string }
+                name: { type: string }
+      responses:
+        "204": { description: renamed }
+
+  /api/files/upload:
+    post:
+      summary: Upload one file into a directory
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [path, file]
+              properties:
+                path: { type: string, description: Target directory, empty for the root }
+                file: { type: string, format: binary }
+      responses:
+        "201":
+          description: created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FileNode" }
+
+  /api/files/download:
+    get:
+      summary: Download or inline-render a file
+      parameters:
+        - name: path
+          in: query
+          required: true
+          schema: { type: string }
+        - name: inline
+          in: query
+          description: Ask for inline rendering. The server re-checks the type and the bytes, so a stale or hostile declaration cannot force this.
+          schema: { type: string, enum: ["1"] }
+      responses:
+        "200":
+          description: the file
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        "415":
+          description: the type is never rendered inline
+
+  /api/files/thumbnail:
+    get:
+      summary: A small raster preview for image files
+      parameters:
+        - name: path
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: a JPEG
+          content:
+            image/jpeg:
+              schema: { type: string, format: binary }
+        "415":
+          description: not an image
+
+  /api/shares/:
+    get:
+      summary: Shares owned by the caller
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/Share" } }
+    post:
+      summary: Create a share
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path, kind]
+              properties:
+                path: { type: string }
+                kind: { $ref: "#/components/schemas/ShareKind" }
+                password: { type: string }
+                expires_in_seconds: { type: integer }
+                max_downloads: { type: integer }
+                max_uploads: { type: integer }
+      responses:
+        "201":
+          description: created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ShareCreated" }
+
+  /api/shares/{id}:
+    delete:
+      summary: Revoke a share
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "204": { description: revoked }
+
+  /api/audit/events:
+    get:
+      summary: Audit events, newest first
+      parameters:
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0 }
+        - name: actions
+          in: query
+          schema: { type: string }
+        - name: result
+          in: query
+          schema: { type: string }
+        - name: since
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuditPage" }
+
+  /api/apppasswords/:
+    get:
+      summary: App passwords for WebDAV and other clients
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/AppPassword" } }
+    post:
+      summary: Issue an app password
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [label, scope]
+              properties:
+                label: { type: string }
+                scope: { type: string, enum: [rw, ro] }
+      responses:
+        "201":
+          description: created; the plaintext appears exactly once
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [secret, id, prefix]
+                properties:
+                  secret: { type: string }
+                  id: { type: string }
+                  prefix: { type: string }
+                  note: { type: string }
+
+  /api/apppasswords/{id}:
+    delete:
+      summary: Revoke an app password
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "204": { description: revoked }
+
+  /s/{token}:
+    get:
+      summary: Public share landing
+      description: |
+        Returns the shell as HTML for a navigation and JSON for a fetch, so the same URL works
+        for both. No session is required.
+      parameters:
+        - name: token
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: the landing page, or its data
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ShareLanding" }
+            text/html:
+              schema: { type: string }
+        "404": { $ref: "#/components/responses/NotFoundResult" }
+
+components:
+  responses:
+    Unauthenticated:
+      description: no live session
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFoundResult:
+      description: |
+        Absent, or present but not visible to this caller. The two are deliberately
+        indistinguishable so a client cannot probe for existence.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+        message: { type: string }
+
+    Me:
+      type: object
+      required: [id, username, email, role]
+      properties:
+        id: { type: string }
+        username: { type: string }
+        email: { type: string }
+        display_name: { type: string }
+        role: { type: string }
+        quota_bytes: { type: integer }
+        used_bytes: { type: integer }
+        storage:
+          type: object
+          properties:
+            layout: { type: string }
+            backend: { type: string }
+
+    FileNode:
+      type: object
+      required: [id, name, path, kind, size, modified_at, created_at]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        path: { type: string }
+        kind: { type: string, enum: [file, dir] }
+        size: { type: integer }
+        mime: { type: string }
+        etag: { type: string }
+        modified_at: { type: string }
+        created_at: { type: string }
+        trashed: { type: boolean }
+        preview:
+          $ref: "#/components/schemas/PreviewKind"
+        share_count: { type: integer, description: Omitted when zero. }
+        has_versions: { type: boolean, description: Omitted when false. }
+
+    PreviewKind:
+      type: string
+      enum: [image, video, audio, pdf, text]
+
+    Listing:
+      type: object
+      required: [path, name, children, truncated]
+      properties:
+        path: { type: string }
+        name: { type: string }
+        truncated: { type: boolean }
+        children:
+          type: array
+          items: { $ref: "#/components/schemas/FileNode" }
+
+    Version:
+      type: object
+      required: [version, size, created_at]
+      properties:
+        version: { type: integer }
+        size: { type: integer }
+        created_at: { type: string }
+
+    VersionsResponse:
+      type: object
+      required: [path, versions, cheap_versions]
+      properties:
+        path: { type: string }
+        cheap_versions: { type: boolean }
+        versions:
+          type: array
+          items: { $ref: "#/components/schemas/Version" }
+
+    ShareKind:
+      type: string
+      enum: [link, email, request]
+
+    Share:
+      type: object
+      required: [id, node_id, kind, label, node_path, has_password, download_count, upload_count, permissions, hide_contents, created_at]
+      properties:
+        id: { type: string }
+        node_id: { type: string }
+        kind: { $ref: "#/components/schemas/ShareKind" }
+        label: { type: string }
+        url: { type: string }
+        node_path: { type: string }
+        has_password: { type: boolean }
+        expires_at: { type: string }
+        max_downloads: { type: integer }
+        download_count: { type: integer }
+        max_uploads: { type: integer }
+        upload_count: { type: integer }
+        permissions: { type: array, items: { type: string } }
+        hide_contents: { type: boolean }
+        recipients: { type: array, items: { type: string } }
+        created_at: { type: string }
+        revoked_at: { type: string }
+
+    ShareCreated:
+      type: object
+      required: [share, token, note]
+      properties:
+        share: { $ref: "#/components/schemas/Share" }
+        token: { type: string, description: The plaintext token, returned exactly once. }
+        note: { type: string }
+
+    AuditEvent:
+      type: object
+      required: [id, ts, actor_kind, action, target_kind, result]
+      properties:
+        id: { type: integer }
+        ts: { type: string }
+        actor_kind: { type: string }
+        actor_user_id: { type: string }
+        actor_email: { type: string }
+        actor_ip: { type: string }
+        user_agent: { type: string }
+        action: { type: string }
+        target_kind: { type: string }
+        target_id: { type: string }
+        share_id: { type: string }
+        result: { type: string }
+        bytes: { type: integer }
+        metadata:
+          type: object
+          additionalProperties: true
+
+    AuditPage:
+      type: object
+      required: [events, total, offset, page_size, has_more, actions]
+      properties:
+        events:
+          type: array
+          items: { $ref: "#/components/schemas/AuditEvent" }
+        total: { type: integer }
+        offset: { type: integer }
+        page_size: { type: integer }
+        has_more: { type: boolean }
+        actions:
+          type: array
+          items: { type: string }
+
+    AppPassword:
+      type: object
+      required: [id, label, prefix, scope, created_at, revoked]
+      properties:
+        id: { type: string }
+        label: { type: string }
+        prefix: { type: string }
+        scope: { type: string }
+        created_at: { type: string }
+        expires_at: { type: string }
+        last_used: { type: string }
+        revoked: { type: boolean }
+
+    ShareLanding:
+      type: object
+      required: [kind, can_read, requires_password, requires_email, upload_count]
+      properties:
+        kind: { $ref: "#/components/schemas/ShareKind" }
+        label: { type: string }
+        can_read: { type: boolean }
+        requires_password: { type: boolean }
+        requires_email: { type: boolean }
+        expires_at: { type: string }
+        max_uploads: { type: integer }
+        upload_count: { type: integer }
+        children:
+          type: array
+          items: { $ref: "#/components/schemas/FileNode" }

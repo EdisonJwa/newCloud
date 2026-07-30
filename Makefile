@@ -1,4 +1,4 @@
-.PHONY: test test-race build web lint fmt clean race vuln check devidp e2e uicheck dropcheck example-config
+.PHONY: test test-race build web webcheck api apicheck lint fmt clean race vuln check devidp e2e uicheck dropcheck example-config
 
 GO ?= go
 
@@ -23,7 +23,16 @@ test-race: race
 # Rebuild the browser client. The output lands in internal/webassets/dist, which is committed
 # and embedded, so `go build` on its own always works; this target guarantees it is current.
 web:
-	cd web && pnpm install --frozen-lockfile && pnpm build
+	cd web && pnpm install --frozen-lockfile && pnpm gen:api && pnpm build
+
+# Regenerate the client types from the OpenAPI document.
+api:
+	cd web && pnpm gen:api
+
+# Client checks. Mirrors the `web` job in CI so a local `make webcheck` means the same thing.
+webcheck:
+	cd web && pnpm typecheck
+	cd web && pnpm gen:api:check
 
 build: web
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags="-s -w" -o bin/newcloud ./cmd/newcloud
@@ -61,7 +70,7 @@ dropcheck:
 	$(GO) run ./tools/demoshot -base https://localhost:8443 -out demo-run/dropcheck -test-drop
 
 # Full pre-commit check.
-check: lint example-config race
+check: lint example-config webcheck race
 
 clean:
 	rm -rf bin

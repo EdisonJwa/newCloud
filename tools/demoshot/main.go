@@ -40,6 +40,9 @@ var (
 	// eval runs one expression after sign-in and prints the result. Layout bugs are easier to
 	// settle by measuring the live DOM than by reasoning about the cascade.
 	evalExpr = flag.String("eval", "", "evaluate this JS after sign-in and print the result")
+	// startPath navigates to base+path after sign-in and before -eval runs, so a probe can
+	// measure a specific view instead of whatever the landing page happens to be.
+	startPath = flag.String("path", "", "navigate here (relative) after sign-in, before -eval")
 )
 
 func main() {
@@ -136,6 +139,13 @@ func run() error {
 		return checkDropUpload(cdp)
 	}
 
+	if *startPath != "" {
+		if err := navigate(cdp, *base+*startPath); err != nil {
+			return err
+		}
+		time.Sleep(2000 * time.Millisecond)
+	}
+
 	if *evalExpr != "" {
 		out, err := evalString(cdp, *evalExpr)
 		if err != nil {
@@ -210,6 +220,101 @@ func run() error {
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
+
+	// Back to the root: the grid and selection frames need a folder with several entries, and
+	// the steps above deliberately descended into a one-file directory.
+	if err := navigate(cdp, *base+"/?view=files"); err != nil {
+		return err
+	}
+	time.Sleep(2200 * time.Millisecond)
+
+	// ---- Grid layout ----
+	//
+	// Only the deepest column can be a grid; the ones to its left are navigation. The frame
+	// is captured right after the toggle so it proves the control works, not that a grid can
+	// be rendered at all.
+	fmt.Println("capturing the grid layout…")
+	if msg, err := jsClickSelector(cdp, ".seg button:nth-child(2)"); err != nil {
+		return err
+	} else if msg != "ok" {
+		return fmt.Errorf("could not switch to grid: %s", msg)
+	}
+	time.Sleep(1100 * time.Millisecond)
+	if err := shoot(cdp, filepath.Join(*outDir, "files-grid.png")); err != nil {
+		return err
+	}
+	if _, err := jsClickSelector(cdp, ".seg button:nth-child(1)"); err != nil {
+		return err
+	}
+	time.Sleep(700 * time.Millisecond)
+
+	// ---- Multi-select ----
+	fmt.Println("capturing a multi-selection…")
+	if msg, err := evalString(cdp, `(() => {
+		const rows = [...document.querySelectorAll('.col:last-child .row')];
+		if (rows.length < 3) return 'few';
+		rows[0].dispatchEvent(new MouseEvent('click', { bubbles: true }));
+		rows[2].dispatchEvent(new MouseEvent('click', { bubbles: true, metaKey: true }));
+		rows[3].dispatchEvent(new MouseEvent('click', { bubbles: true, metaKey: true }));
+		return 'ok';
+	})()`); err != nil {
+		return err
+	} else if msg != "ok" {
+		fmt.Println("  (not enough rows in this folder; skipping the selection frame)")
+	} else {
+		time.Sleep(700 * time.Millisecond)
+		if err := shoot(cdp, filepath.Join(*outDir, "files-selection.png")); err != nil {
+			return err
+		}
+		if _, err := evalString(cdp, `(() => {
+			const box = document.querySelector('.colbody');
+			if (box) box.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+			return 'ok';
+		})()`); err != nil {
+			return err
+		}
+		time.Sleep(400 * time.Millisecond)
+	}
+
+	// ---- Right to left ----
+	//
+	// Every rule uses logical properties, so this is the whole of the RTL implementation. The
+	// frame exists to prove that claim rather than to assert it.
+	fmt.Println("capturing a right-to-left layout…")
+	// Capture the hard case: a selected file, so the detail panel is present and the column
+	// strip has to share the width with it. Mirroring an empty screen proves very little.
+	if _, err := jsFirst(cdp, ".col:last-child .row", "click"); err != nil {
+		return err
+	}
+	time.Sleep(900 * time.Millisecond)
+	if _, err := evalString(cdp, "(() => { document.documentElement.dir = 'rtl'; return 'ok'; })()"); err != nil {
+		return err
+	}
+	time.Sleep(600 * time.Millisecond)
+	if metrics, err := evalString(cdp, `(() => {
+		const r = (e) => e ? { l: Math.round(e.getBoundingClientRect().left), w: Math.round(e.getBoundingClientRect().width) } : null;
+		const cols = document.querySelector('.cols');
+		return JSON.stringify({
+			scrollWidth: cols ? cols.scrollWidth : -1,
+			clientWidth: cols ? cols.clientWidth : -1,
+			scrollLeft: cols ? cols.scrollLeft : -1,
+			collist: r(document.querySelector('.collist')),
+			col: r(document.querySelector('.col')),
+			detail: r(document.querySelector('.detail')),
+		});
+	})()`); err != nil {
+		return err
+	} else {
+		fmt.Println("  rtl metrics: " + metrics)
+	}
+	time.Sleep(700 * time.Millisecond)
+	if err := shoot(cdp, filepath.Join(*outDir, "files-rtl.png")); err != nil {
+		return err
+	}
+	if _, err := evalString(cdp, "(() => { document.documentElement.dir = 'ltr'; return 'ok'; })()"); err != nil {
+		return err
+	}
+	time.Sleep(400 * time.Millisecond)
 
 	// ---- Sharing, activity, trash, access ----
 	for _, section := range []struct{ name, file string }{
@@ -308,6 +413,17 @@ func jsClick(cdp *wsConn, sel, want string) (string, error) {
 		el.click();
 		return 'ok';
 	})()`, sel, strings.ToLower(want))
+	return evalString(cdp, expr)
+}
+
+// jsClickSelector clicks the first element matching a CSS selector.
+func jsClickSelector(cdp *wsConn, sel string) (string, error) {
+	expr := fmt.Sprintf(`(() => {
+		const el = document.querySelector(%q);
+		if (!el) return 'miss';
+		el.click();
+		return 'ok';
+	})()`, sel)
 	return evalString(cdp, expr)
 }
 
@@ -479,7 +595,7 @@ func checkInteractions(cdp *wsConn) error {
 
 func shoot(cdp *wsConn, path string) error {
 	raw, err := cdp.CallWithResult("Page.captureScreenshot", map[string]any{
-		"format": "png", "captureBeyondViewport": true,
+		"format": "png", "captureBeyondViewport": false,
 	})
 	if err != nil {
 		return err
