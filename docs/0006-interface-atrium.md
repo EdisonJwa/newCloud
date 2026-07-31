@@ -383,5 +383,44 @@ RTL 实测是**正确镜像**的：`dir=rtl` 后详情面板到左侧、导航�
 这类问题正是"看着还行"与"达标"之间的差距：加一个 10px 的灰色标签，肉眼看不出问题，
 测一下就是 3.4:1。
 
+---
+
+## 14. 与重构前的对照
+
+对照用的不是记忆，是同一天、同一批示例数据、同一浏览器窗口（1440×1000）下的实拍。旧版由
+`git worktree add <dir> 30a341b` 单独构建并运行，两版都通过各自的 `tools/demoshot` 抓图。
+
+| | 重构前（Atlas，30a341b） | 重构后（Atrium） |
+|---|---|---|
+| 首屏 | 直接落在文件列表 | 首页：最近 / 你分享的 / 空间用量 |
+| 导航 | 左侧 216px 侧边栏 | 顶栏分区，无侧边栏 |
+| 层级 | 面包屑 + 单列表 | 列视图，路径即列 |
+| 详情 | 常驻第三列或覆盖层 | 末列按需出现，选中多个时为选择条 |
+| 视图 | 列表 / 网格切换（末列） | 列表 / 网格（末列）+ 排序 |
+| 搜索 | 当前文件夹筛选 | 跨树名称搜索（⌘K） |
+| 预览 | 面板内嵌预览 | 全屏沉浸式 + 兄弟文件胶片条 |
+| 批量 | 无 | Shift/⌘ 多选 + 批量删除 |
+| 技术 | 手写 DOM，无构建 | React + TS + Vite，类型由 OpenAPI 生成 |
+
+可见的结构差异不是配色或字号：旧版第一屏是"左边一竖条 + 中间一张表"，新版第一屏没有任何
+列表，且整个左侧是空的。文件页里，旧版永远只有一张表，新版随着下钻长出第二、第三列。
+
+复现方式（两版都能重新抓）：
+
+```bash
+# 旧版
+git worktree add ../newcloud-before 30a341b
+cd ../newcloud-before && go run ./tools/demo -data ./demo-run
+go run ./tools/demoshot -base https://localhost:8443 -out ./demo-run/before <share-token>
+
+# 当前版
+go run ./tools/demo -data ./demo-run
+go run ./tools/demoshot -base https://localhost:8443 -out ./demo-run/after <share-token>
+```
+
+截图不入库：它们是构建产物，提交进来会随每次样式调整产生无法阅读的二进制 diff。抓图脚本在
+仓库里，命令在上面。
+
+
 
 
