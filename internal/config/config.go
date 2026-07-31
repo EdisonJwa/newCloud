@@ -117,10 +117,29 @@ type LocalStorage struct {
 	Root string `yaml:"root"`
 }
 
+// S3Storage configures the object-store backend.
+//
+// Credentials are optional on purpose: when they are absent the standard AWS chain is used
+// (environment, shared credentials file, instance role). A deployment in a cloud account
+// should not need to put a key in a config file to start.
 type S3Storage struct {
-	Endpoint string `yaml:"endpoint"`
-	Bucket   string `yaml:"bucket"`
-	Region   string `yaml:"region"`
+	Endpoint  string `yaml:"endpoint"`
+	Bucket    string `yaml:"bucket"`
+	Region    string `yaml:"region"`
+	AccessKey string `yaml:"access_key"`
+	SecretKey string `yaml:"secret_key"`
+	// Secure selects https and defaults to true. Sending object data in the clear must be an
+	// explicit decision rather than something inherited from a zero value.
+	Secure *bool  `yaml:"secure"`
+	Prefix string `yaml:"prefix"`
+}
+
+// UseTLS reports whether the connection must use https.
+func (s S3Storage) UseTLS() bool {
+	if s.Secure == nil {
+		return true
+	}
+	return *s.Secure
 }
 
 type LimitsConfig struct {
@@ -322,6 +341,12 @@ func (c *Config) Validate() error {
 	case "s3":
 		if c.Storage.S3.Bucket == "" {
 			return invalid("storage.s3.bucket is required when backend=s3")
+		}
+		if c.Storage.S3.Endpoint == "" {
+			return invalid("storage.s3.endpoint is required when backend=s3")
+		}
+		if (c.Storage.S3.AccessKey == "") != (c.Storage.S3.SecretKey == "") {
+			return invalid("storage.s3.access_key and secret_key must be set together, or both left empty to use the environment chain")
 		}
 	default:
 		return invalid("storage.backend must be \"local\" or \"s3\", got %q", c.Storage.Backend)

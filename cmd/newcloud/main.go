@@ -27,6 +27,7 @@ import (
 	"github.com/EdisonJwa/newCloud/internal/authz"
 	"github.com/EdisonJwa/newCloud/internal/blob"
 	"github.com/EdisonJwa/newCloud/internal/blob/local"
+	s3blob "github.com/EdisonJwa/newCloud/internal/blob/s3"
 	"github.com/EdisonJwa/newCloud/internal/config"
 	"github.com/EdisonJwa/newCloud/internal/mail"
 	"github.com/EdisonJwa/newCloud/internal/server"
@@ -239,6 +240,44 @@ func openMetadata(ctx context.Context, log *slog.Logger) (storepkg.Store, func()
 	return pg, pool.Close, nil
 }
 
+// openS3Storage builds the content store on top of an S3-compatible bucket.
+//
+// The layout is still the content-addressed one: the bucket holds blobs keyed by hash, and the
+// tree layout is rejected in openStorage because it is a filesystem mirror by definition. That
+// keeps the two axes independent exactly as they are for local disk.
+func openS3Storage(cfg config.Config, meta storepkg.Store, log *slog.Logger) (layout.ContentStore, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	s3cfg := cfg.Storage.S3
+	store, err := s3blob.New(ctx, s3blob.Config{
+		Endpoint:  s3cfg.Endpoint,
+		Bucket:    s3cfg.Bucket,
+		Region:    s3cfg.Region,
+		AccessKey: s3cfg.AccessKey,
+		SecretKey: s3cfg.SecretKey,
+		Secure:    s3cfg.UseTLS(),
+		Prefix:    s3cfg.Prefix,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	log.Info("storage ready",
+		"backend", "s3", "layout", string(layout.ModeBlob),
+		"endpoint", s3cfg.Endpoint, "bucket", s3cfg.Bucket,
+		"deduplicated", true, "inspectable", false)
+
+	adapter, err := blobstore.New(store, &resolverAdapter{r: meta.Resolver()})
+	if err != nil {
+		return nil, err
+	}
+	// Uploads stage on local disk even when the bytes land in a bucket: the hash is needed
+	// before the object can be named.
+	adapter = adapter.WithSpoolDir(cfg.Storage.Local.Root)
+	return adapter, nil
+}
+
 // openStorage builds the content store for the configured backend and layout.
 //
 // The two axes are independent:
@@ -265,8 +304,12 @@ func openStorage(cfg config.Config, meta storepkg.Store, log *slog.Logger) (layo
 		return s, nil
 	}
 
+	if cfg.Storage.Backend == "s3" {
+		return openS3Storage(cfg, meta, log)
+	}
+
 	if cfg.Storage.Backend != "local" {
-		return nil, fmt.Errorf("storage backend %q is not implemented yet; use \"local\"", cfg.Storage.Backend)
+		return nil, fmt.Errorf("storage backend %q is not supported; use \"local\" or \"s3\"", cfg.Storage.Backend)
 	}
 
 	ls, err := local.New(cfg.Storage.Local.Root)

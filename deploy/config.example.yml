@@ -52,10 +52,26 @@ storage:
     # tree layout: the user-visible tree itself.
     root: "/var/lib/newcloud/blobs"
   s3:
-    endpoint: "https://minio.example.com"
+    # S3-compatible object storage. Tested against AWS S3 semantics; MinIO, Ceph,
+    # Cloudflare R2, Backblaze B2 and Wasabi all work through the same client.
+    #
+    # The bucket must already exist: creating buckets needs account-level
+    # permission that a storage server should not have, and a typo in a bucket
+    # name should fail at boot rather than silently create a second one.
+    endpoint: "minio.example.com"
     bucket: "newcloud"
     region: "us-east-1"
-
+    # Leave the keys empty to use the standard AWS chain (environment,
+    # ~/.aws/credentials, instance role). Setting them here is supported for
+    # self-hosters who prefer a single config file, but a secret in YAML ends up
+    # in backups and in `docker inspect`.
+    access_key: ""
+    secret_key: ""
+    # https. Defaults to true; set false only for a plaintext endpoint on a
+    # trusted network.
+    secure: true
+    # Optional key prefix, for a bucket shared with other applications.
+    prefix: ""
 limits:
   max_file_bytes: 1099511627776        # 1 TiB hard cap
   default_file_quota_bytes: 10737418240 # 10 GiB default per-user soft cap

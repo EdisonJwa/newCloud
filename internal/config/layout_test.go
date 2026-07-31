@@ -59,6 +59,7 @@ func TestLayoutValidation(t *testing.T) {
 			cfg.Storage.Layout = c.layout
 			cfg.Storage.Local.Root = "/tmp/blobs"
 			cfg.Storage.S3.Bucket = "bucket"
+			cfg.Storage.S3.Endpoint = "minio.example.com"
 
 			err := cfg.Validate()
 			if c.wantErr {

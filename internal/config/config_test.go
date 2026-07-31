@@ -121,8 +121,15 @@ func TestStorageBackendValidation(t *testing.T) {
 	}
 
 	c.Storage.S3.Bucket = "cloud"
+	// A bucket without an endpoint is under-specified: there is no endpoint to guess at, and
+	// guessing would point a self-hosted deployment at somebody else's service.
+	if err := c.Validate(); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatal("s3 without an endpoint must be rejected")
+	}
+
+	c.Storage.S3.Endpoint = "minio.example.com"
 	if err := c.Validate(); err != nil {
-		t.Fatalf("s3 with a bucket should pass: %v", err)
+		t.Fatalf("s3 with a bucket and an endpoint should pass: %v", err)
 	}
 }
 
