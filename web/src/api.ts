@@ -1,9 +1,20 @@
 // API client.
 //
-// Everything goes through `request`, so there is one place that handles the session, offline
-// state, and error shape. A failed call raises APIError with the server's code and message,
-// which the UI shows verbatim rather than inventing its own wording for a server condition.
+// The calls are typed and generated from openapi.yaml: `client.GET("/api/files/", ...)` only
+// compiles if the path and its parameters exist in the document, and the response type comes
+// from the schema rather than from a hand-written interface that could drift. Adding an
+// endpoint means changing the document and regenerating, not editing this file.
+//
+// Two things are deliberately not routed through it:
+//
+//   * uploads, whose body is a stream and which need an AbortSignal, and
+//   * the public share-landing calls, which are unauthenticated, have no session, and answer
+//     both HTML and JSON on the same URL.
+//
+// Both are marked below. Everything else is one line per endpoint, which is the point.
 
+import createClient from "openapi-fetch";
+import type { paths } from "./api-types";
 import type {
   AppPassword,
   AuditPage,
@@ -38,82 +49,67 @@ export function setOnline(value: boolean): void {
   online = value;
 }
 
-async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+const client = createClient<paths>({
+  // Same origin. An empty base keeps the generated paths as they appear in the document.
+  baseUrl: "",
+  credentials: "same-origin",
+  headers: { Accept: "application/json" },
+});
+
+/**
+ * call unwraps an openapi-fetch result into a value or an APIError.
+ *
+ * Every failure the UI shows comes through here, so the error shape is decided once: the
+ * server's own code and message, never a client-invented summary of them.
+ */
+async function call<T>(request: Promise<{ data?: T; error?: unknown; response: Response }>): Promise<T> {
   if (!online) {
     throw new APIError(0, "offline", "offline");
   }
 
-  const init: RequestInit = { method, credentials: "same-origin", headers: {} };
-  if (body instanceof FormData) {
-    init.body = body;
-  } else if (body !== undefined) {
-    init.headers = { "Content-Type": "application/json" };
-    init.body = JSON.stringify(body);
-  }
+  const { data, error, response } = await request;
 
-  const resp = await fetch("/api" + path, init);
-
-  if (resp.status === 401) {
+  if (response.status === 401) {
     throw new APIError(401, "unauthenticated", "unauthenticated");
   }
-  if (resp.status === 204) {
-    return undefined as T;
+  if (!response.ok) {
+    const body = (error ?? {}) as { error?: string; message?: string };
+    throw new APIError(response.status, body.error ?? "", body.message ?? "");
   }
-
-  const text = await resp.text();
-  let payload: unknown = null;
-  if (text) {
-    try {
-      payload = JSON.parse(text);
-    } catch {
-      payload = { message: text };
-    }
-  }
-
-  if (!resp.ok) {
-    const p = (payload ?? {}) as { error?: string; message?: string };
-    throw new APIError(resp.status, p.error ?? "", p.message ?? "");
-  }
-  return payload as T;
+  return data as T;
 }
 
-const q = (params: Record<string, string | number | undefined>): string => {
-  const search = new URLSearchParams();
-  for (const [k, v] of Object.entries(params)) {
-    if (v !== undefined && v !== "") search.set(k, String(v));
-  }
-  const s = search.toString();
-  return s ? `?${s}` : "";
-};
-
 export const api = {
-  me: () => request<Me>("GET", "/auth/me"),
-  logout: () => request<void>("POST", "/auth/logout"),
+  me: () => call<Me>(client.GET("/api/auth/me")),
+  logout: () => call<void>(client.POST("/api/auth/logout")),
 
-  list: (path: string) => request<Listing>("GET", `/files/${q({ path })}`),
-  trash: () => request<{ items: FileNode[] }>("GET", "/files/trash"),
-  recent: (limit = 12) => request<{ items: FileNode[] }>("GET", `/files/recent?limit=${limit}`),
-  // Name search across the tree. The server returns nothing below two characters, so the
-  // client does not have to duplicate that rule to avoid noise — but it still debounces.
-  search: (query: string, limit = 12) =>
-    request<{ items: FileNode[]; query: string }>(
-      "GET",
-      `/files/search?q=${encodeURIComponent(query)}&limit=${limit}`,
+  list: (path: string) => call<Listing>(client.GET("/api/files/", { params: { query: { path } } })),
+  recent: (limit = 12) =>
+    call<{ items: FileNode[] }>(client.GET("/api/files/recent", { params: { query: { limit } } })),
+  search: (q: string, limit = 12) =>
+    call<{ items: FileNode[]; query: string }>(
+      client.GET("/api/files/search", { params: { query: { q, limit } } }),
     ),
-  versions: (path: string) => request<VersionsResponse>("GET", `/files/versions${q({ path })}`),
+  trash: () => call<{ items: FileNode[] }>(client.GET("/api/files/trash")),
+  versions: (path: string) =>
+    call<VersionsResponse>(client.GET("/api/files/versions", { params: { query: { path } } })),
   restoreVersion: (path: string, version: number) =>
-    request<void>("POST", "/files/restore-version", { path, version }),
-  restore: (id: string) => request<void>("POST", "/files/restore", { id }),
-  mkdir: (path: string) => request<void>("POST", "/files/mkdir", { path }),
-  rename: (path: string, name: string) => request<void>("POST", "/files/rename", { path, name }),
-  remove: (path: string) => request<void>("DELETE", `/files/${q({ path })}`),
+    call<void>(client.POST("/api/files/restore-version", { body: { path, version } })),
+  restore: (id: string) => call<void>(client.POST("/api/files/restore", { body: { id } })),
+  mkdir: (path: string) => call<void>(client.POST("/api/files/mkdir", { body: { path } })),
+  rename: (path: string, name: string) =>
+    call<void>(client.POST("/api/files/rename", { body: { path, name } })),
+  remove: (path: string) => call<void>(client.DELETE("/api/files/", { params: { query: { path } } })),
 
+  // Not generated: the body is a stream and the caller needs to cancel it. Failures are turned
+  // into the same APIError shape so callers cannot tell the difference.
   upload: (dir: string, file: File, signal?: AbortSignal) => {
+    if (!online) {
+      return Promise.reject(new APIError(0, "offline", "offline"));
+    }
     const form = new FormData();
     form.append("path", dir);
     form.append("file", file);
-    // `request` does not take a signal; uploads are the one call that benefits from one, so
-    // the fetch is issued directly here and shares the same error shape.
     return fetch("/api/files/upload", {
       method: "POST",
       body: form,
@@ -122,19 +118,19 @@ export const api = {
     }).then(async (resp) => {
       if (!resp.ok) {
         const text = await resp.text();
-        let p: { error?: string; message?: string } = {};
+        let payload: { error?: string; message?: string } = {};
         try {
-          p = JSON.parse(text);
+          payload = JSON.parse(text);
         } catch {
-          p = { message: text };
+          payload = { message: text };
         }
-        throw new APIError(resp.status, p.error ?? "", p.message ?? "");
+        throw new APIError(resp.status, payload.error ?? "", payload.message ?? "");
       }
       return (await resp.json()) as FileNode;
     });
   },
 
-  shares: () => request<{ items: Share[] }>("GET", "/shares/"),
+  shares: () => call<{ items: Share[] }>(client.GET("/api/shares/")),
   createShare: (body: {
     path: string;
     kind: string;
@@ -142,31 +138,36 @@ export const api = {
     expires_in_seconds?: number;
     max_downloads?: number;
     max_uploads?: number;
-  }) => request<ShareCreated>("POST", "/shares/", body),
-  revokeShare: (id: string) => request<void>("DELETE", `/shares/${id}`),
+  }) => call<ShareCreated>(client.POST("/api/shares/", { body: body as never })),
+  revokeShare: (id: string) =>
+    call<void>(client.DELETE("/api/shares/{id}", { params: { path: { id } } })),
 
   audit: (params: { offset?: number; actions?: string; result?: string; since?: string }) =>
-    request<AuditPage>("GET", `/audit/events${q(params)}`),
+    call<AuditPage>(client.GET("/api/audit/events", { params: { query: params } })),
 
-  appPasswords: () => request<{ items: AppPassword[] }>("GET", "/apppasswords/"),
+  appPasswords: () => call<{ items: AppPassword[] }>(client.GET("/api/apppasswords/")),
   createAppPassword: (body: { label: string; scope: string }) =>
-    request<{ secret: string; id: string; prefix: string }>("POST", "/apppasswords/", body),
-  revokeAppPassword: (id: string) => request<void>("DELETE", `/apppasswords/${id}`),
+    call<{ secret: string; id: string; prefix: string }>(
+      client.POST("/api/apppasswords/", { body: body as never }),
+    ),
+  revokeAppPassword: (id: string) =>
+    call<void>(client.DELETE("/api/apppasswords/{id}", { params: { path: { id } } })),
 };
 
 // Content URLs are plain links, not fetches: the browser handles range requests, caching and
 // download disposition for us, and the server decides whether inline rendering is allowed.
 
-export const downloadURL = (path: string): string =>
-  `/api/files/download${q({ path })}`;
+export const downloadURL = (path: string): string => `/api/files/download?path=${encodeURIComponent(path)}`;
 
 export const inlineURL = (path: string): string =>
-  `/api/files/download${q({ path, inline: "1" })}`;
+  `/api/files/download?path=${encodeURIComponent(path)}&inline=1`;
 
 export const thumbnailURL = (path: string): string =>
-  `/api/files/thumbnail${q({ path })}`;
+  `/api/files/thumbnail?path=${encodeURIComponent(path)}`;
 
-// The public share landing page speaks a different, unauthenticated protocol.
+// The public share landing speaks a different, unauthenticated protocol: no session, and the
+// same URL answers HTML to a navigation and JSON to a fetch. None of that belongs in the
+// generated client, which assumes a signed-in JSON API.
 
 export async function fetchShareLanding(token: string): Promise<ShareLanding> {
   const resp = await fetch(`/s/${encodeURIComponent(token)}`, {

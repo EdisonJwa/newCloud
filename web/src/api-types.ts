@@ -175,6 +175,52 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/files/search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Name search across the tree
+         * @description Matches node names only, not contents. Queries shorter than two characters return
+         *     nothing rather than the whole library.
+         */
+        get: {
+            parameters: {
+                query: {
+                    q: string;
+                    limit?: number;
+                };
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description ok */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            query: string;
+                            items: components["schemas"]["FileNode"][];
+                        };
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/files/trash": {
         parameters: {
             query?: never;

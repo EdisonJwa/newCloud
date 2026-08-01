@@ -11,9 +11,10 @@
     "typecheck": "tsc -b --noEmit",
     "gen:api": "openapi-typescript openapi.yaml -o src/api-types.ts",
     "contrast": "node scripts/contrast.mjs",
-    "gen:api:check": "openapi-typescript openapi.yaml -o src/api-types.ts && git diff --exit-code -- src/api-types.ts"
+    "gen:api:check": "openapi-typescript openapi.yaml -o src/api-types.ts && git diff --ignore-cr-at-eol --exit-code -- src/api-types.ts"
   },
   "dependencies": {
+    "openapi-fetch": "^0.17.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0"
   },
