@@ -256,7 +256,8 @@ a:hover {
   align-items: center;
   gap: 8px;
   padding-inline-end: 12px;
-  flex: none;
+  flex: 0 1 auto;
+  min-width: 0;
 }
 
 /* The mark: two stacked slabs, drawn rather than an image. Reads as storage without a cloud. */
@@ -288,13 +289,24 @@ a:hover {
   font-weight: 650;
   letter-spacing: -0.02em;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .nav {
   display: flex;
   align-items: center;
   gap: 2px;
-  flex: none;
+  /* Shrinks last and scrolls when it has to. Longer translations must not push the top bar
+   * past the viewport; a section label that can be scrolled to is a better trade than a page
+   * that scrolls sideways. */
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.nav::-webkit-scrollbar {
+  display: none;
 }
 
 .nav button {
@@ -332,7 +344,7 @@ a:hover {
 .searchbox {
   position: relative;
   flex: 0 1 260px;
-  min-width: 100px;
+  min-width: 0;
 }
 .searchbox input {
   width: 100%;

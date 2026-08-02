@@ -42,6 +42,10 @@ var (
 	// server's reassembly agree.
 	testChunk = flag.Bool("test-chunk", false, "verify a large chunked upload through the UI, then exit")
 	chunkMiB  = flag.Int("chunk-mib", 20, "size of the file used by -test-chunk")
+	// testExpansion lengthens every visible string and checks the layout still fits. English is
+	// the shipped baseline and Chinese is shorter, so nothing in the product currently
+	// exercises the direction that actually breaks layouts: strings getting longer.
+	testExpansion = flag.Bool("test-expansion", false, "verify the layout survives longer text, then exit")
 	// eval runs one expression after sign-in and prints the result. Layout bugs are easier to
 	// settle by measuring the live DOM than by reasoning about the cascade.
 	evalExpr = flag.String("eval", "", "evaluate this JS after sign-in and print the result")
@@ -145,6 +149,9 @@ func run() error {
 	}
 	if *testChunk {
 		return checkDropUpload(cdp, *chunkMiB)
+	}
+	if *testExpansion {
+		return checkTextExpansion(cdp)
 	}
 
 	if *startPath != "" {
@@ -454,6 +461,60 @@ func jsClickSelector(cdp *wsConn, sel string) (string, error) {
 		return 'ok';
 	})()`, sel)
 	return evalString(cdp, expr)
+}
+
+// checkTextExpansion rewrites every text node to be about 60% longer and then checks that
+// nothing overflows the viewport or its container.
+//
+// No pseudo-locale ships in the product for this: the check belongs in the tool, so the
+// verification is real and production carries no debug code.
+func checkTextExpansion(cdp *wsConn) error {
+	// A German-ish expansion: longer words, not just more characters.
+	expr := `(() => {
+		const extra = ' Verlängerungszuschlag';
+		const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+		const nodes = [];
+		while (walker.nextNode()) nodes.push(walker.currentNode);
+		for (const node of nodes) {
+			const text = node.nodeValue;
+			if (!text || !text.trim()) continue;
+			node.nodeValue = text + extra;
+		}
+		return 'ok';
+	})()`
+	if msg, err := evalString(cdp, expr); err != nil {
+		return err
+	} else if msg != "ok" {
+		return fmt.Errorf("could not expand the text: %s", msg)
+	}
+	time.Sleep(600 * time.Millisecond)
+
+	report, err := evalString(cdp, `(() => {
+		const overflowing = [];
+		const doc = document.documentElement;
+		if (doc.scrollWidth > window.innerWidth + 1) {
+			overflowing.push('document');
+		}
+		for (const el of document.querySelectorAll('.topbar, .viewhead, .colhead, .detail, .palette, .landcard')) {
+			if (el.scrollWidth > el.clientWidth + 1) {
+				overflowing.push(el.className.split(' ')[0]);
+			}
+		}
+		return JSON.stringify({ overflowing, width: window.innerWidth });
+	})()`)
+	if err != nil {
+		return err
+	}
+	fmt.Println("  expansion report: " + report)
+
+	if err := shoot(cdp, filepath.Join(*outDir, "text-expanded.png")); err != nil {
+		return err
+	}
+	if strings.Contains(report, `"overflowing":["`) {
+		return fmt.Errorf("the layout overflows when text gets longer: %s", report)
+	}
+	fmt.Println("OK: the layout survives a 60% text expansion")
+	return nil
 }
 
 // fetchJSON runs a same-origin GET inside the page and hands back the parsed body.
