@@ -37,6 +37,7 @@ import (
 	"github.com/EdisonJwa/newCloud/internal/storage/tree"
 	storepkg "github.com/EdisonJwa/newCloud/internal/store"
 	"github.com/EdisonJwa/newCloud/internal/ticket"
+	"github.com/EdisonJwa/newCloud/internal/upload"
 	"github.com/EdisonJwa/newCloud/internal/worker"
 )
 
@@ -156,6 +157,37 @@ func serve() error {
 	shares := share.New(meta, share.DefaultArgon())
 	shares.SetTicketIssuer(tickets)
 
+	// Resumable uploads stage on local disk even when the bytes land in a bucket: a chunk has
+	// to be written somewhere before it can be hashed and published.
+	uploadDir := cfg.Storage.UploadDir
+	if uploadDir == "" {
+		uploadDir = filepath.Join(os.TempDir(), "newcloud-uploads")
+		log.Info("upload staging directory is not configured; using the temporary directory",
+			"dir", uploadDir, "hint", "set storage.upload_dir on a real deployment")
+	}
+	uploads, err := upload.NewManager(uploadDir, 24*time.Hour, 4)
+	if err != nil {
+		return err
+	}
+	defer uploads.Close()
+
+	// Expired sessions hold staging files, so the sweep has to run periodically rather than
+	// only at startup.
+	go func() {
+		ticker := time.NewTicker(15 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if n := uploads.Sweep(); n > 0 {
+					log.Info("discarded expired upload sessions", "count", n)
+				}
+			}
+		}
+	}()
+
 	deps := server.Deps{
 		Config:   cfg,
 		Meta:     meta,
@@ -167,6 +199,7 @@ func serve() error {
 		Shares:   shares,
 		Mailer:   mailer,
 		Provider: provider,
+		Uploads:  uploads,
 		Log:      log,
 		Version:  version,
 	}

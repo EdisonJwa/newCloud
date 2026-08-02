@@ -26,6 +26,7 @@ import (
 	"github.com/EdisonJwa/newCloud/internal/storage/layout"
 	"github.com/EdisonJwa/newCloud/internal/store"
 	"github.com/EdisonJwa/newCloud/internal/ticket"
+	"github.com/EdisonJwa/newCloud/internal/upload"
 )
 
 // harness wires the whole HTTP surface over in-memory storage, so the tests
@@ -82,6 +83,14 @@ func newHarness(t *testing.T) *harness {
 	shares.SetTicketIssuer(tickets)
 	mailer := &recordingMailer{}
 
+	// Resumable uploads stage in the test's own directory so a failing test cannot leave
+	// files behind and two tests cannot see each other's sessions.
+	uploads, err := upload.NewManager(t.TempDir(), time.Hour, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(uploads.Close)
+
 	s, err := server.New(server.Deps{
 		Config: cfg, Meta: meta, Content: content,
 		Authz:   authz.NewService(&accessor{m: meta}),
@@ -89,6 +98,7 @@ func newHarness(t *testing.T) *harness {
 		AppPass: auth.NewAppPasswords(meta),
 		Shares:  shares,
 		Mailer:  mailer,
+		Uploads: uploads,
 		Log:     testLogger(t),
 		Version: "test",
 	})

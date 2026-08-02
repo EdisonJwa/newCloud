@@ -79,6 +79,31 @@ async function call<T>(request: Promise<{ data?: T; error?: unknown; response: R
   return data as T;
 }
 
+/** callJson is the raw-fetch sibling of call(): same error shape, no generated wrapper. */
+async function callJson<T>(url: string, init: RequestInit): Promise<T> {
+  if (!online) {
+    throw new APIError(0, "offline", "offline");
+  }
+  const resp = await fetch(url, { credentials: "same-origin", ...init });
+  if (resp.status === 401) {
+    throw new APIError(401, "unauthenticated", "unauthenticated");
+  }
+  const text = await resp.text();
+  let payload: unknown = null;
+  if (text) {
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      payload = { message: text };
+    }
+  }
+  if (!resp.ok) {
+    const body = (payload ?? {}) as { error?: string; message?: string };
+    throw new APIError(resp.status, body.error ?? "", body.message ?? "");
+  }
+  return payload as T;
+}
+
 export const api = {
   me: () => call<Me>(client.GET("/api/auth/me")),
   logout: () => call<void>(client.POST("/api/auth/logout")),
@@ -100,6 +125,44 @@ export const api = {
   rename: (path: string, name: string) =>
     call<void>(client.POST("/api/files/rename", { body: { path, name } })),
   remove: (path: string) => call<void>(client.DELETE("/api/files/", { params: { query: { path } } })),
+
+  // Resumable uploads. Like the single-request upload, the chunk body is raw bytes, so these
+  // three go through fetch rather than the generated client; the JSON in and out is still
+  // shaped by the schema. The interesting case is 409: it carries the offset to resume from,
+  // so it is returned rather than thrown.
+  startUpload: (dir: string, name: string, size: number) =>
+    callJson<{ id: string; offset: number; chunk_size: number }>("/api/files/uploads", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: dir, name, size }),
+    }),
+
+  putChunk: async (id: string, start: number, end: number, total: number, body: Blob) => {
+    const resp = await fetch(`/api/files/uploads/${encodeURIComponent(id)}`, {
+      method: "PUT",
+      credentials: "same-origin",
+      headers: { "Content-Range": `bytes ${start}-${end}/${total}` },
+      body,
+    });
+    const payload = (await resp.json().catch(() => ({}))) as { offset?: number; message?: string };
+    if (resp.status === 409) {
+      // Not an error: the server is telling the client where to continue.
+      return { offset: payload.offset ?? 0, conflict: true };
+    }
+    if (!resp.ok) {
+      throw new APIError(resp.status, "chunk_failed", payload.message ?? "");
+    }
+    return { offset: payload.offset ?? end + 1, conflict: false };
+  },
+
+  completeUpload: (id: string) => callJson<FileNode>(`/api/files/uploads/${encodeURIComponent(id)}/complete`, { method: "POST" }),
+
+  abortUpload: async (id: string) => {
+    await fetch(`/api/files/uploads/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      credentials: "same-origin",
+    });
+  },
 
   // Not generated: the body is a stream and the caller needs to cancel it. Failures are turned
   // into the same APIError shape so callers cannot tell the difference.

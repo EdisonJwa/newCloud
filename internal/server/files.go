@@ -190,6 +190,103 @@ func (s *Server) handleMkdir(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, toFileJSON(created, body.Path))
 }
 
+// Two sentinel errors so writableParent can say why without choosing a status code. The
+// handler maps them, and both are reported to the client as 404: a write target the caller may
+// not see must not be distinguishable from one that does not exist.
+var (
+	errNotADirectory   = errors.New("target is a file")
+	errNoSuchDirectory = errors.New("no such directory")
+)
+
+// writableParent resolves a directory path and checks the caller may write into it.
+//
+// Both the single-request upload and the resumable endpoints need exactly this, and the check
+// has to be identical in both: an authorization rule that differs between two ways of writing
+// the same bytes is a way in.
+func (s *Server) writableParent(ctx context.Context, actor authz.Actor, dirRel string) (store.Node, []store.Node, error) {
+	nodes, err := s.deps.Meta.Resolve(ctx, actor.ID(), dirRel)
+	if err != nil {
+		return store.Node{}, nil, err
+	}
+	parent := nodes[len(nodes)-1]
+	if !parent.IsDir() {
+		return store.Node{}, nil, errNotADirectory
+	}
+
+	cap, err := s.deps.Authz.Authorize(actor, parent.ID)
+	if err != nil {
+		return store.Node{}, nil, err
+	}
+	if !cap.Can(authz.PermWrite) {
+		return store.Node{}, nil, errNoSuchDirectory
+	}
+	return parent, nodes, nil
+}
+
+// publishFile records stored bytes as a node, keeping a version when the name already exists,
+// and writes the audit entry in the same transaction.
+//
+// Extracted so the single-request upload and the resumable one cannot diverge: the versioning
+// policy and the audit record are part of the write, not an afterthought one of them might
+// forget to keep in step.
+func (s *Server) publishFile(
+	ctx context.Context, r *http.Request, actor authz.Actor,
+	parentID uuid.UUID, name, rel, mime string, res layout.PutResult,
+) (store.Node, error) {
+	etag := etagFor(res.Hash)
+	var node store.Node
+
+	err := s.deps.Meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		existing, cerr := tx.ChildByName(ctx, parentID, name)
+		if cerr == nil {
+			n, uerr := tx.UpdateFile(ctx, store.UpdateFile{
+				NodeID: existing.ID, Size: res.Size, Mime: mime, ETag: etag,
+				BlobID: s.deps.Meta.BlobIDFor(ctx, res.Hash), BlobHash: res.Hash,
+				KeepVersion: true, MaxVersions: s.maxVersions(),
+			})
+			if uerr != nil {
+				return uerr
+			}
+			node = n
+		} else {
+			n, cerr2 := tx.CreateFile(ctx, store.NewFile{
+				OwnerID: actor.ID(), ParentID: parentID, Name: name,
+				Size: res.Size, Mime: mime, ETag: etag,
+				BlobID: s.deps.Meta.BlobIDFor(ctx, res.Hash), BlobHash: res.Hash,
+			})
+			if cerr2 != nil {
+				return cerr2
+			}
+			node = n
+		}
+
+		bytes := res.Size
+		return tx.Audit(ctx, store.AuditEntry{
+			ActorKind: "user", ActorUserID: actor.Ptr(), ActorEmail: actor.Email(),
+			ActorIP: clientIP(r), UserAgent: r.UserAgent(),
+			Action: "file.write", TargetKind: "node", TargetID: node.ID.String(),
+			Result: "ok", Bytes: &bytes, Metadata: map[string]any{"name": name},
+		})
+	})
+	if err != nil {
+		return store.Node{}, err
+	}
+	return node, nil
+}
+
+// nodeFor builds the content-store node a path maps to.
+func nodeFor(actor authz.Actor, rel string) layout.Node {
+	return layout.Node{Owner: actor.ID().String(), Path: rel}
+}
+
+// uploadStagingDir is where finished sessions leave their bytes for cleanup.
+func (s *Server) uploadStagingDir() string {
+	if s.deps.Uploads == nil {
+		return ""
+	}
+	return s.deps.Uploads.Dir()
+}
+
 // handleUpload stores one file.
 //
 // Multipart is used rather than a raw body so the browser can send a filename
@@ -220,74 +317,25 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	parentNodes, err := s.deps.Meta.Resolve(r.Context(), actor.ID(), dirRel)
+	parent, _, err := s.writableParent(r.Context(), actor, dirRel)
 	if err != nil {
 		s.writeStoreError(w, err)
-		return
-	}
-	parent := parentNodes[len(parentNodes)-1]
-	if !parent.IsDir() {
-		writeError(w, http.StatusBadRequest, "not_a_directory", "target is a file")
-		return
-	}
-
-	cap, err := s.deps.Authz.Authorize(actor, parent.ID)
-	if err != nil {
-		s.writeStoreError(w, err)
-		return
-	}
-	if !cap.Can(authz.PermWrite) {
-		writeError(w, http.StatusNotFound, "not_found", "no such directory")
 		return
 	}
 
 	rel := path.Join(dirRel, name)
-	res, err := s.deps.Content.Put(r.Context(), layout.Node{
-		Owner: actor.ID().String(), Path: rel,
-	}, file, header.Size)
+	res, err := s.deps.Content.Put(r.Context(), nodeFor(actor, rel), file, header.Size)
 	if err != nil {
 		s.writeStoreError(w, err)
 		return
 	}
 
-	etag := etagFor(res.Hash)
 	mime := header.Header.Get("Content-Type")
 	if mime == "" || strings.HasPrefix(mime, "application/octet-stream") {
 		mime = guessType(name)
 	}
 
-	var node store.Node
-	err = s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
-		existing, cerr := tx.ChildByName(ctx, parent.ID, name)
-		if cerr == nil {
-			n, uerr := tx.UpdateFile(ctx, store.UpdateFile{
-				NodeID: existing.ID, Size: res.Size, Mime: mime, ETag: etag,
-				BlobID: s.deps.Meta.BlobIDFor(r.Context(), res.Hash), BlobHash: res.Hash,
-				KeepVersion: true, MaxVersions: s.maxVersions(),
-			})
-			if uerr != nil {
-				return uerr
-			}
-			node = n
-		} else {
-			n, cerr2 := tx.CreateFile(ctx, store.NewFile{
-				OwnerID: actor.ID(), ParentID: parent.ID, Name: name,
-				Size: res.Size, Mime: mime, ETag: etag,
-				BlobID: s.deps.Meta.BlobIDFor(r.Context(), res.Hash), BlobHash: res.Hash,
-			})
-			if cerr2 != nil {
-				return cerr2
-			}
-			node = n
-		}
-		bytes := res.Size
-		return tx.Audit(ctx, store.AuditEntry{
-			ActorKind: "user", ActorUserID: actor.Ptr(), ActorEmail: actor.Email(),
-			ActorIP: clientIP(r), UserAgent: r.UserAgent(),
-			Action: "file.write", TargetKind: "node", TargetID: node.ID.String(),
-			Result: "ok", Bytes: &bytes, Metadata: map[string]any{"name": name},
-		})
-	})
+	node, err := s.publishFile(r.Context(), r, actor, parent.ID, name, rel, mime, res)
 	if err != nil {
 		s.writeStoreError(w, err)
 		return

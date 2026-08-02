@@ -37,6 +37,11 @@ var (
 	// Chrome and sign in, and the drop path cannot be tested from the DOM: a DataTransfer
 	// built in JavaScript carries no OS files.
 	testDrop = flag.Bool("test-drop", false, "verify drag-and-drop upload, then exit")
+	// testChunk drops a file large enough to take the resumable path and then checks the
+	// published size: the only end-to-end evidence that the browser's slicing and the
+	// server's reassembly agree.
+	testChunk = flag.Bool("test-chunk", false, "verify a large chunked upload through the UI, then exit")
+	chunkMiB  = flag.Int("chunk-mib", 20, "size of the file used by -test-chunk")
 	// eval runs one expression after sign-in and prints the result. Layout bugs are easier to
 	// settle by measuring the live DOM than by reasoning about the cascade.
 	evalExpr = flag.String("eval", "", "evaluate this JS after sign-in and print the result")
@@ -136,7 +141,10 @@ func run() error {
 
 	// ---- Optional: verify a real drag-and-drop upload ----
 	if *testDrop {
-		return checkDropUpload(cdp)
+		return checkDropUpload(cdp, 0)
+	}
+	if *testChunk {
+		return checkDropUpload(cdp, *chunkMiB)
 	}
 
 	if *startPath != "" {
@@ -448,6 +456,20 @@ func jsClickSelector(cdp *wsConn, sel string) (string, error) {
 	return evalString(cdp, expr)
 }
 
+// fetchJSON runs a same-origin GET inside the page and hands back the parsed body.
+//
+// It goes through the page rather than the tool's own HTTP client so the request carries the
+// session cookie the browser already has.
+func fetchJSON(cdp *wsConn, path string, dst any) error {
+	out, err := evalString(cdp, fmt.Sprintf(`(() => {
+		return fetch(%q, { credentials: 'same-origin' }).then((r) => r.text());
+	})()`, path))
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal([]byte(out), dst)
+}
+
 // jsFirst dispatches an event on the first element matching sel.
 func jsFirst(cdp *wsConn, sel, event string) (string, error) {
 	expr := fmt.Sprintf(`(() => {
@@ -463,10 +485,15 @@ func navigate(cdp *wsConn, target string) error {
 	return cdp.Call("Page.navigate", map[string]any{"url": target})
 }
 
-// jsShowFiles switches the sidebar back to the file list.
+// jsShowFiles switches back to the file list.
+//
+// This used to click a button in the old left rail. After the redesign the navigation lives in
+// the top bar, so the selector had to move with it — a stale selector here does not fail, it
+// quietly leaves the tool on the Home view and every later assertion measures the wrong page.
 const jsShowFiles = `(() => {
-	const b = [...document.querySelectorAll('.rail-nav button')].find(x => x.textContent.trim() === 'Files');
-	if (b) b.click();
+	const b = [...document.querySelectorAll('.nav button')].find((x) => (x.textContent || '').trim() === 'Files');
+	if (!b) return 'miss';
+	b.click();
 	return 'ok';
 })()`
 
@@ -476,17 +503,29 @@ const jsShowFiles = `(() => {
 // files, so dispatching a synthetic `drop` proves only that the listener runs. The DevTools
 // protocol can dispatch a drag naming a real path, which Chrome turns into a File the page
 // can read — the closest thing available to a user dragging from Explorer.
-func checkDropUpload(cdp *wsConn) error {
+func checkDropUpload(cdp *wsConn, bigMiB int) error {
 	dir, err := os.MkdirTemp("", "newcloud-drop-")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(dir)
 
-	source := filepath.Join(dir, "dropped-file.txt")
-	if err := os.WriteFile(source, []byte("uploaded by dragging\n"), 0o644); err != nil {
+	payload := []byte("uploaded by dragging\n")
+	name := "dropped-file.txt"
+	if bigMiB > 0 {
+		// Large enough to cross the chunk threshold, and patterned so nothing silently
+		// deduplicates it against an existing blob.
+		payload = make([]byte, bigMiB<<20)
+		for i := range payload {
+			payload[i] = byte((i*31 + 7) % 251)
+		}
+		name = fmt.Sprintf("big-%dMiB.bin", bigMiB)
+	}
+	source := filepath.Join(dir, name)
+	if err := os.WriteFile(source, payload, 0o644); err != nil {
 		return err
 	}
+	wantSize := int64(len(payload))
 
 	countRows := func() int {
 		out, cerr := evalString(cdp, `(() => String(document.querySelectorAll('.row').length))()`)
@@ -499,8 +538,10 @@ func checkDropUpload(cdp *wsConn) error {
 	}
 
 	// Start from the file list, so the count is about the root folder.
-	if _, err := evalString(cdp, jsShowFiles); err != nil {
+	if msg, err := evalString(cdp, jsShowFiles); err != nil {
 		return err
+	} else if msg != "ok" {
+		return fmt.Errorf("could not switch to the File view (%s)", msg)
 	}
 	time.Sleep(1400 * time.Millisecond)
 
@@ -540,7 +581,37 @@ func checkDropUpload(cdp *wsConn) error {
 		return fmt.Errorf("the drop added no file (rows stayed at %d)", before)
 	}
 	fmt.Printf("rows after the drop:  %d\n", after)
-	fmt.Println("OK: drag and drop uploaded the file")
+
+	// For the large file the interesting assertion is the published size: a mis-assembled
+	// upload still produces a row, just a short one.
+	if bigMiB > 0 {
+		name := filepath.Base(source)
+		var files struct {
+			Children []struct {
+				Name string `json:"name"`
+				Size int64  `json:"size"`
+			} `json:"children"`
+		}
+		if err := fetchJSON(cdp, "/api/files/?path=", &files); err != nil {
+			return err
+		}
+		found := false
+		for _, child := range files.Children {
+			if child.Name != name {
+				continue
+			}
+			found = true
+			if child.Size != wantSize {
+				return fmt.Errorf("published size %d, want %d", child.Size, wantSize)
+			}
+		}
+		if !found {
+			return fmt.Errorf("%s missing from the API listing", name)
+		}
+		fmt.Printf("OK: %d bytes uploaded in chunks and reassembled exactly\n", wantSize)
+	} else {
+		fmt.Println("OK: drag and drop uploaded the file")
+	}
 	return nil
 }
 

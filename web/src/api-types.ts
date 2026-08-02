@@ -135,6 +135,196 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/files/uploads": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start a resumable upload
+         * @description Returns a session id and the offset the server is at. Chunks are appended with
+         *     Content-Range, and the response to a conflicting chunk carries the true offset so the
+         *     client resumes rather than restarts.
+         *
+         *     Sessions live in memory: an upload survives a dropped connection, not a server restart.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": {
+                        /** @description Target directory */
+                        path: string;
+                        name: string;
+                        size: number;
+                    };
+                };
+            };
+            responses: {
+                /** @description session created */
+                201: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["UploadSession"];
+                    };
+                };
+                /** @description the declared size exceeds the configured limit */
+                413: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description too many unfinished uploads for this account */
+                429: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/files/uploads/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Append one chunk */
+        put: {
+            parameters: {
+                query?: never;
+                header: {
+                    /** @description bytes <start>-<end>/<total> */
+                    "Content-Range": string;
+                };
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/octet-stream": string;
+                };
+            };
+            responses: {
+                /** @description chunk accepted */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            offset: number;
+                        };
+                    };
+                };
+                /** @description the chunk did not start at the server's offset */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["UploadConflict"];
+                    };
+                };
+            };
+        };
+        post?: never;
+        /** Abort an upload and discard its staged bytes */
+        delete: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description discarded */
+                204: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                404: components["responses"]["NotFoundResult"];
+            };
+        };
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/files/uploads/{id}/complete": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Publish a completed upload */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description the file now exists */
+                201: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["FileNode"];
+                    };
+                };
+                /** @description the upload is not complete yet; the offset says where the server is */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["UploadConflict"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/files/recent": {
         parameters: {
             query?: never;
@@ -931,6 +1121,18 @@ export interface components {
             share_count?: number;
             /** @description Omitted when false. */
             has_versions?: boolean;
+        };
+        UploadSession: {
+            id: string;
+            offset: number;
+            /** @description The size the server suggests for each chunk. */
+            chunk_size: number;
+        };
+        UploadConflict: {
+            error: string;
+            message?: string;
+            /** @description The offset the client must resume from. */
+            offset: number;
         };
         /** @enum {string} */
         PreviewKind: "image" | "video" | "audio" | "pdf" | "text";

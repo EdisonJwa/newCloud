@@ -59,6 +59,99 @@ paths:
         "204": { description: trashed }
         "404": { $ref: "#/components/responses/NotFoundResult" }
 
+  /api/files/uploads:
+    post:
+      summary: Start a resumable upload
+      description: |
+        Returns a session id and the offset the server is at. Chunks are appended with
+        Content-Range, and the response to a conflicting chunk carries the true offset so the
+        client resumes rather than restarts.
+
+        Sessions live in memory: an upload survives a dropped connection, not a server restart.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path, name, size]
+              properties:
+                path: { type: string, description: Target directory, empty for the root }
+                name: { type: string }
+                size: { type: integer, minimum: 0 }
+      responses:
+        "201":
+          description: session created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UploadSession" }
+        "413": { description: the declared size exceeds the configured limit }
+        "429": { description: too many unfinished uploads for this account }
+
+  /api/files/uploads/{id}:
+    put:
+      summary: Append one chunk
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: Content-Range
+          in: header
+          required: true
+          description: 'bytes <start>-<end>/<total>'
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        "200":
+          description: chunk accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [offset]
+                properties:
+                  offset: { type: integer }
+        "409":
+          description: the chunk did not start at the server's offset
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UploadConflict" }
+    delete:
+      summary: Abort an upload and discard its staged bytes
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "204": { description: discarded }
+        "404": { $ref: "#/components/responses/NotFoundResult" }
+
+  /api/files/uploads/{id}/complete:
+    post:
+      summary: Publish a completed upload
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "201":
+          description: the file now exists
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FileNode" }
+        "409":
+          description: the upload is not complete yet; the offset says where the server is
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UploadConflict" }
+
   /api/files/recent:
     get:
       summary: Recently modified files, newest first
@@ -449,6 +542,22 @@ components:
           $ref: "#/components/schemas/PreviewKind"
         share_count: { type: integer, description: Omitted when zero. }
         has_versions: { type: boolean, description: Omitted when false. }
+
+    UploadSession:
+      type: object
+      required: [id, offset, chunk_size]
+      properties:
+        id: { type: string }
+        offset: { type: integer }
+        chunk_size: { type: integer, description: The size the server suggests for each chunk. }
+
+    UploadConflict:
+      type: object
+      required: [error, offset]
+      properties:
+        error: { type: string }
+        message: { type: string }
+        offset: { type: integer, description: The offset the client must resume from. }
 
     PreviewKind:
       type: string

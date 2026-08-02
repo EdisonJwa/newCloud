@@ -111,11 +111,21 @@ type StorageConfig struct {
 	Layout Layout       `yaml:"layout"`
 	Local  LocalStorage `yaml:"local"`
 	S3     S3Storage    `yaml:"s3"`
+	// UploadDir stages resumable uploads. Empty falls back to the system temporary directory.
+	UploadDir string `yaml:"upload_dir"`
 }
 
 type LocalStorage struct {
 	Root string `yaml:"root"`
 }
+
+// UploadDir is where resumable uploads are staged before publishing.
+//
+// It is separate from the content root on purpose: with the tree layout the content root is the
+// user-visible tree, and half-written uploads must never appear there. Empty means the process
+// temporary directory, which works everywhere but is worth setting explicitly on a real
+// deployment — /tmp is often a small tmpfs.
+const DefaultUploadDir = ""
 
 // S3Storage configures the object-store backend.
 //

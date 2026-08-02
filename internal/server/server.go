@@ -28,6 +28,7 @@ import (
 	"github.com/EdisonJwa/newCloud/internal/store"
 	"github.com/EdisonJwa/newCloud/internal/thumbnail"
 	"github.com/EdisonJwa/newCloud/internal/ticket"
+	"github.com/EdisonJwa/newCloud/internal/upload"
 	"github.com/EdisonJwa/newCloud/internal/webassets"
 )
 
@@ -50,7 +51,10 @@ type Deps struct {
 	Mailer mail.Sender
 	// Thumbs renders image previews. Nil disables the endpoint, which then answers 415 and
 	// the client falls back to a type badge.
-	Thumbs  *thumbnail.Generator
+	Thumbs *thumbnail.Generator
+	// Uploads holds in-progress resumable uploads. Nil disables the chunked endpoints, which
+	// then answer 503 and the client falls back to a single-request upload.
+	Uploads *upload.Manager
 	Log     *slog.Logger
 	Version string
 }
@@ -156,6 +160,12 @@ func (s *Server) Handler() http.Handler {
 				r.Get("/trash", s.handleTrashList)
 				r.Post("/restore", s.handleRestore)
 				r.Get("/thumbnail", s.handleThumbnail)
+				r.Route("/uploads", func(r chi.Router) {
+					r.Post("/", s.handleUploadCreate)
+					r.Put("/{id}", s.handleUploadChunk)
+					r.Post("/{id}/complete", s.handleUploadComplete)
+					r.Delete("/{id}", s.handleUploadAbort)
+				})
 				r.Get("/versions", s.handleVersions)
 				r.Post("/restore-version", s.handleRestoreVersion)
 			})

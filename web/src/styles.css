@@ -2124,3 +2124,16 @@ dialog .foot {
   font-size: 10px;
   color: var(--ink-3);
 }
+
+/* Per-file count plus a byte meter while a large upload is in flight. The meter is a native
+ * <progress> for the same reason as the storage bar: the CSP forbids inline styles. */
+.upload-progress {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+.meter.inline {
+  width: 90px;
+  margin-top: 0;
+}

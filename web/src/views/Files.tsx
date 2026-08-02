@@ -33,6 +33,15 @@ interface Props {
   onPathChange: (path: string) => void;
 }
 
+/**
+ * Files above this size are sent in chunks so a dropped connection can resume. Below it the
+ * single-request path is simpler and has no session to leak.
+ */
+const CHUNK_THRESHOLD = 8 * 1024 * 1024;
+
+/** How many times one chunk is retried before the whole upload is abandoned. */
+const MAX_CHUNK_ATTEMPTS = 5;
+
 type ViewMode = "rows" | "grid";
 type SortKey = "name" | "size" | "modified";
 interface Sort {
@@ -126,7 +135,12 @@ export function Files({ initialPath = "", reloadKey, onPathChange }: Props) {
     | { kind: "share"; entry: FileNode }
     | null
   >(null);
-  const [upload, setUpload] = useState<{ done: number; total: number } | null>(null);
+  const [upload, setUpload] = useState<{
+    done: number;
+    total: number;
+    bytesDone: number;
+    bytesTotal: number;
+  } | null>(null);
   const [dragging, setDragging] = useState(false);
 
   const colRefs = useRef<Array<HTMLDivElement | null>>([]);
@@ -295,17 +309,25 @@ export function Files({ initialPath = "", reloadKey, onPathChange }: Props) {
         toast.error(t("toast.uploading"));
         return;
       }
-      setUpload({ done: 0, total: files.length });
+      const bytesTotal = files.reduce((sum, f) => sum + f.size, 0);
+      setUpload({ done: 0, total: files.length, bytesDone: 0, bytesTotal });
       let done = 0;
       let failed = 0;
+      let bytesDone = 0;
+
       for (const file of files) {
+        const onProgress = (sent: number) => {
+          setUpload({ done, total: files.length, bytesDone: bytesDone + sent, bytesTotal });
+        };
         try {
-          await api.upload(deepest, file);
+          await uploadOne(deepest, file, onProgress);
           done += 1;
+          bytesDone += file.size;
         } catch {
           failed += 1;
+          bytesDone += file.size;
         }
-        setUpload({ done: done + failed, total: files.length });
+        setUpload({ done: done + failed, total: files.length, bytesDone, bytesTotal });
       }
       setUpload(null);
       reload();
@@ -431,8 +453,18 @@ export function Files({ initialPath = "", reloadKey, onPathChange }: Props) {
           {t("files.newFolder")}
         </button>
         {upload ? (
-          <span className="mono upload-count">
-            {upload.done}/{upload.total}
+          <span className="upload-progress">
+            <span className="mono upload-count">
+              {upload.done}/{upload.total}
+            </span>
+            {upload.bytesTotal > CHUNK_THRESHOLD ? (
+              <progress
+                className="meter inline"
+                max={upload.bytesTotal}
+                value={upload.bytesDone}
+                aria-label={t("files.upload")}
+              />
+            ) : null}
           </span>
         ) : null}
         {picked.length > 1 ? (
@@ -744,6 +776,54 @@ export function Files({ initialPath = "", reloadKey, onPathChange }: Props) {
       ) : null}
     </>
   );
+}
+
+/**
+ * uploadOne sends one file, using chunks when it is large enough to be worth resuming.
+ *
+ * A dropped connection on a 20 GiB file used to mean starting over. Now the retry loop resumes
+ * from whatever offset the server reports, and a 409 is not a failure but the answer to "where
+ * was I" — which is why a failed chunk is retried unchanged rather than with a guessed offset.
+ */
+async function uploadOne(
+  dir: string,
+  file: File,
+  onProgress: (sent: number) => void,
+): Promise<void> {
+  if (file.size <= CHUNK_THRESHOLD) {
+    await api.upload(dir, file);
+    onProgress(file.size);
+    return;
+  }
+
+  const session = await api.startUpload(dir, file.name, file.size);
+  const chunk = session.chunk_size > 0 ? session.chunk_size : CHUNK_THRESHOLD;
+  let offset = session.offset;
+  let attempt = 0;
+
+  while (offset < file.size) {
+    const start = offset;
+    const end = Math.min(start + chunk, file.size) - 1;
+    try {
+      const result = await api.putChunk(session.id, start, end, file.size, file.slice(start, end + 1));
+      offset = result.offset;
+      onProgress(offset);
+      attempt = 0;
+    } catch (err) {
+      attempt += 1;
+      if (attempt > MAX_CHUNK_ATTEMPTS) {
+        // Give up cleanly: leaving the session open would keep occupying a slot until it
+        // expires.
+        await api.abortUpload(session.id);
+        throw err;
+      }
+      // Retry the same range. If the server did receive it, the next response is a conflict
+      // carrying the true offset, and the loop continues from there.
+      await new Promise((resolve) => setTimeout(resolve, Math.min(500 * attempt, 4000)));
+    }
+  }
+
+  await api.completeUpload(session.id);
 }
 
 /* ---------- detail ---------- */

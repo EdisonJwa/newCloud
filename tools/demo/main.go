@@ -136,10 +136,11 @@ storage:
   layout: "blob"
   local:
     root: %q
+  upload_dir: %q
 mail:
   enabled: false
 `, *appPort, publicURL, fmt.Sprintf("https://content.localhost:%d", *tlsPort),
-		idp.URL(), filepath.Join(dir, "blobs"))
+		idp.URL(), filepath.Join(dir, "blobs"), filepath.Join(dir, "uploads"))
 
 	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
 		return err

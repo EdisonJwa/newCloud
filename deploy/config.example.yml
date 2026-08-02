@@ -51,6 +51,11 @@ storage:
     #              publishing a blob is a rename(2).
     # tree layout: the user-visible tree itself.
     root: "/var/lib/newcloud/blobs"
+  # Where resumable uploads are staged before publishing. Keep this off the content root:
+  # with the tree layout the content root is the user-visible tree, and half-written files
+  # must never appear there. Defaults to the system temporary directory, which is often a
+  # small tmpfs on a real host, so set it explicitly.
+  upload_dir: "/var/lib/newcloud/uploads"
   s3:
     # S3-compatible object storage. Tested against AWS S3 semantics; MinIO, Ceph,
     # Cloudflare R2, Backblaze B2 and Wasabi all work through the same client.
