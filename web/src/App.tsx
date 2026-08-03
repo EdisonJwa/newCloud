@@ -96,7 +96,7 @@ function Shell() {
       .then(setMe)
       .catch((err) => {
         // An unauthenticated session is not an error state to render: send them to the IdP.
-        if (err instanceof APIError && err.status === 401) location.href = "/auth/login";
+        if (err instanceof APIError && err.status === 401) location.href = "/api/auth/login";
       });
   }, []);
 

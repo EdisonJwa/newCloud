@@ -73,7 +73,8 @@ func (g gateResult) allowed() bool {
 
 // recipientCookieName scopes a verified-address grant to one share.
 func recipientCookieName(shareID string) string {
-	return "__Host-wc_rcpt_" + shareID
+	// Same reasoning as shareCookieName: a path-scoped cookie cannot carry the __Host- prefix.
+	return "__Secure-wc_rcpt_" + shareID
 }
 
 // mintRecipientCookie issues the grant for a verified address.

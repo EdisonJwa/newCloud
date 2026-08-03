@@ -46,6 +46,14 @@ var (
 	// the shipped baseline and Chinese is shorter, so nothing in the product currently
 	// exercises the direction that actually breaks layouts: strings getting longer.
 	testExpansion = flag.Bool("test-expansion", false, "verify the layout survives longer text, then exit")
+	// testShare drives the password gate on a share page. Nothing else in the tooling ever
+	// submitted that form, which is how a broken access cookie shipped.
+	testShare = flag.Bool("test-share", false, "verify the share password gate, then exit")
+	// testFresh opens / with no session, which is what a visitor actually does. Every other
+	// mode signs in through /api/auth/login first, so a broken sign-in redirect — the kind
+	// that reloads forever — was invisible to this tool.
+	testFresh = flag.Bool("test-fresh", false, "open / with no session and verify it settles, then exit")
+	sharePass = flag.String("share-password", "", "password for -test-share")
 	// eval runs one expression after sign-in and prints the result. Layout bugs are easier to
 	// settle by measuring the live DOM than by reasoning about the cascade.
 	evalExpr = flag.String("eval", "", "evaluate this JS after sign-in and print the result")
@@ -117,6 +125,11 @@ func run() error {
 		}
 	}
 
+	// ---- Cold start: / with no session ----
+	if *testFresh {
+		return checkColdStart(cdp)
+	}
+
 	// ---- Signed-out: the share landing page ----
 	openToken := flag.Arg(0)
 	if openToken != "" {
@@ -152,6 +165,9 @@ func run() error {
 	}
 	if *testExpansion {
 		return checkTextExpansion(cdp)
+	}
+	if *testShare {
+		return checkSharePassword(cdp, flag.Arg(0), *sharePass)
 	}
 
 	if *startPath != "" {
@@ -461,6 +477,150 @@ func jsClickSelector(cdp *wsConn, sel string) (string, error) {
 		return 'ok';
 	})()`, sel)
 	return evalString(cdp, expr)
+}
+
+// checkColdStart opens the app the way a person does — by typing the address — and verifies
+// that the page settles instead of reloading.
+//
+// A sign-in redirect pointed at a path the SPA answers turns authentication into a reload loop
+// with no error message: every load reports "not signed in", every redirect returns the shell,
+// forever. The signal is the number of distinct documents: performance.timeOrigin changes on
+// every navigation, so a loop shows up as many origins behind one address.
+func checkColdStart(cdp *wsConn) error {
+	if err := navigate(cdp, *base+"/"); err != nil {
+		return err
+	}
+
+	probe := `(() => {
+		const key = 'wc_origins';
+		const seen = JSON.parse(sessionStorage.getItem(key) || '[]');
+		const cur = String(window.performance.timeOrigin);
+		if (!seen.includes(cur)) {
+			seen.push(cur);
+			sessionStorage.setItem(key, JSON.stringify(seen));
+		}
+		return JSON.stringify({
+			origins: seen.length,
+			path: location.pathname,
+			shell: !!document.querySelector('.nav'),
+			prompt: !!document.querySelector('input[type="password"], .signin'),
+		});
+	})()`
+
+	// Sample fast: a reload loop cycles in a few hundred milliseconds, so a one-second poll
+	// would sample the same document every time and report a healthy page.
+	deadline := time.Now().Add(20 * time.Second)
+	saw := 0
+	var settled bool
+	for time.Now().Before(deadline) {
+		time.Sleep(120 * time.Millisecond)
+		raw, err := evalString(cdp, probe)
+		if err != nil {
+			// Navigating tears down the execution context; that is expected mid-flight.
+			continue
+		}
+		var state struct {
+			Origins int    `json:"origins"`
+			Path    string `json:"path"`
+			Shell   bool   `json:"shell"`
+			Prompt  bool   `json:"prompt"`
+		}
+		if err := json.Unmarshal([]byte(raw), &state); err != nil {
+			continue
+		}
+		if state.Origins > saw {
+			saw = state.Origins
+		}
+		if state.Origins > 6 && !state.Prompt {
+			return fmt.Errorf("the app cycled through %d documents without settling: the sign-in redirect loops", state.Origins)
+		}
+		if state.Shell && state.Path == "/" {
+			settled = true
+			// Keep sampling briefly after it looks settled: a loop can pass through a
+			// momentary good frame.
+			if state.Origins <= 3 {
+				break
+			}
+		}
+	}
+
+	if !settled {
+		return fmt.Errorf("the app never settled on a signed-in shell (documents seen: %d)", saw)
+	}
+	if saw > 3 {
+		return fmt.Errorf("the app settled but only after %d documents: the redirects are cycling", saw)
+	}
+	fmt.Printf("OK: / settled in %d document load(s), signed in\n", saw)
+	return shoot(cdp, filepath.Join(*outDir, "cold-start.png"))
+}
+
+// checkSharePassword drives the password gate the way a visitor does.
+//
+// It exists because a browser rejects an access cookie that the Go tests happily accept, so
+// every server-side test of this flow passed while the page kept asking for the password.
+func checkSharePassword(cdp *wsConn, token, password string) error {
+	if token == "" || password == "" {
+		return fmt.Errorf("-test-share needs a share token argument and -share-password")
+	}
+
+	if err := navigate(cdp, *base+"/s/"+token); err != nil {
+		return err
+	}
+	time.Sleep(2200 * time.Millisecond)
+
+	// It has to start gated, or the test proves nothing.
+	state, err := evalString(cdp, `(() => {
+		const pw = document.querySelector('input[type="password"]');
+		return pw ? 'gated' : 'open';
+	})()`)
+	if err != nil {
+		return err
+	}
+	if state != "gated" {
+		return fmt.Errorf("the share page did not ask for a password (state %q)", state)
+	}
+
+	// Fill the field the way a user would: React ignores a plain assignment, so the native
+	// setter and an input event are required.
+	msg, err := evalString(cdp, fmt.Sprintf(`(() => {
+		const input = document.querySelector('input[type="password"]');
+		if (!input) return 'no-input';
+		const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+		setter.call(input, %q);
+		input.dispatchEvent(new Event('input', { bubbles: true }));
+		const form = input.closest('form');
+		if (!form) return 'no-form';
+		form.requestSubmit ? form.requestSubmit() : form.submit();
+		return 'ok';
+	})()`, password))
+	if err != nil {
+		return err
+	}
+	if msg != "ok" {
+		return fmt.Errorf("could not submit the password form: %s", msg)
+	}
+
+	// After a correct password the page must offer the content, not the form again.
+	deadline := time.Now().Add(12 * time.Second)
+	var last string
+	for time.Now().Before(deadline) {
+		time.Sleep(500 * time.Millisecond)
+		last, err = evalString(cdp, `(() => {
+			const pw = document.querySelector('input[type="password"]');
+			const dl = document.querySelector('a[href*="/download"]');
+			if (dl) return 'download';
+			return pw ? 'gated' : 'other';
+		})()`)
+		if err != nil {
+			return err
+		}
+		if last == "download" {
+			fmt.Println("OK: the password gate let the visitor through")
+			return shoot(cdp, filepath.Join(*outDir, "share-unlocked.png"))
+		}
+	}
+	return fmt.Errorf("the page still asks for the password after a correct one (state %q); "+
+		"the access cookie was probably rejected by the browser", last)
 }
 
 // checkTextExpansion rewrites every text node to be about 60% longer and then checks that

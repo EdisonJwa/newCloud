@@ -336,8 +336,13 @@ func (s *Server) renderShareError(w http.ResponseWriter, r *http.Request, err er
 }
 
 // shareCookieName scopes the access grant to one share.
+//
+// The __Secure- prefix, not __Host-: the cookie is deliberately scoped to "/s/<token>", and
+// __Host- requires Path=/ — a browser silently drops such a cookie, which looks exactly like a
+// wrong password. The per-share scoping therefore lives in the name and in the signed value,
+// both of which the server checks, rather than in the prefix.
 func shareCookieName(shareID string) string {
-	return "__Host-wc_share_" + shareID
+	return "__Secure-wc_share_" + shareID
 }
 
 // mintShareCookie issues the access grant.
