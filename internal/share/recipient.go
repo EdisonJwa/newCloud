@@ -132,6 +132,15 @@ func (s *Service) IssueRecipientCode(ctx context.Context, sh store.Share, email 
 // The code is checked against both the share and the address. A code minted for
 // alice@example.com must not work for bob@example.com on the same share, or any invited
 // person could let in anyone by forwarding their code.
+//
+// Three guarantees, each of which was missing before SHARE-02 was addressed:
+//
+//	single use     the recipient row is marked consumed, so a code works once even if
+//	               its whole TTL has not elapsed and even if it leaked;
+//	throttled      failures are counted per (share, address) inside a rolling window,
+//	               so online guessing is bounded regardless of source address;
+//	no oracle      a throttled attempt is indistinguishable from a wrong code, because
+//	               telling them apart confirms both the share and the invitation.
 func (s *Service) VerifyRecipientCode(ctx context.Context, sh store.Share, email, code string) error {
 	if s.tickets == nil {
 		return errors.New("share: email verification is not configured")
@@ -142,31 +151,76 @@ func (s *Service) VerifyRecipientCode(ctx context.Context, sh store.Share, email
 		return ErrNotRecipient
 	}
 
+	// The throttle is checked before the code, so a correct guess arriving after the
+	// limit is still refused. Checking afterwards would let an attacker keep
+	// guessing until one landed.
+	var failures int
+	_ = s.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		n, ferr := tx.OTPFailureCount(ctx, sh.ID, email, store.OTPWindow)
+		failures = n
+		return ferr
+	})
+	if failures >= store.OTPMaxAttempts {
+		s.auditDenied(ctx, sh, email, "throttled")
+		return ErrNotRecipient
+	}
+
+	// Record the attempt before validating: a crash between the check and the
+	// validation must not silently refund an attempt.
+	record := func(success bool, reason string) {
+		_ = s.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+			return tx.RecordOTPAttempt(ctx, store.OTPAttempt{
+				ShareID: sh.ID, Email: email, Success: success, Reason: reason,
+			})
+		})
+	}
+
 	claims, err := s.tickets.Verify(ticket.PurposeEmailVerify, code)
 	if err != nil {
+		record(false, "bad_code")
 		s.auditDenied(ctx, sh, email, "bad_code")
 		return ErrNotRecipient
 	}
 	if claims.Subject != sh.ID.String() {
+		record(false, "code_for_other_share")
 		s.auditDenied(ctx, sh, email, "code_for_other_share")
 		return ErrNotRecipient
 	}
 	// Constant time: comparing an HMAC'd claim with == leaks nothing practical, but
 	// the habit should not depend on remembering which field is secret.
 	if subtle.ConstantTimeCompare([]byte(claims.ID), []byte(email)) != 1 {
+		record(false, "code_for_other_recipient")
 		s.auditDenied(ctx, sh, email, "code_for_other_recipient")
 		return ErrNotRecipient
 	}
 
 	// The address must still be on the list: it may have been revoked after the code
 	// was sent, and a code is not a durable capability.
-	if _, err := s.ResolveRecipient(ctx, sh, email); err != nil {
+	rec, err := s.ResolveRecipient(ctx, sh, email)
+	if err != nil {
+		record(false, "recipient_withdrawn")
 		return err
+	}
+	if rec.ConsumedAt != nil {
+		record(false, "already_used")
+		s.auditDenied(ctx, sh, email, "already_used")
+		return ErrNotRecipient
 	}
 
 	return s.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		// Consuming and verifying happen in one transaction, and consumption is a
+		// conditional UPDATE, so two concurrent submissions of the same code cannot
+		// both succeed.
+		if cerr := tx.ConsumeRecipientCode(ctx, sh.ID, email); cerr != nil {
+			return ErrNotRecipient
+		}
 		if merr := tx.MarkRecipientVerified(ctx, sh.ID, email); merr != nil {
 			return merr
+		}
+		if aerr := tx.RecordOTPAttempt(ctx, store.OTPAttempt{
+			ShareID: sh.ID, Email: email, Success: true, Reason: "verified",
+		}); aerr != nil {
+			return aerr
 		}
 		return tx.Audit(ctx, store.AuditEntry{
 			ActorKind: "anonymous", ActorEmail: email,

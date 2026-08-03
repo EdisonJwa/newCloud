@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/EdisonJwa/newCloud/internal/authz"
 	"github.com/EdisonJwa/newCloud/internal/store"
 )
@@ -224,6 +226,148 @@ func lockTokenFromIf(ifHeader string) string {
 		return ""
 	}
 	return ifHeader[start+1 : end]
+}
+
+// submittedTokens returns every lock token named in the request's If header.
+//
+// A request may submit several tagged lists, one per resource. Ownership is
+// decided by matching any of them against the lock on the target, which is what
+// RFC 4918 §10.4 describes; treating the header as a single opaque string (as an
+// earlier version did) means a client that tags its lists differently gets a
+// spurious 423 on its own lock.
+func submittedTokens(ifHeader string) []string {
+	var out []string
+	for {
+		start := strings.IndexByte(ifHeader, '<')
+		if start < 0 {
+			return out
+		}
+		rest := ifHeader[start+1:]
+		end := strings.IndexByte(rest, '>')
+		if end < 0 {
+			return out
+		}
+		tok := strings.TrimSpace(rest[:end])
+		if tok != "" {
+			out = append(out, tok)
+		}
+		ifHeader = rest[end+1:]
+	}
+}
+
+// lockBlocks reports whether a live lock prevents this actor from writing nodeID.
+//
+// It is the one place that answers "is this write allowed past the lock", called
+// from every mutating method. Before this existed, locks were enforced only in the
+// LOCK handler itself: a client could take a lock, and then any other writer —
+// including the same client through a different entry point — would overwrite the
+// file without ever being told the resource was locked. That is precisely the
+// silent-corruption case RFC 4918 §6 exists to prevent.
+func (h *Handler) lockBlocks(ctx context.Context, a authz.Actor, nodeID [16]byte, ifHeader string) bool {
+	return h.lockBlocksAtDepth(ctx, a, nodeID, ifHeader, true)
+}
+
+// lockBlocksAtDepth is lockBlocks with an explicit answer to "does a Depth: 0 lock count here".
+//
+// anyDepth=false is used on the ancestor walk for content writes, where only a Depth: infinity
+// lock covers the child. anyDepth=true is used for the node itself, where the lock covers its
+// own content regardless of depth: a Depth: 0 lock on a file still protects that file's bytes.
+func (h *Handler) lockBlocksAtDepth(ctx context.Context, a authz.Actor, nodeID [16]byte,
+	ifHeader string, anyDepth bool) bool {
+	lock, held := h.activeLock(ctx, nodeID)
+	if !held {
+		return false
+	}
+	// A Depth: 0 lock on an ancestor protects membership, not this child's content. Only
+	// Depth: infinity reaches down into the subtree (RFC 4918 §7.4).
+	if !anyDepth && lock.Depth != "infinity" {
+		return false
+	}
+	// The holder may write through its own lock, and only by submitting the
+	// token. Accepting the write without the token would make the lock advisory,
+	// which is worse than no lock: the client believes it is protected.
+	if lock.UserID != nil && *lock.UserID == a.ID() {
+		for _, tok := range submittedTokens(ifHeader) {
+			if tok == lock.Token {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// requireUnlocked writes the 423 response when a lock blocks the write.
+//
+// 423 Locked with a DAV:lock-token-submitted body is what makes Windows and
+// Office show "the file is in use by another user" instead of a generic failure.
+func (h *Handler) requireUnlocked(w http.ResponseWriter, ctx context.Context, a authz.Actor,
+	nodeID [16]byte, ifHeader string) bool {
+
+	if h.lockBlocks(ctx, a, nodeID, ifHeader) {
+		writeXMLError(w, http.StatusLocked, "lock-token-submitted")
+		return false
+	}
+	return true
+}
+
+// lockAncestors reports whether a live lock on any ancestor blocks the write.
+//
+// Depth: infinity locks cover the whole subtree per RFC 4918 §9.10.3, so creating
+// or replacing a child of a locked collection must be refused. Without this a
+// client can lock a folder, and another client can still write into it.
+func (h *Handler) lockAncestors(ctx context.Context, a authz.Actor, parentID [16]byte, ifHeader string) bool {
+	return h.lockAncestorsDepth(ctx, a, parentID, ifHeader, true)
+}
+
+// lockAncestorsInfinityOnly is the same walk, restricted to Depth: infinity locks.
+//
+// The distinction is RFC 4918 §7.4 and it is not cosmetic. A Depth: 0 lock on a collection
+// protects the collection's *membership* — you may not add or remove children — but it says
+// nothing about the content of an existing child. A Depth: infinity lock covers the whole
+// subtree, content included.
+//
+// The two call sites need different answers:
+//
+//   - PUT over an existing member changes that member's content. Only a Depth: infinity ancestor
+//     lock blocks it. Using the membership rule here makes a client that locked a folder unable
+//     to edit any file inside it, which is not what a Depth: 0 lock means and not what the
+//     client asked for.
+//   - MKCOL/DELETE change membership. A Depth: 0 parent lock blocks them, because that is
+//     exactly the right it protects.
+//
+// Before this split one function answered both, so Depth was ignored entirely and a Depth: 0
+// lock behaved like Depth: infinity on the ancestor path — over-blocking, and silently, because
+// the client gets 423 with no indication that its own Depth: 0 lock is the cause.
+func (h *Handler) lockAncestorsInfinityOnly(ctx context.Context, a authz.Actor, parentID [16]byte,
+	ifHeader string) bool {
+	return h.lockAncestorsDepth(ctx, a, parentID, ifHeader, false)
+}
+
+// lockAncestorsDepth walks the ancestor chain and reports whether a lock blocks.
+//
+// anyDepth reports whether a Depth: 0 lock on an ancestor counts. It is the parameter that makes
+// the membership/content distinction explicit at every call site.
+func (h *Handler) lockAncestorsDepth(ctx context.Context, a authz.Actor, parentID [16]byte,
+	ifHeader string, anyDepth bool) bool {
+	for depth := 0; depth < 256; depth++ {
+		if h.lockBlocksAtDepth(ctx, a, parentID, ifHeader, anyDepth) {
+			return true
+		}
+		var parent *uuid.UUID
+		_ = h.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+			n, err := tx.Node(ctx, parentID)
+			if err != nil {
+				return nil
+			}
+			parent = n.ParentID
+			return nil
+		})
+		if parent == nil {
+			return false
+		}
+		parentID = *parent
+	}
+	return false
 }
 
 // newLockToken mints an opaquelocktoken as required by RFC 4918.

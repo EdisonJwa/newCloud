@@ -139,7 +139,9 @@ func (t *memTx) UpsertIdPUser(ctx context.Context, in UpsertUser) (User, error) 
 		if in.DisplayName != "" {
 			byIdentity.DisplayName = in.DisplayName
 		}
-		byIdentity.Role = orDefault(in.Role, "guest")
+		// Role is intentionally not written here: ApplyIdPRole owns it, because
+		// only it can also revoke the credentials a demotion invalidates. Writing
+		// it in both places made the change invisible to the reconciler.
 		byIdentity.UpdatedAt = t.m.now()
 		return *byIdentity, nil
 
@@ -161,20 +163,77 @@ func (t *memTx) UpsertIdPUser(ctx context.Context, in UpsertUser) (User, error) 
 		if in.DisplayName != "" {
 			byName.DisplayName = in.DisplayName
 		}
-		byName.Role = orDefault(in.Role, "guest")
+		// See above: role reconciliation belongs to ApplyIdPRole.
 		byName.UpdatedAt = t.m.now()
 		return *byName, nil
 	}
 
 	now := t.m.now()
+
+	// The email column is UNIQUE in PostgreSQL, and this store must enforce the same
+	// rule or the two disagree about a case that actually happens: an IdP reassigning
+	// a mailbox to a new person. PostgreSQL answered ErrConflict; the memory store
+	// happily created a second account with the same address, so a test could prove a
+	// behaviour production did not have.
+	if in.Email != "" {
+		for _, existing := range t.m.users {
+			if strings.EqualFold(existing.Email, in.Email) {
+				return User{}, fmt.Errorf("%w: email %q is already attached to another identity",
+					ErrConflict, in.Email)
+			}
+		}
+	}
+
 	u := &User{
 		ID: newID(), Username: username, Email: in.Email, DisplayName: in.DisplayName,
-		Role: orDefault(in.Role, "guest"), Status: "active",
+		Role: orDefault(in.Role, "guest"), Status: orDefault(in.Status, StatusActive),
 		IdPIssuer: in.Issuer, IdPSubject: in.Subject,
 		CreatedAt: now, UpdatedAt: now,
 	}
 	t.m.users[u.ID] = u
 	return *u, nil
+}
+
+// ApplyIdPRole stores the claimed role and revokes credentials on a downgrade.
+//
+// It mirrors the PostgreSQL implementation, including the revocation: a downgrade
+// that only rewrote a field would pass a test of the field and leave the live
+// credential working, which is the failure this exists to prevent.
+func (t *memTx) ApplyIdPRole(ctx context.Context, userID uuid.UUID, role string) (RoleChange, error) {
+	u, ok := t.m.users[userID]
+	if !ok {
+		return RoleChange{}, ErrNotFound
+	}
+
+	out := RoleChange{From: u.Role, To: role}
+	if u.Role == role {
+		return out, nil
+	}
+	out.Changed = true
+	out.Downgraded = roleRank(role) < roleRank(u.Role)
+	u.Role = role
+	u.UpdatedAt = t.m.now()
+
+	if !out.Downgraded {
+		return out, nil
+	}
+
+	now := t.m.now()
+	for _, s := range t.m.sessions {
+		if s.UserID == userID && s.RevokedAt == nil {
+			at := now
+			s.RevokedAt = &at
+			out.SessionsRevoked++
+		}
+	}
+	for _, p := range t.m.appPasswords {
+		if p.UserID == userID && p.RevokedAt == nil {
+			at := now
+			p.RevokedAt = &at
+			out.AppPasswordsRevoked++
+		}
+	}
+	return out, nil
 }
 
 // AddUser creates an account directly. Used by tests and by the break-glass

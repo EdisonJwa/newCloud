@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"io"
 	"mime/multipart"
@@ -24,8 +25,8 @@ const sharePageTimeout = time.Hour
 
 // handleSharePage shows a share's landing page.
 //
-// Anonymous by design. Every failure — unknown token, revoked, expired, exhausted,
-// wrong password — renders the same page, so a visitor cannot use it to discover
+// Anonymous by design. Every failure ??unknown token, revoked, expired, exhausted,
+// wrong password ??renders the same page, so a visitor cannot use it to discover
 // whether a token ever existed.
 //
 // Two consumers share this URL:
@@ -35,7 +36,7 @@ const sharePageTimeout = time.Hour
 //
 // The Accept header distinguishes them. Without that split, opening a share link in a
 // browser showed raw JSON, because the shell is only served as the router's fallback for
-// paths no handler claims — and this path is claimed.
+// paths no handler claims ??and this path is claimed.
 func (s *Server) handleSharePage(w http.ResponseWriter, r *http.Request) {
 	// A browser navigation sends Accept: text/html; fetch() and API clients do not.
 	if wantsHTML(r) {
@@ -86,9 +87,15 @@ func (s *Server) handleSharePage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Listing a shared directory.
+	//
+	// The lookup error is handled rather than discarded. It was previously dropped with `_ =`,
+	// which meant a link whose file had been trashed answered 200 with an empty `root_name` and
+	// no children — the recipient saw a blank page instead of "this is no longer available", and
+	// nothing in the response said why. SHARE-06 asks for the effect of a deleted or moved file
+	// to be defined; a silent empty listing is not a definition.
 	var node store.Node
 	var children []store.Node
-	_ = s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
+	err = s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
 		n, nerr := tx.Node(ctx, sh.NodeID)
 		if nerr != nil {
 			return nerr
@@ -98,6 +105,16 @@ func (s *Server) handleSharePage(w http.ResponseWriter, r *http.Request) {
 		children = c
 		return cerr
 	})
+	if err != nil {
+		// A trashed or purged node is reported as gone, not as an internal failure: the link is
+		// valid, the file is not.
+		if errors.Is(err, store.ErrNotFound) {
+			s.renderShareError(w, r, store.ErrShareGone)
+			return
+		}
+		s.renderShareError(w, r, err)
+		return
+	}
 
 	items := make([]fileJSON, 0, len(children))
 	for _, c := range children {
@@ -171,25 +188,19 @@ func (s *Server) handleShareDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Count first, stream second. Doing it the other way round would let the bytes
-	// leave before discovering that the allowance was already used up.
-	if err := s.deps.Shares.RecordDownload(r.Context(), sh, share.DownloadMeta{
-		ActorKind: "anonymous",
-		ActorIP:   clientIP(r), UserAgent: r.UserAgent(),
-		Name: node.Name, Bytes: node.Size,
-	}); err != nil {
-		s.renderShareError(w, r, err)
-		return
-	}
-
 	// The content store is keyed by owner + path, so the share root's full path is
 	// needed. It is derived from the metadata tree rather than from the request.
-	rel, err := s.pathOfNode(r.Context(), ownerID, node.ID)
+	rel, err := s.pathOfNode(r.Context(), sh.OwnerID, node.ID)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "not_found", "no such file")
 		return
 	}
 
+	_ = rel
+
+	// Open before charging. The previous order spent a download and only then
+	// failed with a 404 when the bytes were missing, so a storage fault silently
+	// consumed a visitor's last allowed download.
 	rc, err := s.deps.Content.Open(r.Context(), layout.Node{
 		Owner: ownerID.String(), Path: rel,
 	})
@@ -199,14 +210,68 @@ func (s *Server) handleShareDownload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rc.Close()
 
+	// Authorize this download as a *session*, not as a request.
+	//
+	// A media player seeking through a shared video issues a Range request per
+	// seek, and a resumed download is another request for the same bytes. Charging
+	// each one consumed a limited share almost immediately. The session is keyed by
+	// (share, node, visitor grant) and carries the node's ETag, so:
+	//   - the first request pays one download and stores the session,
+	//   - later Range requests and retries join it and pay nothing,
+	//   - a different visitor, or the same visitor downloading another file, pays,
+	//   - a session minted for one version never serves another.
+	grant := s.downloadGrantHash(r, sh)
+	// A Range request continues a download already authorised; a plain GET is a
+	// fresh download and is charged as one. That is the distinction the owner's
+	// "max downloads" setting actually means.
+	continuation := r.Header.Get("Range") != ""
+	err = s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
+		_, _, aerr := tx.AuthorizeDownload(ctx, store.DownloadSession{
+			ShareID:   sh.ID,
+			NodeID:    node.ID,
+			GrantHash: grant,
+			ETag:      node.ETag,
+			ExpiresAt: time.Now().Add(store.DownloadSessionTTL),
+		}, continuation)
+		return aerr
+	})
+	if err != nil {
+		// Out of allowance, or the share went away between the gate and here.
+		s.renderShareError(w, r, err)
+		return
+	}
+
 	w.Header().Set("Content-Type", contentTypeFor(node))
 	w.Header().Set("Content-Disposition", contentDisposition(node.Name))
-	w.Header().Set("Content-Length", strconv.FormatInt(node.Size, 10))
 	w.Header().Set("X-Robots-Tag", "noindex, nofollow, noarchive")
-	if _, err := io.Copy(w, rc); err != nil {
-		s.deps.Log.Warn("share download interrupted", "error", err)
-	}
+	w.Header().Set("ETag", node.ETag)
+
+	// ServeContent supplies Range, If-Range and If-None-Match against the seekable
+	// reader: seeking inside a shared video works, and a resumed download continues
+	// instead of restarting. The previous code set Content-Length and copied the
+	// whole entity, so every Range request received the full body.
+	http.ServeContent(w, r, node.Name, node.ModifiedAt, rc)
 	_ = filePath
+}
+
+// downloadGrantHash identifies the visitor's access grant for session binding.
+//
+// It hashes whichever grant the visitor actually proved ??the share password cookie
+// or the recipient-email cookie ??so two visitors cannot share one paid download.
+// A visitor who proved nothing (an open link) gets a stable anonymous key per
+// client address, which is the only identity available and is enough to keep one
+// client's Range requests on one session.
+func (s *Server) downloadGrantHash(r *http.Request, sh store.Share) []byte {
+	grant := ""
+	if c, err := r.Cookie(shareCookieName(sh.ID.String())); err == nil && c.Value != "" {
+		grant = "pw:" + c.Value
+	} else if c, err := r.Cookie(recipientCookieName(sh.ID.String())); err == nil && c.Value != "" {
+		grant = "rcpt:" + c.Value
+	} else {
+		grant = "anon:" + clientIP(r) + ":" + r.UserAgent()
+	}
+	sum := sha256.Sum256([]byte(grant))
+	return sum[:]
 }
 
 // handleShareUpload accepts a file into a request share.
@@ -305,7 +370,7 @@ func (s *Server) handleShareUpload(w http.ResponseWriter, r *http.Request) {
 		n, cerr := tx.CreateFile(ctx, store.NewFile{
 			OwnerID: sh.OwnerID, ParentID: root.ID, Name: finalName,
 			Size: res.Size, Mime: header.Header.Get("Content-Type"),
-			ETag: etagFor(res.Hash), BlobID: s.deps.Meta.BlobIDFor(ctx, res.Hash),
+			ETag: etagFor(res.Hash), BlobID: s.deps.Meta.BlobIDFor(ctx, res.Hash, res.Size),
 			BlobHash: res.Hash,
 		})
 		if cerr != nil {
@@ -338,7 +403,7 @@ func (s *Server) renderShareError(w http.ResponseWriter, r *http.Request, err er
 // shareCookieName scopes the access grant to one share.
 //
 // The __Secure- prefix, not __Host-: the cookie is deliberately scoped to "/s/<token>", and
-// __Host- requires Path=/ — a browser silently drops such a cookie, which looks exactly like a
+// __Host- requires Path=/ ??a browser silently drops such a cookie, which looks exactly like a
 // wrong password. The per-share scoping therefore lives in the name and in the signed value,
 // both of which the server checks, rather than in the prefix.
 func shareCookieName(shareID string) string {

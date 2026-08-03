@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"github.com/EdisonJwa/newCloud/internal/storage/s3fake"
 	"log/slog"
 	"os"
 	"strings"
@@ -37,13 +38,21 @@ func TestOpenStorageRejectsTreeOnS3(t *testing.T) {
 // TestOpenStorageBuildsS3 runs the real constructor against an S3-compatible endpoint.
 func TestOpenStorageBuildsS3(t *testing.T) {
 	endpoint := os.Getenv("TEST_S3_ENDPOINT")
-	if endpoint == "" {
-		t.Skip("TEST_S3_ENDPOINT not set; skipping the S3 wiring test")
-	}
-
 	bucket := os.Getenv("TEST_S3_BUCKET")
 	if bucket == "" {
 		bucket = "newcloud-test"
+	}
+
+	var accessKey, secretKey string
+	if endpoint == "" {
+		// No live endpoint: use the in-process fake so the wiring is actually exercised.
+		fake := s3fake.New(bucket)
+		t.Cleanup(fake.Close)
+		endpoint = fake.Endpoint()
+		accessKey, secretKey = "fake-access", "fake-secret"
+	} else {
+		accessKey = os.Getenv("TEST_S3_ACCESS_KEY")
+		secretKey = os.Getenv("TEST_S3_SECRET_KEY")
 	}
 
 	var cfg config.Config
@@ -57,8 +66,8 @@ func TestOpenStorageBuildsS3(t *testing.T) {
 	cfg.Storage.S3 = config.S3Storage{
 		Endpoint:  endpoint,
 		Bucket:    bucket,
-		AccessKey: os.Getenv("TEST_S3_ACCESS_KEY"),
-		SecretKey: os.Getenv("TEST_S3_SECRET_KEY"),
+		AccessKey: accessKey,
+		SecretKey: secretKey,
 		Secure:    &insecure,
 		Prefix:    "wiring",
 	}

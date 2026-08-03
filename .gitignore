@@ -24,3 +24,6 @@ web/dist/
 *.pass
 config.yml
 !deploy/config.example.yml
+
+# Local package-manager cache (not project source).
+.pnpm-store/

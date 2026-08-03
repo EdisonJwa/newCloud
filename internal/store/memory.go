@@ -41,7 +41,8 @@ type Memory struct {
 	// auditTimes runs parallel to audit. The write-side entry has no timestamp by
 	// design (the SQL column defaults to now()), so the memory store stamps on append.
 	auditTimes   []time.Time
-	jobs         []Job
+	jobs         []queuedJob
+	nextJobID    int64
 	usage        map[uuid.UUID]int64
 	quota        map[uuid.UUID]int64
 	users        map[uuid.UUID]*User
@@ -51,9 +52,21 @@ type Memory struct {
 	deadProps    map[uuid.UUID]map[[2]string]string
 	shares       map[uuid.UUID]*Share
 	blobIDs      map[[32]byte]uuid.UUID
+	// auditFault makes audit writes fail, so tests can exercise the T-16 fail-closed policy.
+	auditFault   error
 	recipients   map[[2]string]*ShareRecipient
+	downloads    map[string]*DownloadSession
+	acl          map[uuid.UUID][]ACLEntry
+	groups       []Group
+	groupMembers []GroupMember
+	otpAttempts  []OTPAttempt
 	nextVersion  int
-	now          func() time.Time
+	// broken simulates an unreachable backend, for tests of failure handling.
+	broken *brokenFlag
+	now    func() time.Time
+	// clockOffset lets a test move time forward without sleeping. Nil means "use the
+	// real clock".
+	clockOffset *offsetFlag
 }
 
 var _ Store = (*Memory)(nil)
@@ -74,7 +87,7 @@ type memNode struct {
 
 // NewMemory returns an empty metadata store.
 func NewMemory() *Memory {
-	return &Memory{
+	m := &Memory{
 		nodes:        map[uuid.UUID]*memNode{},
 		children:     map[uuid.UUID]map[string]uuid.UUID{},
 		roots:        map[uuid.UUID]uuid.UUID{},
@@ -88,30 +101,49 @@ func NewMemory() *Memory {
 		shares:       map[uuid.UUID]*Share{},
 		blobIDs:      map[[32]byte]uuid.UUID{},
 		recipients:   map[[2]string]*ShareRecipient{},
+		downloads:    map[string]*DownloadSession{},
+		acl:          map[uuid.UUID][]ACLEntry{},
+		groups:       nil,
+		groupMembers: nil,
+		otpAttempts:  nil,
 		now:          time.Now,
 	}
+	// Route every timestamp through the offset-aware clock, so a test can advance time
+	// and have job scheduling, lease expiry and retention all move together.
+	m.applyClock()
+	return m
 }
-
-func nameKey(name string) string { return strings.ToLower(name) }
 
 func lower(s string) string { return strings.ToLower(s) }
 
 // txDepthKey marks a context that is already inside a transaction.
 type txDepthKey struct{}
 
+// txMemKey carries the active transaction so store-level methods that must write through the
+// snapshot can find it.
+//
+// Some methods take a bare "no Tx argument" signature (BlobIDFor, for historical reasons) and are
+// called from inside a WithTx callback. Without this they write to the store instead of the
+// snapshot, and the snapshot then overwrites them on commit — which silently disabled blob
+// deduplication. Carrying the tx explicitly is what lets those methods see the right target
+// without changing their signatures at every call site.
+type txMemKey struct{}
+
 // WithTx executes fn against a private copy of the data and publishes it on
 // success.
 //
 // Why a copy rather than locking around the callback: the callback is arbitrary
-// user code and almost always calls back into the store (Resolve, Node, …). A
+// user code and almost always calls back into the store (Resolve, Node, ??. A
 // sync.Mutex is not reentrant, so holding the write lock across the callback
-// deadlocks the moment a transaction reads anything through a public method —
-// which the DAV handlers do constantly.
+// deadlocks the moment a transaction reads anything through a public method ??// which the DAV handlers do constantly.
 //
 // The copy is cheap in the only place this implementation runs (tests and the
 // pre-database wiring), and PostgreSQL gets real transactions. What matters is
 // that commit is atomic: a reader sees either none of a transaction or all of it.
 func (m *Memory) WithTx(ctx context.Context, fn func(ctx context.Context, tx Tx) error) error {
+	if m.isBroken() {
+		return ErrUnavailable
+	}
 	// Re-entry guard. A transaction callback that calls another Store method
 	// (Resolve, Root, Usage) would otherwise start a nested transaction and
 	// deadlock on txMu. PostgreSQL has no nested transactions either, so refusing
@@ -121,6 +153,7 @@ func (m *Memory) WithTx(ctx context.Context, fn func(ctx context.Context, tx Tx)
 		return ErrNestedTx
 	}
 	ctx = context.WithValue(ctx, txDepthKey{}, true)
+	ctx = context.WithValue(ctx, txMemKey{}, (*memTx)(nil)) // replaced below once tx exists
 
 	// Serialise transactions, but release the mutex before invoking fn. The
 	// private copy is what isolates them; the mutex only orders the swap.
@@ -132,6 +165,7 @@ func (m *Memory) WithTx(ctx context.Context, fn func(ctx context.Context, tx Tx)
 	m.mu.RUnlock()
 
 	tx := &memTx{m: work}
+	ctx = context.WithValue(ctx, txMemKey{}, tx)
 	if err := fn(ctx, tx); err != nil {
 		return err
 	}
@@ -153,6 +187,11 @@ func (m *Memory) WithTx(ctx context.Context, fn func(ctx context.Context, tx Tx)
 	m.shares = work.shares
 	m.blobIDs = work.blobIDs
 	m.recipients = work.recipients
+	m.downloads = work.downloads
+	m.acl = work.acl
+	m.groups = work.groups
+	m.groupMembers = work.groupMembers
+	m.otpAttempts = work.otpAttempts
 	m.audit = work.audit
 	// The timestamps travel with the entries. Copying one without the other is how the
 	// indexes drift out of step, and an index out of range during an audit export is a
@@ -179,10 +218,18 @@ func (m *Memory) snapshot() *Memory {
 		deadProps:    make(map[uuid.UUID]map[[2]string]string, len(m.deadProps)),
 		shares:       make(map[uuid.UUID]*Share, len(m.shares)),
 		blobIDs:      make(map[[32]byte]uuid.UUID, len(m.blobIDs)),
+		// The audit fault is configuration, not data: it must survive the snapshot or a
+		// transaction would silently succeed while the store reports itself healthy.
+		auditFault:   m.auditFault,
 		recipients:   make(map[[2]string]*ShareRecipient, len(m.recipients)),
+		downloads:    make(map[string]*DownloadSession, len(m.downloads)),
+		acl:          make(map[uuid.UUID][]ACLEntry, len(m.acl)),
+		groups:       append([]Group(nil), m.groups...),
+		groupMembers: append([]GroupMember(nil), m.groupMembers...),
+		otpAttempts:  append([]OTPAttempt(nil), m.otpAttempts...),
 		audit:        append([]AuditEntry(nil), m.audit...),
 		auditTimes:   append([]time.Time(nil), m.auditTimes...),
-		jobs:         append([]Job(nil), m.jobs...),
+		jobs:         append([]queuedJob(nil), m.jobs...),
 		nextVersion:  m.nextVersion,
 		now:          m.now,
 	}
@@ -200,6 +247,16 @@ func (m *Memory) snapshot() *Memory {
 	}
 	for k, v := range m.roots {
 		work.roots[k] = v
+	}
+	// The dedup index has to travel with the snapshot.
+	//
+	// Everything else in this function copies its map by hand; blobIDs was declared in the clone
+	// but never filled, so every transaction began with an empty index and commit replaced the
+	// real one with it. The visible bug: two files with identical content received different blob
+	// ids, so the blob layout silently stopped deduplicating and every upload consumed full size.
+	// It only shows up across transactions — within one, the map works.
+	for k, v := range m.blobIDs {
+		work.blobIDs[k] = v
 	}
 	for k, v := range m.usage {
 		work.usage[k] = v
@@ -241,6 +298,14 @@ func (m *Memory) snapshot() *Memory {
 		cp := *v
 		work.recipients[k] = &cp
 	}
+	for k, v := range m.downloads {
+		cp := *v
+		cp.GrantHash = append([]byte(nil), v.GrantHash...)
+		work.downloads[k] = &cp
+	}
+	for k, v := range m.acl {
+		work.acl[k] = append([]ACLEntry(nil), v...)
+	}
 	return work
 }
 
@@ -254,6 +319,15 @@ var _ Tx = (*memTx)(nil)
 func (t *memTx) Node(ctx context.Context, id uuid.UUID) (Node, error) {
 	rec, ok := t.m.nodes[id]
 	if !ok || rec.node.TrashedAt != nil {
+		return Node{}, ErrNotFound
+	}
+	return rec.node, nil
+}
+
+// NodeIncludingTrashed returns a node in any state, for the restore flow.
+func (t *memTx) NodeIncludingTrashed(ctx context.Context, id uuid.UUID) (Node, error) {
+	rec, ok := t.m.nodes[id]
+	if !ok {
 		return Node{}, ErrNotFound
 	}
 	return rec.node, nil
@@ -278,15 +352,39 @@ func (t *memTx) Children(ctx context.Context, parentID uuid.UUID, limit int) ([]
 	return out, nil
 }
 
+// ChildrenAfter implements keyset pagination, mirroring the SQL predicate.
+func (t *memTx) ChildrenAfter(ctx context.Context, parentID uuid.UUID, after string, limit int) ([]Node, error) {
+	all, err := t.Children(ctx, parentID, 0)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Node, 0, len(all))
+	for _, n := range all {
+		// Strictly greater-than, and byte-wise like PostgreSQL's default
+		// collation: a locale-aware comparison here would make the two backends
+		// paginate in different orders, which is the kind of divergence the shared
+		// suite exists to catch.
+		if n.Name > after {
+			out = append(out, n)
+		}
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}
+
 func (t *memTx) ChildByName(ctx context.Context, parentID uuid.UUID, name string) (Node, error) {
 	childID, ok := t.m.children[parentID][nameKey(name)]
 	if !ok {
 		return Node{}, ErrNotFound
 	}
 	rec := t.m.nodes[childID]
-	if rec.node.TrashedAt != nil || rec.node.Name != name {
+	if rec.node.TrashedAt != nil {
 		return Node{}, ErrNotFound
 	}
+	// The key already folded case and normalisation, so two spellings of one name reach the same
+	// node on purpose (T-12). Comparing the raw bytes here would undo that.
 	return rec.node, nil
 }
 
@@ -358,6 +456,9 @@ func (t *memTx) UpdateFile(ctx context.Context, u UpdateFile) (Node, error) {
 	if rec.node.Kind != KindFile {
 		return Node{}, fmt.Errorf("%w: not a file", ErrInvalidName)
 	}
+	if !u.Expect.Matches(rec.node.ETag, true) {
+		return Node{}, ErrPrecondition
+	}
 
 	// Quota accounting is on the delta, not the new size: re-uploading a file
 	// with the same content must not consume quota twice.
@@ -366,7 +467,10 @@ func (t *memTx) UpdateFile(ctx context.Context, u UpdateFile) (Node, error) {
 		return Node{}, err
 	}
 
-	if u.KeepVersion && rec.node.BlobID != nil {
+	// Keep a version only when the content actually differs. A retried upload of
+	// the same bytes should not fill the history with identical copies, which is
+	// what the PostgreSQL implementation decides too.
+	if u.KeepVersion && rec.node.BlobID != nil && *rec.node.BlobID != u.BlobID {
 		rec.versions = append(rec.versions, Version{
 			ID: newID(), NodeID: rec.node.ID,
 			VersionNo: len(rec.versions) + 1,
@@ -388,6 +492,37 @@ func (t *memTx) UpdateFile(ctx context.Context, u UpdateFile) (Node, error) {
 	rec.blob = u.BlobHash
 	t.m.usage[rec.node.OwnerID] += delta
 	return rec.node, nil
+}
+
+// WriteFile implements the shared upsert-with-precondition path.
+func (t *memTx) WriteFile(ctx context.Context, w WriteFile) (Node, bool, error) {
+	existing, err := t.ChildByName(ctx, w.ParentID, w.Name)
+	switch {
+	case err == nil:
+		if !w.Expect.Matches(existing.ETag, true) {
+			return Node{}, false, ErrPrecondition
+		}
+		n, uerr := t.UpdateFile(ctx, UpdateFile{
+			NodeID: existing.ID, Size: w.Size, Mime: w.Mime, ETag: w.ETag,
+			BlobID: w.BlobID, BlobHash: w.BlobHash,
+			KeepVersion: w.KeepVersion, MaxVersions: w.MaxVersions,
+		})
+		if uerr != nil {
+			return Node{}, false, uerr
+		}
+		return n, false, nil
+	case errors.Is(err, ErrNotFound):
+		if !w.Expect.Matches("", false) {
+			return Node{}, false, ErrPrecondition
+		}
+		n, cerr := t.CreateFile(ctx, w.NewFile)
+		if cerr != nil {
+			return Node{}, false, cerr
+		}
+		return n, true, nil
+	default:
+		return Node{}, false, err
+	}
 }
 
 func (t *memTx) checkQuota(ownerID uuid.UUID, delta int64) error {
@@ -535,7 +670,7 @@ func (t *memTx) Restore(ctx context.Context, id uuid.UUID) (Node, error) {
 		return Node{}, fmt.Errorf("%w: not in trash", ErrNotFound)
 	}
 	// Restore the whole subtree. Restoring only the directory would bring back an
-	// empty folder while its children stayed invisible — they were never removed
+	// empty folder while its children stayed invisible ??they were never removed
 	// from the parent's child list, so no trash listing would show them either,
 	// making them unreachable forever.
 	if err := t.restoreRecursive(id, 0); err != nil {
@@ -588,13 +723,56 @@ func (t *memTx) RestoreVersion(ctx context.Context, nodeID uuid.UUID, versionNo 
 }
 
 func (t *memTx) Audit(ctx context.Context, e AuditEntry) error {
+	// Fail-closed (T-16): the same rule as the PostgreSQL store. The in-memory backend has no
+	// disk to fill, so this is injected rather than discovered, but the behaviour must match or
+	// the two backends would diverge on exactly the security property that matters.
+	if t.m.auditFault != nil {
+		return fmt.Errorf("%w: %v", ErrAuditUnavailable, t.m.auditFault)
+	}
 	t.m.audit = append(t.m.audit, e)
 	t.m.auditTimes = append(t.m.auditTimes, t.m.now())
 	return nil
 }
 
+// SetAuditFault makes every subsequent audit write fail, for tests of the T-16 policy.
+//
+// Injection rather than a real failing disk: the property under test is the store's refusal to
+// commit an unauditable change, not the disk driver.
+func (m *Memory) SetAuditFault(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.auditFault = err
+}
+
 func (t *memTx) Enqueue(ctx context.Context, j Job) error {
-	t.m.jobs = append(t.m.jobs, j)
+	runAfter := j.RunAfter
+	if runAfter.IsZero() {
+		runAfter = t.m.now()
+	}
+
+	// Dedupe applies while a job with the same key is still outstanding, matching the
+	// SQL partial unique index. Without it a retried request would queue the same work
+	// twice and the worker would do it twice.
+	if j.DedupeKey != "" {
+		for i := range t.m.jobs {
+			existing := &t.m.jobs[i]
+			if existing.CompletedAt == nil && existing.DedupeKey == j.DedupeKey && existing.Kind == j.Kind {
+				return nil
+			}
+		}
+	}
+
+	maxAttempts := j.MaxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = 5
+	}
+
+	t.m.nextJobID++
+	t.m.jobs = append(t.m.jobs, queuedJob{
+		ID: t.m.nextJobID, Kind: j.Kind, Payload: copyPayload(j.Payload),
+		DedupeKey: j.DedupeKey, RunAfter: runAfter,
+		MaxAttempts: maxAttempts, CreatedAt: t.m.now(),
+	})
 	return nil
 }
 
@@ -685,10 +863,22 @@ func (m *Memory) AuditLog() []AuditEntry {
 }
 
 // Jobs returns queued jobs.
+// Jobs returns every queued job, for tests that assert work was enqueued.
+//
+// It exposes the input shape rather than the queue record: a test asking "was this
+// queued" should not depend on lease bookkeeping, and the full row is available through
+// JobCounts and the admin surface.
 func (m *Memory) Jobs() []Job {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return append([]Job(nil), m.jobs...)
+	out := make([]Job, 0, len(m.jobs))
+	for _, j := range m.jobs {
+		out = append(out, Job{
+			Kind: j.Kind, Payload: copyPayload(j.Payload),
+			DedupeKey: j.DedupeKey, RunAfter: j.RunAfter,
+		})
+	}
+	return out
 }
 
 func (m *Memory) Resolver() Resolver { return &memResolver{m: m} }
@@ -781,4 +971,32 @@ func newID() uuid.UUID {
 	b[6] = (b[6] & 0x0f) | 0x40 // version 4
 	b[8] = (b[8] & 0x3f) | 0x80 // variant
 	return uuid.UUID(b)
+}
+
+// Now returns the store's current time, including any test clock offset.
+//
+// Every internal timestamp goes through m.now, which this wraps. Advancing the clock
+// therefore moves job scheduling, retention and lease expiry together — the same way a
+// real clock would — instead of only the one field a test happened to touch.
+func (m *Memory) Now() time.Time {
+	now := m.now()
+	if m.clockOffset != nil {
+		now = now.Add(m.clockOffset.by)
+	}
+	return now
+}
+
+// applyClock replaces m.now with a closure that honours the offset.
+//
+// It runs once when the store is built, so every existing call site of m.now gains the
+// behaviour without being rewritten.
+func (m *Memory) applyClock() {
+	base := m.now
+	m.now = func() time.Time {
+		now := base()
+		if m.clockOffset != nil {
+			now = now.Add(m.clockOffset.by)
+		}
+		return now
+	}
 }

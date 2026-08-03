@@ -94,6 +94,10 @@ type ShareRecipient struct {
 	FirstAccessAt *time.Time
 	LastAccessAt  *time.Time
 	RevokedAt     *time.Time
+	// ConsumedAt marks the moment the invitation's verification code was used.
+	// A code is single-use: without this, it stayed valid for its whole TTL and
+	// could be replayed by anyone who saw it once.
+	ConsumedAt *time.Time
 }
 
 // Share errors.
@@ -104,6 +108,14 @@ var (
 	ErrShareExhausted = errors.New("store: share limit reached")
 	// ErrShareRevoked: the owner revoked it.
 	ErrShareRevoked = errors.New("store: share revoked")
+	// ErrShareGone: the share is valid but the file it points at was deleted (SHARE-06).
+	//
+	// Internal only. The recipient deliberately cannot tell this apart from "revoked",
+	// "expired" or "never existed" — renderShareError collapses them all, because
+	// distinguishing the causes would turn the endpoint into a token oracle. The value of this
+	// sentinel is that the server stops silently serving an empty listing and can log the real
+	// reason.
+	ErrShareGone = errors.New("store: the shared file no longer exists")
 	// ErrSharePassword: the presented password did not match.
 	ErrSharePassword = errors.New("store: share password incorrect")
 	// ErrRecipientDenied: the caller is not a recipient of an email share.

@@ -1,0 +1,289 @@
+// Package metrics is a small, dependency-free metrics registry in the Prometheus text
+// exposition format (§11.1).
+//
+// Why not client_golang: this process needs counters and a gauge for queue depth, and the
+// requirements name specific signals rather than a full instrumentation ecosystem. A
+// hundred lines with tests beats a dependency that brings its own collector model, its own
+// HTTP handler and its own opinions about naming. If the project later outgrows this, the
+// exposition format is the compatible part and the registry can be swapped.
+//
+// What the requirement asks for, and where it lives:
+//
+//	请求错误率        newcloud_http_requests_total{status_class}
+//	DAV 冲突率        newcloud_dav_conflicts_total
+//	上传失败率        newcloud_uploads_total{result}
+//	队列积压          newcloud_jobs{state}
+//	GC 指标           newcloud_blob_gc_* (deleted/failed)
+//	审计校验指标      newcloud_audit_events, newcloud_audit_chain_head_age_seconds
+package metrics
+
+import (
+	"fmt"
+	"net/http"
+	"sort"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// Registry holds the counters and gauges.
+//
+// Counters are atomics rather than mutex-guarded maps because they are incremented on the
+// request path: a lock there would serialise every request behind a metric, which is the
+// classic way observability makes an outage worse.
+type Registry struct {
+	// httpRequests is keyed by method and status class, so error rate is a query rather
+	// than a pre-computation. Bucketing statuses into classes keeps the cardinality fixed:
+	// one series per route x status code would grow without bound as paths multiply.
+	httpRequests sync.Map // map[string]*atomic.Uint64
+
+	// davConflicts counts 409/412 responses on WebDAV, which is the signal that clients
+	// are fighting over a file (or that lock handling is wrong).
+	davConflicts atomic.Uint64
+	// davRequests counts WebDAV requests, so the conflict rate has a denominator.
+	davRequests atomic.Uint64
+
+	// uploads is keyed by result ("ok", "too_large", "failed", "aborted").
+	uploads sync.Map // map[string]*atomic.Uint64
+
+	// Thumbnail decode outcomes, keyed by result.
+	thumbnails sync.Map // map[string]*atomic.Uint64
+
+	// Audit chain gauges, refreshed by the worker.
+	auditEvents      atomic.Int64
+	auditHeadAgeNano atomic.Int64
+	auditVerifyFail  atomic.Uint64
+	auditVerifyOK    atomic.Uint64
+
+	// Blob GC outcomes.
+	blobsDeleted atomic.Uint64
+	blobsGCError atomic.Uint64
+
+	// Queue depth, refreshed by the worker on each poll.
+	jobsPending atomic.Int64
+	jobsRunning atomic.Int64
+	jobsFailed  atomic.Int64
+
+	startedAt time.Time
+}
+
+// New returns an empty registry.
+func New() *Registry {
+	return &Registry{startedAt: time.Now()}
+}
+
+// counter returns the counter for key, creating it on first use.
+func counter(m *sync.Map, key string) *atomic.Uint64 {
+	if v, ok := m.Load(key); ok {
+		return v.(*atomic.Uint64)
+	}
+	actual, _ := m.LoadOrStore(key, new(atomic.Uint64))
+	return actual.(*atomic.Uint64)
+}
+
+// ObserveRequest records one HTTP response.
+func (r *Registry) ObserveRequest(method string, status int, dav bool) {
+	counter(&r.httpRequests, method+" "+statusClass(status)).Add(1)
+	if dav {
+		r.davRequests.Add(1)
+		if status == http.StatusConflict || status == http.StatusPreconditionFailed {
+			r.davConflicts.Add(1)
+		}
+	}
+}
+
+// ObserveUpload records an upload outcome.
+func (r *Registry) ObserveUpload(result string) {
+	counter(&r.uploads, result).Add(1)
+}
+
+// ObserveThumbnail records a thumbnail outcome.
+func (r *Registry) ObserveThumbnail(result string) {
+	counter(&r.thumbnails, result).Add(1)
+}
+
+// SetAudit reports the chain's length and the age of its head.
+func (r *Registry) SetAudit(events int64, headAge time.Duration) {
+	r.auditEvents.Store(events)
+	r.auditHeadAgeNano.Store(int64(headAge))
+}
+
+// ObserveAuditVerify records an anchor verification outcome.
+func (r *Registry) ObserveAuditVerify(ok bool) {
+	if ok {
+		r.auditVerifyOK.Add(1)
+		return
+	}
+	r.auditVerifyFail.Add(1)
+}
+
+// ObserveBlobGC records the blob collector's outcome.
+func (r *Registry) ObserveBlobGC(deleted int, failed bool) {
+	r.blobsDeleted.Add(uint64(deleted))
+	if failed {
+		r.blobsGCError.Add(1)
+	}
+}
+
+// SetJobs reports the queue depth.
+func (r *Registry) SetJobs(pending, running, failed int) {
+	r.jobsPending.Store(int64(pending))
+	r.jobsRunning.Store(int64(running))
+	r.jobsFailed.Store(int64(failed))
+}
+
+// statusClass buckets a status code.
+//
+// 2xx/3xx/4xx/5xx rather than the exact code: the useful question is "what fraction of
+// requests are failing", and exact-code series per route is how a metrics endpoint becomes
+// a memory leak.
+func statusClass(status int) string {
+	switch {
+	case status >= 500:
+		return "5xx"
+	case status >= 400:
+		return "4xx"
+	case status >= 300:
+		return "3xx"
+	case status >= 200:
+		return "2xx"
+	default:
+		return "1xx"
+	}
+}
+
+// Handler serves the Prometheus text format.
+//
+// The format is written by hand, which is why the labels are quoted and escaped: a label
+// value containing a quote or a newline would otherwise produce a document that scrapers
+// silently reject, and a metrics endpoint that is subtly malformed is worse than none.
+func (r *Registry) Handler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		r.write(w)
+	})
+}
+
+// write emits the exposition document.
+func (r *Registry) write(w http.ResponseWriter) {
+	// HTTP requests, sorted for a stable document: an unordered dump makes a scrape diff
+	// useless and hides real changes among reshuffled lines.
+	fmt.Fprintln(w, "# HELP newcloud_http_requests_total HTTP responses by method and status class.")
+	fmt.Fprintln(w, "# TYPE newcloud_http_requests_total counter")
+	var httpKeys []string
+	r.httpRequests.Range(func(k, _ any) bool {
+		httpKeys = append(httpKeys, k.(string))
+		return true
+	})
+	sort.Strings(httpKeys)
+	for _, k := range httpKeys {
+		method, class := splitKey(k)
+		v, _ := r.httpRequests.Load(k)
+		fmt.Fprintf(w, "newcloud_http_requests_total{method=%q,status_class=%q} %d\n",
+			method, class, v.(*atomic.Uint64).Load())
+	}
+
+	fmt.Fprintln(w, "# HELP newcloud_dav_requests_total WebDAV requests.")
+	fmt.Fprintln(w, "# TYPE newcloud_dav_requests_total counter")
+	fmt.Fprintf(w, "newcloud_dav_requests_total %d\n", r.davRequests.Load())
+
+	fmt.Fprintln(w, "# HELP newcloud_dav_conflicts_total WebDAV 409/412 responses (lock contention or a stale etag).")
+	fmt.Fprintln(w, "# TYPE newcloud_dav_conflicts_total counter")
+	fmt.Fprintf(w, "newcloud_dav_conflicts_total %d\n", r.davConflicts.Load())
+
+	writeCounterMap(w, "newcloud_uploads_total", "Upload outcomes.", &r.uploads)
+	writeCounterMap(w, "newcloud_thumbnails_total", "Thumbnail decode outcomes.", &r.thumbnails)
+
+	fmt.Fprintln(w, "# HELP newcloud_jobs Queue depth by state.")
+	fmt.Fprintln(w, "# TYPE newcloud_jobs gauge")
+	fmt.Fprintf(w, "newcloud_jobs{state=\"pending\"} %d\n", r.jobsPending.Load())
+	fmt.Fprintf(w, "newcloud_jobs{state=\"running\"} %d\n", r.jobsRunning.Load())
+	fmt.Fprintf(w, "newcloud_jobs{state=\"failed\"} %d\n", r.jobsFailed.Load())
+
+	fmt.Fprintln(w, "# HELP newcloud_audit_events Events in the audit chain.")
+	fmt.Fprintln(w, "# TYPE newcloud_audit_events gauge")
+	fmt.Fprintf(w, "newcloud_audit_events %d\n", r.auditEvents.Load())
+
+	fmt.Fprintln(w, "# HELP newcloud_audit_chain_head_age_seconds Age of the newest audit event.")
+	fmt.Fprintln(w, "# TYPE newcloud_audit_chain_head_age_seconds gauge")
+	fmt.Fprintf(w, "newcloud_audit_chain_head_age_seconds %.3f\n",
+		time.Duration(r.auditHeadAgeNano.Load()).Seconds())
+
+	fmt.Fprintln(w, "# HELP newcloud_audit_anchor_verify_total Anchor verifications by outcome.")
+	fmt.Fprintln(w, "# TYPE newcloud_audit_anchor_verify_total counter")
+	fmt.Fprintf(w, "newcloud_audit_anchor_verify_total{result=\"ok\"} %d\n", r.auditVerifyOK.Load())
+	fmt.Fprintf(w, "newcloud_audit_anchor_verify_total{result=\"failed\"} %d\n", r.auditVerifyFail.Load())
+
+	fmt.Fprintln(w, "# HELP newcloud_blob_gc_deleted_total Blobs removed by the collector.")
+	fmt.Fprintln(w, "# TYPE newcloud_blob_gc_deleted_total counter")
+	fmt.Fprintf(w, "newcloud_blob_gc_deleted_total %d\n", r.blobsDeleted.Load())
+
+	fmt.Fprintln(w, "# HELP newcloud_blob_gc_errors_total Blob collection runs that failed.")
+	fmt.Fprintln(w, "# TYPE newcloud_blob_gc_errors_total counter")
+	fmt.Fprintf(w, "newcloud_blob_gc_errors_total %d\n", r.blobsGCError.Load())
+
+	fmt.Fprintln(w, "# HELP newcloud_uptime_seconds Seconds since this process started.")
+	fmt.Fprintln(w, "# TYPE newcloud_uptime_seconds gauge")
+	fmt.Fprintf(w, "newcloud_uptime_seconds %.0f\n", time.Since(r.startedAt).Seconds())
+}
+
+// writeCounterMap emits one family from a keyed counter map.
+func writeCounterMap(w http.ResponseWriter, name, help string, m *sync.Map) {
+	fmt.Fprintf(w, "# HELP %s %s\n", name, help)
+	fmt.Fprintf(w, "# TYPE %s counter\n", name)
+
+	var keys []string
+	m.Range(func(k, _ any) bool {
+		keys = append(keys, k.(string))
+		return true
+	})
+	sort.Strings(keys)
+	for _, k := range keys {
+		v, _ := m.Load(k)
+		fmt.Fprintf(w, "%s{result=%q} %d\n", name, k, v.(*atomic.Uint64).Load())
+	}
+}
+
+// splitKey splits a "method class" key.
+func splitKey(k string) (string, string) {
+	for i := len(k) - 1; i >= 0; i-- {
+		if k[i] == ' ' {
+			return k[:i], k[i+1:]
+		}
+	}
+	return k, ""
+}
+
+// Snapshot is a point-in-time copy, for tests and the admin view.
+type Snapshot struct {
+	HTTPRequests map[string]uint64
+	DAVRequests  uint64
+	DAVConflicts uint64
+	Uploads      map[string]uint64
+	QueuePending int64
+	QueueRunning int64
+	QueueFailed  int64
+}
+
+// Snapshot returns the current values.
+func (r *Registry) Snapshot() Snapshot {
+	s := Snapshot{
+		HTTPRequests: map[string]uint64{},
+		Uploads:      map[string]uint64{},
+		DAVRequests:  r.davRequests.Load(),
+		DAVConflicts: r.davConflicts.Load(),
+		QueuePending: r.jobsPending.Load(),
+		QueueRunning: r.jobsRunning.Load(),
+		QueueFailed:  r.jobsFailed.Load(),
+	}
+	r.httpRequests.Range(func(k, v any) bool {
+		s.HTTPRequests[k.(string)] = v.(*atomic.Uint64).Load()
+		return true
+	})
+	r.uploads.Range(func(k, v any) bool {
+		s.Uploads[k.(string)] = v.(*atomic.Uint64).Load()
+		return true
+	})
+	return s
+}

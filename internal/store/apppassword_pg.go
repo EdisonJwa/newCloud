@@ -36,6 +36,16 @@ func (t *pgTx) RevokeAppPassword(ctx context.Context, id uuid.UUID) error {
 	return translate(err)
 }
 
+func (t *pgTx) RevokeUserAppPasswords(ctx context.Context, userID uuid.UUID) (int, error) {
+	const q = `UPDATE app_passwords SET revoked_at = now()
+		WHERE user_id = $1 AND revoked_at IS NULL`
+	tag, err := t.tx.Exec(ctx, q, userID)
+	if err != nil {
+		return 0, translate(err)
+	}
+	return int(tag.RowsAffected()), nil
+}
+
 func (t *pgTx) ListAppPasswords(ctx context.Context, userID uuid.UUID) ([]AppPassword, error) {
 	const q = `SELECT id, user_id, label, prefix, token_hash, scope, created_at,
 		expires_at, last_used_at, COALESCE(last_used_ip::text,''), revoked_at

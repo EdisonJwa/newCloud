@@ -78,6 +78,11 @@ func (s *Server) handleShareCreate(w http.ResponseWriter, r *http.Request) {
 		MaxUploads   *int     `json:"max_uploads"`
 		Permissions  []string `json:"permissions"`
 		Recipients   []string `json:"recipients"`
+		// The per-share upload limits. They were enforced on the read path but
+		// could not be set here, so a drop box could never actually be limited —
+		// decodeJSON rejects unknown fields, so sending them was a 400.
+		MaxBytesPerFile *int64   `json:"max_bytes_per_file"`
+		AllowedMIME     []string `json:"allowed_mime"`
 		// HideContents is accepted but not trusted: the service forces it on for request
 		// shares. It is in the struct anyway because the client sends it, and
 		// decodeJSON rejects unknown fields — omitting it here made every "create a drop
@@ -134,6 +139,7 @@ func (s *Server) handleShareCreate(w http.ResponseWriter, r *http.Request) {
 		NodeID: node.ID, OwnerID: actor.ID(), OwnerEmail: actor.Email(), NodePath: strings.TrimPrefix(body.Path, "/"), Kind: kind,
 		Label: body.Label, Password: body.Password, TTL: ttl,
 		MaxDownloads: body.MaxDownloads, MaxUploads: body.MaxUploads,
+		MaxBytesPerFile: body.MaxBytesPerFile, AllowedMIME: body.AllowedMIME,
 		Permissions: body.Permissions, Recipients: body.Recipients,
 	})
 	if err != nil {
@@ -261,11 +267,13 @@ func (s *Server) toShareJSON(ctx context.Context, sh store.Share) shareJSON {
 		CreatedAt: sh.CreatedAt, RevokedAt: sh.RevokedAt,
 	}
 
-	// Resolving the node path makes the list readable; a failure here must not
-	// break the whole listing, so it is best-effort.
-	if nodes, err := s.deps.Meta.Resolve(ctx, sh.OwnerID, ""); err == nil {
-		_ = nodes
-	}
+	// The path makes the list readable ("/docs/report.pdf" rather than a UUID). It
+	// used to resolve the owner's *root* instead of the shared node, so the field
+	// was always empty — a silent placeholder is worse than an absent one.
+	//
+	// Best-effort: a resolution failure must not break the whole listing, and a
+	// file that was renamed since the share was made simply shows its new path.
+	out.NodePath = s.pathOfShare(ctx, sh)
 
 	_ = s.deps.Meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
 		recs, err := tx.RecipientsFor(ctx, sh.ID)
@@ -278,6 +286,44 @@ func (s *Server) toShareJSON(ctx context.Context, sh store.Share) shareJSON {
 		return nil
 	})
 	return out
+}
+
+// pathOfShare reconstructs the shared node's path, or "" when it is gone.
+func (s *Server) pathOfShare(ctx context.Context, sh store.Share) string {
+	var name string
+	var parent *uuid.UUID
+	err := s.deps.Meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		n, nerr := tx.Node(ctx, sh.NodeID)
+		if nerr != nil {
+			return nerr
+		}
+		name, parent = n.Name, n.ParentID
+		return nil
+	})
+	if err != nil || parent == nil {
+		// A root has no path of its own; the caller sees the namespace root.
+		return ""
+	}
+
+	segs := []string{name}
+	id := *parent
+	for depth := 0; depth < 256; depth++ {
+		var n store.Node
+		ferr := s.deps.Meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+			got, gerr := tx.Node(ctx, id)
+			n = got
+			return gerr
+		})
+		if ferr != nil || n.ParentID == nil {
+			break
+		}
+		segs = append(segs, n.Name)
+		id = *n.ParentID
+	}
+	for i, j := 0, len(segs)-1; i < j; i, j = i+1, j-1 {
+		segs[i], segs[j] = segs[j], segs[i]
+	}
+	return "/" + strings.Join(segs, "/")
 }
 
 func (s *Server) shareURL(token string) string {

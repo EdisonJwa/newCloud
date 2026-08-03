@@ -157,7 +157,7 @@ func (t *pgTx) AddRecipient(ctx context.Context, r ShareRecipient) error {
 
 func (t *pgTx) RecipientsFor(ctx context.Context, shareID uuid.UUID) ([]ShareRecipient, error) {
 	const q = `SELECT id, share_id, email, user_id, invited_at, verified_at,
-			first_access_at, last_access_at, revoked_at
+			first_access_at, last_access_at, revoked_at, consumed_at
 		FROM share_recipients WHERE share_id = $1 ORDER BY invited_at`
 	rows, err := t.tx.Query(ctx, q, shareID)
 	if err != nil {
@@ -178,7 +178,7 @@ func (t *pgTx) RecipientsFor(ctx context.Context, shareID uuid.UUID) ([]ShareRec
 
 func (t *pgTx) RecipientFor(ctx context.Context, shareID uuid.UUID, email string) (ShareRecipient, error) {
 	const q = `SELECT id, share_id, email, user_id, invited_at, verified_at,
-			first_access_at, last_access_at, revoked_at
+			first_access_at, last_access_at, revoked_at, consumed_at
 		FROM share_recipients WHERE share_id = $1 AND email = $2`
 	return scanRecipient(t.tx.QueryRow(ctx, q, shareID, email))
 }
@@ -201,7 +201,7 @@ func (t *pgTx) MarkRecipientAccess(ctx context.Context, shareID uuid.UUID, email
 func scanRecipient(row pgx.Row) (ShareRecipient, error) {
 	var r ShareRecipient
 	err := row.Scan(&r.ID, &r.ShareID, &r.Email, &r.UserID, &r.InvitedAt,
-		&r.VerifiedAt, &r.FirstAccessAt, &r.LastAccessAt, &r.RevokedAt)
+		&r.VerifiedAt, &r.FirstAccessAt, &r.LastAccessAt, &r.RevokedAt, &r.ConsumedAt)
 	if err != nil {
 		return ShareRecipient{}, translate(err)
 	}

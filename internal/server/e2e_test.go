@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"mime/multipart"
@@ -41,9 +42,34 @@ type harness struct {
 	// mailer records verification codes so tests can complete the email flow without a
 	// real transport. It never sends anything.
 	mailer *recordingMailer
+	// sessions mints a session for a second account, which cross-account tests need:
+	// acting as somebody else is the only way to test that they are *not* allowed to
+	// do something.
+	sessions *auth.Sessions
+	// uploads is the resumable-upload manager the server uses. Retained so a test can start
+	// a session as one account and then try to touch it as another: the Manager is
+	// in-memory, so the store cannot fabricate a session for the HTTP-layer check.
+	uploads *upload.Manager
+	// cfg is the configuration the server was built with. Tests that exercise a
+	// configurable feature mutate it before rebuilding the server.
+	cfg *config.Config
+	// authz is the same authorizer the server uses, so a test can ask the question
+	// the handlers ask rather than approximating it.
+	authz *authz.Service
 }
 
 func newHarness(t *testing.T) *harness {
+	t.Helper()
+	return newHarnessWith(t, nil)
+}
+
+// newHarnessWith builds the harness with a config override applied *before* the server
+// is constructed.
+//
+// The order matters: a test that mutated the returned cfg would be mutating a copy the
+// server already captured, so the feature under test would silently stay disabled and
+// the test would prove nothing (or, worse, pass for the wrong reason).
+func newHarnessWith(t *testing.T, mutate func(*config.Config)) *harness {
 	t.Helper()
 
 	cfg := config.Default()
@@ -51,6 +77,9 @@ func newHarness(t *testing.T) *harness {
 	cfg.Server.UserContentURL = "https://content.example.test"
 	cfg.Limits.MaxProfindChildren = 100
 	cfg.Limits.MaxFileBytes = 1 << 20
+	if mutate != nil {
+		mutate(&cfg)
+	}
 
 	meta := store.NewMemory()
 	user := meta.AddUser(store.User{Username: "alice", Email: "alice@example.test", Role: "user"})
@@ -91,9 +120,10 @@ func newHarness(t *testing.T) *harness {
 	}
 	t.Cleanup(uploads.Close)
 
+	authorizer := authz.NewService(&accessor{m: meta})
 	s, err := server.New(server.Deps{
 		Config: cfg, Meta: meta, Content: content,
-		Authz:   authz.NewService(&accessor{m: meta}),
+		Authz:   authorizer,
 		Tickets: tickets, Sessions: sessions,
 		AppPass: auth.NewAppPasswords(meta),
 		Shares:  shares,
@@ -109,7 +139,8 @@ func newHarness(t *testing.T) *harness {
 	ts := httptest.NewServer(s.Handler())
 	t.Cleanup(ts.Close)
 
-	return &harness{t: t, srv: ts, meta: meta, user: user, session: session, mailer: mailer}
+	return &harness{t: t, srv: ts, meta: meta, user: user, session: session,
+		mailer: mailer, sessions: sessions, cfg: &cfg, authz: authorizer, uploads: uploads}
 }
 
 // do issues an authenticated request.
@@ -629,7 +660,26 @@ func (a *accessor) LoadNode(id uuid.UUID) (authz.Node, error) {
 	return authz.Node{ID: n.ID, OwnerID: n.OwnerID, ParentID: n.ParentID}, nil
 }
 func (a *accessor) OwnerGroupPerm(actorID, nodeID uuid.UUID) (authz.Perm, bool, error) {
-	return 0, false, nil
+	// Resolve real grants. This used to be a stub returning "no grant", which meant
+	// the whole HTTP surface was tested with ACLs disabled: a handler that forgot to
+	// honour a grant, or a bug in the grant-to-authorizer wiring, could not fail a
+	// test. The fake accessor exists to avoid a database, not to avoid the model.
+	var (
+		perms store.Perm
+		ok    bool
+	)
+	err := a.m.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+		p, found, gerr := tx.EffectivePermsFor(ctx, actorID, nodeID)
+		perms, ok = p, found
+		return gerr
+	})
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	return authz.Perm(perms), ok, nil
 }
 func (a *accessor) ShareForActor(actorID, nodeID uuid.UUID) (*authz.ShareGrant, error) {
 	return nil, nil
@@ -637,4 +687,57 @@ func (a *accessor) ShareForActor(actorID, nodeID uuid.UUID) (*authz.ShareGrant, 
 
 func testLogger(t *testing.T) *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// TestReadinessReflectsDependencyHealth is what makes /readyz worth having.
+//
+// A probe that returns 200 unconditionally tells an orchestrator nothing, and the one
+// failure it must catch — "the process is up but cannot reach its data" — is exactly
+// the one a static body hides.
+func TestReadinessReflectsDependencyHealth(t *testing.T) {
+	h := newHarness(t)
+
+	resp, err := http.Get(h.srv.URL + "/readyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&body)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("a healthy instance must report ready, got %d (%v)", resp.StatusCode, body)
+	}
+	checks, _ := body["checks"].(map[string]any)
+	if checks == nil {
+		t.Fatal("readyz must report which dependencies it checked")
+	}
+	if checks["metadata"] != "ok" {
+		t.Fatalf("metadata check should pass, got %v", checks["metadata"])
+	}
+
+	// Break the metadata store under the running server and confirm the probe
+	// notices. This is the failure the probe exists for.
+	h.meta.BreakForTest()
+	defer h.meta.UnbreakForTest()
+
+	resp2, err := http.Get(h.srv.URL + "/readyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("an unreachable dependency must fail the probe, got %d", resp2.StatusCode)
+	}
+}
+
+// mkdir creates a directory in the harness user's tree, failing the test on refusal.
+func (h *harness) mkdir(t *testing.T, path string) {
+	t.Helper()
+	body, _ := json.Marshal(map[string]string{"path": path})
+	resp := h.do(http.MethodPost, "/api/files/mkdir", bytes.NewReader(body), nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("mkdir %q: want 201, got %d", path, resp.StatusCode)
+	}
 }

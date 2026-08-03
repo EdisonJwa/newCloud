@@ -13,6 +13,15 @@ auth:
   # groups is mandatory: Pocket ID only releases group membership when the
   # scope is requested, and roles are derived from group names.
   scopes: ["openid", "profile", "email", "groups"]
+  # jit decides what happens the first time an unknown identity signs in (ID-04).
+  #   open    - provision immediately (the historical behaviour, and the default)
+  #   pending - create the account disabled; an administrator must approve it
+  #   deny    - refuse; accounts must be pre-created
+  # allowed_domains narrows who may be provisioned at all, in any mode. It is a second
+  # lock, not a replacement for the IdP being the real gate.
+  jit:
+    mode: "open"
+    allowed_domains: []
   group_role_map:
     "cloud-admins": admin
     "cloud-users": user
@@ -83,8 +92,31 @@ limits:
   max_propfind_children: 100000        # protects a single huge directory
   upload_chunk_bytes: 268435456        # 256 MiB chunks
 
+  # Data retention. 0 means "keep forever", which is the default and the only safe
+  # default: a deployment that has not decided a policy must not silently delete a
+  # user's recoverable data.
+  #
+  # The sweeper runs every 6 hours. When both of these are 0 the server logs a
+  # warning at startup, because "retention configured" and "retention does
+  # nothing" look identical from outside until the disk fills.
+  trash_retention_days: 30             # how long a deleted item stays restorable
+  version_retention_days: 365          # how long an old version is kept
+  version_count_limit: 0               # per-file version count cap; 0 = layout default (10 blob / 3 tree)
+  upload_session_ttl_hours: 24         # how long an unfinished resumable upload may sit idle
+
 audit:
   retention_days: 365
+  # anchor_dir publishes a daily checkpoint of the audit chain head (INV-09).
+  #
+  # A hash chain proves internal consistency, not completeness: someone with database
+  # access can delete the newest rows and the remaining chain still verifies. The anchor
+  # closes that, so long as it is stored where the application cannot write.
+  #
+  # Point this at a location with DIFFERENT credentials from the database - a WORM
+  # bucket, an append-only volume, a mounted share the app user cannot modify. A
+  # directory on the metadata volume makes the anchor decorative.
+  # Left empty, anchoring is off and startup logs a warning saying so.
+  anchor_dir: ""
 
 # Mail delivers share recipient verification codes. It is required for email shares:
 # without it the server still accepts the invitation and generates the code, but can only

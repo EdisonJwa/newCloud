@@ -61,6 +61,19 @@ func (t *memTx) RevokeAppPassword(ctx context.Context, id uuid.UUID) error {
 	return nil
 }
 
+func (t *memTx) RevokeUserAppPasswords(ctx context.Context, userID uuid.UUID) (int, error) {
+	n := 0
+	now := t.m.now()
+	for _, p := range t.m.appPasswords {
+		if p.UserID == userID && p.RevokedAt == nil {
+			at := now
+			p.RevokedAt = &at
+			n++
+		}
+	}
+	return n, nil
+}
+
 func (t *memTx) ListAppPasswords(ctx context.Context, userID uuid.UUID) ([]AppPassword, error) {
 	var out []AppPassword
 	for _, p := range t.m.appPasswords {

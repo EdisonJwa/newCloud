@@ -121,6 +121,19 @@ func translate(err error) error {
 const nodeColumns = `id, parent_id, owner_id, owner_group_id, name, kind, size,
 	mime, etag, blob_id, created_at, modified_at, trashed_at`
 
+// nodeColumnsQualified is nodeColumns with every name prefixed by alias.
+//
+// Needed in any query that joins: the recursive subtree walk joins `nodes n` to a CTE that
+// also has an `id`, and unqualified columns there fail with "column reference id is ambiguous".
+// The alternative — writing the list out per query — is how the two drift apart.
+func nodeColumnsQualified(alias string) string {
+	parts := strings.Split(nodeColumns, ",")
+	for i, p := range parts {
+		parts[i] = alias + "." + strings.TrimSpace(p)
+	}
+	return strings.Join(parts, ", ")
+}
+
 func scanNode(row pgx.Row) (Node, error) {
 	var n Node
 	var kind string
@@ -174,13 +187,40 @@ func (t *pgTx) Children(ctx context.Context, parentID uuid.UUID, limit int) ([]N
 	return out, translate(rows.Err())
 }
 
-func (t *pgTx) ChildByName(ctx context.Context, parentID uuid.UUID, name string) (Node, error) {
-	// Names are compared exactly, not case-insensitively. The unique index is on
-	// the raw name, so "Readme.md" and "README.md" are two distinct nodes; that
-	// matches a case-sensitive client and avoids silently merging uploads.
+// ChildrenAfter implements keyset pagination.
+//
+// The comparison is strictly greater-than on the same key the sort uses, so a
+// concurrent insert behind the cursor cannot make the next page start earlier, and
+// a concurrent delete ahead of it cannot skip a row. An OFFSET would do both.
+func (t *pgTx) ChildrenAfter(ctx context.Context, parentID uuid.UUID, after string, limit int) ([]Node, error) {
 	const q = `SELECT ` + nodeColumns + ` FROM nodes
-		WHERE parent_id = $1 AND name = $2 AND trashed_at IS NULL`
-	return scanNode(t.tx.QueryRow(ctx, q, parentID, name))
+		WHERE parent_id = $1 AND trashed_at IS NULL AND name > $2
+		ORDER BY name
+		LIMIT $3`
+	rows, err := t.tx.Query(ctx, q, parentID, after, limitArg(limit))
+	if err != nil {
+		return nil, translate(err)
+	}
+	defer rows.Close()
+
+	var out []Node
+	for rows.Next() {
+		n, err := scanNode(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, n)
+	}
+	return out, translate(rows.Err())
+}
+
+func (t *pgTx) ChildByName(ctx context.Context, parentID uuid.UUID, name string) (Node, error) {
+	// Lookup compares name_key, not name (T-12): case and Unicode normalisation are handled by
+	// the same Go function the memory backend uses, so the two cannot drift. Comparing the raw
+	// name here would make "README.md" miss a node created as "Readme.md".
+	const q = `SELECT ` + nodeColumns + ` FROM nodes
+		WHERE parent_id = $1 AND name_key = $2 AND trashed_at IS NULL`
+	return scanNode(t.tx.QueryRow(ctx, q, parentID, nameKey(name)))
 }
 
 func (t *pgTx) CreateDir(ctx context.Context, n NewNode) (Node, error) {
@@ -193,10 +233,11 @@ func (t *pgTx) CreateDir(ctx context.Context, n NewNode) (Node, error) {
 	if err := validateName(n.Name); err != nil {
 		return Node{}, err
 	}
-	const q = `INSERT INTO nodes (parent_id, owner_id, owner_group_id, name, kind, size, mime, etag)
-		VALUES ($1, $2, $3, $4, 'dir', 0, '', '')
+	const q = `INSERT INTO nodes (parent_id, owner_id, owner_group_id, name, name_key, kind, size, mime, etag)
+		VALUES ($1, $2, $3, $4, $5, 'dir', 0, '', '')
 		RETURNING ` + nodeColumns
-	return scanNode(t.tx.QueryRow(ctx, q, n.ParentID, n.OwnerID, n.OwnerGroupID, n.Name))
+	return scanNode(t.tx.QueryRow(ctx, q, n.ParentID, n.OwnerID, n.OwnerGroupID, n.Name,
+		nameKey(n.Name)))
 }
 
 func (t *pgTx) CreateFile(ctx context.Context, n NewFile) (Node, error) {
@@ -214,11 +255,12 @@ func (t *pgTx) CreateFile(ctx context.Context, n NewFile) (Node, error) {
 	}
 
 	// Reference the blob row for referential integrity and refcount.
-	const q = `INSERT INTO nodes (parent_id, owner_id, owner_group_id, name, kind, size, mime, etag, blob_id)
-		VALUES ($1, $2, $3, $4, 'file', $5, $6, $7, $8)
+	const q = `INSERT INTO nodes (parent_id, owner_id, owner_group_id, name, name_key, kind, size, mime, etag, blob_id)
+		VALUES ($1, $2, $3, $4, $5, 'file', $6, $7, $8, $9)
 		RETURNING ` + nodeColumns
 	node, err := scanNode(t.tx.QueryRow(ctx, q,
-		n.ParentID, n.OwnerID, n.OwnerGroupID, n.Name, n.Size, n.Mime, n.ETag, n.BlobID))
+		n.ParentID, n.OwnerID, n.OwnerGroupID, n.Name, nameKey(n.Name),
+		n.Size, n.Mime, n.ETag, n.BlobID))
 	if err != nil {
 		return Node{}, err
 	}
@@ -237,6 +279,15 @@ func (t *pgTx) UpdateFile(ctx context.Context, u UpdateFile) (Node, error) {
 	if current.Kind != KindFile {
 		return Node{}, fmt.Errorf("%w: not a file", ErrInvalidName)
 	}
+	// The precondition is evaluated against the row as locked by this
+	// transaction. Combined with the row lock taken below, that makes the check
+	// and the write one step: a competing writer cannot slip between them.
+	if err := t.lockNode(ctx, u.NodeID); err != nil {
+		return Node{}, err
+	}
+	if !u.Expect.Matches(current.ETag, true) {
+		return Node{}, ErrPrecondition
+	}
 
 	// Quota accounting is on the delta. Re-uploading the same file must not
 	// consume quota twice, and that is only true if we subtract the old size.
@@ -249,7 +300,7 @@ func (t *pgTx) UpdateFile(ctx context.Context, u UpdateFile) (Node, error) {
 		return Node{}, err
 	}
 
-	if u.KeepVersion && current.BlobID != nil {
+	if u.KeepVersion && current.BlobID != nil && *current.BlobID != u.BlobID {
 		if err := t.pushVersion(ctx, current); err != nil {
 			return Node{}, err
 		}
@@ -266,11 +317,20 @@ func (t *pgTx) UpdateFile(ctx context.Context, u UpdateFile) (Node, error) {
 		}
 	}
 
+	// The ETag predicate is repeated in the UPDATE even though the row is
+	// locked. Two lines of redundancy buy the guarantee that survives a future
+	// refactor which drops the lock: the write itself refuses to clobber a
+	// different version.
 	const q = `UPDATE nodes SET size = $2, mime = $3, etag = $4, blob_id = $5, modified_at = now()
-		WHERE id = $1 AND trashed_at IS NULL
+		WHERE id = $1 AND trashed_at IS NULL AND etag = $6
 		RETURNING ` + nodeColumns
-	node, err := scanNode(t.tx.QueryRow(ctx, q, u.NodeID, u.Size, u.Mime, u.ETag, u.BlobID))
+	node, err := scanNode(t.tx.QueryRow(ctx, q, u.NodeID, u.Size, u.Mime, u.ETag, u.BlobID, current.ETag))
 	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			// The row was there a moment ago and the predicate matched, so a
+			// miss here means somebody else committed first.
+			return Node{}, ErrPrecondition
+		}
 		return Node{}, err
 	}
 	newBlob := u.BlobID
@@ -278,6 +338,58 @@ func (t *pgTx) UpdateFile(ctx context.Context, u UpdateFile) (Node, error) {
 		return Node{}, err
 	}
 	return node, nil
+}
+
+// lockNode takes a row lock on a node for the rest of the transaction.
+//
+// This is what removes the time-of-check/time-of-use window in conditional
+// writes: without it, two transactions can both read the same ETag before either
+// writes, and both conclude they are allowed to proceed.
+func (t *pgTx) lockNode(ctx context.Context, id uuid.UUID) error {
+	const q = `SELECT 1 FROM nodes WHERE id = $1 AND trashed_at IS NULL FOR UPDATE`
+	var one int
+	if err := t.tx.QueryRow(ctx, q, id).Scan(&one); err != nil {
+		return translate(err)
+	}
+	return nil
+}
+
+// WriteFile implements the shared upsert-with-precondition path.
+func (t *pgTx) WriteFile(ctx context.Context, w WriteFile) (Node, bool, error) {
+	// The parent row is locked first. Two concurrent creates of the same name in
+	// the same directory then serialise here instead of racing into the unique
+	// index, which turns a retryable conflict into a hard error for one client.
+	if err := t.lockNode(ctx, w.ParentID); err != nil {
+		return Node{}, false, err
+	}
+
+	existing, err := t.ChildByName(ctx, w.ParentID, w.Name)
+	switch {
+	case err == nil:
+		if !w.Expect.Matches(existing.ETag, true) {
+			return Node{}, false, ErrPrecondition
+		}
+		n, uerr := t.UpdateFile(ctx, UpdateFile{
+			NodeID: existing.ID, Size: w.Size, Mime: w.Mime, ETag: w.ETag,
+			BlobID: w.BlobID, BlobHash: w.BlobHash,
+			KeepVersion: w.KeepVersion, MaxVersions: w.MaxVersions,
+		})
+		if uerr != nil {
+			return Node{}, false, uerr
+		}
+		return n, false, nil
+	case errors.Is(err, ErrNotFound):
+		if !w.Expect.Matches("", false) {
+			return Node{}, false, ErrPrecondition
+		}
+		n, cerr := t.CreateFile(ctx, w.NewFile)
+		if cerr != nil {
+			return Node{}, false, cerr
+		}
+		return n, true, nil
+	default:
+		return Node{}, false, err
+	}
 }
 
 func (t *pgTx) pushVersion(ctx context.Context, cur Node) error {
@@ -289,18 +401,57 @@ func (t *pgTx) pushVersion(ctx context.Context, cur Node) error {
 		SELECT $1,
 		       COALESCE((SELECT max(version_no) FROM versions WHERE node_id = $1), 0) + 1,
 		       $2, $3, $4`
-	_, err := t.tx.Exec(ctx, q, cur.ID, cur.BlobID, cur.Size, (*uuid.UUID)(nil))
-	return translate(err)
+	if _, err := t.tx.Exec(ctx, q, cur.ID, cur.BlobID, cur.Size, (*uuid.UUID)(nil)); err != nil {
+		return translate(err)
+	}
+	// The new version row is a reference to the bytes. Without this increment the
+	// blob's refcount falls to zero as soon as the live file is replaced, and the
+	// sweep deletes content that history still needs — restoring an old version
+	// then fails with a missing blob, months later, with no obvious cause.
+	return t.adjustBlobRef(ctx, cur.BlobID, +1)
 }
 
 func (t *pgTx) trimVersions(ctx context.Context, nodeID uuid.UUID, keep int) error {
+	// The blobs of the versions being dropped must lose their reference before the
+	// rows disappear, or their refcount stays permanently high and the bytes are
+	// never collected.
+	const refs = `SELECT blob_id FROM versions
+		WHERE node_id = $1
+		  AND version_no <= (
+		    SELECT COALESCE(max(version_no), 0) - $2 FROM versions WHERE node_id = $1
+		  )`
+	rows, err := t.tx.Query(ctx, refs, nodeID, keep)
+	if err != nil {
+		return translate(err)
+	}
+	var dropped []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return translate(err)
+		}
+		dropped = append(dropped, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return translate(err)
+	}
+
 	const q = `DELETE FROM versions
 		WHERE node_id = $1
 		  AND version_no <= (
 		    SELECT COALESCE(max(version_no), 0) - $2 FROM versions WHERE node_id = $1
 		  )`
-	_, err := t.tx.Exec(ctx, q, nodeID, keep)
-	return translate(err)
+	if _, err := t.tx.Exec(ctx, q, nodeID, keep); err != nil {
+		return translate(err)
+	}
+	for i := range dropped {
+		if err := t.adjustBlobRef(ctx, &dropped[i], -1); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // reserveQuota adds n bytes to the owner's usage, failing if it would exceed the
@@ -360,10 +511,12 @@ func (t *pgTx) adjustBlobRef(ctx context.Context, blobID *uuid.UUID, delta int) 
 }
 
 func (t *pgTx) Rename(ctx context.Context, id uuid.UUID, name string) (Node, error) {
-	const q = `UPDATE nodes SET name = $2, modified_at = now()
+	// name_key is updated with the name: leaving it stale would make the renamed node
+	// unlookupable under its new name and would let a later file take its old key.
+	const q = `UPDATE nodes SET name = $2, name_key = $3, modified_at = now()
 		WHERE id = $1 AND trashed_at IS NULL AND parent_id IS NOT NULL
 		RETURNING ` + nodeColumns
-	return scanNode(t.tx.QueryRow(ctx, q, id, name))
+	return scanNode(t.tx.QueryRow(ctx, q, id, name, nameKey(name)))
 }
 
 func (t *pgTx) Move(ctx context.Context, id, newParent uuid.UUID) (Node, error) {
@@ -528,10 +681,16 @@ func (t *pgTx) RestoreVersion(ctx context.Context, nodeID uuid.UUID, versionNo i
 		return Node{}, err
 	}
 
+	// The ETag must be derived from the content address, exactly like every
+	// other write path. This used to be an unquoted UUID prefix, which meant a
+	// conditional write after a restore could never match again: every WebDAV
+	// client holding the ETag would get 412 forever.
+	etag := etagForBlob(blobID.String())
+
 	const upd = `UPDATE nodes SET blob_id = $2, size = $3, etag = $4, modified_at = now()
 		WHERE id = $1 AND trashed_at IS NULL
 		RETURNING ` + nodeColumns
-	node, err := scanNode(t.tx.QueryRow(ctx, upd, nodeID, blobID, size, blobID.String()[:16]))
+	node, err := scanNode(t.tx.QueryRow(ctx, upd, nodeID, blobID, size, etag))
 	if err != nil {
 		return Node{}, err
 	}
@@ -542,24 +701,66 @@ func (t *pgTx) RestoreVersion(ctx context.Context, nodeID uuid.UUID, versionNo i
 }
 
 func (t *pgTx) Audit(ctx context.Context, e AuditEntry) error {
+	// Fail-closed (T-16). An operation that cannot be recorded must not be committed, or the
+	// audit log becomes a partial fiction — a platform whose tamper-evident log silently stops
+	// recording under disk pressure is worse than one that refuses the write, because the
+	// cheapest attack becomes "fill the disk".
+	//
+	// The policy and its cost (an audit outage means no writes) are documented for operators in
+	// deploy/audit-failure-policy.md.
 	if t.s.auditWriter == nil {
-		// Failing loudly is the point: an operation that cannot be recorded must
-		// not be committed, or the audit log becomes a partial fiction.
-		return errors.New("store: audit writer not configured; refusing to commit an unaudited operation")
+		return fmt.Errorf("%w: audit writer not configured; refusing to commit an unaudited operation",
+			ErrAuditUnavailable)
 	}
-	return t.s.auditWriter.Append(ctx, t, e)
+	if err := t.s.auditWriter.Append(ctx, t, e); err != nil {
+		// Wrapped so the HTTP layer can answer with a diagnosable status instead of a generic
+		// 500: an operator seeing "audit storage unavailable" knows to check the audit table and
+		// the disk, which "something went wrong" does not tell them.
+		return fmt.Errorf("%w: %w", ErrAuditUnavailable, err)
+	}
+	return nil
 }
 
 func (t *pgTx) Enqueue(ctx context.Context, j Job) error {
+	// A job with no explicit schedule is due *now*, and "now" must be the database's clock.
+	//
+	// Using the application clock here made the queue intermittently unclaimable: a job
+	// stamped with a Go time a few milliseconds ahead of the database's `now()` is not
+	// `run_after <= now()` when the worker asks, so it sits unclaimed until the clocks
+	// drift past each other. The conformance suite caught it only on PostgreSQL, only
+	// sometimes, and only after the machine had been up long enough for the two clocks to
+	// diverge - which is the worst kind of flake to debug.
+	//
+	// A caller-supplied RunAfter is still honoured as-is (it is a deliberate future
+	// schedule), but the default comes from the database.
 	runAfter := j.RunAfter
 	if runAfter.IsZero() {
-		runAfter = t.now
+		runAfter = time.Time{} // sentinel: let the SQL use now()
 	}
-	const q = `INSERT INTO jobs (kind, payload, dedupe_key, run_after)
-		VALUES ($1, $2, $3, $4)
+	// A nil payload would violate the column's NOT NULL constraint. A job with no
+	// arguments is legitimate, so it is stored as an empty object rather than
+	// rejected — the alternative is every producer remembering to pass one.
+	payload := j.Payload
+	if payload == nil {
+		payload = map[string]any{}
+	}
+
+	maxAttempts := j.MaxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = 5
+	}
+
+	const q = `INSERT INTO jobs (kind, payload, dedupe_key, run_after, max_attempts)
+		VALUES ($1, $2, $3, COALESCE($4, now()), $5)
 		ON CONFLICT (kind, dedupe_key) WHERE completed_at IS NULL AND dedupe_key IS NOT NULL
 		DO NOTHING`
-	_, err := t.tx.Exec(ctx, q, j.Kind, j.Payload, nullableString(j.DedupeKey), runAfter)
+
+	// A nil timestamp lets COALESCE pick now(); passing time.Time{} would write year 1.
+	var runAfterArg any
+	if !runAfter.IsZero() {
+		runAfterArg = runAfter
+	}
+	_, err := t.tx.Exec(ctx, q, j.Kind, payload, nullableString(j.DedupeKey), runAfterArg, maxAttempts)
 	return translate(err)
 }
 
@@ -622,8 +823,8 @@ func (s *PG) Root(ctx context.Context, ownerID uuid.UUID) (Node, error) {
 // index on (owner_id) WHERE parent_id IS NULL is what makes ON CONFLICT usable,
 // so both callers converge on one row instead of creating two roots.
 func (s *PG) EnsureRoot(ctx context.Context, ownerID uuid.UUID) (Node, error) {
-	const q = `INSERT INTO nodes (parent_id, owner_id, name, kind, size, mime, etag)
-		VALUES (NULL, $1, '', 'dir', 0, '', '')
+	const q = `INSERT INTO nodes (parent_id, owner_id, name, name_key, kind, size, mime, etag)
+		VALUES (NULL, $1, '', '', 'dir', 0, '', '')
 		ON CONFLICT (owner_id) WHERE parent_id IS NULL AND trashed_at IS NULL DO NOTHING
 		RETURNING ` + nodeColumns
 

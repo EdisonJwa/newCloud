@@ -102,7 +102,10 @@ func TestAuthorizeMatrix(t *testing.T) {
 			name:  "admin reads metadata and may force-delete, but not write or share",
 			actor: NewUserActor(fixedID(adminUser), "a@example.com", RoleAdmin, ScopeRead|ScopeWrite),
 			node:  fixedID(nodeOwned),
-			want:  PermRead | PermDelete,
+			// Metadata only. PermRead would imply PermDownload if it were expanded,
+			// so the admin branch is deliberately excluded from expansion: an
+			// administrator who could download could read every user's files.
+			want: PermRead | PermDelete | PermListChildren,
 		},
 		{
 			name:  "group editor grant applies to a non-owner",
@@ -111,7 +114,8 @@ func TestAuthorizeMatrix(t *testing.T) {
 			setup: func(a *fakeAccessor) {
 				a.group[[2]uuid.UUID{fixedID(groupMate), fixedID(nodeOwned)}] = PermRead | PermWrite | PermListChildren
 			},
-			want: PermRead | PermWrite | PermListChildren,
+			// Write implies create and overwrite; it does not imply delete. Read no longer`n			// implies download, so a grant wanting both must list both.
+			want: PermRead | PermWrite | PermListChildren | PermCreate | PermOverwrite,
 		},
 		{
 			name:  "live share grants its permission bits",
@@ -122,6 +126,7 @@ func TestAuthorizeMatrix(t *testing.T) {
 					ShareID: fixedID(99), Perms: PermRead, ExpiresAt: &expiry,
 				}
 			},
+			// A share grants exactly the bits it lists.
 			want: PermRead,
 		},
 		{
@@ -150,7 +155,9 @@ func TestAuthorizeMatrix(t *testing.T) {
 			name:  "read-only app password never yields write",
 			actor: NewUserActor(fixedID(owner), "o@example.com", RoleUser, ScopeRead),
 			node:  fixedID(nodeOwned),
-			want:  PermRead | PermListChildren | PermReadVersions,
+			// A read-only credential keeps every read-shaped bit, including the
+			// fine-grained ones that read implies.
+			want: PermRead | PermListChildren | PermReadVersions | PermDownload | PermViewHistory,
 		},
 		{
 			name:  "anonymous actor is confined to upload-only bits",
@@ -254,5 +261,42 @@ func ExamplePerm_String() {
 	fmt.Println(AllPerms)
 	// Output:
 	// read+list
-	// read+write+delete+share+list+read_versions+restore_version+upload_only
+	// read+write+delete+share+list+read_versions+restore_version+upload_only+download+create+overwrite+rename+move+manage_permissions+view_history
+}
+
+// TestAdminCannotDownloadUserContent pins the promise the admin branch makes.
+//
+// The requirement is explicit that administrators see metadata and may force-delete,
+// but never read file content. A previous change made PermRead imply PermDownload for
+// every actor, which silently gave administrators the one capability the branch exists
+// to withhold — the comment still said "admins do not read user content" while the
+// bitmap disagreed.
+func TestAdminCannotDownloadUserContent(t *testing.T) {
+	svc, _ := newFixture()
+	admin := NewUserActor(fixedID(adminUser), "a@example.com", RoleAdmin, ScopeRead|ScopeWrite)
+
+	cap, err := svc.Authorize(admin, fixedID(nodeOwned))
+	if err != nil {
+		t.Fatalf("an admin must still see metadata: %v", err)
+	}
+
+	for _, forbidden := range []struct {
+		perm Perm
+		name string
+	}{
+		{PermDownload, "download"},
+		{PermReadVersions, "read_versions"},
+		{PermViewHistory, "view_history"},
+		{PermRestoreVersion, "restore_version"},
+	} {
+		if cap.Can(forbidden.perm) {
+			t.Fatalf("an administrator must not have %s on user content, got %v",
+				forbidden.name, cap.Perms())
+		}
+	}
+
+	// They must keep the two capabilities the design grants them.
+	if !cap.Can(PermRead) || !cap.Can(PermDelete) {
+		t.Fatalf("an admin must keep metadata read and force-delete, got %v", cap.Perms())
+	}
 }

@@ -1,4 +1,4 @@
-# newcloud — single-host deployment.
+# newCloud — single-host deployment.
 #
 # Two decisions in this file are not stylistic:
 #
@@ -11,6 +11,23 @@
 
 name: newcloud
 
+# Two database passwords are required:
+#
+#   PG_PASSWORD      the owner (newcloud), used by migrations and by this postgres service
+#   PG_APP_PASSWORD  the application role (newcloud_app), used to serve requests
+#
+# They must differ. The point of the split is that the request-serving connection cannot
+# rewrite the audit log; sharing one password gives that up.
+#
+# Bootstrap the application role password once, after the first migration:
+#
+#   docker compose exec postgres psql -U newcloud -d newcloud \
+#     -c "ALTER ROLE newcloud_app PASSWORD '...'"
+#
+# The migration that creates newcloud_app leaves it without a password on purpose: a
+# password in a migration file would be in version control forever and shared by every
+# environment.
+
 services:
   web:
     image: newcloud:latest
@@ -20,10 +37,20 @@ services:
     restart: unless-stopped
     environment:
       NEWCLOUD_CONFIG: /etc/newcloud/config.yml
-      DATABASE_URL: postgres://newcloud:${PG_PASSWORD}@postgres:5432/newcloud?sslmode=disable
+      # The application connects as newcloud_app, NOT as the owner.
+      #
+      # newcloud_app has SELECT/INSERT/UPDATE/DELETE on the public tables but only
+      # SELECT/INSERT on the audit log, so the append-only guarantee is enforced by the
+      # database rather than by convention. It is a non-superuser: a superuser bypasses
+      # every GRANT, which made the restriction decorative while the app connected as the
+      # owner.
+      #
+      # Migrations still need the owner. Run them with DATABASE_URL pointing at the
+      # superuser - see deploy/README.md.
+      DATABASE_URL: postgres://newcloud_app:${PG_APP_PASSWORD}@postgres:5432/newcloud?sslmode=disable
       PGHOST: postgres
-      PGUSER: newcloud
-      PGPASSWORD: ${PG_PASSWORD}
+      PGUSER: newcloud_app
+      PGPASSWORD: ${PG_APP_PASSWORD}
       PGDATABASE: newcloud
     volumes:
       - /etc/newcloud:/etc/newcloud:ro

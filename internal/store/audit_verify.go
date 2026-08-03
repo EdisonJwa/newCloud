@@ -7,53 +7,54 @@ import (
 	"github.com/EdisonJwa/newCloud/internal/audit"
 )
 
-// VerifyAuditChain re-reads the audit log and checks the hash chain.
+// AuditRows returns events after a sequence position, oldest first, for the chain
+// verifier.
 //
-// It exists because a tamper-evident log that is never verified is just a log: the
-// chain only has value if something reads it back and complains. This is what the
-// daily anchor job calls before publishing the head.
-//
-// The whole log is loaded in one pass. For a year of events that is large but
-// bounded, and it runs off the request path.
-func (s *PG) VerifyAuditChain(ctx context.Context, limit int) error {
-	const q = `SELECT ts, actor_kind, actor_user_id, COALESCE(actor_email::text, ''),
+// Keyset pagination on id rather than OFFSET: the table is append-only and the
+// verifier walks the whole log, so an offset would re-scan from the start for every
+// batch and turn verification of a large log into a quadratic query.
+func (s *PG) AuditRows(ctx context.Context, afterID int64, limit int) ([]audit.Event, error) {
+	const q = `SELECT id, ts, actor_kind, actor_user_id, COALESCE(actor_email::text, ''),
 			COALESCE(actor_ip::text,''), user_agent, action, target_kind, target_id,
 			share_id, result, bytes, metadata, prev_hash, hash
 		FROM audit.events
-		ORDER BY id DESC
-		LIMIT $1`
+		WHERE id > $1
+		ORDER BY id
+		LIMIT $2`
 
-	rows, err := s.pool.Query(ctx, q, limitArg(limit))
+	rows, err := s.pool.Query(ctx, q, afterID, limitArg(limit))
 	if err != nil {
-		return fmt.Errorf("store: read audit log: %w", err)
+		return nil, fmt.Errorf("store: read audit rows: %w", translate(err))
 	}
 	defer rows.Close()
 
-	var events []audit.Event
+	out := make([]audit.Event, 0, limit)
 	for rows.Next() {
 		var e audit.Event
 		var actorKind, action, targetKind, result string
-		if err := rows.Scan(&e.Time, &actorKind, &e.ActorUserID, &e.ActorEmail,
+		if err := rows.Scan(&e.ID, &e.Time, &actorKind, &e.ActorUserID, &e.ActorEmail,
 			&e.ActorIP, &e.UserAgent, &action, &targetKind, &e.TargetID,
 			&e.ShareID, &result, &e.Bytes, &e.Metadata, &e.PrevHash, &e.Hash); err != nil {
-			return fmt.Errorf("store: scan audit row: %w", err)
+			return nil, fmt.Errorf("store: scan audit row: %w", translate(err))
 		}
 		e.ActorKind = audit.ActorKind(actorKind)
 		e.Action = audit.Action(action)
 		e.TargetKind = audit.TargetKind(targetKind)
 		e.Result = audit.Result(result)
-		events = append(events, e)
+		out = append(out, e)
 	}
-	if err := rows.Err(); err != nil {
+	return out, translate(rows.Err())
+}
+
+// VerifyAuditChain re-reads the audit log and checks the hash chain.
+//
+// Kept for callers that want the boolean answer; the CLI uses auditverify.Run so the
+// operator gets a report rather than an error string.
+func (s *PG) VerifyAuditChain(ctx context.Context, limit int) error {
+	events, err := s.AuditRows(ctx, 0, limit)
+	if err != nil {
 		return err
 	}
-
-	// The query returns newest-first for the LIMIT to keep the most recent window;
-	// the chain verifies oldest-first.
-	for i, j := 0, len(events)-1; i < j; i, j = i+1, j-1 {
-		events[i], events[j] = events[j], events[i]
-	}
-
 	bad, err := audit.VerifyChain(events)
 	if err != nil {
 		return fmt.Errorf("store: audit chain broken at event %d: %w", bad, err)
@@ -76,6 +77,11 @@ func (s *PG) AuditHead(ctx context.Context) ([]byte, error) {
 }
 
 // RecordAnchor stores the published head so an auditor can compare.
+//
+// It upserts rather than inserts because a drill may re-publish a day. Note that the
+// application role holds only INSERT on audit.anchors; running this needs the
+// migration role, which is intentional: writing an anchor from the serving process
+// would let an attacker who owns that process rewrite the checkpoint too.
 func (s *PG) RecordAnchor(ctx context.Context, head []byte, destination string) error {
 	const q = `INSERT INTO audit.anchors (day, head_hash, destination)
 		VALUES (CURRENT_DATE, $1, $2)

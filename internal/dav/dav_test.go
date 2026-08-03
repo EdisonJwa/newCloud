@@ -34,6 +34,8 @@ type testEnv struct {
 	blobs  *local.Store
 	user   store.User
 	secret string
+	// extra holds additional accounts' app-password secrets, keyed by username.
+	extra map[string]string
 }
 
 func newEnv(t *testing.T) *testEnv {
@@ -68,7 +70,8 @@ func newEnv(t *testing.T) *testEnv {
 	authorizer := authz.NewService(&authzAccessor{m: meta})
 
 	h := New(cfg, meta, content, authorizer, appPass)
-	return &testEnv{h: h, meta: meta, blobs: blobs, user: user, secret: secret}
+	return &testEnv{h: h, meta: meta, blobs: blobs, user: user, secret: secret,
+		extra: map[string]string{}}
 }
 
 // resolverAdapter bridges store.Resolver onto blobstore.NodeResolver, mirroring
@@ -125,7 +128,25 @@ func (a *authzAccessor) LoadNode(id uuid.UUID) (authz.Node, error) {
 }
 
 func (a *authzAccessor) OwnerGroupPerm(actorID, nodeID uuid.UUID) (authz.Perm, bool, error) {
-	return 0, false, nil
+	// Resolve real grants. The stub that used to be here meant every WebDAV test ran
+	// with the ACL layer disabled, so a write path that ignored a grant could not be
+	// caught by the suite that exists to catch exactly that.
+	var (
+		perms store.Perm
+		ok    bool
+	)
+	err := a.m.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+		p, found, gerr := tx.EffectivePermsFor(ctx, actorID, nodeID)
+		perms, ok = p, found
+		return gerr
+	})
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	return authz.Perm(perms), ok, nil
 }
 
 func (a *authzAccessor) ShareForActor(actorID, nodeID uuid.UUID) (*authz.ShareGrant, error) {
@@ -147,6 +168,41 @@ func (e *testEnv) do(t *testing.T, method, path string, body io.Reader, headers 
 
 func (e *testEnv) davPath(rel string) string {
 	return "https://cloud.example.test/dav/alice/" + strings.TrimPrefix(rel, "/")
+}
+
+// addUserWithSecret provisions a second account and returns its app password.
+//
+// Several tests need a *different* authenticated principal: a lock held by
+// yourself is not a lock, and a cross-account check that uses the same identity
+// proves nothing.
+func (e *testEnv) addUserWithSecret(t *testing.T, u store.User, _ string) string {
+	t.Helper()
+	created := e.meta.AddUser(u)
+	if _, err := e.meta.EnsureRoot(context.Background(), created.ID); err != nil {
+		t.Fatal(err)
+	}
+	// Issue through the same service the handler verifies against, so the test
+	// cannot accidentally pass by fabricating a credential the server would reject.
+	secret, _, err := e.h.appPass.Issue(context.Background(), created.ID, "test", "rw", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.extra[created.Username] = secret
+	return secret
+}
+
+// doAs issues a request as another account, using an app password.
+func (e *testEnv) doAs(t *testing.T, user, secret, method, path string, body io.Reader,
+	headers map[string]string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(method, path, body)
+	req.SetBasicAuth(user, secret)
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	rec := httptest.NewRecorder()
+	e.h.ServeHTTP(rec, req)
+	return rec
 }
 
 func TestOptionsNeedsNoAuth(t *testing.T) {
@@ -299,15 +355,197 @@ func TestPutIntoMissingDirectoryFails(t *testing.T) {
 
 func TestPutOverwritesAndKeepsVersion(t *testing.T) {
 	e := newEnv(t)
-	e.do(t, http.MethodPut, e.davPath("a.txt"), strings.NewReader("v1"), nil)
-	rec := e.do(t, http.MethodPut, e.davPath("a.txt"), strings.NewReader("v2 is longer"), nil)
+	rec := e.do(t, http.MethodPut, e.davPath("a.txt"), strings.NewReader("v1"), nil)
 	if rec.Code != http.StatusCreated {
-		t.Fatalf("overwrite: want 201, got %d", rec.Code)
+		t.Fatalf("create: want 201, got %d", rec.Code)
+	}
+	rec = e.do(t, http.MethodPut, e.davPath("a.txt"), strings.NewReader("v2 is longer"), nil)
+	// RFC 4918 §9.7.1: a replaced resource answers 204, not 201. Saying 201 makes
+	// a client believe every save created a new file.
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("overwrite: want 204, got %d", rec.Code)
 	}
 
 	rec = e.do(t, http.MethodGet, e.davPath("a.txt"), nil, nil)
 	if got := rec.Body.String(); got != "v2 is longer" {
 		t.Fatalf("content after overwrite: %q", got)
+	}
+}
+
+// TestPutIfMatchGuardsAgainstLostUpdate is the T-03 regression test: a second
+// writer holding a stale ETag must be refused rather than silently winning.
+func TestPutIfMatchGuardsAgainstLostUpdate(t *testing.T) {
+	e := newEnv(t)
+	rec := e.do(t, http.MethodPut, e.davPath("a.txt"), strings.NewReader("v1"), nil)
+	staleETag := rec.Header().Get("ETag")
+	if staleETag == "" {
+		t.Fatal("PUT must return an ETag")
+	}
+
+	// Somebody else writes.
+	if rec := e.do(t, http.MethodPut, e.davPath("a.txt"), strings.NewReader("v2"), nil); rec.Code != http.StatusNoContent {
+		t.Fatalf("second write: %d", rec.Code)
+	}
+
+	// The first writer now saves on top of the stale tag.
+	rec = e.do(t, http.MethodPut, e.davPath("a.txt"), strings.NewReader("stale write"), map[string]string{
+		"If-Match": staleETag,
+	})
+	if rec.Code != http.StatusPreconditionFailed {
+		t.Fatalf("stale If-Match must be 412, got %d", rec.Code)
+	}
+	if body := e.do(t, http.MethodGet, e.davPath("a.txt"), nil, nil).Body.String(); body != "v2" {
+		t.Fatalf("the refused write must not have landed: %q", body)
+	}
+}
+
+// TestPutIfNoneMatchStarIsCreateOnly: "create, or fail" is the conditional a
+// browser tab needs so it cannot clobber a file that appeared meanwhile.
+func TestPutIfNoneMatchStarIsCreateOnly(t *testing.T) {
+	e := newEnv(t)
+	if rec := e.do(t, http.MethodPut, e.davPath("new.txt"), strings.NewReader("x"), map[string]string{
+		"If-None-Match": "*",
+	}); rec.Code != http.StatusCreated {
+		t.Fatalf("create-only on a free name: want 201, got %d", rec.Code)
+	}
+	if rec := e.do(t, http.MethodPut, e.davPath("new.txt"), strings.NewReader("y"), map[string]string{
+		"If-None-Match": "*",
+	}); rec.Code != http.StatusPreconditionFailed {
+		t.Fatalf("create-only on a taken name: want 412, got %d", rec.Code)
+	}
+}
+
+// TestPutRefusedWhileLockedHeldByOther: the lock has to mean something on the write
+// path, which is where it was previously never consulted.
+//
+// The lock holder must submit its token, exactly as RFC 4918 §10.4 requires. A lock
+// the holder cannot be told apart from everybody else is not a lock, and the
+// previous code never checked this on any mutating method.
+func TestPutRefusedWhileLockedHeldByOther(t *testing.T) {
+	e := newEnv(t)
+	e.do(t, http.MethodPut, e.davPath("doc.txt"), strings.NewReader("x"), nil)
+
+	body := `<?xml version="1.0"?><D:lockinfo xmlns:D="DAV:">
+		<D:lockscope><D:exclusive/></D:lockscope>
+		<D:locktype><D:write/></D:locktype>
+		<D:owner><D:href>alice</D:href></D:owner></D:lockinfo>`
+	rec := e.do(t, "LOCK", e.davPath("doc.txt"), strings.NewReader(body), nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("LOCK: want 200, got %d", rec.Code)
+	}
+	token := strings.Trim(rec.Header().Get("Lock-Token"), "<>")
+	if token == "" {
+		t.Fatal("LOCK must return a token")
+	}
+
+	// Without the token the write is refused, even though the lock is our own.
+	rec = e.do(t, http.MethodPut, e.davPath("doc.txt"), strings.NewReader("intruder"), nil)
+	if rec.Code != http.StatusLocked {
+		t.Fatalf("write without the lock token: want 423, got %d", rec.Code)
+	}
+	if body := e.do(t, http.MethodGet, e.davPath("doc.txt"), nil, nil).Body.String(); body != "x" {
+		t.Fatalf("locked content must be unchanged: %q", body)
+	}
+
+	// Submitting the token through the If header authorizes the write.
+	rec = e.do(t, http.MethodPut, e.davPath("doc.txt"), strings.NewReader("updated"), map[string]string{
+		"If": "(<" + token + ">)",
+	})
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("write with the lock token: want 204, got %d", rec.Code)
+	}
+	if body := e.do(t, http.MethodGet, e.davPath("doc.txt"), nil, nil).Body.String(); body != "updated" {
+		t.Fatalf("unlocked write should land: %q", body)
+	}
+}
+
+// TestDeleteRefusedWhileLocked: DELETE was the other method that ignored locks.
+func TestDeleteRefusedWhileLocked(t *testing.T) {
+	e := newEnv(t)
+	e.do(t, http.MethodPut, e.davPath("doc.txt"), strings.NewReader("x"), nil)
+	body := `<?xml version="1.0"?><D:lockinfo xmlns:D="DAV:">
+		<D:lockscope><D:exclusive/></D:lockscope>
+		<D:locktype><D:write/></D:locktype>
+		<D:owner><D:href>alice</D:href></D:owner></D:lockinfo>`
+	if rec := e.do(t, "LOCK", e.davPath("doc.txt"), strings.NewReader(body), nil); rec.Code != http.StatusOK {
+		t.Fatalf("LOCK: %d", rec.Code)
+	}
+
+	rec := e.do(t, http.MethodDelete, e.davPath("doc.txt"), nil, nil)
+	if rec.Code != http.StatusLocked {
+		t.Fatalf("delete under a live lock: want 423, got %d", rec.Code)
+	}
+}
+
+// TestMkcolRefusedUnderLockedParent covers the Depth: infinity case: a lock on a
+// collection covers everything inside it, so creating a child must be refused.
+func TestMkcolRefusedUnderLockedParent(t *testing.T) {
+	e := newEnv(t)
+	e.do(t, "MKCOL", e.davPath("locked"), nil, nil)
+
+	body := `<?xml version="1.0"?><D:lockinfo xmlns:D="DAV:">
+		<D:lockscope><D:exclusive/></D:lockscope>
+		<D:locktype><D:write/></D:locktype>
+		<D:owner><D:href>alice</D:href></D:owner></D:lockinfo>`
+	rec := e.do(t, "LOCK", e.davPath("locked"), strings.NewReader(body), map[string]string{"Depth": "infinity"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("LOCK: want 200, got %d", rec.Code)
+	}
+
+	rec = e.do(t, "MKCOL", e.davPath("locked/child"), nil, nil)
+	if rec.Code != http.StatusLocked {
+		t.Fatalf("MKCOL under a locked collection: want 423, got %d", rec.Code)
+	}
+}
+
+// TestCopyDirectoryIsRecursive: the previous implementation created an empty folder
+// and reported success, which is worse than refusing.
+func TestCopyDirectoryIsRecursive(t *testing.T) {
+	e := newEnv(t)
+	e.do(t, "MKCOL", e.davPath("src"), nil, nil)
+	e.do(t, "MKCOL", e.davPath("src/sub"), nil, nil)
+	e.do(t, http.MethodPut, e.davPath("src/a.txt"), strings.NewReader("alpha"), nil)
+	e.do(t, http.MethodPut, e.davPath("src/sub/b.txt"), strings.NewReader("beta"), nil)
+
+	rec := e.do(t, "COPY", e.davPath("src"), nil, map[string]string{
+		"Destination": "https://cloud.example.test/dav/alice/dst",
+		"Depth":       "infinity",
+	})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("directory COPY: want 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	for _, tc := range []struct{ path, want string }{
+		{"dst/a.txt", "alpha"},
+		{"dst/sub/b.txt", "beta"},
+	} {
+		got := e.do(t, http.MethodGet, e.davPath(tc.path), nil, nil)
+		if got.Code != http.StatusOK {
+			t.Fatalf("%s: want 200, got %d", tc.path, got.Code)
+		}
+		if got.Body.String() != tc.want {
+			t.Fatalf("%s: want %q, got %q", tc.path, tc.want, got.Body.String())
+		}
+	}
+}
+
+// TestMoveOverwriteRequiresDeleteRight: MOVE used to trash the destination without
+// authorizing it, which let a writable folder become a way to delete anything.
+func TestMoveOverwriteRequiresDeleteRight(t *testing.T) {
+	e := newEnv(t)
+	e.do(t, http.MethodPut, e.davPath("src.txt"), strings.NewReader("source"), nil)
+	e.do(t, http.MethodPut, e.davPath("victim.txt"), strings.NewReader("victim"), nil)
+
+	rec := e.do(t, "MOVE", e.davPath("src.txt"), nil, map[string]string{
+		"Destination": "https://cloud.example.test/dav/alice/victim.txt",
+		"Overwrite":   "T",
+	})
+	// Same owner: allowed, and the destination is replaced.
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("same-owner overwrite MOVE: want 201, got %d", rec.Code)
+	}
+	if body := e.do(t, http.MethodGet, e.davPath("victim.txt"), nil, nil).Body.String(); body != "source" {
+		t.Fatalf("destination should hold the source bytes: %q", body)
 	}
 }
 
@@ -716,3 +954,96 @@ func mustResolve(t *testing.T, e *testEnv, rel string) uuid.UUID {
 var _ = bytes.MinRead
 var _ = sha256.Sum256
 var _ = ticket.PurposeSession
+
+// TestDepthZeroCollectionLockDoesNotBlockChildContent is RFC 4918 §7.4 on the DAV side.
+//
+// A Depth: 0 lock on a collection protects its membership: no new children, no removals. It does
+// not protect the *content* of a child that already exists. Treating it as a subtree lock means a
+// client that locked a folder can no longer edit the files inside it, and the 423 gives no hint
+// that its own Depth: 0 lock is the cause.
+//
+// The API side has the mirror of this test; §5.3 wants one arbitration rule, so both surfaces
+// have to agree that Depth means the same thing.
+func TestDepthZeroCollectionLockDoesNotBlockChildContent(t *testing.T) {
+	e := newEnv(t)
+
+	if rec := e.do(t, "MKCOL", e.davPath("locked-folder"), nil, nil); rec.Code != http.StatusCreated {
+		t.Fatalf("MKCOL: want 201, got %d", rec.Code)
+	}
+	if rec := e.do(t, http.MethodPut, e.davPath("locked-folder/child.txt"),
+		strings.NewReader("original"), nil); rec.Code != http.StatusCreated {
+		t.Fatalf("PUT child: want 201, got %d", rec.Code)
+	}
+
+	// Lock the collection with Depth: 0 (the default when no Depth header is sent).
+	lockBody := `<?xml version="1.0"?><D:lockinfo xmlns:D="DAV:">
+		<D:lockscope><D:exclusive/></D:lockscope>
+		<D:locktype><D:write/></D:locktype>
+		<D:owner><D:href>alice</D:href></D:owner></D:lockinfo>`
+	rec := e.do(t, "LOCK", e.davPath("locked-folder"), strings.NewReader(lockBody),
+		map[string]string{"Depth": "0"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("LOCK: want 200, got %d", rec.Code)
+	}
+	token := strings.Trim(rec.Header().Get("Lock-Token"), "<>")
+
+	// 1. Editing the existing child is NOT a membership change, so it must succeed.
+	rec = e.do(t, http.MethodPut, e.davPath("locked-folder/child.txt"),
+		strings.NewReader("edited"), nil)
+	if rec.Code == http.StatusLocked {
+		t.Fatal("a Depth:0 collection lock must not block editing an existing child")
+	}
+	if body := e.do(t, http.MethodGet, e.davPath("locked-folder/child.txt"), nil, nil).Body.String(); body != "edited" {
+		t.Fatalf("the edit must have been applied, got %q", body)
+	}
+
+	// 2. Adding a new child IS a membership change, so it must be refused.
+	rec = e.do(t, http.MethodPut, e.davPath("locked-folder/new.txt"),
+		strings.NewReader("new"), nil)
+	if rec.Code != http.StatusLocked {
+		t.Fatalf("adding a child to a Depth:0-locked collection: want 423, got %d", rec.Code)
+	}
+
+	// 3. So is a subdirectory.
+	rec = e.do(t, "MKCOL", e.davPath("locked-folder/sub"), nil, nil)
+	if rec.Code != http.StatusLocked {
+		t.Fatalf("MKCOL inside a Depth:0-locked collection: want 423, got %d", rec.Code)
+	}
+
+	// 4. With the token, the holder may add a child.
+	rec = e.do(t, http.MethodPut, e.davPath("locked-folder/allowed.txt"),
+		strings.NewReader("ok"), map[string]string{"If": "<" + token + ">"})
+	if rec.Code == http.StatusLocked {
+		t.Fatal("the lock holder submitting its token must be allowed to add a child")
+	}
+}
+
+// TestDepthInfinityCollectionLockBlocksChildContent is the other half on the DAV surface.
+func TestDepthInfinityCollectionLockBlocksChildContent(t *testing.T) {
+	e := newEnv(t)
+
+	if rec := e.do(t, "MKCOL", e.davPath("tree"), nil, nil); rec.Code != http.StatusCreated {
+		t.Fatalf("MKCOL: want 201, got %d", rec.Code)
+	}
+	if rec := e.do(t, http.MethodPut, e.davPath("tree/child.txt"),
+		strings.NewReader("original"), nil); rec.Code != http.StatusCreated {
+		t.Fatalf("PUT child: want 201, got %d", rec.Code)
+	}
+
+	lockBody := `<?xml version="1.0"?><D:lockinfo xmlns:D="DAV:">
+		<D:lockscope><D:exclusive/></D:lockscope>
+		<D:locktype><D:write/></D:locktype>
+		<D:owner><D:href>alice</D:href></D:owner></D:lockinfo>`
+	rec := e.do(t, "LOCK", e.davPath("tree"), strings.NewReader(lockBody),
+		map[string]string{"Depth": "infinity"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("LOCK infinity: want 200, got %d", rec.Code)
+	}
+
+	// A Depth: infinity lock reaches the child's content.
+	rec = e.do(t, http.MethodPut, e.davPath("tree/child.txt"),
+		strings.NewReader("clobbered"), nil)
+	if rec.Code != http.StatusLocked {
+		t.Fatalf("a Depth:infinity lock must block editing a child: want 423, got %d", rec.Code)
+	}
+}

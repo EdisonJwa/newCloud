@@ -1,6 +1,6 @@
 openapi: 3.1.0
 info:
-  title: newcloud
+  title: newCloud
   version: "1"
   description: |
     The REST surface the browser client uses.
@@ -37,10 +37,23 @@ paths:
   /api/files/:
     get:
       summary: List one directory
+      description: |
+        Pages are addressed by a cursor, not an offset. An offset over a name sort
+        returns duplicates and drops rows whenever a sibling is created or deleted
+        between requests; the cursor is the last name of the previous page, so the
+        next page starts strictly after it and stays correct under concurrent edits.
       parameters:
         - name: path
           in: query
           schema: { type: string }
+        - name: cursor
+          in: query
+          description: The `cursor` from the previous page. Omit for the first page.
+          schema: { type: string }
+        - name: limit
+          in: query
+          description: Page size, clamped by the server's configured maximum.
+          schema: { type: integer, minimum: 1 }
       responses:
         "200":
           description: ok
@@ -344,6 +357,264 @@ paths:
         "415":
           description: not an image
 
+  /api/admin/users:
+    get:
+      summary: List accounts, optionally filtered by status
+      description: |
+        Administrator only. A non-admin gets 404, not 403, so the surface is invisible
+        rather than merely forbidden.
+
+        The `status` filter is the approval queue: a deployment running the `pending` JIT
+        policy creates accounts disabled, and this is how an administrator finds them.
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [active, pending, disabled]
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, maximum: 1000, default: 100 }
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [users]
+                properties:
+                  users:
+                    type: array
+                    items: { $ref: "#/components/schemas/AdminUser" }
+        "404": { $ref: "#/components/responses/NotFoundResult" }
+
+  /api/admin/users/{id}/status:
+    post:
+      summary: Approve, disable or re-enable an account
+      description: |
+        One endpoint for all three because they are the same state change with a different
+        target value; three endpoints would be three places to forget the audit row or the
+        credential revocation.
+
+        Any status other than `active` revokes the account's sessions and app passwords in
+        the same transaction: a disabled account whose session still works has not been
+        disabled.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status:
+                  type: string
+                  enum: [active, pending, disabled]
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: "#/components/schemas/AdminUser" }
+                  changed: { type: boolean }
+                  sessions_revoked: { type: integer }
+                  app_passwords_revoked: { type: integer }
+        "400": { description: unknown status }
+        "404": { $ref: "#/components/responses/NotFoundResult" }
+
+  /api/acl/:
+    get:
+      summary: List the grants set directly on a node
+      description: |
+        Direct grants only: inherited permissions are already reflected in what the
+        caller can do, and listing a whole ancestor chain would bury the two rows the
+        owner actually set.
+
+        Requires `manage_permissions` on the node. A caller without it gets 404, not
+        403, so the endpoint cannot be used to probe which paths exist.
+      parameters:
+        - name: path
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  path: { type: string }
+                  permissions: { type: string }
+                  grants:
+                    type: array
+                    items: { $ref: "#/components/schemas/ACLGrant" }
+        "404": { $ref: "#/components/responses/NotFoundResult" }
+    post:
+      summary: Grant a user or group access to a node
+      description: |
+        The subject is named the way a person knows it — a username, an email address,
+        or a group name — and resolved server-side. An unknown subject is a 404 rather
+        than a grant pointing at an id that does nothing.
+
+        Re-granting the same subject replaces the previous grant: two rows for one
+        (node, subject) would make the effective permission depend on read order.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path, subject, permissions]
+              properties:
+                path: { type: string }
+                subject: { type: string }
+                subject_kind:
+                  type: string
+                  enum: [user, group]
+                permissions:
+                  type: array
+                  items: { type: string }
+                inherit:
+                  type: boolean
+                  description: Applies to descendants. Defaults to true.
+      responses:
+        "201": { description: granted }
+        "400": { description: unknown permission, or no permission supplied }
+        "404": { $ref: "#/components/responses/NotFoundResult" }
+
+  /api/acl/{id}:
+    delete:
+      summary: Revoke one grant
+      description: |
+        The grant must belong to the node named by `path`. Ids are unguessable, but they
+        appear in every listing the caller can manage, and a mistake is not unguessable.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - name: path
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "204": { description: revoked }
+        "404": { $ref: "#/components/responses/NotFoundResult" }
+
+  /api/auth/breakglass:
+    post:
+      summary: Local administrator login
+      description: |
+        The credential path that works when the IdP does not. Restricted to the
+        configured source networks, refused from anywhere else, and every attempt is
+        audited.
+
+        Answers 404 when `auth.allow_local_admin` is false, so a deployment that never
+        enabled it does not advertise a login that cannot work.
+
+        `content_access` is always false: this account administers and audits, and
+        cannot read user files.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string }
+                password: { type: string }
+      responses:
+        "200":
+          description: authenticated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  authenticated: { type: boolean }
+                  role: { type: string }
+                  content_access: { type: boolean }
+        "401": { description: invalid credentials }
+        "403": { description: source address not permitted }
+        "404": { description: local admin is not enabled }
+
+  /api/shared:
+    get:
+      summary: List nodes other accounts have granted you access to
+      description: |
+        Every other path in this API addresses a node by a path inside the caller's
+        own namespace. A resource-ACL grant can point into somebody else's tree, so
+        those nodes are unreachable by path — this is the explicit second way in.
+
+        Only the roots of granted subtrees are returned; descend with
+        `/api/shared/{id}`. The `permissions` string is advisory: every action
+        re-checks through the same authorizer.
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/SharedNode" }
+
+  /api/shared/{id}/content:
+    get:
+      summary: Stream a shared file's bytes
+      description: |
+        The content half of `/api/shared/{id}`. A grantee's own namespace cannot name
+        another account's path, so without this route a `download` grant was unusable.
+
+        Requires the `download` permission specifically, not `read`: an ACL can grant
+        metadata visibility without the right to take a copy.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: the file's bytes
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        "400": { description: the node is a directory }
+        "404": { $ref: "#/components/responses/NotFoundResult" }
+
+  /api/shared/{id}:
+    get:
+      summary: Read one node by id, including its children
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SharedNode" }
+        "404": { $ref: "#/components/responses/NotFoundResult" }
+
   /api/shares/:
     get:
       summary: Shares owned by the caller
@@ -373,6 +644,18 @@ paths:
                 expires_in_seconds: { type: integer }
                 max_downloads: { type: integer }
                 max_uploads: { type: integer }
+                # Per-share upload limits. They are enforced on the upload path, so
+                # a drop box that cannot set them cannot be limited at all.
+                max_bytes_per_file: { type: integer }
+                allowed_mime:
+                  type: array
+                  items: { type: string }
+                permissions:
+                  type: array
+                  items: { type: string }
+                recipients:
+                  type: array
+                  items: { type: string }
       responses:
         "201":
           description: created
@@ -565,14 +848,77 @@ components:
 
     Listing:
       type: object
-      required: [path, name, children, truncated]
+      required: [path, name, children, truncated, cursor]
       properties:
         path: { type: string }
         name: { type: string }
         truncated: { type: boolean }
+        # Empty string means this is the last page. It is the sort key of the last
+        # row returned, so sending it back as `cursor` cannot skip a row.
+        cursor: { type: string }
         children:
           type: array
           items: { $ref: "#/components/schemas/FileNode" }
+
+    AdminUser:
+      type: object
+      required: [id, username, role, status]
+      properties:
+        id: { type: string, format: uuid }
+        username: { type: string }
+        email: { type: string }
+        display_name: { type: string }
+        role: { type: string, enum: [admin, user, guest] }
+        status: { type: string, enum: [active, pending, disabled] }
+        quota_bytes: { type: integer }
+        used_bytes: { type: integer }
+        # Exposed because it changes what the account can do: break-glass bypasses the IdP,
+        # and an operator auditing the account list should be able to see it.
+        is_breakglass: { type: boolean }
+        created_at: { type: string }
+
+    ACLGrant:
+      type: object
+      required: [id, subject_kind, subject, permissions, inherit, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        subject_kind:
+          type: string
+          enum: [user, group]
+        subject: { type: string }
+        display: { type: string }
+        # The stored vocabulary, e.g. ["read", "list"]. "write" is stored as itself
+        # and expanded by the authorizer, so the row reads back as it was written.
+        permissions:
+          type: array
+          items: { type: string }
+        inherit: { type: boolean }
+        created_at: { type: string }
+
+    SharedNode:
+      type: object
+      required: [id, name, kind, permissions]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        kind: { type: string, enum: [file, dir] }
+        size: { type: integer }
+        mime: { type: string }
+        modified_at: { type: string }
+        owner_id: { type: string, format: uuid }
+        # The resolved permission names, e.g. "read+list+download". Advisory: the
+        # server re-checks every action, so a stale value cannot grant anything.
+        permissions: { type: string }
+        children:
+          type: array
+          nullable: true
+          items:
+            type: object
+            properties:
+              id: { type: string, format: uuid }
+              name: { type: string }
+              kind: { type: string }
+              size: { type: integer }
 
     Version:
       type: object

@@ -20,6 +20,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"net/netip"
 	"sort"
 	"time"
 
@@ -65,7 +66,11 @@ const (
 	ActionFileVersionRead Action = "file.version.read"
 
 	// Administration.
-	ActionUserCreate        Action = "user.create"
+	ActionUserCreate Action = "user.create"
+	// ActionUserRoleChange records an IdP-driven role change. A downgrade is the
+	// security-relevant case, so it is a first-class event rather than a log line:
+	// "who lost admin, when, and did their credentials actually stop working".
+	ActionUserRoleChange    Action = "user.role.change"
 	ActionUserDisable       Action = "user.disable"
 	ActionUserQuotaChange   Action = "user.quota.change"
 	ActionGroupMemberChange Action = "group.member.change"
@@ -180,7 +185,7 @@ func (e *Event) canonical() ([]byte, error) {
 		writeStr("")
 	}
 	writeStr(e.ActorEmail)
-	writeStr(e.ActorIP)
+	writeStr(normaliseIP(e.ActorIP))
 	writeStr(e.UserAgent)
 	writeStr(string(e.Action))
 	writeStr(string(e.TargetKind))
@@ -214,6 +219,30 @@ func (e *Event) Seal() error {
 	h.Write(body)
 	e.Hash = h.Sum(nil)
 	return nil
+}
+
+// normaliseIP makes the address hash-identical on the way in and on the way out.
+//
+// This is not cosmetic. The column is PostgreSQL `inet`, which renders a plain
+// address with its prefix length: `127.0.0.1` is stored as `127.0.0.1/32` and read
+// back that way. The writer hashed the string it was handed ("127.0.0.1") while the
+// verifier hashed what the database returned ("127.0.0.1/32"), so *every* event
+// carrying an address failed verification — the chain looked tampered-with while it
+// was in fact intact.
+//
+// The fix normalises the value rather than changing the column: an audit row must
+// keep hashing the same way forever, and rewriting existing hashes is exactly the
+// operation the chain exists to make impossible.
+func normaliseIP(ip string) string {
+	// A netip.Addr always formats without a prefix length, and parsing accepts the
+	// "/32" form PostgreSQL adds, so both sides converge on one representation.
+	if addr, err := netip.ParsePrefix(ip); err == nil {
+		return addr.Addr().String()
+	}
+	if addr, err := netip.ParseAddr(ip); err == nil {
+		return addr.String()
+	}
+	return ip
 }
 
 // canonicalJSON produces a deterministic byte encoding of metadata:

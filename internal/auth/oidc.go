@@ -91,15 +91,33 @@ type Claims struct {
 // The cookies use the __Host- prefix so a sibling subdomain cannot set them. The
 // PKCE verifier is what stops an intercepted code from being redeemed by another
 // client; state stops CSRF on the callback.
-func (p *Provider) AuthCodeURL(state, verifier string) string {
-	return p.oauth.AuthCodeURL(state,
+// AuthCodeURL returns the redirect target with PKCE and a nonce.
+//
+// The nonce is the one OIDC check this flow was missing (ID-02). PKCE binds the code
+// to this client and state binds the callback to this browser session; the nonce binds
+// the *ID token* to this authorization request, which is the remaining replay window:
+// without it, an ID token obtained from a different request to the same client would
+// verify here, because signature, issuer, audience and expiry would all still hold.
+//
+// The token is echoed back in the ID token's nonce claim, so a verifier that compares
+// them knows the token was minted for this request and not lifted from elsewhere.
+func (p *Provider) AuthCodeURL(state, verifier, nonce string) string {
+	opts := []oauth2.AuthCodeOption{
 		oauth2.SetAuthURLParam("code_challenge", pkceChallenge(verifier)),
 		oauth2.SetAuthURLParam("code_challenge_method", "S256"),
-	)
+	}
+	if nonce != "" {
+		opts = append(opts, oauth2.SetAuthURLParam("nonce", nonce))
+	}
+	return p.oauth.AuthCodeURL(state, opts...)
 }
 
 // Exchange redeems an authorization code and verifies the ID token.
-func (p *Provider) Exchange(ctx context.Context, code, verifier string) (*Claims, error) {
+//
+// expectedNonce is compared against the token's nonce claim. An empty expectation means
+// the caller did not start a nonce-bearing flow; that is only reachable from tests and
+// from a stale cookie, and is refused here rather than silently skipped.
+func (p *Provider) Exchange(ctx context.Context, code, verifier, expectedNonce string) (*Claims, error) {
 	ctx = oidc.ClientContext(ctx, http.DefaultClient)
 
 	token, err := p.oauth.Exchange(ctx, code, oauth2.SetAuthURLParam("code_verifier", verifier))
@@ -117,6 +135,17 @@ func (p *Provider) Exchange(ctx context.Context, code, verifier string) (*Claims
 	idToken, err := p.verifier.Verify(ctx, rawID)
 	if err != nil {
 		return nil, fmt.Errorf("auth: verify id_token: %w", err)
+	}
+
+	// The nonce check lives here rather than with the other claims because go-oidc
+	// does not enforce it: it verifies signature, issuer, audience and expiry, and
+	// leaves the replay binding to the caller. Constant-time comparison is not needed
+	// for a value the attacker must guess outright, but it is free.
+	if expectedNonce == "" {
+		return nil, errors.New("auth: no nonce was issued for this flow")
+	}
+	if subtle.ConstantTimeCompare([]byte(idToken.Nonce), []byte(expectedNonce)) != 1 {
+		return nil, errors.New("auth: id_token nonce does not match the authorization request")
 	}
 
 	var claims struct {

@@ -102,6 +102,18 @@ func (b *browser) noRedirect() *http.Client {
 	return &c
 }
 
+// jarlessClient returns a client that shares the transport but not the cookie jar.
+//
+// It exists for replaying one specific credential. A rejected request usually
+// answers with a Set-Cookie that clears that cookie; if the client shared the jar it
+// would also clear whatever valid session the browser is holding, which turns "did
+// the old token get refused?" into a test that can no longer tell.
+func (b *browser) jarlessClient() *http.Client {
+	c := *b.client
+	c.Jar = nil
+	return &c
+}
+
 // get issues a GET following redirects.
 func (b *browser) get(path string) (*http.Response, error) {
 	return b.client.Get(b.URL(path))
@@ -161,4 +173,18 @@ func (b *browser) resetJar(t *testing.T) {
 		t.Fatal(err)
 	}
 	b.client.Jar = jar
+}
+
+// meUser returns the current account's role, or fails.
+//
+// Tests assert on the role far more often than on the raw JSON, and a helper keeps
+// each of them from inventing its own key lookup.
+func (b *browser) meUser(t *testing.T) string {
+	t.Helper()
+	code, body := b.me()
+	if code != http.StatusOK {
+		t.Fatalf("me: want 200, got %d", code)
+	}
+	role, _ := body["role"].(string)
+	return role
 }

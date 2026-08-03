@@ -113,3 +113,61 @@ func TestHeadOfEmptyChainIsGenesis(t *testing.T) {
 		t.Fatal("empty chain head must be the genesis hash")
 	}
 }
+
+// TestIPAddressFormatsSealIdentically is a regression guard for a bug that made
+// every event with an actor address permanently unverifiable.
+//
+// The actor_ip column is PostgreSQL `inet`, which renders "127.0.0.1" as
+// "127.0.0.1/32". The writer hashed the bare address it was given; the verifier
+// hashed what the database returned. Both are "the same IP" but not the same bytes,
+// so verification reported tampering on an intact log — the worst possible failure
+// for a tamper-evident system, because it trains the operator to ignore the alarm.
+func TestIPAddressFormatsSealIdentically(t *testing.T) {
+	base := Event{
+		Time:      time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		ActorKind: ActorUser,
+		Action:    ActionLoginSuccess,
+		Result:    ResultOK,
+		PrevHash:  GenesisHash,
+	}
+
+	write := base
+	write.ActorIP = "127.0.0.1" // what the request handler has
+	read := base
+	read.ActorIP = "127.0.0.1/32" // what PostgreSQL hands back
+
+	if err := write.Seal(); err != nil {
+		t.Fatal(err)
+	}
+	if err := read.Seal(); err != nil {
+		t.Fatal(err)
+	}
+	if !equalBytes(write.Hash, read.Hash) {
+		t.Fatal("the same address must seal to the same hash regardless of prefix notation")
+	}
+
+	// IPv6 too: PostgreSQL renders a bare IPv6 address with its prefix length as
+	// well, and the two notations must converge.
+	v6a, v6b := base, base
+	v6a.ActorIP = "2001:db8::1"
+	v6b.ActorIP = "2001:db8::1/128"
+	if err := v6a.Seal(); err != nil {
+		t.Fatal(err)
+	}
+	if err := v6b.Seal(); err != nil {
+		t.Fatal(err)
+	}
+	if !equalBytes(v6a.Hash, v6b.Hash) {
+		t.Fatal("IPv6 must normalise the same way IPv4 does")
+	}
+
+	// A genuinely different address must not collide with either.
+	other := base
+	other.ActorIP = "127.0.0.2"
+	if err := other.Seal(); err != nil {
+		t.Fatal(err)
+	}
+	if equalBytes(other.Hash, write.Hash) {
+		t.Fatal("different addresses must seal differently")
+	}
+}

@@ -262,3 +262,64 @@ func TestExpiredCodeRejected(t *testing.T) {
 		t.Fatal("an expired code must be rejected")
 	}
 }
+
+// TestCodeIsSingleUse covers SHARE-02's replay half: a leaked code must not keep
+// working for the rest of its TTL.
+func TestCodeIsSingleUse(t *testing.T) {
+	svc, sh, _, _ := recipientFixture(t)
+	ctx := context.Background()
+
+	code, err := svc.IssueRecipientCode(ctx, sh, "alice@example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.VerifyRecipientCode(ctx, sh, "alice@example.test", code); err != nil {
+		t.Fatalf("first use must succeed: %v", err)
+	}
+	if err := svc.VerifyRecipientCode(ctx, sh, "alice@example.test", code); err == nil {
+		t.Fatal("a one-time code must not verify twice")
+	}
+}
+
+// TestVerificationIsThrottled covers T-09's brute-force half. Without the counter,
+// an attacker with a share link could try guesses as fast as the server answers.
+func TestVerificationIsThrottled(t *testing.T) {
+	svc, sh, _, _ := recipientFixture(t)
+	ctx := context.Background()
+
+	// A genuine code, issued before the guessing starts: the throttle must refuse it
+	// too, or an attacker simply keeps guessing until one lands.
+	good, err := svc.IssueRecipientCode(ctx, sh, "alice@example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < store.OTPMaxAttempts; i++ {
+		if err := svc.VerifyRecipientCode(ctx, sh, "alice@example.test", "wrong-code"); err == nil {
+			t.Fatalf("attempt %d must fail", i)
+		}
+	}
+
+	if err := svc.VerifyRecipientCode(ctx, sh, "alice@example.test", good); err == nil {
+		t.Fatal("a correct code arriving after the limit must still be refused")
+	}
+}
+
+// TestThrottleIsPerAddress: guessing against one invited address must not lock out
+// the others on the same share.
+func TestThrottleIsPerAddress(t *testing.T) {
+	svc, sh, _, _ := recipientFixture(t)
+	ctx := context.Background()
+
+	for i := 0; i < store.OTPMaxAttempts+1; i++ {
+		_ = svc.VerifyRecipientCode(ctx, sh, "alice@example.test", "wrong-code")
+	}
+
+	code, err := svc.IssueRecipientCode(ctx, sh, "bob@example.test")
+	if err != nil {
+		t.Fatalf("issue to the other recipient: %v", err)
+	}
+	if err := svc.VerifyRecipientCode(ctx, sh, "bob@example.test", code); err != nil {
+		t.Fatalf("another address must still be able to verify: %v", err)
+	}
+}

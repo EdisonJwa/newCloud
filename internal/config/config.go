@@ -65,17 +65,23 @@ type ServerConfig struct {
 }
 
 type AuthConfig struct {
-	Issuer           string           `yaml:"issuer"`
-	ClientID         string           `yaml:"client_id"`
-	ClientSecret     string           `yaml:"client_secret"`
-	ClientSecretFile string           `yaml:"client_secret_file"`
-	Scopes           []string         `yaml:"scopes"`
-	GroupRoleMap     map[string]Role  `yaml:"group_role_map"`
-	SessionTTL       time.Duration    `yaml:"session_ttl"`
-	SessionSecret    string           `yaml:"session_secret"`
-	AllowLocalAdmin  bool             `yaml:"allow_local_admin"`
-	LocalAdmin       LocalAdminConfig `yaml:"local_admin"`
-	SCIMToken        string           `yaml:"scim_token"`
+	Issuer           string          `yaml:"issuer"`
+	ClientID         string          `yaml:"client_id"`
+	ClientSecret     string          `yaml:"client_secret"`
+	ClientSecretFile string          `yaml:"client_secret_file"`
+	Scopes           []string        `yaml:"scopes"`
+	GroupRoleMap     map[string]Role `yaml:"group_role_map"`
+	SessionTTL       time.Duration   `yaml:"session_ttl"`
+	SessionSecret    string          `yaml:"session_secret"`
+	// JIT controls what happens the first time an unknown IdP identity signs in (ID-04).
+	//
+	// The default is "open" because that is what the project has always done, and
+	// changing the default would silently lock existing deployments out on upgrade. The
+	// point of the switch is that a deployment handling other people's data can close it.
+	JIT             JITConfig        `yaml:"jit"`
+	AllowLocalAdmin bool             `yaml:"allow_local_admin"`
+	LocalAdmin      LocalAdminConfig `yaml:"local_admin"`
+	SCIMToken       string           `yaml:"scim_token"`
 }
 
 type LocalAdminConfig struct {
@@ -157,10 +163,96 @@ type LimitsConfig struct {
 	DefaultFileQuotaBytes int64 `yaml:"default_file_quota_bytes"`
 	MaxProfindChildren    int   `yaml:"max_propfind_children"`
 	UploadChunkBytes      int64 `yaml:"upload_chunk_bytes"`
+
+	// Retention (§8.2). Every value here was previously either missing or a
+	// constant inside a handler, which meant an operator could not state a data
+	// retention policy at all — the requirement's own parameter list was
+	// unmeetable.
+	//
+	// Zero means "keep forever". That is the safe default: a deployment that has
+	// not thought about retention must not silently delete data.
+	VersionRetentionDays int `yaml:"version_retention_days"`
+	VersionCountLimit    int `yaml:"version_count_limit"`
+	TrashRetentionDays   int `yaml:"trash_retention_days"`
+	UploadSessionTTLHrs  int `yaml:"upload_session_ttl_hours"`
 }
+
+// VersionRetention is how long an old version is kept. Zero means forever.
+func (l LimitsConfig) VersionRetention() time.Duration {
+	return time.Duration(l.VersionRetentionDays) * 24 * time.Hour
+}
+
+// TrashRetention is how long a deleted item stays restorable. Zero means forever.
+func (l LimitsConfig) TrashRetention() time.Duration {
+	return time.Duration(l.TrashRetentionDays) * 24 * time.Hour
+}
+
+// UploadSessionTTL is how long an unfinished resumable upload may sit idle.
+func (l LimitsConfig) UploadSessionTTL() time.Duration {
+	if l.UploadSessionTTLHrs <= 0 {
+		return 24 * time.Hour
+	}
+	return time.Duration(l.UploadSessionTTLHrs) * time.Hour
+}
+
+// MaxVersionsFor reports how many versions to keep for a layout.
+//
+// The cap is layout-aware because the cost differs by an order of magnitude: the
+// tree layout stores each version as a full copy, the blob layout stores
+// differences. It is a method rather than two constants in two handlers — which is
+// what it used to be, and those constants could not be configured.
+func (l LimitsConfig) MaxVersionsFor(cheapVersions bool) int {
+	if l.VersionCountLimit > 0 {
+		return l.VersionCountLimit
+	}
+	if cheapVersions {
+		return 10
+	}
+	return 3
+}
+
+// JITConfig governs just-in-time provisioning of accounts on first login.
+//
+// Three modes rather than a boolean, because the middle one is what most organisations
+// actually want: nobody is admitted silently, but an administrator does not have to
+// pre-create every account either.
+type JITConfig struct {
+	// Mode is "open", "pending" or "deny".
+	//
+	//   open    - any identity the IdP asserts gets an account immediately (the old
+	//             behaviour, and the default)
+	//   pending - the account is created disabled with status "pending"; an
+	//             administrator must approve it before it can be used
+	//   deny    - the identity is refused; accounts must be pre-created
+	Mode string `yaml:"mode"`
+	// AllowedDomains limits which email domains may be provisioned at all, in every
+	// mode. Empty means any domain.
+	//
+	// It is not a substitute for the IdP: an IdP that lets anyone register is the real
+	// gate. It is a second lock for the case where the IdP's tenant is wider than the
+	// set of people who should reach this deployment.
+	AllowedDomains []string `yaml:"allowed_domains"`
+}
+
+// JIT mode constants.
+const (
+	JITOpen    = "open"
+	JITPending = "pending"
+	JITDeny    = "deny"
+)
 
 type AuditConfig struct {
 	RetentionDays int `yaml:"retention_days"`
+	// AnchorDir is where daily chain-head checkpoints are published (INV-09).
+	//
+	// Empty disables anchoring. That is a real choice with a real consequence: a chain
+	// that is never anchored cannot detect its own truncation, because an attacker who
+	// rewrites the tail leaves a log that still verifies.
+	//
+	// It must point somewhere with *different credentials* from the database. A
+	// directory on the same volume as the metadata store makes the anchor decorative,
+	// and the deployment documentation says so.
+	AnchorDir string `yaml:"anchor_dir"`
 }
 
 // Default returns the safe baseline. Everything that can be wrong by omission
@@ -175,6 +267,7 @@ func Default() Config {
 				"cloud-admins": RoleAdmin,
 				"cloud-users":  RoleUser,
 			},
+			JIT: JITConfig{Mode: JITOpen},
 		},
 		Storage: StorageConfig{
 			Backend: "local",
@@ -218,7 +311,12 @@ func Load(path string) (Config, error) {
 
 	// The same file-over-inline preference applies to the mail password: a mounted
 	// secret never appears in `docker inspect` or a process listing.
-	if cfg.Mail.Password == "" && cfg.Mail.PasswordFile != "" {
+	//
+	// Only read when mail is actually enabled. A disabled transport still names a secret
+	// path in every example configuration, and demanding that the file exist turns the
+	// shipped example into one that cannot start - which is how an operator concludes the
+	// documentation is wrong rather than that they misconfigured something.
+	if cfg.Mail.Enabled && cfg.Mail.Password == "" && cfg.Mail.PasswordFile != "" {
 		secret, err := os.ReadFile(cfg.Mail.PasswordFile)
 		if err != nil {
 			return cfg, fmt.Errorf("read mail.password_file: %w", err)
@@ -320,6 +418,19 @@ func (c *Config) Validate() error {
 		default:
 			return invalid("auth.group_role_map[%q]: unknown role %q", name, role)
 		}
+	}
+
+	// JIT defaults to open when unset, so an existing configuration file keeps working.
+	// The modes are validated rather than guessed: an unrecognised value here decides who
+	// gets an account, and silently falling back to the permissive one is the wrong guess.
+	if c.Auth.JIT.Mode == "" {
+		c.Auth.JIT.Mode = JITOpen
+	}
+	switch c.Auth.JIT.Mode {
+	case JITOpen, JITPending, JITDeny:
+	default:
+		return invalid("auth.jit.mode: want %q, %q or %q, got %q",
+			JITOpen, JITPending, JITDeny, c.Auth.JIT.Mode)
 	}
 
 	if c.Auth.AllowLocalAdmin {

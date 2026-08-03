@@ -22,6 +22,7 @@ const (
 	sessionCookie = "__Host-wc_session"
 	stateCookie   = "__Host-wc_state"
 	pkceCookie    = "__Host-wc_pkce"
+	nonceCookie   = "__Host-wc_nonce"
 )
 
 type ctxKey int
@@ -60,6 +61,19 @@ func (s *Server) requireSession(next http.Handler) http.Handler {
 		if err != nil {
 			s.clearSessionCookie(w)
 			writeError(w, http.StatusUnauthorized, "unauthenticated", "account unavailable")
+			return
+		}
+
+		// Status is checked on every request, not only at login.
+		//
+		// Revocation on disable closes the common case, but it is not sufficient on its
+		// own: a session minted a millisecond before the disable commits, or a replica
+		// reading a snapshot taken before it, would survive. Checking here makes "disabled"
+		// true regardless of how the credential was obtained - the same reasoning that made
+		// the account lookup happen per request rather than being trusted from the token.
+		if !user.IsActive() {
+			s.clearSessionCookie(w)
+			writeError(w, http.StatusUnauthorized, "unauthenticated", "account is not active")
 			return
 		}
 

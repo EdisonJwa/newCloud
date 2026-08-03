@@ -82,11 +82,21 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List one directory */
+        /**
+         * List one directory
+         * @description Pages are addressed by a cursor, not an offset. An offset over a name sort
+         *     returns duplicates and drops rows whenever a sibling is created or deleted
+         *     between requests; the cursor is the last name of the previous page, so the
+         *     next page starts strictly after it and stays correct under concurrent edits.
+         */
         get: {
             parameters: {
                 query?: {
                     path?: string;
+                    /** @description The `cursor` from the previous page. Omit for the first page. */
+                    cursor?: string;
+                    /** @description Page size, clamped by the server's configured maximum. */
+                    limit?: number;
                 };
                 header?: never;
                 path?: never;
@@ -786,6 +796,480 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/admin/users": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List accounts, optionally filtered by status
+         * @description Administrator only. A non-admin gets 404, not 403, so the surface is invisible
+         *     rather than merely forbidden.
+         *
+         *     The `status` filter is the approval queue: a deployment running the `pending` JIT
+         *     policy creates accounts disabled, and this is how an administrator finds them.
+         */
+        get: {
+            parameters: {
+                query?: {
+                    status?: "active" | "pending" | "disabled";
+                    limit?: number;
+                };
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description ok */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            users: components["schemas"]["AdminUser"][];
+                        };
+                    };
+                };
+                404: components["responses"]["NotFoundResult"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/users/{id}/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Approve, disable or re-enable an account
+         * @description One endpoint for all three because they are the same state change with a different
+         *     target value; three endpoints would be three places to forget the audit row or the
+         *     credential revocation.
+         *
+         *     Any status other than `active` revokes the account's sessions and app passwords in
+         *     the same transaction: a disabled account whose session still works has not been
+         *     disabled.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": {
+                        /** @enum {string} */
+                        status: "active" | "pending" | "disabled";
+                    };
+                };
+            };
+            responses: {
+                /** @description ok */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            user?: components["schemas"]["AdminUser"];
+                            changed?: boolean;
+                            sessions_revoked?: number;
+                            app_passwords_revoked?: number;
+                        };
+                    };
+                };
+                /** @description unknown status */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                404: components["responses"]["NotFoundResult"];
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/acl/": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List the grants set directly on a node
+         * @description Direct grants only: inherited permissions are already reflected in what the
+         *     caller can do, and listing a whole ancestor chain would bury the two rows the
+         *     owner actually set.
+         *
+         *     Requires `manage_permissions` on the node. A caller without it gets 404, not
+         *     403, so the endpoint cannot be used to probe which paths exist.
+         */
+        get: {
+            parameters: {
+                query: {
+                    path: string;
+                };
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description ok */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            path?: string;
+                            permissions?: string;
+                            grants?: components["schemas"]["ACLGrant"][];
+                        };
+                    };
+                };
+                404: components["responses"]["NotFoundResult"];
+            };
+        };
+        put?: never;
+        /**
+         * Grant a user or group access to a node
+         * @description The subject is named the way a person knows it — a username, an email address,
+         *     or a group name — and resolved server-side. An unknown subject is a 404 rather
+         *     than a grant pointing at an id that does nothing.
+         *
+         *     Re-granting the same subject replaces the previous grant: two rows for one
+         *     (node, subject) would make the effective permission depend on read order.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": {
+                        path: string;
+                        subject: string;
+                        /** @enum {string} */
+                        subject_kind?: "user" | "group";
+                        permissions: string[];
+                        /** @description Applies to descendants. Defaults to true. */
+                        inherit?: boolean;
+                    };
+                };
+            };
+            responses: {
+                /** @description granted */
+                201: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description unknown permission */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                404: components["responses"]["NotFoundResult"];
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/acl/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Revoke one grant
+         * @description The grant must belong to the node named by `path`. Ids are unguessable, but they
+         *     appear in every listing the caller can manage, and a mistake is not unguessable.
+         */
+        delete: {
+            parameters: {
+                query: {
+                    path: string;
+                };
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description revoked */
+                204: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                404: components["responses"]["NotFoundResult"];
+            };
+        };
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/auth/breakglass": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Local administrator login
+         * @description The credential path that works when the IdP does not. Restricted to the
+         *     configured source networks, refused from anywhere else, and every attempt is
+         *     audited.
+         *
+         *     Answers 404 when `auth.allow_local_admin` is false, so a deployment that never
+         *     enabled it does not advertise a login that cannot work.
+         *
+         *     `content_access` is always false: this account administers and audits, and
+         *     cannot read user files.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": {
+                        username: string;
+                        password: string;
+                    };
+                };
+            };
+            responses: {
+                /** @description authenticated */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            authenticated?: boolean;
+                            role?: string;
+                            content_access?: boolean;
+                        };
+                    };
+                };
+                /** @description invalid credentials */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description source address not permitted */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description local admin is not enabled */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/shared": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List nodes other accounts have granted you access to
+         * @description Every other path in this API addresses a node by a path inside the caller's
+         *     own namespace. A resource-ACL grant can point into somebody else's tree, so
+         *     those nodes are unreachable by path — this is the explicit second way in.
+         *
+         *     Only the roots of granted subtrees are returned; descend with
+         *     `/api/shared/{id}`. The `permissions` string is advisory: every action
+         *     re-checks through the same authorizer.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description ok */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            items: components["schemas"]["SharedNode"][];
+                        };
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/shared/{id}/content": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Stream a shared file's bytes
+         * @description The content half of `/api/shared/{id}`. A grantee's own namespace cannot name
+         *     another account's path, so without this route a `download` grant was unusable.
+         *
+         *     Requires the `download` permission specifically, not `read`: an ACL can grant
+         *     metadata visibility without the right to take a copy.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description the file's bytes */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/octet-stream": string;
+                    };
+                };
+                /** @description the node is a directory */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                404: components["responses"]["NotFoundResult"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/shared/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read one node by id, including its children */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description ok */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["SharedNode"];
+                    };
+                };
+                404: components["responses"]["NotFoundResult"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/shares/": {
         parameters: {
             query?: never;
@@ -834,6 +1318,10 @@ export interface paths {
                         expires_in_seconds?: number;
                         max_downloads?: number;
                         max_uploads?: number;
+                        max_bytes_per_file?: number;
+                        allowed_mime?: string[];
+                        permissions?: string[];
+                        recipients?: string[];
                     };
                 };
             };
@@ -1140,7 +1628,54 @@ export interface components {
             path: string;
             name: string;
             truncated: boolean;
+            cursor: string;
             children: components["schemas"]["FileNode"][];
+        };
+        AdminUser: {
+            /** Format: uuid */
+            id: string;
+            username: string;
+            email?: string;
+            display_name?: string;
+            /** @enum {string} */
+            role: "admin" | "user" | "guest";
+            /** @enum {string} */
+            status: "active" | "pending" | "disabled";
+            quota_bytes?: number;
+            used_bytes?: number;
+            is_breakglass?: boolean;
+            created_at?: string;
+        };
+        ACLGrant: {
+            /** Format: uuid */
+            id: string;
+            /** @enum {string} */
+            subject_kind: "user" | "group";
+            subject: string;
+            display?: string;
+            permissions: string[];
+            inherit: boolean;
+            created_at: string;
+        };
+        SharedNode: {
+            /** Format: uuid */
+            id: string;
+            name: string;
+            /** @enum {string} */
+            kind: "file" | "dir";
+            size?: number;
+            mime?: string;
+            modified_at?: string;
+            /** Format: uuid */
+            owner_id?: string;
+            permissions: string;
+            children?: {
+                /** Format: uuid */
+                id?: string;
+                name?: string;
+                kind?: string;
+                size?: number;
+            }[] | null;
         };
         Version: {
             version: number;

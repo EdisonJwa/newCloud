@@ -66,6 +66,48 @@ type IdentityTx interface {
 	// user who changes their email keeps their files. Keying on email would
 	// silently create a second account and orphan the first one's data.
 	UpsertIdPUser(ctx context.Context, u UpsertUser) (User, error)
+	// ApplyIdPRole records the role the IdP now claims for an account, revoking
+	// its live sessions when that is a downgrade.
+	//
+	// This exists because "the role changed in the IdP" and "the role changed in
+	// NewCloud" are different events, and only the second one affects access. A
+	// person removed from the admin group must lose admin rights for the session
+	// they already hold — otherwise the removal is advisory until their token
+	// expires, which for a WebDAV client can be months.
+	ApplyIdPRole(ctx context.Context, userID uuid.UUID, role string) (RoleChange, error)
+}
+
+// RoleChange reports what ApplyIdPRole did.
+type RoleChange struct {
+	// From and To are the stored and the newly claimed role.
+	From, To string
+	// Changed reports whether the stored role moved.
+	Changed bool
+	// Downgraded reports a move to strictly less privilege. That is the case the
+	// revocation exists for: everything else takes effect on the next request
+	// because the middleware reads the role live.
+	Downgraded bool
+	// SessionsRevoked and AppPasswordsRevoked count what was killed.
+	SessionsRevoked     int
+	AppPasswordsRevoked int
+}
+
+// roleRank orders roles so "downgrade" is decidable without a second table.
+//
+// It mirrors the ordering in internal/config: guest < user < admin. An unknown
+// role ranks 0, so a claim that stops matching the map is treated as a downgrade
+// rather than silently preserved.
+func roleRank(role string) int {
+	switch role {
+	case "admin":
+		return 3
+	case "user":
+		return 2
+	case "guest":
+		return 1
+	default:
+		return 0
+	}
 }
 
 // UpsertUser is the input for JIT provisioning.
@@ -76,9 +118,19 @@ type UpsertUser struct {
 	Email       string
 	DisplayName string
 	Role        string
+	// Status is the initial status for a *new* account. Empty means active.
+	//
+	// It matters because the provisioning policy (ID-04) decides whether a first-time
+	// identity is admitted or held for approval, and it can only express that by creating
+	// the account in a non-active state. Without this field the policy computed a status
+	// that nothing stored, so "pending" mode silently behaved like "open".
+	//
+	// It is ignored for an existing account: status is changed through SetUserStatus, so
+	// that approval is a deliberate act with its own audit row.
+	Status string
 }
 
-// Tx combines every operation available inside a transaction.
+// FullTx combines every operation available inside a transaction.
 //
 // It is split into embeddable interfaces so that a component can depend on just
 // the part it needs (the auth package only needs sessions and identity) while
@@ -87,6 +139,10 @@ type FullTx interface {
 	Tx
 	SessionTx
 	IdentityTx
+	AppPasswordTx
+	ShareTx
+	LockTx
+	DeadPropTx
 }
 
 var (

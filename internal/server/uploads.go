@@ -28,6 +28,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/EdisonJwa/newCloud/internal/authz"
 	"github.com/EdisonJwa/newCloud/internal/upload"
 )
 
@@ -66,7 +67,7 @@ func (s *Server) handleUploadCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, _, err := s.writableParent(r.Context(), actor, body.Path); err != nil {
+	if _, _, err := s.writableParent(r.Context(), actor, body.Path, authz.PermCreate); err != nil {
 		s.writeStoreError(w, err)
 		return
 	}
@@ -149,7 +150,7 @@ func (s *Server) handleUploadComplete(w http.ResponseWriter, r *http.Request) {
 	}
 	defer cleanup()
 
-	parent, _, err := s.writableParent(r.Context(), actor, sess.Dir)
+	parent, _, err := s.writableParent(r.Context(), actor, sess.Dir, authz.PermCreate)
 	if err != nil {
 		s.writeStoreError(w, err)
 		return
@@ -163,7 +164,11 @@ func (s *Server) handleUploadComplete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	mime := guessType(sess.Name)
-	node, err := s.publishFile(r.Context(), r, actor, parent.ID, sess.Name, rel, mime, res)
+	// The precondition is re-evaluated here, at commit, not when the session was
+	// created: an upload can take hours, and the target may have been replaced
+	// meanwhile. This is what §6.1's "re-validate at commit" means in practice.
+	node, err := s.publishFile(r.Context(), r, actor, parent.ID, sess.Name, rel, mime, res,
+		preconditionFromHeader(r))
 	if err != nil {
 		s.writeStoreError(w, err)
 		return

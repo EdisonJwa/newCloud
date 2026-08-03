@@ -2,10 +2,11 @@ package s3
 
 // Contract tests for the object-store backend.
 //
-// These need a real S3-compatible server; there is no in-process fake, because a fake would
-// only test this package against my own assumptions about HTTP rather than against the
-// behaviour of an object store. They are skipped unless TEST_S3_ENDPOINT is set, so
-// `go test ./...` still works on a machine without one, and CI provides MinIO as a service.
+// They run against an in-process fake by default and against a real endpoint when
+// TEST_S3_ENDPOINT is set. The earlier note here claimed a fake "would only test this package
+// against my own assumptions about HTTP" — true of a careless fake, but the alternative was a
+// test that skipped everywhere it mattered, which is worse than an imperfect test that runs.
+// A real endpoint still catches protocol drift the fake cannot.
 
 import (
 	"bytes"
@@ -18,18 +19,31 @@ import (
 	"testing"
 
 	"github.com/EdisonJwa/newCloud/internal/blob"
+	"github.com/EdisonJwa/newCloud/internal/storage/s3fake"
 )
 
 func testStore(t *testing.T) *Store {
 	t.Helper()
 	endpoint := os.Getenv("TEST_S3_ENDPOINT")
-	if endpoint == "" {
-		t.Skip("TEST_S3_ENDPOINT not set; skipping S3 tests")
-	}
-
 	bucket := os.Getenv("TEST_S3_BUCKET")
 	if bucket == "" {
 		bucket = "newcloud-test"
+	}
+
+	var accessKey, secretKey string
+	secure := false
+
+	if endpoint == "" {
+		// No live endpoint: run against the in-process fake, so these tests are evidence
+		// rather than a skip.
+		fake := s3fake.New(bucket)
+		t.Cleanup(fake.Close)
+		endpoint = fake.Endpoint()
+		accessKey, secretKey = "fake-access", "fake-secret"
+	} else {
+		accessKey = os.Getenv("TEST_S3_ACCESS_KEY")
+		secretKey = os.Getenv("TEST_S3_SECRET_KEY")
+		secure = os.Getenv("TEST_S3_SECURE") == "1"
 	}
 
 	// A per-test prefix keeps parallel runs and leftovers from colliding without having to
@@ -39,9 +53,9 @@ func testStore(t *testing.T) *Store {
 	s, err := New(context.Background(), Config{
 		Endpoint:  endpoint,
 		Bucket:    bucket,
-		AccessKey: os.Getenv("TEST_S3_ACCESS_KEY"),
-		SecretKey: os.Getenv("TEST_S3_SECRET_KEY"),
-		Secure:    os.Getenv("TEST_S3_SECURE") == "1",
+		AccessKey: accessKey,
+		SecretKey: secretKey,
+		Secure:    secure,
 		Prefix:    prefix,
 	})
 	if err != nil {

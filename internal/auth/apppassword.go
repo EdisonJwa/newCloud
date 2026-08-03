@@ -60,8 +60,9 @@ func NewAppPasswords(meta store.Store) *AppPasswords {
 // The plaintext is not recoverable afterwards: only its SHA-256 is stored. That
 // is deliberate — a database dump must not yield working credentials.
 func (a *AppPasswords) Issue(ctx context.Context, userID uuid.UUID, label, scope string, ttl time.Duration) (string, AppPassword, error) {
-	if scope != "ro" && scope != "rw" {
-		return "", AppPassword{}, fmt.Errorf("auth: scope must be \"ro\" or \"rw\", got %q", scope)
+	if !ValidScope(scope) {
+		return "", AppPassword{}, fmt.Errorf("auth: scope must be %q or %q, got %q",
+			ScopeReadOnly, ScopeReadWrite, scope)
 	}
 	label = strings.TrimSpace(label)
 	if label == "" {
@@ -185,6 +186,21 @@ func (a *AppPasswords) Revoke(ctx context.Context, id uuid.UUID) error {
 	})
 }
 
+// RevokeAll kills every live credential of a user and reports how many.
+//
+// Disabling an account calls this: a session revocation covers the browser, but a
+// WebDAV app password is a ninety-day credential that would otherwise keep working
+// for a person who has been locked out.
+func (a *AppPasswords) RevokeAll(ctx context.Context, userID uuid.UUID) (int, error) {
+	var n int
+	err := a.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		got, rerr := tx.RevokeUserAppPasswords(ctx, userID)
+		n = got
+		return rerr
+	})
+	return n, err
+}
+
 // List returns the caller's credentials for the management screen.
 func (a *AppPasswords) List(ctx context.Context, userID uuid.UUID) ([]AppPassword, error) {
 	var out []AppPassword
@@ -206,11 +222,36 @@ func (a *AppPasswords) List(ctx context.Context, userID uuid.UUID) ([]AppPasswor
 }
 
 // ScopeForActor translates a credential scope into the authz scope bits.
+//
+// It is the single translation between the stored string and the permission
+// model. Both entry points that authenticate a credential — the WebDAV handler and
+// the automation path — must use it, or one of them silently grants more than the
+// credential says.
 func ScopeForActor(scope string) (read, write bool) {
-	if scope == "ro" {
+	switch scope {
+	case ScopeReadOnly:
 		return true, false
+	default:
+		return true, true
 	}
-	return true, true
+}
+
+// Credential scopes.
+//
+// The requirement is that a credential carries the least authority that makes it
+// useful, so an automation token meant to upload cannot delete. Two scopes are
+// implemented; anything else is rejected at issuance rather than silently treated
+// as read-write.
+const (
+	// ScopeReadOnly permits reading and listing, never writing.
+	ScopeReadOnly = "ro"
+	// ScopeReadWrite permits everything the owner may do.
+	ScopeReadWrite = "rw"
+)
+
+// ValidScope reports whether a scope string is accepted.
+func ValidScope(scope string) bool {
+	return scope == ScopeReadOnly || scope == ScopeReadWrite
 }
 
 func min(a, b int) int {

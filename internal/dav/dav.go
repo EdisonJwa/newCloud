@@ -148,7 +148,7 @@ func (h *Handler) authenticate(w http.ResponseWriter, r *http.Request) (authz.Ac
 	// only for diagnostics.
 	_ = user
 
-	u, _, err := h.appPass.Verify(r.Context(), pass, clientIP(r))
+	u, cred, err := h.appPass.Verify(r.Context(), pass, clientIP(r))
 	if err != nil {
 		h.challenge(w)
 		return authz.Actor{}, false
@@ -167,10 +167,23 @@ func (h *Handler) authenticate(w http.ResponseWriter, r *http.Request) (authz.Ac
 		return authz.Actor{}, false
 	}
 
+	// The credential's scope narrows the actor, and it has to. Granting
+	// ScopeRead|ScopeWrite unconditionally — which this used to do — made every
+	// "read-only" app password a full read-write credential over WebDAV, so the
+	// one place a read-only token is most useful was the one place it was ignored.
+	readOnly, writable := auth.ScopeForActor(cred.Scope)
+	var scope authz.Scope
+	if readOnly {
+		scope |= authz.ScopeRead
+	}
+	if writable {
+		scope |= authz.ScopeWrite
+	}
+
 	// The namespace segment comes from the account record, never from the URL the
 	// client sent: taking it from the request would let a client address another
 	// user's namespace by writing a different username in the path.
-	actor := authz.NewUserActor(u.ID, u.Email, role, authz.ScopeRead|authz.ScopeWrite)
+	actor := authz.NewUserActor(u.ID, u.Email, role, scope)
 	return actor.WithUsername(ownerName(u)), true
 }
 
@@ -323,6 +336,9 @@ func statusForError(err error) int {
 		return http.StatusRequestEntityTooLarge
 	case errors.Is(err, store.ErrCycle):
 		return http.StatusConflict
+	case errors.Is(err, store.ErrPrecondition):
+		// The target changed under the client. RFC 9110 §15.5.13.
+		return http.StatusPreconditionFailed
 	case errors.Is(err, store.ErrInvalidName), errors.Is(err, layout.ErrInvalidNode),
 		errors.Is(err, layout.ErrUnsafePath):
 		return http.StatusBadRequest

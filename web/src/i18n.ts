@@ -12,7 +12,7 @@ export type Lang = "en" | "zh-Hans";
 type Table = Record<string, string>;
 
 const en: Table = {
-  "app.name": "newcloud",
+  "app.name": "newCloud",
 
   "nav.home": "Home",
   "nav.files": "Files",
@@ -247,11 +247,11 @@ const en: Table = {
   "share.slots": "{left} of {max} slots left",
   "share.uploadOne": "Upload a file to send it.",
   "share.cannotRead": "This link cannot be downloaded.",
-  "share.sharedWith": "Shared with newcloud",
+  "share.sharedWith": "Shared with newCloud",
 };
 
 const zh: Table = {
-  "app.name": "newcloud",
+  "app.name": "newCloud",
 
   "nav.home": "首页",
   "nav.files": "文件",
@@ -481,7 +481,7 @@ const zh: Table = {
   "share.slots": "还剩 {left} / {max} 个名额",
   "share.uploadOne": "上传一个文件发送过去。",
   "share.cannotRead": "此链接不可下载。",
-  "share.sharedWith": "由 newcloud 分享",
+  "share.sharedWith": "由 newCloud 分享",
 };
 
 const TABLES: Record<Lang, Table> = { en, "zh-Hans": zh };

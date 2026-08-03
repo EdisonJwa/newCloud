@@ -18,15 +18,19 @@ type BlobRef struct {
 // It lives on Tx so the worker's decision and the deletion it triggers can be
 // observed consistently; the query itself only reads.
 //
-// Two conditions must both hold: refcount is zero (nothing points at the bytes)
-// and collect_after has passed (the grace period is over). The second is what
-// makes "delete, then undo" work: a file restored from the trash re-increments
-// the refcount and clears collect_after, so the sweep skips it.
+// Three conditions must all hold: refcount is zero (nothing points at the bytes),
+// collect_after has passed (the grace period is over), and no version row still
+// names the blob. The version check is belt-and-braces against a refcount that
+// drifted: a version is a live reference to content, and collecting bytes a
+// historical version needs would turn "restore an old version" into a permanent
+// error for that file.
 func (t *pgTx) CollectableBlobs(ctx context.Context, grace time.Duration) ([]BlobRef, error) {
-	const q = `SELECT id, size FROM blobs
-		WHERE refcount = 0
-		  AND collect_after IS NOT NULL
-		  AND collect_after <= now()
+	const q = `SELECT b.id, b.size FROM blobs b
+		WHERE b.refcount = 0
+		  AND b.collect_after IS NOT NULL
+		  AND b.collect_after <= now()
+		  AND NOT EXISTS (SELECT 1 FROM versions v WHERE v.blob_id = b.id)
+		  AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.blob_id = b.id)
 		LIMIT 1000`
 	rows, err := t.tx.Query(ctx, q)
 	if err != nil {
@@ -50,7 +54,10 @@ func (t *pgTx) DeleteBlob(ctx context.Context, id uuid.UUID) error {
 	// Refuse to delete a blob that is still referenced. This is the last line of
 	// defence: a bug in the refcount accounting must not translate into data loss
 	// for a user who still has the file.
-	const q = `DELETE FROM blobs WHERE id = $1 AND refcount = 0`
+	const q = `DELETE FROM blobs b
+		WHERE b.id = $1 AND b.refcount = 0
+		  AND NOT EXISTS (SELECT 1 FROM versions v WHERE v.blob_id = b.id)
+		  AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.blob_id = b.id)`
 	tag, err := t.tx.Exec(ctx, q, id)
 	if err != nil {
 		return translate(err)

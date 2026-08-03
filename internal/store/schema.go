@@ -88,21 +88,27 @@ func ApplySchema(ctx context.Context, pool *pgxpool.Pool) error {
 // its own BEGIN ... END, and deleting those lines corrupts the block into a syntax
 // error. Line-based filtering alone is not enough, which is exactly the bug this
 // function had when the migration first failed to apply.
+// stripTxControl removes the wrapper BEGIN/COMMIT from a migration file, because the
+// runner executes each file inside its own transaction.
+//
+// It must ignore anything inside a dollar-quoted body. Two forms occur: anonymous `$$` and
+// a named tag such as `$fn$`. Tracking only `$$` is not enough — a `CREATE FUNCTION ...
+// $fn$ ... $fn$` block then reads as ordinary SQL, and any line inside it that happens to
+// be "BEGIN" (a PL/pgSQL block opener) is dropped, silently corrupting the function body.
+// That failure is invisible locally and produces a confusing "is an index" error at apply
+// time, so both forms are handled here.
 func stripTxControl(sql string) string {
 	var (
-		out      []string
-		inDollar bool
+		out  []string
+		open string // the currently open dollar-quote tag, or "" when outside
 	)
 
 	for _, line := range strings.Split(sql, "\n") {
-		// A dollar-quote may open and close on the same line; count occurrences.
-		dollars := strings.Count(line, "$$")
-		wasInDollar := inDollar
-		if dollars%2 == 1 {
-			inDollar = !inDollar
-		}
+		wasOpen := open != ""
+		// Scan the line for dollar-quote delimiters, honouring named tags.
+		open = scanDollarQuotes(line, open)
 
-		if !wasInDollar && !inDollar {
+		if !wasOpen && open == "" {
 			trimmed := strings.TrimSpace(strings.ToUpper(line))
 			if trimmed == "BEGIN;" || trimmed == "BEGIN" ||
 				trimmed == "COMMIT;" || trimmed == "COMMIT" {
@@ -112,4 +118,49 @@ func stripTxControl(sql string) string {
 		out = append(out, line)
 	}
 	return strings.Join(out, "\n")
+}
+
+// scanDollarQuotes advances the dollar-quote state across one line.
+//
+// PostgreSQL dollar quoting is `$tag$ ... $tag$` where the tag is an optional identifier.
+// The opening and closing delimiters must match, so the state is the tag itself rather than
+// a boolean: a `$fn$` body containing `$$` (a nested anonymous quote, which is legal) would
+// otherwise close early.
+func scanDollarQuotes(line, open string) string {
+	for i := 0; i < len(line); {
+		if line[i] != '$' {
+			i++
+			continue
+		}
+		// Read the candidate tag: $ [identifier] $
+		j := i + 1
+		for j < len(line) && (isTagChar(line[j])) {
+			j++
+		}
+		if j >= len(line) || line[j] != '$' {
+			i++
+			continue
+		}
+		tag := line[i : j+1] // includes both dollars
+
+		if open == "" {
+			open = tag
+		} else if open == tag {
+			open = ""
+		}
+		// A different tag inside a quoted body is text, not a delimiter.
+		i = j + 1
+	}
+	return open
+}
+
+// isTagChar reports whether c may appear in a dollar-quote tag.
+//
+// PostgreSQL allows [A-Za-z_][A-Za-z0-9_]*; a leading digit is not valid, but accepting it
+// here is harmless because the delimiter must still close with a matching `$`.
+func isTagChar(c byte) bool {
+	return c == '_' ||
+		(c >= 'a' && c <= 'z') ||
+		(c >= 'A' && c <= 'Z') ||
+		(c >= '0' && c <= '9')
 }

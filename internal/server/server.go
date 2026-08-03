@@ -7,7 +7,9 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -17,12 +19,14 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/google/uuid"
 
 	"github.com/EdisonJwa/newCloud/internal/auth"
 	"github.com/EdisonJwa/newCloud/internal/authz"
 	"github.com/EdisonJwa/newCloud/internal/config"
 	"github.com/EdisonJwa/newCloud/internal/dav"
 	"github.com/EdisonJwa/newCloud/internal/mail"
+	"github.com/EdisonJwa/newCloud/internal/metrics"
 	"github.com/EdisonJwa/newCloud/internal/share"
 	"github.com/EdisonJwa/newCloud/internal/storage/layout"
 	"github.com/EdisonJwa/newCloud/internal/store"
@@ -45,6 +49,12 @@ type Deps struct {
 	AppPass  *auth.AppPasswords
 	Shares   *share.Service
 	Provider *auth.Provider
+	// Providers holds the OIDC provider when it may not have been discovered yet (ID-07).
+	//
+	// Distinct from Provider, which is the "already known at startup" case the tests use. In
+	// production the holder is what makes an IdP outage a login-only degradation instead of a
+	// refusal to start: the server comes up without it and discovers lazily.
+	Providers *auth.ProviderHolder
 	// Mailer delivers recipient verification codes. Nil means no transport is
 	// configured: email shares still exist, but the server logs a warning each time a
 	// code is generated rather than pretending it was sent.
@@ -55,6 +65,9 @@ type Deps struct {
 	// Uploads holds in-progress resumable uploads. Nil disables the chunked endpoints, which
 	// then answer 503 and the client falls back to a single-request upload.
 	Uploads *upload.Manager
+	// Metrics records request outcomes and operational signals. Nil means metrics are not
+	// collected, which is the default for tests that do not care.
+	Metrics *metrics.Registry
 	Log     *slog.Logger
 	Version string
 }
@@ -85,6 +98,17 @@ func New(deps Deps) (*Server, error) {
 	}
 	if deps.Log == nil {
 		deps.Log = slog.Default()
+	}
+
+	// A break-glass account that is configured but unusable is worse than none: an
+	// operator relies on it during an outage and only then discovers the hash file is
+	// unreadable. Checking at startup turns that into a failure that happens at a time
+	// somebody can fix it.
+	if deps.Config.Auth.AllowLocalAdmin {
+		if _, err := readFileTrimmed(deps.Config.Auth.LocalAdmin.PasswordFile); err != nil {
+			return nil, fmt.Errorf("break-glass: read %s: %w",
+				deps.Config.Auth.LocalAdmin.PasswordFile, err)
+		}
 	}
 
 	thumbs := deps.Thumbs
@@ -118,6 +142,9 @@ func (s *Server) Handler() http.Handler {
 	r.Use(s.requestLogger)
 	r.Use(s.securityHeaders)
 	r.Use(middleware.Recoverer)
+	// After Recoverer, so a panicking handler still records the 500 the client saw rather
+	// than being invisible to the error-rate signal.
+	r.Use(s.observeRequest)
 
 	// WebDAV must be intercepted before routing: chi validates methods against a
 	// fixed list, so PROPFIND/MKCOL/COPY/MOVE/LOCK/UNLOCK cannot be registered and
@@ -129,11 +156,23 @@ func (s *Server) Handler() http.Handler {
 	r.Get("/healthz", s.handleHealthz)
 	r.Get("/readyz", s.handleReadyz)
 
+	// /metrics is deliberately unauthenticated but bound by the same listener as
+	// everything else: a scraper cannot use a session cookie, and the values it exposes
+	// are operational counts rather than user data. A deployment that must not expose it
+	// publicly should not route this path through its reverse proxy.
+	if s.deps.Metrics != nil {
+		r.Method(http.MethodGet, "/metrics", s.deps.Metrics.Handler())
+	}
+
 	r.Route("/api", func(r chi.Router) {
 		r.Route("/auth", func(r chi.Router) {
 			r.Get("/login", s.handleLogin)
 			r.Get("/callback", s.handleCallback)
 			r.Post("/logout", s.handleLogout)
+			// Break-glass is a *credential* submission, not a redirect: it is the
+			// path that works when the IdP does not. It answers 404 when the feature
+			// is not configured, so it never advertises a login that cannot work.
+			r.Post("/breakglass", s.handleBreakglassLogin)
 		})
 
 		// /me needs the session, so it lives outside the pre-auth group.
@@ -168,6 +207,33 @@ func (s *Server) Handler() http.Handler {
 				})
 				r.Get("/versions", s.handleVersions)
 				r.Post("/restore-version", s.handleRestoreVersion)
+			})
+
+			// "Shared with me": the way into another account's tree once an ACL
+			// grant exists. Path-based handlers cannot name those nodes, because
+			// their path is in somebody else's namespace.
+			r.Get("/shared", s.handleSharedWithMe)
+			r.Get("/shared/{id}", s.handleSharedNode)
+			// The content half: without it `download` on a shared node was a permission with
+			// no route that could exercise it.
+			r.Get("/shared/{id}/content", s.handleSharedContent)
+
+			// Account administration. Approving a JIT-provisioned account is the
+			// remedy the provisioning policy names, and until this existed the policy
+			// had no way out of the state it created.
+			r.Route("/admin/users", func(r chi.Router) {
+				r.Get("/", s.handleAdminUsers)
+				r.Post("/{id}/status", s.handleAdminSetUserStatus)
+				r.Delete("/{id}", s.handleAdminDeleteUser)
+			})
+
+			// ACL management. Creating a grant is a permission of its own
+			// (manage_permissions) rather than an owner-only right, so an owner can
+			// delegate the ability to delegate — and revoke it like anything else.
+			r.Route("/acl", func(r chi.Router) {
+				r.Get("/", s.handleACLList)
+				r.Post("/", s.handleACLGrant)
+				r.Delete("/{id}", s.handleACLRevoke)
 			})
 
 			r.Route("/shares", func(r chi.Router) {
@@ -274,21 +340,75 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleReadyz reports whether the instance can serve traffic, including which
-// storage layout is active. A deployment that meant to use "tree" but got "blob"
-// has its data somewhere completely different on disk, and that is worth seeing
-// without reading the config file.
+// handleReadyz reports whether the instance can actually serve traffic.
+//
+// "Ready" has to mean "its dependencies answer", not "the process started". The
+// previous version returned 200 with a static body, so a container whose database had
+// gone away still reported healthy and the orchestrator kept routing to it — the one
+// failure a readiness probe exists to prevent.
+//
+// The checks are deliberately shallow: a round trip to the metadata store and the
+// ability to answer a tiny read from the content store. Deep checks (row counts,
+// cross-region latency) belong in monitoring, not in a probe that every load balancer
+// calls twice a second.
 func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	if !s.ready.Load() {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "starting"})
 		return
 	}
+
+	// A probe must not hang: an unresponsive dependency has to produce a failed probe,
+	// not a stalled one.
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+
+	checks := map[string]string{}
+	healthy := true
+
+	// The metadata store, exercised with the cheapest read that proves the connection
+	// and the schema are both usable. A query against nodes would fail on a
+	// half-migrated database, which is exactly the state worth reporting.
+	probeID := uuid.Nil
+	err := s.deps.Meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		_, nerr := tx.Node(ctx, probeID)
+		// ErrNotFound is the healthy answer for a nil uuid: it proves the query ran.
+		if nerr != nil && !errors.Is(nerr, store.ErrNotFound) {
+			return nerr
+		}
+		return nil
+	})
+	if err != nil {
+		checks["metadata"] = "error: " + err.Error()
+		healthy = false
+	} else {
+		checks["metadata"] = "ok"
+	}
+
+	// The content store. Opening a path that does not exist proves the backend is
+	// reachable — for S3 that is a real request, not a cached capability.
+	if _, err := s.deps.Content.Open(ctx, layout.Node{
+		Owner: uuid.Nil.String(), Path: ".readiness-probe",
+	}); err != nil && !errors.Is(err, layout.ErrNotFound) {
+		checks["content"] = "error: " + err.Error()
+		healthy = false
+	} else {
+		checks["content"] = "ok"
+	}
+
 	caps := s.deps.Content.Capabilities()
-	writeJSON(w, http.StatusOK, map[string]any{
-		"status":  "ready",
+	status := "ready"
+	code := http.StatusOK
+	if !healthy {
+		status = "degraded"
+		code = http.StatusServiceUnavailable
+	}
+
+	writeJSON(w, code, map[string]any{
+		"status":  status,
 		"version": s.deps.Version,
 		"backend": s.deps.Config.Storage.Backend,
 		"layout":  string(s.deps.Content.Mode()),
+		"checks":  checks,
 		"capabilities": map[string]bool{
 			"deduplicated":      caps.Deduplicated,
 			"cheap_versions":    caps.CheapVersions,

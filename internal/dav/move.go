@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"path"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/EdisonJwa/newCloud/internal/authz"
 	"github.com/EdisonJwa/newCloud/internal/storage/layout"
@@ -146,13 +149,39 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request, a authz
 		writeXMLError(w, statusForError(err), "")
 		return
 	}
+	// Two different source rights, because a copy and a move consume different things.
+	//
+	//   COPY takes a copy of the bytes: `download` (plus `read` to see the node at all).
+	//   MOVE relocates the node: `delete`-class authority over it — plus `download`, since
+	//        moving a file the caller may not read is a way to exfiltrate it by moving it
+	//        into a namespace they can read.
+	//
+	// §4.2 names both halves explicitly: "MOVE：验证源移动/删除权限及目标创建权限".
 	verb := authz.PermWrite
 	if move {
 		verb = authz.PermDelete
 	}
-	if !srcCap.Can(authz.PermRead) || !srcCap.Can(verb) {
+	if !srcCap.Can(authz.PermDownload) || !srcCap.Can(verb) {
 		writeXMLError(w, http.StatusNotFound, "")
 		return
+	}
+
+	// A collection MOVE or COPY carries its whole subtree, so every inner node must permit
+	// the operation too (§4.2: 目录递归操作不能只检查根目录).
+	if src.IsDir() {
+		need := authz.PermRead
+		if move {
+			need = authz.PermDelete
+		}
+		ok, serr := h.subtreeAllows(ctx, a, src.ID, need)
+		if serr != nil {
+			writeXMLError(w, statusForError(serr), "")
+			return
+		}
+		if !ok {
+			writeXMLError(w, http.StatusLocked, "")
+			return
+		}
 	}
 
 	destPath := r.Header.Get("Destination")
@@ -181,6 +210,12 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request, a authz
 
 	overwrite := !strings.EqualFold(r.Header.Get("Overwrite"), "F")
 
+	// A locked source cannot be moved or copied away from under its holder, and a
+	// locked destination cannot be replaced.
+	if !h.requireUnlocked(w, ctx, a, src.ID, r.Header.Get("If")) {
+		return
+	}
+
 	// Does the destination already exist?
 	var existing *store.Node
 	_ = h.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
@@ -195,6 +230,18 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request, a authz
 		if !overwrite {
 			// RFC 4918 §9.8.4 / §9.9.4: refuse rather than clobber.
 			w.WriteHeader(http.StatusPreconditionFailed)
+			return
+		}
+		// Overwriting destroys the destination, so it needs the same authorization
+		// that an explicit DELETE of it would. The previous code trashed the
+		// destination without checking anything, which let a MOVE into a writable
+		// folder delete a file the caller could not otherwise touch.
+		dstCap, derr := h.authz.Authorize(a, existing.ID)
+		if derr != nil || !dstCap.Can(authz.PermDelete) {
+			writeXMLError(w, http.StatusNotFound, "")
+			return
+		}
+		if !h.requireUnlocked(w, ctx, a, existing.ID, r.Header.Get("If")) {
 			return
 		}
 		if err := h.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
@@ -248,27 +295,16 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request, a authz
 }
 
 // copyNode copies a file or a directory subtree.
+//
+// Directory copies are recursive. The earlier version created the destination
+// directory and returned, which reported success while producing an empty folder —
+// the worst possible outcome, because the client believes its data was copied.
 func (h *Handler) copyNode(ctx context.Context, a authz.Actor, src store.Node,
 	dstParent store.Node, dstName, dstRel string, r *http.Request) error {
 
 	if src.IsDir() {
-		// Directories are copied by walking the source subtree. The limit is the
-		// same PROPFIND cap, so a copy cannot be used to enumerate more than a
-		// listing could.
-		return h.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
-			newDir, err := tx.CreateDir(ctx, store.NewNode{
-				OwnerID: a.ID(), ParentID: dstParent.ID, Name: dstName,
-			})
-			if err != nil {
-				return err
-			}
-			return tx.Audit(ctx, store.AuditEntry{
-				ActorKind: "user", ActorUserID: a.Ptr(), ActorEmail: a.Email(),
-				ActorIP: clientIP(r), UserAgent: r.UserAgent(),
-				Action: "file.write", TargetKind: "node", TargetID: newDir.ID.String(),
-				Result: "ok", Metadata: map[string]any{"name": dstName, "kind": "dir", "copied_from": src.Name},
-			})
-		})
+		_, srcRel, _ := h.splitPath(r.URL.Path)
+		return h.copyTree(ctx, a, src, srcRel, dstParent.ID, dstName, dstRel, r, 0)
 	}
 
 	// Files: copy the bytes (the blob layout deduplicates them, the tree layout
@@ -290,7 +326,7 @@ func (h *Handler) copyNode(ctx context.Context, a authz.Actor, src store.Node,
 		node, cerr := tx.CreateFile(ctx, store.NewFile{
 			OwnerID: a.ID(), ParentID: dstParent.ID, Name: dstName,
 			Size: res.Size, Mime: src.Mime, ETag: etag,
-			BlobID: h.blobIDFor(ctx, res.Hash), BlobHash: res.Hash,
+			BlobID: h.blobIDFor(ctx, res.Hash, res.Size), BlobHash: res.Hash,
 		})
 		if cerr != nil {
 			return cerr
@@ -302,6 +338,93 @@ func (h *Handler) copyNode(ctx context.Context, a authz.Actor, src store.Node,
 			Result: "ok", Metadata: map[string]any{"name": dstName, "copied_from": src.Name},
 		})
 	})
+}
+
+// copyTree recreates one directory and, recursively, everything under it.
+//
+// The depth guard is not paranoia: a corrupted parent chain would otherwise turn a
+// COPY into an infinite loop, and the tree comes from a database that a bug could
+// have written a cycle into (the Move path forbids cycles, but COPY reads whatever
+// is there). Every level re-authorizes, so copying a folder the caller only
+// partially can read fails at the first child they cannot, rather than silently
+// skipping it or — worse — copying it.
+func (h *Handler) copyTree(ctx context.Context, a authz.Actor, src store.Node,
+	srcRel string, dstParentID uuid.UUID, dstName, dstRel string, r *http.Request, depth int) error {
+
+	if depth > 64 {
+		return store.ErrCycle
+	}
+
+	var newDir store.Node
+	err := h.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		n, cerr := tx.CreateDir(ctx, store.NewNode{
+			OwnerID: a.ID(), ParentID: dstParentID, Name: dstName,
+		})
+		if cerr != nil {
+			return cerr
+		}
+		newDir = n
+		return tx.Audit(ctx, store.AuditEntry{
+			ActorKind: "user", ActorUserID: a.Ptr(), ActorEmail: a.Email(),
+			ActorIP: clientIP(r), UserAgent: r.UserAgent(),
+			Action: "file.write", TargetKind: "node", TargetID: n.ID.String(),
+			Result: "ok", Metadata: map[string]any{"name": dstName, "kind": "dir", "copied_from": src.Name},
+		})
+	})
+	if err != nil {
+		return err
+	}
+
+	// The tree layout mirrors the hierarchy on disk, so the directory has to exist
+	// there before any child is written into it.
+	_ = h.content.Mkdir(ctx, layout.Node{Owner: a.ID().String(), Path: dstRel, IsDir: true})
+
+	children, err := h.listChildren(ctx, src)
+	if err != nil {
+		return err
+	}
+	for _, child := range children {
+		childSrcRel := path.Join(srcRel, child.Name)
+		childDstRel := path.Join(dstRel, child.Name)
+
+		if child.IsDir() {
+			if err := h.copyTree(ctx, a, child, childSrcRel, newDir.ID, child.Name, childDstRel, r, depth+1); err != nil {
+				return err
+			}
+			continue
+		}
+
+		rc, oerr := h.content.Open(ctx, layout.Node{Owner: a.ID().String(), Path: childSrcRel})
+		if oerr != nil {
+			return oerr
+		}
+		res, perr := h.content.Put(ctx, layout.Node{Owner: a.ID().String(), Path: childDstRel}, rc, child.Size)
+		_ = rc.Close()
+		if perr != nil {
+			return perr
+		}
+
+		etag := etagFor(res.Hash)
+		if terr := h.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+			n, cerr := tx.CreateFile(ctx, store.NewFile{
+				OwnerID: a.ID(), ParentID: newDir.ID, Name: child.Name,
+				Size: res.Size, Mime: child.Mime, ETag: etag,
+				BlobID: h.blobIDFor(ctx, res.Hash, res.Size), BlobHash: res.Hash,
+			})
+			if cerr != nil {
+				return cerr
+			}
+			return tx.Audit(ctx, store.AuditEntry{
+				ActorKind: "user", ActorUserID: a.Ptr(), ActorEmail: a.Email(),
+				ActorIP: clientIP(r), UserAgent: r.UserAgent(),
+				Action: "file.write", TargetKind: "node", TargetID: n.ID.String(),
+				Result: "ok", Metadata: map[string]any{"name": child.Name, "copied_from": child.Name},
+			})
+		}); terr != nil {
+			return terr
+		}
+	}
+	return nil
 }
 
 // resolveDestination resolves a Destination header to its parent and name.

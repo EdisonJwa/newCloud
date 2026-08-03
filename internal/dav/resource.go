@@ -271,6 +271,44 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request, a authz.Acto
 		return
 	}
 
+	// Did this path exist before? That decides create-vs-update, which matters three ways:
+	// the status code, whether a version is kept, and which lock rule applies.
+	var existing *store.Node
+	_ = h.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		n, cerr := tx.ChildByName(ctx, parentNode.ID, name)
+		if cerr == nil {
+			existing = &n
+		}
+		return nil
+	})
+
+	// Locks (§5.3, RFC 4918 §7.4). Which ancestor rule applies depends on whether this PUT adds
+	// a name or replaces content:
+	//
+	//   - a new child is a membership change, so a Depth: 0 lock on the parent blocks it;
+	//   - an existing child is content, and only a Depth: infinity ancestor lock reaches it.
+	//
+	// A lock on the target itself blocks either way, because it protects that resource's bytes.
+	if existing != nil {
+		if !h.requireUnlocked(w, ctx, a, existing.ID, r.Header.Get("If")) {
+			return
+		}
+		if h.lockAncestorsInfinityOnly(ctx, a, parentNode.ID, r.Header.Get("If")) {
+			writeXMLError(w, http.StatusLocked, "lock-token-submitted")
+			return
+		}
+	} else if h.lockAncestors(ctx, a, parentNode.ID, r.Header.Get("If")) {
+		writeXMLError(w, http.StatusLocked, "lock-token-submitted")
+		return
+	}
+
+	// If-None-Match: * is the "create, or fail" conditional a second tab needs so it cannot
+	// clobber a file that appeared while it was editing.
+	if r.Header.Get("If-None-Match") == "*" && existing != nil {
+		w.WriteHeader(http.StatusPreconditionFailed)
+		return
+	}
+
 	if r.ContentLength > h.cfg.Limits.MaxFileBytes {
 		writeXMLError(w, http.StatusRequestEntityTooLarge, "")
 		return
@@ -296,17 +334,7 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request, a authz.Acto
 		mime = guessType(name)
 	}
 
-	// Did this path exist before? That decides create-vs-update, and the two are
-	// different operations for versioning purposes.
-	var existing *store.Node
-	_ = h.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
-		n, err := tx.ChildByName(ctx, parentNode.ID, name)
-		if err == nil {
-			existing = &n
-		}
-		return nil
-	})
-
+	// The existence check happened above, before the lock rule needed its answer.
 	if existing != nil {
 		if !h.checkIfMatch(r, existing.ETag) {
 			w.WriteHeader(http.StatusPreconditionFailed)
@@ -315,7 +343,7 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request, a authz.Acto
 		err = h.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
 			_, uerr := tx.UpdateFile(ctx, store.UpdateFile{
 				NodeID: existing.ID, Size: res.Size, Mime: mime, ETag: etag,
-				BlobID:   h.blobIDFor(ctx, res.Hash),
+				BlobID:   h.blobIDFor(ctx, res.Hash, res.Size),
 				BlobHash: res.Hash,
 				// Keep a version only when the content actually changed: the
 				// client may retry an upload, and duplicating identical versions
@@ -339,7 +367,7 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request, a authz.Acto
 			node, cerr := tx.CreateFile(ctx, store.NewFile{
 				OwnerID: a.ID(), ParentID: parentNode.ID, Name: name,
 				Size: res.Size, Mime: mime, ETag: etag,
-				BlobID: h.blobIDFor(ctx, res.Hash), BlobHash: res.Hash,
+				BlobID: h.blobIDFor(ctx, res.Hash, res.Size), BlobHash: res.Hash,
 			})
 			if cerr != nil {
 				return cerr
@@ -362,6 +390,12 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request, a authz.Acto
 	}
 
 	w.Header().Set("ETag", etag)
+	// RFC 4918 §9.7.1: a replaced resource answers 204, a created one 201. Saying 201 for both
+	// makes a client believe every save created a new file.
+	if existing != nil {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	w.WriteHeader(http.StatusCreated)
 }
 
@@ -381,8 +415,8 @@ func (h *Handler) checkIfMatch(r *http.Request, etag string) bool {
 // only knows "these bytes hash to X", not which row represents them. Returning a
 // zero UUID here — which this used to do — makes every WebDAV write fail the
 // blob_id foreign key, and the client sees only a 404.
-func (h *Handler) blobIDFor(ctx context.Context, hash [32]byte) uuid.UUID {
-	return h.meta.BlobIDFor(ctx, hash)
+func (h *Handler) blobIDFor(ctx context.Context, hash [32]byte, size int64) uuid.UUID {
+	return h.meta.BlobIDFor(ctx, hash, size)
 }
 
 // maxVersions adapts the retention policy to the storage layout.
@@ -417,6 +451,16 @@ func (h *Handler) handleDelete(w http.ResponseWriter, r *http.Request, a authz.A
 
 	if !h.checkIfMatch(r, node.ETag) {
 		w.WriteHeader(http.StatusPreconditionFailed)
+		return
+	}
+
+	// A lock on the node blocks deleting it, and a Depth: infinity lock on an ancestor does too.
+	// Removing a node also changes its parent's membership, which the ancestor walk covers.
+	if !h.requireUnlocked(w, r.Context(), a, node.ID, r.Header.Get("If")) {
+		return
+	}
+	if h.lockAncestors(r.Context(), a, node.ID, r.Header.Get("If")) {
+		writeXMLError(w, http.StatusLocked, "lock-token-submitted")
 		return
 	}
 
@@ -463,6 +507,13 @@ func (h *Handler) handleMkcol(w http.ResponseWriter, r *http.Request, a authz.Ac
 	}
 	if !parentCap.Can(authz.PermWrite) {
 		writeXMLError(w, http.StatusNotFound, "")
+		return
+	}
+
+	// Creating a collection is a membership change on the parent, so a Depth: 0 lock on it
+	// blocks this (RFC 4918 §7.4). This is the DAV mirror of the API's guardParentUnlocked.
+	if h.lockAncestors(ctx, a, parentNode.ID, r.Header.Get("If")) {
+		writeXMLError(w, http.StatusLocked, "lock-token-submitted")
 		return
 	}
 

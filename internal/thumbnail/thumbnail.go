@@ -20,6 +20,7 @@ import (
 	"image/png"
 	"io"
 	"sync"
+	"time"
 
 	// Registering the decoders is not enough for a downscale that respects EXIF
 	// orientation: the orientation tag lives in the metadata, and jpeg.Decode ignores it.
@@ -51,6 +52,20 @@ var ErrTooLarge = errors.New("thumbnail: image dimensions too large")
 // down, so the header is inspected first and the decode refused.
 const maxPixels = 50_000_000 // 50 MP, comfortably above any camera or phone
 
+// ErrBusy means the decode queue was too long to wait for.
+//
+// It is a normal outcome, not a fault: the caller answers "no thumbnail" and the client
+// shows a generic icon. Reporting it as an error the user sees would punish them for
+// somebody else's traffic.
+var ErrBusy = errors.New("thumbnail: too many concurrent decode requests")
+
+// ErrTimeout means one decode exceeded its deadline.
+//
+// Distinct from a decode error because the cause is different and worth logging
+// separately: a timeout usually means a crafted file, while a decode error usually means
+// an ordinary corrupt one.
+var ErrTimeout = errors.New("thumbnail: decode exceeded its deadline")
+
 // Generator produces thumbnails and memoises them.
 //
 // The cache is in memory and keyed by content address. That is the right key: the same
@@ -62,11 +77,41 @@ type Generator struct {
 	// maxEntries bounds memory. At ~15 KB per entry this is about 12 MB, which is a
 	// reasonable ceiling for an in-process cache that can always be recomputed.
 	maxEntries int
+
+	// sem bounds how many images are decoded at once.
+	//
+	// The pixel cap stops one image from being huge; it does not stop a hundred requests
+	// from arriving together and each decoding a legitimate 50 MP bitmap. Without a
+	// bound, the memory a single request can be refused for is multiplied by the number
+	// of concurrent requests, which is a way to take the process down with files that are
+	// individually acceptable.
+	sem chan struct{}
+	// timeout bounds one decode.
+	//
+	// A decoder is CPU-bound but not interruptible: a crafted file can make it spin far
+	// longer than a real image of the same size. Cancelling after the deadline at least
+	// bounds how long a request holds a slot, and the request path treats the deadline as
+	// "no thumbnail" rather than an error the user must see.
+	timeout time.Duration
 }
+
+// DefaultConcurrency is how many thumbnails are decoded at once.
+//
+// Four is chosen to match a small server's cores rather than its request rate: the work
+// is CPU-bound, so allowing more would only lengthen every queue.
+const DefaultConcurrency = 4
+
+// DefaultTimeout bounds one decode.
+const DefaultTimeout = 10 * time.Second
 
 // New builds a generator.
 func New() *Generator {
-	return &Generator{cache: make(map[[32]byte][]byte), maxEntries: 800}
+	return &Generator{
+		cache:      make(map[[32]byte][]byte),
+		maxEntries: 800,
+		sem:        make(chan struct{}, DefaultConcurrency),
+		timeout:    DefaultTimeout,
+	}
 }
 
 // Kind reports whether these bytes look like an image this package can decode.
@@ -89,7 +134,56 @@ func Kind(head []byte) (string, bool) {
 //
 // The output is always PNG regardless of the input format. Re-encoding a JPEG to JPEG saves
 // little at this size and costs a generation loss; PNG keeps the thumbnail exact.
+// Generate produces a thumbnail, bounding both concurrency and time.
+//
+// Two limits, for two different failures. The semaphore stops a burst of legitimate
+// images from multiplying the memory a single decode may use. The deadline stops one
+// crafted file from holding a slot indefinitely. Neither is a substitute for the pixel
+// cap: that refuses the decode outright, this bounds how many and how long.
 func (g *Generator) Generate(hash [32]byte, r io.ReadSeeker) ([]byte, error) {
+	if cached, ok := g.get(hash); ok {
+		return cached, nil
+	}
+
+	// Take a slot. The context is deliberately not plumbed from the request: a cancelled
+	// HTTP request should not abort a decode another request is queued behind, and the
+	// result is cached for everyone. The deadline below is what bounds the work.
+	select {
+	case g.sem <- struct{}{}:
+		defer func() { <-g.sem }()
+	case <-time.After(waitBudget):
+		// The queue is long enough that answering without a thumbnail is better than
+		// making the client wait behind an unknown number of decodes.
+		return nil, ErrBusy
+	}
+
+	// Run the decode with a deadline. The goroutine cannot be killed, so this bounds how
+	// long the *caller* waits and how long the slot is held; the decode itself finishes
+	// or fails on its own. That is the honest limit of what Go allows for a CPU-bound
+	// library call, and it is why the pixel cap matters as well.
+	type result struct {
+		data []byte
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		data, err := g.generate(hash, r)
+		done <- result{data, err}
+	}()
+
+	select {
+	case res := <-done:
+		return res.data, res.err
+	case <-time.After(g.timeout):
+		return nil, ErrTimeout
+	}
+}
+
+// waitBudget bounds how long a request waits for a decode slot.
+const waitBudget = 5 * time.Second
+
+// generate is the unbounded decoder; Generate wraps it with the queue and deadline.
+func (g *Generator) generate(hash [32]byte, r io.ReadSeeker) ([]byte, error) {
 	if cached, ok := g.get(hash); ok {
 		return cached, nil
 	}

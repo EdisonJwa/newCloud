@@ -14,8 +14,12 @@ import (
 
 // EnsureRoot provisions the owner's root inside the transaction.
 func (t *pgTx) EnsureRoot(ctx context.Context, ownerID uuid.UUID) (Node, error) {
-	const q = `INSERT INTO nodes (parent_id, owner_id, name, kind, size, mime, etag)
-		VALUES (NULL, $1, '', 'dir', 0, '', '')
+	// name_key is required: the column is NOT NULL and the uniqueness rule compares on it
+	// (T-12). Omitting it here aborted the transaction with a not-null violation, and because
+	// this is the in-transaction variant, the caller then saw "current transaction is aborted"
+	// rather than the real cause.
+	const q = `INSERT INTO nodes (parent_id, owner_id, name, name_key, kind, size, mime, etag)
+		VALUES (NULL, $1, '', '', 'dir', 0, '', '')
 		ON CONFLICT (owner_id) WHERE parent_id IS NULL AND trashed_at IS NULL DO NOTHING
 		RETURNING ` + nodeColumns
 
@@ -127,12 +131,26 @@ func (t *pgTx) UpsertIdPUser(ctx context.Context, u UpsertUser) (User, error) {
 		return t.refreshIdPUser(ctx, *existing, u, role)
 	}
 
-	const q = `INSERT INTO users (username, email, display_name, idp_issuer, idp_subject, role)
-		VALUES ($1, $2, $3, $4, $5, $6)
+	// The status comes from the caller so the provisioning policy (ID-04) can create an
+	// account pending approval. Empty means active.
+	status := orDefault(u.Status, StatusActive)
+
+	const q = `INSERT INTO users (username, email, display_name, idp_issuer, idp_subject, role, status)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
 		RETURNING ` + userColumns
 	user, err := scanUser(t.tx.QueryRow(ctx, q, username, nullableString(u.Email),
-		u.DisplayName, u.Issuer, u.Subject, role))
+		u.DisplayName, u.Issuer, u.Subject, role, status))
 	if err != nil {
+		// A recycled address is the expected collision, and it must not surface as a
+		// 500. The email column is UNIQUE (deliberately: two accounts sharing an
+		// address would make "share with alice@example.com" ambiguous), so an IdP that
+		// reassigns an address to a new subject hits the constraint. That is a real
+		// situation — people leave, addresses get reused — and the correct answer is a
+		// clear, non-inheriting refusal rather than an internal error.
+		if errors.Is(err, ErrConflict) {
+			return User{}, fmt.Errorf("%w: email %q is already attached to another identity",
+				ErrConflict, u.Email)
+		}
 		return User{}, err
 	}
 	if !user.IsActive() {
@@ -175,6 +193,13 @@ func (t *pgTx) lookupIdPUser(ctx context.Context, issuer, subject, username stri
 
 // refreshIdPUser updates the mutable profile fields and binds the identity when the
 // account was pre-provisioned.
+//
+// The role is deliberately NOT written here. It used to be, and that made
+// ApplyIdPRole unable to do its job: by the time the role change was reconciled the
+// stored role had already been overwritten with the new one, so "did this change?"
+// was always false and a demotion never revoked the credentials minted under the old
+// role. Role is owned by ApplyIdPRole, which is the only place that can also revoke
+// what the change invalidates.
 func (t *pgTx) refreshIdPUser(ctx context.Context, cur User, u UpsertUser, role string) (User, error) {
 	// The username is intentionally not updated: it appears in WebDAV URLs and share
 	// links, so renaming it would break existing paths for everyone else.
@@ -182,11 +207,60 @@ func (t *pgTx) refreshIdPUser(ctx context.Context, cur User, u UpsertUser, role 
 		SET idp_issuer = $2, idp_subject = $3,
 		    email = COALESCE($4, email),
 		    display_name = COALESCE(NULLIF($5, ''), display_name),
-		    role = $6, updated_at = now()
+		    updated_at = now()
 		WHERE id = $1
 		RETURNING ` + userColumns
 	return scanUser(t.tx.QueryRow(ctx, q, cur.ID, u.Issuer, u.Subject,
-		nullableString(u.Email), u.DisplayName, role))
+		nullableString(u.Email), u.DisplayName))
+}
+
+// ApplyIdPRole stores the role the IdP now claims and, on a downgrade, revokes the
+// account's live credentials.
+//
+// Why revoke rather than just write the new role: the middleware reads users.role on
+// every request, so an *upgrade* needs nothing further. A *downgrade* is different —
+// a WebDAV client holds an app password that does not re-authenticate against the
+// IdP, and a browser session may be long-lived. Writing the lower role is not enough
+// if a credential minted while the account was an admin is still accepted, so both
+// are killed. The user simply signs in again and gets the correct role.
+func (t *pgTx) ApplyIdPRole(ctx context.Context, userID uuid.UUID, role string) (RoleChange, error) {
+	cur, err := t.UserByID(ctx, userID)
+	if err != nil {
+		return RoleChange{}, err
+	}
+
+	out := RoleChange{From: cur.Role, To: role}
+	if cur.Role == role {
+		return out, nil
+	}
+	out.Changed = true
+	out.Downgraded = roleRank(role) < roleRank(cur.Role)
+
+	const q = `UPDATE users SET role = $2, updated_at = now() WHERE id = $1`
+	if _, err := t.tx.Exec(ctx, q, userID, role); err != nil {
+		return out, translate(err)
+	}
+
+	if !out.Downgraded {
+		return out, nil
+	}
+
+	// Count and revoke in one statement each, so the audit record names what
+	// actually happened rather than a best guess.
+	tag, err := t.tx.Exec(ctx,
+		`UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL`, userID)
+	if err != nil {
+		return out, translate(err)
+	}
+	out.SessionsRevoked = int(tag.RowsAffected())
+
+	ptag, err := t.tx.Exec(ctx,
+		`UPDATE app_passwords SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL`, userID)
+	if err != nil {
+		return out, translate(err)
+	}
+	out.AppPasswordsRevoked = int(ptag.RowsAffected())
+	return out, nil
 }
 
 // Users is the non-transactional read path used by admin screens and the
@@ -202,11 +276,12 @@ func (s *PG) SetUserQuota(ctx context.Context, id uuid.UUID, limit int64) error 
 	return translate(err)
 }
 
-// DisableUser blocks sign-in and revokes every live session.
+// DisableUser blocks sign-in, revokes every live session and every app password.
 //
-// Revoking sessions in the same call is the point: disabling an account while
-// leaving its sessions alive means the person you just disabled keeps working
-// until their token expires, which for a WebDAV app password is up to 90 days.
+// Revoking both in the same call is the point: disabling an account while leaving
+// its credentials alive means the person you just disabled keeps working until
+// their token expires — which for a WebDAV app password is months. The audit
+// entry is written in the same transaction so the revocation itself is recorded.
 func (s *PG) DisableUser(ctx context.Context, id uuid.UUID) error {
 	return s.WithTx(ctx, func(ctx context.Context, tx Tx) error {
 		full, ok := tx.(FullTx)
@@ -221,7 +296,18 @@ func (s *PG) DisableUser(ctx context.Context, id uuid.UUID) error {
 			updated_at = now() WHERE id = $1`, id); err != nil {
 			return err
 		}
-		return full.RevokeUserSessions(ctx, id.String())
+		if err := full.RevokeUserSessions(ctx, id.String()); err != nil {
+			return err
+		}
+		revoked, err := full.RevokeUserAppPasswords(ctx, id)
+		if err != nil {
+			return err
+		}
+		return full.Audit(ctx, AuditEntry{
+			ActorKind: "system", Action: "user.disable", TargetKind: "user",
+			TargetID: id.String(), Result: "ok",
+			Metadata: map[string]any{"app_passwords_revoked": revoked},
+		})
 	})
 }
 

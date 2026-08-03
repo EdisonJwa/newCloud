@@ -112,6 +112,11 @@ func (a Actor) IsAnonymous() bool { return a.kind == KindAnonymous }
 func (a Actor) IsAdmin() bool     { return a.role == RoleAdmin }
 
 // Perm is a permission bit.
+//
+// The first group is the original coarse vocabulary. The second group is the finer
+// distinction §4.1 asks for: "may overwrite" and "may delete" are different rights,
+// and a collaborator who can upload a new revision is not necessarily allowed to
+// remove the file.
 type Perm uint16
 
 const (
@@ -123,18 +128,31 @@ const (
 	PermReadVersions
 	PermRestoreVersion
 	PermUploadOnly // file request: create children, nothing else
+
+	// Fine-grained primitives (§4.1). They are additive: a grant that carries
+	// PermWrite still satisfies every check that asks for PermCreate or
+	// PermOverwrite, via ExpandComposite inside the authorizer.
+	PermDownload
+	PermCreate
+	PermOverwrite
+	PermRename
+	PermMove
+	PermManagePermissions
+	PermViewHistory
 )
 
 // AllPerms is used by tests to enumerate every permission.
 const AllPerms = PermRead | PermWrite | PermDelete | PermShare |
-	PermListChildren | PermReadVersions | PermRestoreVersion | PermUploadOnly
+	PermListChildren | PermReadVersions | PermRestoreVersion | PermUploadOnly |
+	PermDownload | PermCreate | PermOverwrite | PermRename | PermMove |
+	PermManagePermissions | PermViewHistory
 
 // String renders a permission set for audit metadata and tests.
 func (p Perm) String() string {
 	if p == 0 {
 		return "none"
 	}
-	names := make([]string, 0, 8)
+	names := make([]string, 0, 16)
 	for _, e := range []struct {
 		bit  Perm
 		name string
@@ -147,6 +165,13 @@ func (p Perm) String() string {
 		{PermReadVersions, "read_versions"},
 		{PermRestoreVersion, "restore_version"},
 		{PermUploadOnly, "upload_only"},
+		{PermDownload, "download"},
+		{PermCreate, "create"},
+		{PermOverwrite, "overwrite"},
+		{PermRename, "rename"},
+		{PermMove, "move"},
+		{PermManagePermissions, "manage_permissions"},
+		{PermViewHistory, "view_history"},
 	} {
 		if p&e.bit != 0 {
 			names = append(names, e.name)
@@ -237,7 +262,7 @@ type Accessor interface {
 	// LoadNode returns ErrNotFound when the node is absent.
 	LoadNode(id uuid.UUID) (Node, error)
 	// OwnerGroupPerm returns the permission a group-shared ancestor grants to
-	// the actor, if any.
+	// the actor, if any. This is now backed by acl_entries rather than a stub.
 	OwnerGroupPerm(actorID, nodeID uuid.UUID) (Perm, bool, error)
 	// ShareForActor returns the grant a share gives this actor on this node.
 	ShareForActor(actorID, nodeID uuid.UUID) (*ShareGrant, error)
@@ -279,6 +304,11 @@ func (s *Service) Authorize(a Actor, nodeID uuid.UUID) (Cap, error) {
 		perms    Perm
 		viaShare bool
 		shareID  uuid.UUID
+		// adminNoContent marks the administrator branch, whose permission set must
+		// NOT be expanded: PermRead normally implies PermDownload, and an admin
+		// holding PermDownload could read every user's files — the one capability
+		// this branch exists to withhold.
+		adminNoContent bool
 	)
 
 	switch {
@@ -292,7 +322,8 @@ func (s *Service) Authorize(a Actor, nodeID uuid.UUID) (Cap, error) {
 		// Admins do not read user content. They can see metadata and force
 		// deletion, which keeps "admin abuse" an auditable event rather than a
 		// standing capability.
-		perms = PermRead | PermDelete
+		perms = PermRead | PermDelete | PermListChildren
+		adminNoContent = true
 
 	default:
 		if a.kind == KindUser {
@@ -318,6 +349,16 @@ func (s *Service) Authorize(a Actor, nodeID uuid.UUID) (Cap, error) {
 		perms &= PermUploadOnly | PermWrite
 	}
 
+	// "Write" has always meant "may modify", and every existing call site checks
+	// it. Expanding it here lets a grant express only the fine-grained half
+	// ("overwrite but not delete") without breaking those checks.
+	//
+	// The administrator branch is excluded: its whole point is to withhold content
+	// access, and expanding its PermRead into PermDownload would hand it back.
+	if !adminNoContent {
+		perms = expandComposite(perms)
+	}
+
 	perms = applyScope(a.scopes, perms)
 
 	if perms == 0 {
@@ -334,13 +375,46 @@ func (s *Service) Authorize(a Actor, nodeID uuid.UUID) (Cap, error) {
 	}, nil
 }
 
+// expandComposite turns the coarse bits into the fine ones they imply.
+//
+// Two directions matter:
+//
+//	PermWrite     -> PermCreate | PermOverwrite   (a writer may add and replace)
+//	PermRead      -> PermDownload                 (seeing a file implies fetching it)
+//
+// It deliberately does NOT grant PermDelete: write access that silently includes
+// deletion is how a "collaborator" ends up able to destroy the folder they were
+// invited to edit.
+func expandComposite(p Perm) Perm {
+	if p&PermWrite != 0 {
+		p |= PermCreate | PermOverwrite
+	}
+	// `read` deliberately does NOT imply `download`.
+	//
+	// It used to, on the reasoning that seeing a file implies fetching it. That held only
+	// while download was not separately grantable: as soon as §4.2 split the primitives and
+	// the ACL layer could store them independently, the implication made the split a lie -
+	// a grant of `read` alone still fetched bytes, so `download` could never be withheld.
+	//
+	// Callers that need both (a WebDAV client, the web download button, a share link) check
+	// them separately, and the ACL surface accepts "read,download" for that case. Shares and
+	// legacy grants that say only "read" are handled at their own boundary - see
+	// share.PermissionsToACL, which adds download because a share link that renders a file
+	// in a browser must be able to serve it.
+	if p&PermReadVersions != 0 {
+		p |= PermViewHistory
+	}
+	return p
+}
+
 // applyScope narrows perms for read-only credentials.
 func applyScope(sc Scope, perms Perm) Perm {
 	if sc.Has(ScopeWrite) {
 		return perms
 	}
 	// Read-only: keep read-shaped bits, drop everything that mutates.
-	return perms & (PermRead | PermListChildren | PermReadVersions)
+	return perms & (PermRead | PermListChildren | PermReadVersions |
+		PermDownload | PermViewHistory)
 }
 
 func live(g *ShareGrant, now time.Time) bool {

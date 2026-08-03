@@ -9,20 +9,27 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/EdisonJwa/newCloud/internal/auditverify"
 	"github.com/EdisonJwa/newCloud/internal/auth"
 	"github.com/EdisonJwa/newCloud/internal/authz"
 	"github.com/EdisonJwa/newCloud/internal/blob"
@@ -30,6 +37,8 @@ import (
 	s3blob "github.com/EdisonJwa/newCloud/internal/blob/s3"
 	"github.com/EdisonJwa/newCloud/internal/config"
 	"github.com/EdisonJwa/newCloud/internal/mail"
+	"github.com/EdisonJwa/newCloud/internal/metrics"
+	"github.com/EdisonJwa/newCloud/internal/password"
 	"github.com/EdisonJwa/newCloud/internal/server"
 	"github.com/EdisonJwa/newCloud/internal/share"
 	"github.com/EdisonJwa/newCloud/internal/storage/blobstore"
@@ -63,12 +72,112 @@ func run(args []string) error {
 		return migrate()
 	case "healthcheck":
 		return healthcheck()
+	case "audit":
+		return auditCommand(args[1:])
+	case "breakglass":
+		return breakglassCommand(args[1:])
+	case "drill":
+		return drillCommand(args[1:])
 	case "-h", "--help", "help":
-		fmt.Printf("newcloud %s\n\nusage: newcloud [serve|migrate|healthcheck]\n", version)
+		fmt.Printf("newcloud %s\n\nusage: newcloud [serve|migrate|healthcheck|audit verify|breakglass hash|drill]\n", version)
 		return nil
 	default:
-		return fmt.Errorf("unknown command %q (want serve, migrate or healthcheck)", cmd)
+		return fmt.Errorf("unknown command %q (want serve, migrate, healthcheck, audit verify, breakglass hash or drill)", cmd)
 	}
+}
+
+// auditCommand runs the audit sub-commands.
+//
+// It exists because the hash chain is only worth having if something reads it back
+// and complains. Before this, `VerifyAuditChain` was referenced by tests alone, so
+// tampering would have gone unnoticed in production forever.
+func auditCommand(args []string) error {
+	if len(args) == 0 {
+		return errors.New("audit: missing sub-command (want `audit verify`)")
+	}
+	switch args[0] {
+	case "verify":
+		return auditVerify(args[1:])
+	default:
+		return fmt.Errorf("audit: unknown sub-command %q (want verify)", args[0])
+	}
+}
+
+// auditVerify walks the chain and prints a report.
+//
+// The exit status is the contract: 0 means intact, 1 means broken. That is what
+// makes it usable from cron or CI without parsing output.
+func auditVerify(args []string) error {
+	log := newLogger()
+
+	flags := flag.NewFlagSet("audit verify", flag.ContinueOnError)
+	batch := flags.Int("batch", 1000, "events to read per round trip")
+	jsonOut := flags.Bool("json", false, "emit the report as JSON")
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			// `-h` asks for usage; it is not a failure.
+			return nil
+		}
+		return err
+	}
+
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		return errors.New("audit verify: DATABASE_URL is required")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+
+	pg := storepkg.NewPG(pool)
+	report, err := auditverify.Run(ctx, pg, *batch)
+	if err != nil {
+		return err
+	}
+
+	if *jsonOut {
+		out := map[string]any{
+			"events":    report.Events,
+			"ok":        report.OK(),
+			"head":      hex.EncodeToString(report.Head),
+			"broken_at": report.BrokenAt,
+		}
+		if report.FirstEvent != nil {
+			out["first_event"] = report.FirstEvent.UTC().Format(time.RFC3339)
+		}
+		if report.LastEvent != nil {
+			out["last_event"] = report.LastEvent.UTC().Format(time.RFC3339)
+		}
+		if report.Err != nil {
+			out["error"] = report.Err.Error()
+		}
+		b, _ := json.MarshalIndent(out, "", "  ")
+		fmt.Println(string(b))
+	} else {
+		log.Info("audit chain verified",
+			"events", report.Events,
+			"head", hex.EncodeToString(report.Head),
+			"first_event", formatOptional(report.FirstEvent),
+			"last_event", formatOptional(report.LastEvent))
+	}
+
+	if !report.OK() {
+		return fmt.Errorf("audit verify: chain is broken: %w", report.Err)
+	}
+	return nil
+}
+
+func formatOptional(t *time.Time) string {
+	if t == nil {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339)
 }
 
 func configPath() string {
@@ -123,9 +232,23 @@ func serve() error {
 		return err
 	}
 
-	provider, err := auth.NewProvider(ctx, cfg)
-	if err != nil {
-		return err
+	// OIDC discovery is attempted at startup but is NOT a startup requirement (ID-07).
+	//
+	// Failing here used to abort the process, which took down WebDAV, app-password
+	// authentication and every already-issued browser session — none of which involve the
+	// identity provider. A single-sign-on dependency had become an uptime dependency for the
+	// whole platform. Now the server starts and only new logins degrade, until discovery
+	// succeeds.
+	providers := auth.NewProviderHolder()
+	provider, provErr := auth.NewProvider(ctx, cfg)
+	if provErr != nil {
+		log.Warn("identity provider unreachable at startup: starting anyway; "+
+			"existing sessions, app passwords and WebDAV continue to work, new logins will "+
+			"fail until it is reachable",
+			"issuer", cfg.Auth.Issuer, "error", provErr)
+	} else {
+		providers.Set(provider)
+		log.Info("identity provider discovered", "issuer", cfg.Auth.Issuer)
 	}
 
 	mailer, mailErr := mail.New(mail.Config{
@@ -165,7 +288,7 @@ func serve() error {
 		log.Info("upload staging directory is not configured; using the temporary directory",
 			"dir", uploadDir, "hint", "set storage.upload_dir on a real deployment")
 	}
-	uploads, err := upload.NewManager(uploadDir, 24*time.Hour, 4)
+	uploads, err := upload.NewManager(uploadDir, cfg.Limits.UploadSessionTTL(), 4)
 	if err != nil {
 		return err
 	}
@@ -188,20 +311,26 @@ func serve() error {
 		}
 	}()
 
+	// One registry shared by the server and the worker, so a scrape sees the request
+	// counters and the queue depth in the same document.
+	reg := metrics.New()
+
 	deps := server.Deps{
-		Config:   cfg,
-		Meta:     meta,
-		Content:  content,
-		Authz:    authz.NewService(&authzAccessor{m: meta}),
-		Tickets:  tickets,
-		Sessions: auth.NewSessions(tickets, meta, cfg.Auth.SessionTTL),
-		AppPass:  auth.NewAppPasswords(meta),
-		Shares:   shares,
-		Mailer:   mailer,
-		Provider: provider,
-		Uploads:  uploads,
-		Log:      log,
-		Version:  version,
+		Config:    cfg,
+		Meta:      meta,
+		Content:   content,
+		Authz:     authz.NewService(&authzAccessor{m: meta}),
+		Tickets:   tickets,
+		Sessions:  auth.NewSessions(tickets, meta, cfg.Auth.SessionTTL),
+		AppPass:   auth.NewAppPasswords(meta),
+		Shares:    shares,
+		Mailer:    mailer,
+		Provider:  provider,
+		Providers: providers,
+		Uploads:   uploads,
+		Metrics:   reg,
+		Log:       log,
+		Version:   version,
 	}
 
 	srv, err := server.New(deps)
@@ -212,7 +341,22 @@ func serve() error {
 	// Maintenance runs in-process. The sweep is outbox-style and idempotent, so
 	// starting a second replica later adds a second sweeper without changing
 	// anything here; the queries are written to tolerate it.
-	go worker.New(meta, log).Run(ctx)
+	wk := worker.New(meta, log).WithRetention(cfg.Limits.VersionRetention(), cfg.Limits.TrashRetention())
+	wk.WithMetrics(reg)
+	if cfg.Audit.AnchorDir != "" {
+		if err := wk.EnableAnchoring(cfg.Audit.AnchorDir, meta); err != nil {
+			log.Error("audit anchoring is configured but unusable", "dir", cfg.Audit.AnchorDir, "error", err)
+			return err
+		}
+		log.Info("audit chain anchoring enabled", "dir", cfg.Audit.AnchorDir)
+	} else {
+		// Say so explicitly: an unanchored chain cannot detect its own truncation, and
+		// an operator should learn that from the startup log rather than from an
+		// incident review.
+		log.Warn("audit anchoring is disabled: a truncated log will still verify",
+			"hint", "set audit.anchor_dir to a location with different credentials from the database")
+	}
+	go wk.Run(ctx)
 
 	httpSrv := &http.Server{
 		Addr:              cfg.Server.Addr,
@@ -392,10 +536,28 @@ func (a *authzAccessor) LoadNode(id uuid.UUID) (authz.Node, error) {
 }
 
 func (a *authzAccessor) OwnerGroupPerm(actorID, nodeID uuid.UUID) (authz.Perm, bool, error) {
-	// Group-shared spaces are not implemented yet. Returning "no grant" is the
-	// correct fail-closed answer: a stub that returned read access would silently
-	// widen every user's permissions.
-	return 0, false, nil
+	// This was a stub returning "no grant", which was the fail-closed answer while
+	// acl_entries had no reader. It now resolves real grants: the user's direct
+	// grants plus those of any group they belong to, accumulated up the ancestor
+	// chain while inheritance allows.
+	var (
+		perms storepkg.Perm
+		ok    bool
+	)
+	err := a.m.WithTx(context.Background(), func(ctx context.Context, tx storepkg.Tx) error {
+		p, found, gerr := tx.EffectivePermsFor(ctx, actorID, nodeID)
+		perms, ok = p, found
+		return gerr
+	})
+	if err != nil {
+		if errors.Is(err, storepkg.ErrNotFound) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	// The two packages declare the same bit layout; the conversion is explicit so a
+	// future change to one is a compile-time reminder rather than a silent widening.
+	return authz.Perm(perms), ok, nil
 }
 
 func (a *authzAccessor) ShareForActor(actorID, nodeID uuid.UUID) (*authz.ShareGrant, error) {
@@ -443,7 +605,8 @@ func (a *resolverAdapter) Children(ctx context.Context, owner, dir string, limit
 func migrate() error {
 	log := newLogger()
 
-	if _, err := config.Load(configPath()); err != nil {
+	cfg, err := config.Load(configPath())
+	if err != nil {
 		return err
 	}
 
@@ -465,7 +628,105 @@ func migrate() error {
 		return err
 	}
 	log.Info("schema up to date")
+
+	// Reconcile name_key with the current key function (T-12).
+	//
+	// Migration 0007 backfilled the column with SQL lower(), which cannot do NFC or full case
+	// folding. For ASCII names the two agree, so drift is invisible until a name arrives with a
+	// decomposed accent (macOS) or a foldable pair (ß/ss). A stale key makes the affected file
+	// unreachable by the spelling the user types, so this converges the column rather than
+	// leaving it to "self-heal on next write" — a file nobody renames never gets rewritten.
+	rep, err := storepkg.RepairNameKeys(ctx, pool)
+	if err != nil {
+		return err
+	}
+	switch {
+	case rep.Corrected > 0:
+		log.Warn("name keys reconciled",
+			"scanned", rep.Scanned, "corrected", rep.Corrected, "skipped", len(rep.Skipped))
+	case rep.Scanned > 0:
+		log.Info("name keys already consistent", "scanned", rep.Scanned)
+	}
+	// Skipped rows are reported individually: each is a real ambiguity that an operator has to
+	// resolve by renaming one of the files, and burying them in a count would hide that.
+	for _, s := range rep.Skipped {
+		log.Warn("name key not reconciled", "detail", s)
+	}
+
+	// Re-derive blobs.size from the stored objects (INV-07).
+	//
+	// The column was written as 0 by BlobIDFor for as long as that function existed, so every
+	// blob row from before the fix claims to be empty. The earlier note here said those rows
+	// could not be recovered; that was wrong — the objects are content-addressed and still on
+	// disk, so the hash names the object and the object knows its length.
+	//
+	// A missing object is reported rather than silently given a size: a blob row pointing at
+	// content that is not there is an integrity problem, and papering over it would hide the one
+	// thing the operator needs to see.
+	if err := repairBlobSizes(ctx, cfg, pool, log); err != nil {
+		return err
+	}
+
 	return nil
+}
+
+// repairBlobSizes opens the configured content store and corrects blobs.size.
+//
+// The store is opened here rather than inside the store package so the metadata layer never has
+// to know which backend is configured. Failing to open it is not fatal to the migration: the
+// schema is already applied, and refusing to exit would turn a storage misconfiguration into a
+// blocked deploy. It is logged loudly instead.
+func repairBlobSizes(ctx context.Context, cfg config.Config, pool *pgxpool.Pool, log *slog.Logger) error {
+	blobs, err := openBlobStore(cfg)
+	if err != nil {
+		log.Warn("blob size backfill skipped", "error", err)
+		return nil
+	}
+
+	rep, err := storepkg.RepairBlobSizes(ctx, pool, blobs.Stat)
+	if err != nil {
+		return err
+	}
+	switch {
+	case rep.Fixed > 0:
+		log.Warn("blob sizes reconciled",
+			"scanned", rep.Scanned, "fixed", rep.Fixed, "recovered_bytes", rep.TotalFixedBytes,
+			"missing", len(rep.Missing))
+	case rep.Scanned > 0:
+		log.Info("blob sizes consistent", "scanned", rep.Scanned)
+	}
+	for _, m := range rep.Missing {
+		log.Warn("blob content not found; size left unchanged", "detail", m)
+	}
+	if rep.BackendError != nil {
+		log.Warn("the content store reported errors during the backfill", "error", rep.BackendError)
+	}
+	return nil
+}
+
+// openBlobStore builds the content-addressed backend the backfill needs.
+//
+// The ordinary content store is a layout adapter whose Stat takes a *path*, because that is what
+// the rest of the server asks for. The backfill has a content address, not a path, so it needs the
+// layer below the adapter. Both backends are content-addressed, so both expose it — the tree
+// layout is not, and is reported as unsupported rather than guessed at.
+func openBlobStore(cfg config.Config) (blob.Store, error) {
+	if cfg.Storage.Layout == config.LayoutTree {
+		return nil, errors.New("the tree layout is not content-addressed, so blob sizes cannot be derived")
+	}
+	if cfg.Storage.Backend == "s3" {
+		s3cfg := cfg.Storage.S3
+		return s3blob.New(context.Background(), s3blob.Config{
+			Endpoint:  s3cfg.Endpoint,
+			Bucket:    s3cfg.Bucket,
+			Region:    s3cfg.Region,
+			AccessKey: s3cfg.AccessKey,
+			SecretKey: s3cfg.SecretKey,
+			Secure:    s3cfg.UseTLS(),
+			Prefix:    s3cfg.Prefix,
+		})
+	}
+	return local.New(cfg.Storage.Local.Root)
 }
 
 // healthcheck probes the local server for Docker's HEALTHCHECK directive.
@@ -488,4 +749,58 @@ func healthcheck() error {
 		return fmt.Errorf("healthcheck: status %d", resp.StatusCode)
 	}
 	return nil
+}
+
+// breakglassCommand generates the credential file the local administrator uses.
+//
+// It is a subcommand rather than a documented Go snippet because the alternative is an
+// operator writing code to recover access to their own system — exactly when they are
+// least able to. The secret is read from stdin so it never appears in a shell history
+// or in `ps` output.
+func breakglassCommand(args []string) error {
+	if len(args) == 0 || args[0] != "hash" {
+		return errors.New("breakglass: missing sub-command (want `breakglass hash`)")
+	}
+
+	fmt.Fprintln(os.Stderr, "Reading the password from stdin. It is not echoed and not stored.")
+	fmt.Fprintln(os.Stderr, "Write the output to the file named by auth.local_admin.password_argon2_file.")
+
+	secret, err := readSecretLine(os.Stdin)
+	if err != nil {
+		return err
+	}
+	if len(secret) < 12 {
+		// The one credential that bypasses the IdP deserves a floor. This is not a
+		// strength policy — it is a refusal to accept "admin".
+		return errors.New("breakglass: the password must be at least 12 characters")
+	}
+
+	h, err := password.Hash(secret, password.Default())
+	if err != nil {
+		return err
+	}
+	// Hex so the file is readable and can be compared against what an operator wrote
+	// down; the hash is salted, so publishing one does not help an attacker.
+	fmt.Println(hex.EncodeToString(h))
+	return nil
+}
+
+// readSecretLine reads one line from r, rejecting an empty value.
+//
+// No terminal echoing control is attempted: this runs on whatever shell invoked it, and
+// a half-working no-echo implementation is worse than a documented "the shell may echo
+// what you type". The value is read from a pipe in every documented usage.
+func readSecretLine(r io.Reader) (string, error) {
+	sc := bufio.NewScanner(r)
+	if !sc.Scan() {
+		if err := sc.Err(); err != nil {
+			return "", err
+		}
+		return "", errors.New("breakglass: no password on stdin")
+	}
+	secret := strings.TrimRight(sc.Text(), "\r\n")
+	if secret == "" {
+		return "", errors.New("breakglass: empty password")
+	}
+	return secret, nil
 }

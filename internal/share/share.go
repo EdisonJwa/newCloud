@@ -18,7 +18,6 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -27,8 +26,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"golang.org/x/crypto/argon2"
 
+	"github.com/EdisonJwa/newCloud/internal/password"
 	"github.com/EdisonJwa/newCloud/internal/store"
 	"github.com/EdisonJwa/newCloud/internal/ticket"
 )
@@ -47,24 +46,16 @@ type Service struct {
 
 // ArgonParams configures password hashing.
 //
-// Share passwords are human-chosen, so they need a slow KDF — unlike app
-// passwords, which are 256-bit random values.
-type ArgonParams struct {
-	Time    uint32
-	Memory  uint32
-	Threads uint8
-	KeyLen  uint32
-}
+// It is an alias for password.Params so the KDF has exactly one implementation: the
+// same parameters now guard share passwords and the break-glass administrator, and two
+// copies would eventually drift into one of them being weaker.
+type ArgonParams = password.Params
 
 // DefaultArgon are the production parameters (64 MiB, 3 passes).
-func DefaultArgon() ArgonParams {
-	return ArgonParams{Time: 3, Memory: 64 * 1024, Threads: 4, KeyLen: 32}
-}
+func DefaultArgon() ArgonParams { return password.Default() }
 
 // TestArgon are intentionally weak parameters for fast tests.
-func TestArgon() ArgonParams {
-	return ArgonParams{Time: 1, Memory: 8 * 1024, Threads: 1, KeyLen: 32}
-}
+func TestArgon() ArgonParams { return password.Test() }
 
 // New builds the service.
 func New(meta store.Store, params ArgonParams) *Service {
@@ -406,23 +397,10 @@ func tokenHash(token string) []byte {
 // stored format that embeds its parameters would allow tuning them later without
 // invalidating existing shares; that is a deliberate simplification for v1 and is
 // recorded here rather than discovered later.
-func (s *Service) HashPassword(password string) ([]byte, error) {
-	salt := make([]byte, 16)
-	if _, err := rand.Read(salt); err != nil {
-		return nil, err
-	}
-	key := argon2.IDKey([]byte(password), salt, s.argonParams.Time,
-		s.argonParams.Memory, s.argonParams.Threads, s.argonParams.KeyLen)
-	return append(salt, key...), nil
+func (s *Service) HashPassword(secret string) ([]byte, error) {
+	return password.Hash(secret, s.argonParams)
 }
 
-func (s *Service) checkPassword(password string, stored []byte) bool {
-	const saltLen = 16
-	if len(stored) <= saltLen {
-		return false
-	}
-	salt, want := stored[:saltLen], stored[saltLen:]
-	got := argon2.IDKey([]byte(password), salt, s.argonParams.Time,
-		s.argonParams.Memory, s.argonParams.Threads, s.argonParams.KeyLen)
-	return subtle.ConstantTimeCompare(got, want) == 1
+func (s *Service) checkPassword(secret string, stored []byte) bool {
+	return password.Verify(secret, stored, s.argonParams)
 }

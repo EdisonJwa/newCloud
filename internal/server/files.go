@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -68,9 +69,15 @@ func toFileJSON(n store.Node, rel string) fileJSON {
 //
 // The path comes from a query parameter rather than the URL so that names with
 // slashes and spaces do not need re-encoding by every client.
+//
+// Pages are addressed by an opaque `cursor` returned with the previous page, not by
+// an offset. An offset over a name sort returns duplicates and drops rows whenever a
+// sibling is created or deleted between requests — the exact failure T-19 describes.
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	actor, _ := actorFrom(r.Context())
 	rel := r.URL.Query().Get("path")
+	cursor := r.URL.Query().Get("cursor")
+	limit := parseLimit(r.URL.Query().Get("limit"), s.deps.Config.Limits.MaxProfindChildren)
 
 	nodes, err := s.deps.Meta.Resolve(r.Context(), actor.ID(), rel)
 	if err != nil {
@@ -95,13 +102,24 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 
 	var children []store.Node
 	err = s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
-		c, cerr := tx.Children(ctx, dir.ID, s.deps.Config.Limits.MaxProfindChildren)
+		// One extra row is fetched to tell "this is the last page" from "there is
+		// more" without a second count query.
+		c, cerr := tx.ChildrenAfter(ctx, dir.ID, cursor, limit+1)
 		children = c
 		return cerr
 	})
 	if err != nil {
 		s.writeStoreError(w, err)
 		return
+	}
+
+	next := ""
+	if len(children) > limit {
+		children = children[:limit]
+		// The cursor is the last name on this page: the next page starts strictly
+		// after it, so a row inserted meanwhile either belongs to a later page or
+		// is simply visible on refresh — never skipped.
+		next = children[len(children)-1].Name
 	}
 
 	markers := s.nodeMarkers(r.Context(), actor.ID(), children)
@@ -120,10 +138,39 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 		"path":     path.Join("/", rel),
 		"name":     dir.Name,
 		"children": out,
-		// The cap is returned so the UI can say "showing the first N" instead of
-		// silently presenting a truncated directory.
-		"truncated": len(children) >= s.deps.Config.Limits.MaxProfindChildren,
+		// `truncated` is kept for clients that only understand the old shape; the
+		// cursor is what actually lets them continue rather than merely notice.
+		"truncated": next != "",
+		"cursor":    next,
 	})
+}
+
+// defaultPageSize is the page size when the client does not ask for one.
+//
+// Large enough that a normal folder arrives in one request, small enough that a
+// folder with a hundred thousand entries cannot be used to make one response the
+// size of the database.
+const defaultPageSize = 500
+
+// parseLimit clamps a client-supplied page size.
+//
+// Unclamped, `?limit=1000000` is a one-line denial of service against the database
+// and the browser.
+func parseLimit(raw string, max int) int {
+	if raw == "" {
+		if max > 0 && max < defaultPageSize {
+			return max
+		}
+		return defaultPageSize
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return defaultPageSize
+	}
+	if max > 0 && n > max {
+		return max
+	}
+	return n
 }
 
 // handleMkdir creates a directory.
@@ -155,8 +202,19 @@ func (s *Server) handleMkdir(w http.ResponseWriter, r *http.Request) {
 		s.writeStoreError(w, err)
 		return
 	}
-	if !cap.Can(authz.PermWrite) {
+	// Creating a name inside a directory is the `create` primitive, not the composite `write`.
+	//
+	// §4.2 lists create and overwrite separately, and the ACL layer stores them separately, so a
+	// grant can say "you may add files here but not replace existing ones". Checking PermWrite
+	// asked for both and made that grant unexpressible.
+	if !cap.Can(authz.PermCreate) {
 		writeError(w, http.StatusNotFound, "not_found", "no such directory")
+		return
+	}
+
+	// Adding a child changes the parent's membership, so a Depth: 0 lock on the parent blocks
+	// it (RFC 4918 §7.4). This mirrors MKCOL on the DAV side, which already refused.
+	if !s.guardParentUnlocked(w, r, actor, parent.ID) {
 		return
 	}
 
@@ -198,12 +256,17 @@ var (
 	errNoSuchDirectory = errors.New("no such directory")
 )
 
-// writableParent resolves a directory path and checks the caller may write into it.
+// writableParent resolves a directory path and checks the caller holds need on it.
 //
 // Both the single-request upload and the resumable endpoints need exactly this, and the check
 // has to be identical in both: an authorization rule that differs between two ways of writing
 // the same bytes is a way in.
-func (s *Server) writableParent(ctx context.Context, actor authz.Actor, dirRel string) (store.Node, []store.Node, error) {
+//
+// need is a parameter rather than a fixed PermWrite because the correct primitive depends on
+// whether the write creates a new name or replaces an existing one (§4.2 lists create and
+// overwrite separately). A caller that has resolved the target passes the one it means.
+func (s *Server) writableParent(ctx context.Context, actor authz.Actor, dirRel string,
+	need authz.Perm) (store.Node, []store.Node, error) {
 	nodes, err := s.deps.Meta.Resolve(ctx, actor.ID(), dirRel)
 	if err != nil {
 		return store.Node{}, nil, err
@@ -217,7 +280,7 @@ func (s *Server) writableParent(ctx context.Context, actor authz.Actor, dirRel s
 	if err != nil {
 		return store.Node{}, nil, err
 	}
-	if !cap.Can(authz.PermWrite) {
+	if !cap.Can(need) {
 		return store.Node{}, nil, errNoSuchDirectory
 	}
 	return parent, nodes, nil
@@ -229,36 +292,33 @@ func (s *Server) writableParent(ctx context.Context, actor authz.Actor, dirRel s
 // Extracted so the single-request upload and the resumable one cannot diverge: the versioning
 // policy and the audit record are part of the write, not an afterthought one of them might
 // forget to keep in step.
+//
+// expect carries the client's precondition. It defaults to "overwrite freely" because a browser
+// upload of the same name is a deliberate replace; what it must never do is decide that in the
+// handler and then write in a separate step, which is how two concurrent saves both win and one
+// silently disappears.
 func (s *Server) publishFile(
 	ctx context.Context, r *http.Request, actor authz.Actor,
-	parentID uuid.UUID, name, rel, mime string, res layout.PutResult,
+	parentID uuid.UUID, name, rel, mime string, res layout.PutResult, expect *store.Precondition,
 ) (store.Node, error) {
 	etag := etagFor(res.Hash)
 	var node store.Node
 
 	err := s.deps.Meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
-		existing, cerr := tx.ChildByName(ctx, parentID, name)
-		if cerr == nil {
-			n, uerr := tx.UpdateFile(ctx, store.UpdateFile{
-				NodeID: existing.ID, Size: res.Size, Mime: mime, ETag: etag,
-				BlobID: s.deps.Meta.BlobIDFor(ctx, res.Hash), BlobHash: res.Hash,
-				KeepVersion: true, MaxVersions: s.maxVersions(),
-			})
-			if uerr != nil {
-				return uerr
-			}
-			node = n
-		} else {
-			n, cerr2 := tx.CreateFile(ctx, store.NewFile{
+		n, _, werr := tx.WriteFile(ctx, store.WriteFile{
+			NewFile: store.NewFile{
 				OwnerID: actor.ID(), ParentID: parentID, Name: name,
 				Size: res.Size, Mime: mime, ETag: etag,
-				BlobID: s.deps.Meta.BlobIDFor(ctx, res.Hash), BlobHash: res.Hash,
-			})
-			if cerr2 != nil {
-				return cerr2
-			}
-			node = n
+				BlobID: s.deps.Meta.BlobIDFor(ctx, res.Hash, res.Size), BlobHash: res.Hash,
+			},
+			Expect:      expect,
+			KeepVersion: true,
+			MaxVersions: s.maxVersions(),
+		})
+		if werr != nil {
+			return werr
 		}
+		node = n
 
 		bytes := res.Size
 		return tx.Audit(ctx, store.AuditEntry{
@@ -317,13 +377,60 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	parent, _, err := s.writableParent(r.Context(), actor, dirRel)
+	parent, _, err := s.writableParent(r.Context(), actor, dirRel, authz.PermCreate)
 	if err != nil {
 		s.writeStoreError(w, err)
 		return
 	}
 
 	rel := path.Join(dirRel, name)
+
+	// One resolution, used for both the membership and the overwrite decision. Asking twice also
+	// meant asking wrongly: existingFile reports "no such file" for a new name, so a guard written
+	// after it never ran for exactly the case it was there for.
+	exists, existingNode, xerr := s.existingFile(r.Context(), actor.ID(), rel)
+	if xerr != nil {
+		s.writeStoreError(w, xerr)
+		return
+	}
+	_ = existingNode
+	if !exists {
+		// Creating a new name is a membership change on the parent, so a Depth: 0 parent lock
+		// blocks it (RFC 4918 §7.4).
+		if !s.guardParentUnlocked(w, r, actor, parent.ID) {
+			return
+		}
+	}
+
+	// Replacing an existing file needs `overwrite`, which `create` alone does not imply.
+	//
+	// §4.2 separates them, and the distinction is the difference between "add files here" and
+	// "may replace my work". The existence check is a read; the authoritative guard is the
+	// precondition inside WriteFile, so a file created between here and the write still cannot be
+	// clobbered by a caller who lacks the bit — it fails the precondition instead.
+	if existing, node, xerr := s.existingFile(r.Context(), actor.ID(), rel); xerr == nil && existing {
+		// A WebDAV lock on the target blocks an HTTP overwrite (§5.3). Without this the two write
+		// paths disagree and the lock is advisory on one of them.
+		if !s.guardUnlocked(w, r, actor, node.ID) {
+			return
+		}
+
+		// A Depth: infinity lock on an ancestor also covers this child content (RFC 4918
+		// 7.4), which is the half that makes a subtree lock worth taking.
+		if !s.guardAncestorContentUnlocked(w, r, actor, node.ID) {
+			return
+		}
+		parentCap, cerr := s.deps.Authz.Authorize(actor, parent.ID)
+		if cerr != nil {
+			s.writeStoreError(w, cerr)
+			return
+		}
+		if !parentCap.Can(authz.PermOverwrite) {
+			writeError(w, http.StatusNotFound, "not_found", "no such directory")
+			return
+		}
+	}
+
 	res, err := s.deps.Content.Put(r.Context(), nodeFor(actor, rel), file, header.Size)
 	if err != nil {
 		s.writeStoreError(w, err)
@@ -335,13 +442,31 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		mime = guessType(name)
 	}
 
-	node, err := s.publishFile(r.Context(), r, actor, parent.ID, name, rel, mime, res)
+	// A browser upload replaces by design, so the default precondition is "none".
+	// A caller that wants optimistic concurrency sends If-Match, which is what
+	// makes a second tab editing the same file fail loudly instead of winning
+	// silently.
+	node, err := s.publishFile(r.Context(), r, actor, parent.ID, name, rel, mime, res,
+		preconditionFromHeader(r))
 	if err != nil {
 		s.writeStoreError(w, err)
 		return
 	}
 
 	writeJSON(w, http.StatusCreated, toFileJSON(node, rel))
+}
+
+// preconditionFromHeader reads the conditional headers a browser or client sent.
+//
+// It exists so the three write paths share one interpretation of If-Match and
+// If-None-Match instead of each deciding for itself what those mean.
+func preconditionFromHeader(r *http.Request) *store.Precondition {
+	im := strings.TrimSpace(r.Header.Get("If-Match"))
+	inm := strings.TrimSpace(r.Header.Get("If-None-Match"))
+	if im == "" && inm == "" {
+		return nil
+	}
+	return &store.Precondition{IfMatch: im, IfNoneMatch: inm}
 }
 
 // handleDownload streams a file for the web UI.
@@ -365,7 +490,13 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		s.writeStoreError(w, err)
 		return
 	}
-	if !cap.Can(authz.PermRead) {
+	// Streaming the bytes exercises the `download` primitive, not `read`.
+	//
+	// §4.2 lists them separately and the ACL layer stores them separately, so a grant can
+	// say "you may see that this file exists and read its metadata, but you may not take a
+	// copy". Checking PermRead here made that grant indistinguishable from full access: the
+	// fine-grained bit was expressible, storable, listable, and unenforced.
+	if !cap.Can(authz.PermDownload) {
 		writeError(w, http.StatusNotFound, "not_found", "no such file")
 		return
 	}
@@ -477,8 +608,15 @@ func (s *Server) handleRename(w http.ResponseWriter, r *http.Request) {
 		s.writeStoreError(w, err)
 		return
 	}
-	if !cap.Can(authz.PermWrite) {
+	// Renaming is the `rename` primitive (§4.2), not the composite `write`: an ACL can grant
+	// "edit this file's content but do not reorganise it".
+	if !cap.Can(authz.PermRename) {
 		writeError(w, http.StatusNotFound, "not_found", "no such file")
+		return
+	}
+
+	// A rename moves the node, so a lock on it blocks the operation (§5.3).
+	if !s.guardUnlocked(w, r, actor, node.ID) {
 		return
 	}
 
@@ -534,9 +672,25 @@ func (s *Server) handleMove(w http.ResponseWriter, r *http.Request) {
 		s.writeStoreError(w, err)
 		return
 	}
-	if !cap.Can(authz.PermWrite) {
+	// A move consumes `delete` authority on the source, not merely write: the node leaves
+	// the place it was. §4.2 wants the source's move/delete right and the target's create
+	// right checked independently, which the two blocks below do.
+	if !cap.Can(authz.PermDelete) {
 		writeError(w, http.StatusNotFound, "not_found", "no such file")
 		return
+	}
+
+	// A lock on the source blocks moving it away from under the holder (§5.3).
+	if !s.guardUnlocked(w, r, actor, node.ID) {
+		return
+	}
+
+	// A directory move carries its whole subtree, so every inner node must permit it too.
+	if node.IsDir() {
+		if ok := s.checkSubtreePerm(r, actor, node.ID, authz.PermDelete); !ok {
+			writeError(w, http.StatusNotFound, "not_found", "no such file")
+			return
+		}
 	}
 
 	parentRel, name := splitParent(body.To)
@@ -557,6 +711,9 @@ func (s *Server) handleMove(w http.ResponseWriter, r *http.Request) {
 		s.writeStoreError(w, err)
 		return
 	}
+	// The target needs `create` (adding a name) plus `overwrite` when it replaces something;
+	// PermWrite expands to both, so checking it covers the create side. Overwrite is
+	// re-checked against the *existing* target below, where it is known whether there is one.
 	if !parentCap.Can(authz.PermWrite) {
 		writeError(w, http.StatusNotFound, "not_found", "no such target directory")
 		return
@@ -625,6 +782,22 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A lock blocks deletion through either interface (§5.3).
+	if !s.guardUnlocked(w, r, actor, node.ID) {
+		return
+	}
+
+	// Deleting a directory deletes everything inside it, so the root's permission is not
+	// the whole question (§4.2: 目录递归操作不能只检查根目录). An inner file may carry a
+	// narrower grant, or belong to a subtree somebody else can see — trashing it because
+	// the parent was deletable would be privilege escalation by nesting.
+	if node.IsDir() {
+		if ok := s.checkSubtreePerm(r, actor, node.ID, authz.PermDelete); !ok {
+			writeError(w, http.StatusNotFound, "not_found", "no such file")
+			return
+		}
+	}
+
 	err = s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
 		if terr := tx.Trash(ctx, node.ID); terr != nil {
 			return terr
@@ -674,6 +847,12 @@ func (s *Server) handleTrashList(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleRestore un-deletes a node and its subtree.
+//
+// The request carries only a node id, which is exactly the shape that invites a
+// cross-tenant bug: an id is not a capability, and a trashed node is not visible
+// to its owner's authorizer (trash is reachable only through this flow). So the
+// ownership check has to happen here, against the stored owner, and the restore
+// must re-check that the user may write into the directory it returns to.
 func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 	actor, _ := actorFrom(r.Context())
 
@@ -684,9 +863,38 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := parseUUID(body.ID)
+	if id == uuid.Nil {
+		writeError(w, http.StatusBadRequest, "invalid_target", "not a valid file id")
+		return
+	}
+
+	// Read the trashed node and decide whether this actor may see it at all.
+	// A node belongs to exactly one owner; there is no legitimate cross-account
+	// restore, so anything else answers the same 404 as a nonexistent id.
+	var trashed store.Node
+	err := s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
+		n, nerr := tx.NodeIncludingTrashed(ctx, id)
+		trashed = n
+		return nerr
+	})
+	if err != nil || trashed.TrashedAt == nil || trashed.OwnerID != actor.ID() {
+		writeError(w, http.StatusNotFound, "not_found", "no such item in the trash")
+		return
+	}
+
+	// Restoring puts the subtree back where it came from, so the caller must
+	// still be allowed to write there. Without this, an account whose access to a
+	// directory was revoked could get its files back into it.
+	if trashed.ParentID != nil {
+		cap, cerr := s.deps.Authz.Authorize(actor, *trashed.ParentID)
+		if cerr != nil || !cap.Can(authz.PermWrite) {
+			writeError(w, http.StatusNotFound, "not_found", "no such item in the trash")
+			return
+		}
+	}
 
 	var restored store.Node
-	err := s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
+	err = s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
 		n, rerr := tx.Restore(ctx, id)
 		if rerr != nil {
 			return rerr
@@ -808,11 +1016,11 @@ func (s *Server) handleRestoreVersion(w http.ResponseWriter, r *http.Request) {
 
 // maxVersions adapts retention to the layout: the tree layout pays for a full
 // copy per version, the blob layout only for the differences.
+//
+// The policy itself lives in config so an operator can set it; this is only the
+// adapter to the active storage layout.
 func (s *Server) maxVersions() int {
-	if s.deps.Content.Capabilities().CheapVersions {
-		return 10
-	}
-	return 3
+	return s.deps.Config.Limits.MaxVersionsFor(s.deps.Content.Capabilities().CheapVersions)
 }
 
 // writeStoreError maps metadata and storage errors onto HTTP status codes.
@@ -826,6 +1034,12 @@ func (s *Server) writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, "not_found", "no such file or directory")
 	case errors.Is(err, store.ErrConflict):
 		writeError(w, http.StatusConflict, "conflict", "something with that name already exists")
+	case errors.Is(err, store.ErrPrecondition):
+		// 412 rather than 409: the name did not clash, the file changed under the
+		// caller. A client that gets 409 retries with a different name; one that
+		// gets 412 re-reads and merges, which is the correct behaviour.
+		writeError(w, http.StatusPreconditionFailed, "precondition_failed",
+			"the file changed since you last read it")
 	case errors.Is(err, store.ErrQuota):
 		writeError(w, http.StatusInsufficientStorage, "quota_exceeded", "your storage quota is full")
 	case errors.Is(err, store.ErrTooLarge), errors.Is(err, layout.ErrSizeMismatch):
@@ -835,6 +1049,15 @@ func (s *Server) writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, "invalid_name", err.Error())
 	case errors.Is(err, store.ErrCycle):
 		writeError(w, http.StatusConflict, "cycle", "cannot move a directory into itself")
+	case errors.Is(err, store.ErrAuditUnavailable):
+		// 503, not 500: the request is well-formed and the data is fine — the recorder is down.
+		// Retrying after the audit store recovers will succeed, and saying so is the difference
+		// between an operator checking the data (wrong) and checking the audit table and disk
+		// (right). This is the T-16 fail-closed policy surfacing to the client.
+		s.deps.Log.Error("refused a write because the audit record could not be written",
+			"error", err)
+		writeError(w, http.StatusServiceUnavailable, "audit_unavailable",
+			"the audit log is unavailable, so the change was refused and nothing was modified")
 	default:
 		s.deps.Log.Error("unhandled error", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal", "something went wrong")
@@ -862,3 +1085,26 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 }
 
 var _ = uuid.Nil
+
+// existingFile reports whether a live file already occupies rel.
+//
+// A miss is not an error: the common case is a new file, and an upload must not fail because
+// the caller has permission to create but the target happens not to exist yet.
+func (s *Server) existingFile(ctx context.Context, ownerID uuid.UUID, rel string) (bool, store.Node, error) {
+	var node store.Node
+	err := s.deps.Meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		nodes, rerr := s.deps.Meta.Resolve(ctx, ownerID, rel)
+		if rerr != nil {
+			return rerr
+		}
+		node = nodes[len(nodes)-1]
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return false, store.Node{}, nil
+		}
+		return false, store.Node{}, err
+	}
+	return !node.IsDir(), node, nil
+}

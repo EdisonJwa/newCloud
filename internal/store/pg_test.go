@@ -3,7 +3,6 @@ package store_test
 import (
 	"context"
 	"crypto/rand"
-	"errors"
 	"os"
 	"testing"
 	"time"
@@ -28,6 +27,17 @@ func TestPGConformance(t *testing.T) {
 	}
 
 	storetest.Run(t, func(t *testing.T) (store.Store, uuid.UUID) {
+		// The queue is global, not per-user, so it has to be cleared for each subtest.
+		// The in-memory store is fresh per factory call; without this the two backends
+		// would disagree about how much work is outstanding, and the disagreement would
+		// only ever show up as a confusing failure in the dedupe case.
+		//
+		// DELETE rather than completing the rows: a row left with a live lease would be
+		// invisible to the next subtest's claim *and* invisible to a completion-based
+		// cleanup, which is exactly how a queue test becomes flaky.
+		if _, err := pool.Exec(context.Background(), `DELETE FROM jobs`); err != nil {
+			t.Fatalf("clear jobs: %v", err)
+		}
 		owner := newUser(t, pool)
 		s := store.NewPG(pool)
 		s.EnableAudit()
@@ -36,6 +46,9 @@ func TestPGConformance(t *testing.T) {
 		Versions:   true,
 		NewBlob:    func(t *testing.T) uuid.UUID { return newBlob(t, pool) },
 		AuditCount: func(t *testing.T, s store.Store) int { return countAudit(t, pool) },
+		BlobIDFor: func(t *testing.T, s store.Store, hash [32]byte) uuid.UUID {
+			return s.BlobIDFor(context.Background(), hash, 0)
+		},
 		SetQuota: func(t *testing.T, s store.Store, owner uuid.UUID, limit int64) {
 			if _, err := pool.Exec(context.Background(),
 				`UPDATE users SET quota_bytes = $2 WHERE id = $1`, owner, limit); err != nil {
@@ -82,7 +95,7 @@ func newUser(t *testing.T, pool *pgxpool.Pool) uuid.UUID {
 
 // newBlob inserts a blob row, because nodes.blob_id has a foreign key to it.
 //
-// Fabricating an id would violate that constraint — and the constraint is right:
+// Fabricating an id would violate that constraint ??and the constraint is right:
 // a node referencing content that was never stored is exactly the corruption the
 // foreign key exists to prevent. The suite takes this as a hook so the
 // in-memory store, which has no such table, can run the identical tests.
@@ -112,8 +125,14 @@ func countAudit(t *testing.T, pool *pgxpool.Pool) int {
 	return n
 }
 
-// resetSchema drops and reapplies the embedded schema so each run starts clean.
-// The audit schema is dropped too because the suite asserts absolute row counts.
+// resetSchema drops and reapplies every embedded migration so each run starts
+// clean.
+//
+// It applies *all* of them, through the same applier the binary uses, rather than
+// reading 0001 by filename. That mattered: the version of this helper that read
+// only 0001 meant a later migration's table was never created in the test
+// database, so a test exercising it would fail for a reason that had nothing to do
+// with the code under test ??or, worse, would silently skip the feature.
 func resetSchema(t *testing.T, pool *pgxpool.Pool) error {
 	t.Helper()
 	ctx := context.Background()
@@ -126,14 +145,7 @@ func resetSchema(t *testing.T, pool *pgxpool.Pool) error {
 		return err
 	}
 
-	raw, err := os.ReadFile("../../migrations/0001_init.sql")
-	if err != nil {
-		return err
-	}
-	if _, err := pool.Exec(ctx, string(raw)); err != nil {
-		return errors.New("apply 0001_init.sql: " + err.Error())
-	}
-	return nil
+	return store.ApplySchema(ctx, pool)
 }
 
 // TestPGAuditChainIsLinked verifies the property the chain exists for: each row

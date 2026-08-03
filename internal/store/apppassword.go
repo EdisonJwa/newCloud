@@ -37,5 +37,9 @@ type AppPasswordTx interface {
 	AppPasswordByHash(ctx context.Context, hash []byte) (AppPassword, error)
 	TouchAppPassword(ctx context.Context, id uuid.UUID, ip string) error
 	RevokeAppPassword(ctx context.Context, id uuid.UUID) error
+	// RevokeUserAppPasswords kills every live credential of an account. It exists
+	// because disabling an account must not leave a 90-day WebDAV credential
+	// working: revoking the sessions alone covers the browser and nothing else.
+	RevokeUserAppPasswords(ctx context.Context, userID uuid.UUID) (int, error)
 	ListAppPasswords(ctx context.Context, userID uuid.UUID) ([]AppPassword, error)
 }
