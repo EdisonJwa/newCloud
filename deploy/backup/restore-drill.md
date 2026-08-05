@@ -52,7 +52,24 @@ SELECT day, encode(head_hash,'hex') FROM audit.anchors ORDER BY day DESC LIMIT 1
 ### 3. 恢复 Blob
 
 ```bash
-restic restore latest --target /var/lib/newcloud --include /var/lib/newcloud/blobs
+# Restore to a scratch directory, then move the blob subtree into place.
+#
+# Both steps are needed, and the first version of this page omitted the second. `restic restore`
+# recreates the *absolute* path it backed up underneath --target, so restoring
+# /var/lib/newcloud/blobs to --target /srv/restore produces
+# /srv/restore/var/lib/newcloud/blobs — not /srv/restore/blobs. Pointing --target at the parent
+# and hoping --include scopes it does not help either: --include selects what to restore, it does
+# not flatten where it lands.
+#
+# Restoring straight onto the live root is the tempting shortcut and the wrong one: a partial or
+# failed restore then leaves a half-populated blob store where the server is already reading.
+restic restore latest --target /srv/restore
+
+# Then place it. The trailing slash on the source copies the *contents* of blobs/ into
+# $BLOB_ROOT; without it you get $BLOB_ROOT/blobs/blobs.
+BLOB_ROOT=/var/lib/newcloud/blobs
+install -d "$BLOB_ROOT"
+cp -a "/srv/restore/var/lib/newcloud/blobs/." "$BLOB_ROOT/"
 ```
 
 校验：
@@ -141,7 +158,7 @@ VERDICT: FAIL
 
 **本次仍未验证的三件事**（写在"通过"旁边，而不是藏在后面）：
 
-- **restic 仓库本身的恢复**没有跑。这一轮验证的是"blob 字节在文件级复制后仍然正确且可读"，不是 restic 的快照恢复流程；restic 在当前环境没有安装。两者的差别在于前者验证内容完整性，后者还验证快照管理与去重索引。
+- ~~**restic 仓库本身的恢复**没有跑。~~ **已补上（第二十八/二十九轮）**：装上 restic 0.19.1 后完整跑通了 `blob-backup.sh`（backup → forget → prune → `restic check` 报 "no errors were found"）与 `restic restore`。删除整个 blob 根后恢复，两个 blob 的 SHA-256 与原文件逐字节一致。**过程中发现并修掉两个真问题**：① `--one-file-system` 在 Windows 上直接 panic（"Device IDs are not supported on Windows"），脚本在保存一个字节之前就退出了；② 本文档原先的恢复命令是错的——`restic restore --target X` 会把备份时的**绝对路径**在 X 下重建，于是得到 `X/var/lib/newcloud/blobs` 而不是 `X/blobs`，`--include` 只筛选**恢复什么**、不改变**落在哪里**。已改为"恢复到 scratch 再搬运"的两步流程并实测通过。两者的差别在于前者验证内容完整性，后者还验证快照管理与去重索引。
 - **大库耗时**未知。78 KiB 用时约 1.2 秒，不能外推到 40 TiB；RTO 达标与否必须用真实体量重测。
 - **PITR**（WAL 归档恢复到任意时间点）没有演练。本次验证的是"从 dump 恢复"，不是"恢复到故障前一秒"，两者 RPO 差一个数量级。
 

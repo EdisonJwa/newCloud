@@ -12,6 +12,40 @@
 
 
 
+
+### INV-08 补完 — restic 快照恢复实测（第二十九轮）
+
+上一轮的经验是"本地跑不了通常只是没装"。这一轮把它用在 restic 上：`scoop install restic`（0.19.1）之后，从第八轮起一直挂着的"restic 快照恢复未验证"终于可以实测了。
+
+**跑通了完整备份链**：`blob-backup.sh` 的 backup → forget（7 日/4 周/12 月）→ prune → `restic check --read-data-subset=1/20`，最后一步报 "no errors were found"。
+
+**但第一次运行就崩了，而且是真 bug：**
+
+```
+restic: Device IDs are not supported on Windows
+panic: ...
+```
+
+`--one-file-system` 在 Windows 上**直接 panic**。这个 flag 在 Linux 上是对的（防止备份钻进 blob 根下的挂载点），但脚本无条件带上它，于是任何 Windows 运维机器上这条备份**在保存一个字节之前就退出了**。一个跑不起来的备份脚本保护不了任何东西。修法：按 `uname` 条件添加，Linux/Darwin 保留，其他平台省略。
+
+**第二个问题在文档里，不在代码里。** 我按文档写的恢复命令跑：
+
+```bash
+restic restore latest --target /var/lib/newcloud --include /var/lib/newcloud/blobs
+```
+
+结果是 0 个文件——因为快照里的路径是 `/C/Users/.../blobs`（备份时的**绝对路径**），`--include` 匹配不上。改用 `--target` 指向父目录也不行：`restic restore` 会把绝对路径**在 target 下重建**，得到 `target/var/lib/newcloud/blobs` 而不是 `target/blobs`。`--include` 只筛选**恢复什么**，不改变**落在哪里**。
+
+**文档里的命令是错的，而且错得很危险**：按它恢复会得到一个空目录或一层多余嵌套，运维会以为恢复成功了。已改成两步——先恢复到 scratch，再 `cp -a` 搬运内容——并**实测通过**：
+
+```
+ab\cd\abcd1234   200 bytes   A48742653620D8AE...
+ab\cd\abcd5678    50 bytes   21AB8B865E56EFD6...
+```
+
+两个 blob 的 SHA-256 与删除前的原文件**逐字节一致**，目录布局也正确（`ab/cd/<hash>`，不是 `blobs/blobs`）。
+
+这一轮值得记的不是"又验证了一项"，而是**两处问题都只有真跑才会暴露**：一个 flag 的平台差异，一份文档里想当然的路径语义。十五轮来我一直把这两条写成"未验证"，而它们真正需要的只是安装一个二进制。
 ### CI 等价环境本地化（第二十八轮）
 
 上一轮我写下两项"本地无法验证"：`go test -race`（缺 C 编译器）和 S3 对真实端点（缺 moto 服务）。**这两项都不是环境的固有限制，是我没去装。** 两者装上之后都跑通了。
@@ -1139,6 +1173,7 @@ go test ./internal/store -run 'TestPGPurgeTrash|TestPGExpireVersions'
 
 | 需求 | 现状 | 影响 |
 | --- | --- | --- |
+| INV-08 restic 恢复 | 已实测：`blob-backup.sh` 全链路（backup/forget/prune/check）通过，`restic restore` 后 blob 的 SHA-256 与原件逐字节一致。修掉两个真问题：`--one-file-system` 在 Windows 上 panic；文档里的恢复命令会得到错误的目录布局 | 大库耗时与 40 TiB 外推仍未测；PITR 仍未演练 |
 | SHARE-06 文件删除对链接的影响 | 已明确并测试：文件进回收站后链接返回 404 而非 200 空列表；"文件已删/已吊销/从未存在"三者响应体逐字节相同（否则端点会成为令牌预言机） | 移动文件不会改变节点 id，因此链接继续有效（这是设计而非遗漏，但未单独测试）；缓存与缩略图等衍生资源未覆盖 |
 | T-01 越权访问 | 表驱动覆盖 12 条带 id 路由中的 10 条（其余 2 条各由既有测试覆盖并写明），每条断言 404 而非 403、响应体不泄漏元数据、变更型操作后资源未改动；元测试防止新路由被漏掉 | 上传分片路由在校验身份前先解析 `Content-Range`（缺头返回 400 而非 404）——不是漏洞，但错误顺序不同会让调用者较早得知端点存在 |
 | 文档与代码的一致性 | `TestDocumentsCiteOnlyRealTests` 强制文档引用的每个测试名都真实存在（实测抓住了我自己编的三个）；讨论已废弃名字的句子须显式标记 `docIgnore:` | 只校验名字存在，不校验该测试是否真的断言了所声称的东西 |
