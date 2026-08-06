@@ -113,6 +113,13 @@ jobs:
         # The colour claim is measured, not asserted by eye.
         working-directory: web
         run: pnpm contrast
+
+      - name: every translated key exists, and every used key is translated
+        # A typo in t("...") does not fail the compiler: it renders the key itself, so the
+        # button says "acl.grant". And a key present in English but missing elsewhere silently
+        # falls back, which is how a half-translated screen ships.
+        working-directory: web
+        run: pnpm i18n
       - name: generated API types are current
         # Regenerating from openapi.yaml and diffing is the only way to know the committed
         # output still describes the spec. A stale client type is worse than none.

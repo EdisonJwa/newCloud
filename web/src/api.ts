@@ -215,6 +215,18 @@ export const api = {
     ),
   revokeAppPassword: (id: string) =>
     call<void>(client.DELETE("/api/apppasswords/{id}", { params: { path: { id } } })),
+
+  // Resource ACL (§4.1 layer 2). Grants are per node, so every call names a path.
+  //
+  // The listing returns direct grants only: inherited ones are already reflected in what the
+  // caller can do, and showing a whole ancestor chain would bury the two rows the owner set.
+  acl: (path: string) => call(client.GET("/api/acl/", { params: { query: { path } } })),
+  grant: (body: { path: string; subject: string; permissions: string[]; inherit?: boolean }) =>
+    call(client.POST("/api/acl/", { body: body as never })),
+  // The node path is required as well as the id: a grant must belong to the node named by
+  // `path`. Ids are unguessable, but a mistake is not, so the server checks both.
+  revokeGrant: (id: string, path: string) =>
+    call(client.DELETE("/api/acl/{id}", { params: { path: { id }, query: { path } } })),
 };
 
 // Content URLs are plain links, not fetches: the browser handles range requests, caching and

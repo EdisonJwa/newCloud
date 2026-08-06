@@ -2149,3 +2149,78 @@ dialog .foot {
   width: 90px;
   margin-top: 0;
 }
+
+/* ---------- folder access (ACL) ----------
+ *
+ * The panel is a table plus a small form, so it reuses .table and the global input styling and
+ * only adds the two layouts those do not cover: a path bar and a permission checklist. Keeping it
+ * to that is deliberate — a bespoke look here would imply the ACL screen is a different kind of
+ * place from the rest of Access, which it is not.
+ */
+.aclbar {
+	display: flex;
+	gap: 8px;
+	align-items: center;
+	margin: 12px 0;
+}
+
+.aclbar input {
+	flex: 1;
+	max-width: 420px;
+}
+
+.aclform {
+	margin-top: 18px;
+	padding-top: 16px;
+	border-top: 1px solid var(--line);
+	display: flex;
+	flex-direction: column;
+	gap: 12px;
+	max-width: 640px;
+}
+
+.aclformrow {
+	display: flex;
+	gap: 10px;
+	align-items: center;
+}
+
+.aclformrow label {
+	min-width: 84px;
+	font-size: 13px;
+	color: var(--muted);
+}
+
+.aclformrow input {
+	flex: 1;
+}
+
+.aclperms {
+	border: 0;
+	padding: 0;
+	margin: 0;
+	display: flex;
+	flex-wrap: wrap;
+	gap: 10px 16px;
+}
+
+.aclperms legend {
+	font-size: 13px;
+	color: var(--muted);
+	margin-bottom: 6px;
+	padding: 0;
+}
+
+/* The grant table shows a subject and a kind side by side, so the kind is a quiet tag rather
+ * than a column of its own. */
+.tag {
+	font-size: 11px;
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
+	color: var(--muted);
+	border: 1px solid var(--line);
+	border-radius: 4px;
+	padding: 1px 5px;
+	margin-left: 6px;
+	vertical-align: 1px;
+}

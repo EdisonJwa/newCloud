@@ -9,6 +9,7 @@ import { api, APIError } from "../api";
 import { useI18n } from "../i18n";
 import { EmptyState, ErrorState, Icon, Skeleton, useToast } from "../ui";
 import { NewPasswordDialog } from "../components/Dialogs";
+import { FolderAccess } from "../components/FolderAccess";
 import type { AppPassword, FileNode, Share } from "../types";
 
 /* ---------- shared links ---------- */
@@ -224,6 +225,8 @@ export function Access({ reloadKey }: { reloadKey: number }) {
           <p className="hintline">{t("access.webdavHint")}</p>
         </section>
       </div>
+
+      <FolderAccess />
 
       {error ? (
         <ErrorState message={error} onRetry={load} />

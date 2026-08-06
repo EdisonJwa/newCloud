@@ -28,3 +28,12 @@ export type AuditEvent = Schemas["AuditEvent"];
 export type AuditPage = Schemas["AuditPage"];
 export type AppPassword = Schemas["AppPassword"];
 export type ShareLanding = Schemas["ShareLanding"];
+export type ACLGrant = Schemas["ACLGrant"];
+// The listing wrapper is inline in openapi.yaml (path, permissions, grants) rather than a named
+// schema, so it is written here from the generated path type instead of hand-modelled: the
+// document still decides the shape, and a change there breaks this rather than drifting quietly.
+export type ACLListing = {
+  path: string;
+  permissions: string;
+  grants: ACLGrant[];
+};
