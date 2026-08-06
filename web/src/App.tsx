@@ -14,11 +14,15 @@ import { Home } from "./views/Home";
 import { Files } from "./views/Files";
 import { Access, Shared, Trash } from "./views/Simple";
 import { Activity } from "./views/Activity";
+import { AccountAdmin } from "./views/Admin";
 import { ShareLanding } from "./views/ShareLanding";
 import type { Me } from "./types";
 
-type Section = "home" | "files" | "shared" | "activity" | "trash" | "access";
+type Section = "home" | "files" | "shared" | "activity" | "trash" | "access" | "admin";
 
+// `admin` is not in this list: it is appended only for an administrator, because a nav entry
+// that always 404s is worse than no entry. The server refuses it regardless — this is
+// presentation, not the gate.
 const SECTIONS: Section[] = ["home", "files", "shared", "activity", "trash", "access"];
 const ICONS: Record<Section, string> = {
   home: "home",
@@ -27,6 +31,7 @@ const ICONS: Record<Section, string> = {
   activity: "pulse",
   trash: "trash",
   access: "key",
+  admin: "user",
 };
 
 type Theme = "auto" | "light" | "dark" | "hc";
@@ -177,8 +182,14 @@ function Shell() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
+  // The sections this caller may see. `admin` is appended for administrators only.
+  const visibleSections = useMemo<Section[]>(
+    () => (me?.role === "admin" ? [...SECTIONS, "admin" as Section] : SECTIONS),
+    [me?.role],
+  );
+
   const commands = useMemo<Command[]>(() => {
-    const list: Command[] = SECTIONS.map((s) => ({
+    const list: Command[] = visibleSections.map((s) => ({
       id: `go-${s}`,
       label: t(`palette.go${s[0]?.toUpperCase() ?? ""}${s.slice(1)}`),
       hint: t(`nav.${s}`),
@@ -213,7 +224,7 @@ function Shell() {
           </span>
 
           <nav className="nav" aria-label={t("nav.sections")}>
-            {SECTIONS.map((s) => (
+            {visibleSections.map((s) => (
               <button
                 key={s}
                 type="button"
@@ -306,6 +317,7 @@ function Shell() {
           {section === "activity" ? <Activity reloadKey={reloadKey} /> : null}
           {section === "trash" ? <Trash reloadKey={reloadKey} /> : null}
           {section === "access" ? <Access reloadKey={reloadKey} /> : null}
+          {section === "admin" ? <AccountAdmin /> : null}
         </main>
       </div>
 

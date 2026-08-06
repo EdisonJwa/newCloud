@@ -216,6 +216,16 @@ export const api = {
   revokeAppPassword: (id: string) =>
     call<void>(client.DELETE("/api/apppasswords/{id}", { params: { path: { id } } })),
 
+  // Account administration. A non-admin gets 404 from these, so the UI hides the section rather
+  // than showing an empty one — but the hiding is presentation; the server is the gate.
+  adminUsers: (params: { status?: "active" | "pending" | "disabled"; limit?: number }) =>
+    call(client.GET("/api/admin/users", { params: { query: params } })),
+  setUserStatus: (id: string, status: "active" | "pending" | "disabled") =>
+    call(client.POST("/api/admin/users/{id}/status", {
+      params: { path: { id } },
+      body: { status } as never,
+    })),
+
   // Resource ACL (§4.1 layer 2). Grants are per node, so every call names a path.
   //
   // The listing returns direct grants only: inherited ones are already reflected in what the

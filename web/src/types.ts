@@ -37,3 +37,4 @@ export type ACLListing = {
   permissions: string;
   grants: ACLGrant[];
 };
+export type AdminUser = Schemas["AdminUser"];
