@@ -21,6 +21,7 @@ import (
 	"github.com/EdisonJwa/newCloud/internal/blob"
 	"github.com/EdisonJwa/newCloud/internal/blob/local"
 	"github.com/EdisonJwa/newCloud/internal/config"
+	"github.com/EdisonJwa/newCloud/internal/metrics"
 	"github.com/EdisonJwa/newCloud/internal/server"
 	"github.com/EdisonJwa/newCloud/internal/share"
 	"github.com/EdisonJwa/newCloud/internal/storage/blobstore"
@@ -56,20 +57,33 @@ type harness struct {
 	// authz is the same authorizer the server uses, so a test can ask the question
 	// the handlers ask rather than approximating it.
 	authz *authz.Service
+	// metrics is the registry the server was given, or nil when the harness deliberately has
+	// none. Most tests run without it: /metrics is a deployment-time surface, and the branch
+	// where it is absent is itself worth testing.
+	metrics *metrics.Registry
 }
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
-	return newHarnessWith(t, nil)
+	return newHarnessTuned(t, nil, nil)
 }
 
+// newHarnessWith mutates the configuration before the server is built.
+func newHarnessWith(t *testing.T, mutate func(*config.Config)) *harness {
+	t.Helper()
+	return newHarnessTuned(t, mutate, nil)
+}
+
+// newHarnessTuned is the general form: it can change the config and the deps the server is
+// built with. Reaching the deps matters for surfaces that are optional, because "optional" and
+// "unreachable" look identical from a test that cannot turn them on.
 // newHarnessWith builds the harness with a config override applied *before* the server
 // is constructed.
 //
 // The order matters: a test that mutated the returned cfg would be mutating a copy the
 // server already captured, so the feature under test would silently stay disabled and
 // the test would prove nothing (or, worse, pass for the wrong reason).
-func newHarnessWith(t *testing.T, mutate func(*config.Config)) *harness {
+func newHarnessTuned(t *testing.T, mutate func(*config.Config), tune func(*server.Deps)) *harness {
 	t.Helper()
 
 	cfg := config.Default()
@@ -121,7 +135,7 @@ func newHarnessWith(t *testing.T, mutate func(*config.Config)) *harness {
 	t.Cleanup(uploads.Close)
 
 	authorizer := authz.NewService(&accessor{m: meta})
-	s, err := server.New(server.Deps{
+	deps := server.Deps{
 		Config: cfg, Meta: meta, Content: content,
 		Authz:   authorizer,
 		Tickets: tickets, Sessions: sessions,
@@ -131,7 +145,14 @@ func newHarnessWith(t *testing.T, mutate func(*config.Config)) *harness {
 		Uploads: uploads,
 		Log:     testLogger(t),
 		Version: "test",
-	})
+	}
+	// The hook runs after every field is set, so a test can add an optional dependency
+	// (metrics, say) without this constructor having to know about it.
+	if tune != nil {
+		tune(&deps)
+	}
+
+	s, err := server.New(deps)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,8 +160,10 @@ func newHarnessWith(t *testing.T, mutate func(*config.Config)) *harness {
 	ts := httptest.NewServer(s.Handler())
 	t.Cleanup(ts.Close)
 
-	return &harness{t: t, srv: ts, meta: meta, user: user, session: session,
+	h := &harness{t: t, srv: ts, meta: meta, user: user, session: session,
 		mailer: mailer, sessions: sessions, cfg: &cfg, authz: authorizer, uploads: uploads}
+	h.metrics = deps.Metrics
+	return h
 }
 
 // do issues an authenticated request.

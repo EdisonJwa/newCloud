@@ -15,6 +15,23 @@
 
 
 
+
+### /metrics 端到端接线（第三十二轮）
+
+"没有指标面板"这句我在遗留清单里挂了很多轮，含义模糊。打开看之后，实际情况是：**指标功能是完整实现的**——`internal/metrics` 有 11 个测试，覆盖暴露格式、重复序列、状态码归类、DAV 冲突、上传结果、队列深度、并发安全，甚至"边写边抓"；`main.go` 也真的把 registry 接进了 `server.Deps`。
+
+缺的是**从头到尾没有任何东西通过 HTTP 抓过 `/metrics`**：测试 harness 从来不传 registry。于是三条路径从未被执行过——路由注册、喂数据的那层中间件、以及"registry 为 nil 时没有这个路由"的分支。一个定义好但没挂上的抓取端点，从包自己的测试看和一个正常工作的端点**一模一样**。
+
+补上 `newHarnessTuned`（可在构建前改 `server.Deps`）与四个 HTTP 层测试后，立刻发现两处我原本会写错的地方：
+
+**一、`/metrics` 在没有 registry 时返回 200，不是 404。** 我第一版断言 404，结果红了。原因是 `r.NotFound(s.ui.ServeHTTP)`——单页应用把未注册路径交给外壳，返回 `index.html`。断言"不是指标内容"才是对的：抓取器指向一个没开指标的部署时，必须**明显失败**（content-type 是 HTML），而不是每次静默记一个解析错误或者记成零值。
+
+**二、"未知路径 404"这个测试素材本身是错的。** 我原本用 `/api/definitely-not-a-route` 制造 4xx，它同样落到外壳上返回 200，所以 4xx 计数永远为 0。改用 `/api/files/download?path=/nope/absent.txt` 才真的产生 404。
+
+**三、我的断言一度弱到接不住变异。** 第一版只检查抓取文本里含有 `status_class="4xx"`；把中间件改成"每个请求都记成 method=MUTATED"**依然通过**。改成"必须存在 method="GET"、status_class 为 2xx/4xx 且值大于 0 的序列"之后，同一个变异立刻红：`no non-zero newcloud_http_requests_total{method="GET",status_class="2xx"}`。
+
+这一轮真正学到的：**一个"断言通过了"的结果，只有在对应的变异会让它失败时才有意义。** 我连着两次写出没有牙的断言（第三次想起要跑变异），而真正的接线缺失就是这么溜过去的——11 个单元测试全绿，端点是死的。
+
 ### 账号审批界面（第三十一轮）
 
 与上一轮的 ACL 缺口同型：**JIT 供应策略会把账号创建成 `pending`，而 `pending` 账号登录不了**。审批的 API（`GET /api/admin/users?status=pending`、`POST /api/admin/users/{id}/status`）早就做完并有 8 个测试，但界面上没有任何地方能调到它。也就是说，这条策略**能把一个人放进一个只有 curl 才能解开的处境**。
@@ -1211,6 +1228,7 @@ go test ./internal/store -run 'TestPGPurgeTrash|TestPGExpireVersions'
 
 | 需求 | 现状 | 影响 |
 | --- | --- | --- |
+| 可观测性 | `/metrics` 已有**端到端**验证：路由、中间件、未知路径分支，以及"无 registry 时不暴露指标内容"（该分支返回 200 + 外壳 HTML，不是 404，测试断言的是 content-type 而非状态码）。指标本身有 11 个单元测试 | 没有随附的 Prometheus 抓取配置或告警规则；部署时需要运维自己写 scrape job |
 | ACL / 账号审批 UI | **ACL 与审批都已有界面**：Access 页管理文件夹授权；账号页有审批队列（待审批/已启用/已停用）与状态切换，导航项仅对管理员出现（服务端仍返回 404，测试覆盖）。两个 Go 测试发出与面板完全相同的请求，防止"两边读同一份规格却理解不同" | 没有指标面板 |
 | INV-08 restic 恢复 | 已实测：`blob-backup.sh` 全链路（backup/forget/prune/check）通过，`restic restore` 后 blob 的 SHA-256 与原件逐字节一致。修掉两个真问题：`--one-file-system` 在 Windows 上 panic；文档里的恢复命令会得到错误的目录布局 | 大库耗时与 40 TiB 外推仍未测；PITR 仍未演练 |
 | SHARE-06 文件删除对链接的影响 | 已明确并测试：文件进回收站后链接返回 404 而非 200 空列表；"文件已删/已吊销/从未存在"三者响应体逐字节相同（否则端点会成为令牌预言机） | 移动文件不会改变节点 id，因此链接继续有效（这是设计而非遗漏，但未单独测试）；缓存与缩略图等衍生资源未覆盖 |
