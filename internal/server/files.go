@@ -304,6 +304,16 @@ func (s *Server) publishFile(
 	etag := etagFor(res.Hash)
 	var node store.Node
 
+	// Every successful upload passes through here — the simple handler and the chunked
+	// completion alike — so the outcome is recorded once, at the point that actually decides it,
+	// rather than at each caller where one could be forgotten. Failures are counted at their own
+	// return sites because they do not share a path.
+	defer func() {
+		if s.deps.Metrics != nil && node.ID != uuid.Nil {
+			s.deps.Metrics.ObserveUpload("ok")
+		}
+	}()
+
 	err := s.deps.Meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
 		n, _, werr := tx.WriteFile(ctx, store.WriteFile{
 			NewFile: store.NewFile{

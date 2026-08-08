@@ -1,0 +1,41 @@
+# Prometheus scrape configuration for a single-host newCloud deployment.
+#
+# This is an example, not a drop-in: the target, the retention and the storage path all depend on
+# where Prometheus runs. What it gets right is the parts that are easy to get subtly wrong.
+#
+# /metrics is unauthenticated by design — a scraper has no session cookie, and the values are
+# operational counts rather than user data. That means the path must NOT be routed through the
+# public reverse proxy. The Caddyfile in this directory serves the app on 80/443 and this file
+# assumes Prometheus reaches the process over the private network instead.
+
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+  # Attach the cluster name so a rule copied between environments does not silently refer to the
+  # wrong one.
+  external_labels:
+    cluster: newcloud
+
+rule_files:
+  - alerts.yml
+
+scrape_configs:
+  - job_name: newcloud
+    # The binary serves /metrics on the same listener as everything else, so this is the
+    # application port, not a sidecar. Bind newcloud to a private interface and scrape that.
+    static_configs:
+      - targets: ["newcloud.internal:8080"]
+        labels:
+          service: newcloud
+    metrics_path: /metrics
+    # The exposition is a few hundred bytes of counters; anything approaching the default 10s
+    # timeout means the process is wedged, not that the scrape is slow.
+    scrape_timeout: 5s
+
+    # A deployment without a registry answers /metrics with the application shell (200, HTML)
+    # rather than 404, because the router hands unknown paths to the SPA. Prometheus will report
+    # that as a scrape failure with a confusing "text/html" complaint — which is the right
+    # outcome, but the metric is worth naming here so the operator recognises it:
+    #
+    #   up{job="newcloud"} == 0  with  "expected text/plain"
+    #   -> the process is running but was started without a metrics registry.

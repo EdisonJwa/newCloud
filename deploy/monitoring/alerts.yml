@@ -1,0 +1,179 @@
+# Prometheus alerting rules for newCloud.
+#
+# Every rule here is derived from a metric this server actually publishes — see
+# internal/metrics/metrics.go for the full list and internal/server/metricsroute_test.go for the
+# proof that the route is wired. A rule naming a metric that does not exist is worse than no rule:
+# it sits in "pending" forever, looks like coverage on a dashboard, and never fires.
+#
+# Thresholds are starting points, not truths. Every one of them needs a fortnight of real traffic
+# before it is worth trusting, and the comment on each says what would make it tune.
+#
+# Load with:
+#   prometheus --config.file=prometheus.yml   (see prometheus.example.yml)
+#   promtool check rules alerts.yml
+
+groups:
+  - name: newcloud-availability
+    interval: 30s
+    rules:
+      # The server is up if the scrape succeeds. This is the only rule that should page
+      # unconditionally: everything else is a degraded state somebody can look at in the morning.
+      - alert: NewCloudDown
+        expr: up{job="newcloud"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "newCloud target {{ $labels.instance }} is not answering scrapes"
+          description: >-
+            The exporter has been unreachable for 2 minutes. Check the process, then the
+            database: a server whose database is gone will fail startup and never bind.
+          runbook: "deploy/monitoring/runbook.md#newclouddown"
+
+      # 5xx means we broke, not that the caller did. 4xx is deliberately excluded: a burst of
+      # 404s is someone probing paths, which is noisy but not an outage.
+      - alert: NewCloudErrorRate
+        expr: >-
+          sum(rate(newcloud_http_requests_total{status_class="5xx"}[5m]))
+          /
+          clamp_min(sum(rate(newcloud_http_requests_total[5m])), 0.001)
+          > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "more than 5% of requests are failing with 5xx"
+          description: >-
+            Sustained for 10 minutes across {{ $value | humanizePercentage }} of traffic.
+            A single 5xx is normal; a sustained fraction is a bug or a dependency.
+            If the failures are all on one route, the route is the place to look.
+          runbook: "deploy/monitoring/runbook.md#error-rate"
+
+      # The database being down shows up here rather than as a clean "down", because the process
+      # stays alive and answers /healthz while every query fails.
+      - alert: NewCloudDatabaseDegraded
+        expr: >-
+          sum(rate(newcloud_http_requests_total{status_class="5xx"}[5m])) > 0.05
+          and on()
+          up{job="newcloud"} == 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "the server is up but failing requests"
+          description: >-
+            The process answers scrapes while producing 5xx. That pattern is almost always the
+            database: check /readyz, then the connection pool.
+          runbook: "deploy/monitoring/runbook.md#database-degraded"
+
+  - name: newcloud-integrity
+    interval: 30s
+    rules:
+      # The audit chain is the product's integrity claim. If the head stops advancing, either
+      # nothing is happening (fine, in a quiet deployment) or writes are being lost (not fine).
+      # The age gauge distinguishes those: it grows when no new event lands.
+      - alert: NewCloudAuditChainStalled
+        expr: newcloud_audit_chain_head_age_seconds > 3600
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "no audit event has been written for over an hour"
+          description: >-
+            The newest event in the hash chain is {{ $value | humanizeDuration }} old. Either the
+            deployment is genuinely idle, or audit writes are failing and being swallowed — which
+            is the fail-closed path in deploy/audit-failure-policy.md. Check the logs for
+            "audit" before dismissing this as a quiet night.
+          runbook: "deploy/monitoring/runbook.md#audit-stalled"
+
+      - alert: NewCloudAuditVerificationFailed
+        expr: increase(newcloud_audit_anchor_verify_total{result="failed"}[15m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "the audit anchor verification failed"
+          description: >-
+            A periodic check found the audit chain does not match its anchor. This is the signal
+            the whole audit design exists to produce. Do not restart anything: capture the
+            evidence first, then follow the runbook.
+          runbook: "deploy/monitoring/runbook.md#audit-verify-failed"
+
+      # GC errors mean blobs were supposed to be removed and were not. Disk fills up quietly.
+      - alert: NewCloudBlobGCErrors
+        expr: increase(newcloud_blob_gc_errors_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "blob garbage collection reported errors"
+          description: >-
+            {{ $value }} failures in the last hour. Reclaimed space will be lower than expected;
+            check the storage backend and permissions before assuming the metrics are wrong.
+          runbook: "deploy/monitoring/runbook.md#blob-gc"
+
+  - name: newcloud-backlog
+    interval: 30s
+    rules:
+      # A failed job is not retried forever: it sits in the failed state until someone looks.
+      - alert: NewCloudJobsFailing
+        expr: newcloud_jobs{state="failed"} > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} background jobs are in the failed state"
+          description: >-
+            Failed jobs are terminal; they do not retry. Whatever they were doing is not happening.
+            The queue is inspectable in the database, and the drill covers it, so the cause is
+            recoverable — but nothing will change on its own.
+          runbook: "deploy/monitoring/runbook.md#jobs"
+
+      - alert: NewCloudJobBacklogGrowing
+        expr: newcloud_jobs{state="pending"} > 1000
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "background queue is backing up ({{ $value }} pending)"
+          description: >-
+            The drain rate is not keeping up with arrival. Either the worker is not running, or one
+            class of job became slow. Note that this is a count, not a rate: a backlog that is
+            large but shrinking is fine, which is why the alert waits 30 minutes.
+          runbook: "deploy/monitoring/runbook.md#jobs"
+
+      - alert: NewCloudUploadsFailing
+        expr: >-
+          sum(rate(newcloud_uploads_total{result!="ok"}[10m]))
+          /
+          clamp_min(sum(rate(newcloud_uploads_total[10m])), 0.001)
+          > 0.2
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "more than 20% of uploads are failing"
+          description: >-
+            Upload failure usually means storage rather than the client: a full disk, an
+            unreachable S3 endpoint, or a quota being hit. Check
+            newcloud_blob_gc_errors_total alongside this before blaming the network.
+          runbook: "deploy/monitoring/runbook.md#uploads"
+
+  - name: newcloud-clients
+    interval: 30s
+    rules:
+      # A high conflict rate is not an error, but it is a signal: either a client is polling
+      # badly, or multiple clients are editing the same tree.
+      - alert: NewCloudDAVConflictsHigh
+        expr: >-
+          sum(rate(newcloud_dav_conflicts_total[15m]))
+          /
+          clamp_min(sum(rate(newcloud_dav_requests_total[15m])), 0.001)
+          > 0.1
+        for: 30m
+        labels:
+          severity: info
+        annotations:
+          summary: "over 10% of WebDAV requests are conflicting"
+          description: >-
+            Locks and stale etags, not failures. Worth knowing because the usual cause is one
+            badly-behaved client, and the fix is at that client rather than here.
+          runbook: "deploy/monitoring/runbook.md#dav-conflicts"

@@ -16,6 +16,23 @@
 
 
 
+
+### 告警规则、运行手册，与三个"永远为 0"的指标（第三十三轮）
+
+上一轮把 `/metrics` 端到端跑通之后，剩下的缺口是"没有随附的抓取配置或告警规则"。这一轮补上 `deploy/monitoring/`（`alerts.yml`、`prometheus.example.yml`、`runbook.md`），装了 promtool 校验——**然后在写规则的过程中发现三个指标从来没被生产代码写过**。
+
+`ObserveUpload`、`ObserveThumbnail`、`ObserveBlobGC` 只在 `internal/metrics/metrics_test.go` 里被调用过。也就是说这三个家族的序列**格式完全正确、永远为 0**：11 个单元测试全绿，我照着它们写的告警规则永远不会触发。
+
+一个没人写入的指标，和一个健康的指标**从外部看完全一样**——而且比缺失的指标更糟，因为它看起来像覆盖。
+
+**补上接线**，每处都选在事件真正发生的那一个点：`publishFile` 里用 `defer`（简单上传与分块完成两条路径共用它，所以记一次而不是每个调用者各记一次，也就不会漏）；`writeUploadError` 里按错误类型分类（409 是"续传"，不是失败，混进失败率会让正常客户端看起来坏了）；缩略图在每个返回点分类（"不是图片"不是失败——一整个 PDF 目录否则看起来像渲染器坏了）；GC 在 `sweepBlobs` 的调用点，成功和失败都记（只记成功会让错误计数器永久为 0，那条告警就成了死的）。
+
+**新增 `TestEveryMetricFamilyIsFedByProductionCode`**：从 `metrics.go` 自己解析出所有变更方法，再检查 `internal/metrics` 之外、`_test.go` 之外的代码是否有调用点。删掉 `ObserveThumbnail` 的接线立刻红：`1 metric method(s) are never called outside the metrics package and its tests: ObserveThumbnail`。
+
+**新增 `TestAlertRulesNameOnlyMetricsThatExist`**：从活着的 harness 抓一份真实暴露文本，然后校验三件事——规则里的每个指标名都在暴露里、每个 label 选择器的值都真实存在、每个 `runbook.md#anchor` 都对应一个真实章节。三种都实测能让它变红。
+
+**一个过程上的自我纠正**：这个测试第一次红在 `status_class="5xx"`，因为我的 harness 根本没产生过 5xx ——**测试是对的，缺的是素材**。补上 `ObserveRequest(200/404/500)` 才通过。promtool 只校验规则**语法**，这三个问题一个都盖不到。
+
 ### /metrics 端到端接线（第三十二轮）
 
 "没有指标面板"这句我在遗留清单里挂了很多轮，含义模糊。打开看之后，实际情况是：**指标功能是完整实现的**——`internal/metrics` 有 11 个测试，覆盖暴露格式、重复序列、状态码归类、DAV 冲突、上传结果、队列深度、并发安全，甚至"边写边抓"；`main.go` 也真的把 registry 接进了 `server.Deps`。
@@ -1228,7 +1245,7 @@ go test ./internal/store -run 'TestPGPurgeTrash|TestPGExpireVersions'
 
 | 需求 | 现状 | 影响 |
 | --- | --- | --- |
-| 可观测性 | `/metrics` 已有**端到端**验证：路由、中间件、未知路径分支，以及"无 registry 时不暴露指标内容"（该分支返回 200 + 外壳 HTML，不是 404，测试断言的是 content-type 而非状态码）。指标本身有 11 个单元测试 | 没有随附的 Prometheus 抓取配置或告警规则；部署时需要运维自己写 scrape job |
+| 可观测性 | `/metrics` 端到端验证过（路由/中间件/标签）；**告警规则与运行手册已随附**（`deploy/monitoring/`：10 条规则、抓取配置、9 个 runbook 章节），`promtool` 校验通过。三个"从未被写入"的指标（上传、缩略图、GC）已接线，并有结构性测试防止再出现——没人写入的指标格式正确却永远为 0，看起来和健康指标一样 | 阈值是起始值而非实测结论，需要两周真实流量后再调；没有随附 Grafana 面板 |
 | ACL / 账号审批 UI | **ACL 与审批都已有界面**：Access 页管理文件夹授权；账号页有审批队列（待审批/已启用/已停用）与状态切换，导航项仅对管理员出现（服务端仍返回 404，测试覆盖）。两个 Go 测试发出与面板完全相同的请求，防止"两边读同一份规格却理解不同" | 没有指标面板 |
 | INV-08 restic 恢复 | 已实测：`blob-backup.sh` 全链路（backup/forget/prune/check）通过，`restic restore` 后 blob 的 SHA-256 与原件逐字节一致。修掉两个真问题：`--one-file-system` 在 Windows 上 panic；文档里的恢复命令会得到错误的目录布局 | 大库耗时与 40 TiB 外推仍未测；PITR 仍未演练 |
 | SHARE-06 文件删除对链接的影响 | 已明确并测试：文件进回收站后链接返回 404 而非 200 空列表；"文件已删/已吊销/从未存在"三者响应体逐字节相同（否则端点会成为令牌预言机） | 移动文件不会改变节点 id，因此链接继续有效（这是设计而非遗漏，但未单独测试）；缓存与缩略图等衍生资源未覆盖 |

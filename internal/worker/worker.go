@@ -154,7 +154,15 @@ func (w *Worker) Run(ctx context.Context) {
 				w.log.Info("expired download sessions", "count", n)
 			}
 		case <-sweeps.C:
-			if n, err := w.SweepBlobs(ctx); err != nil {
+			n, err := w.SweepBlobs(ctx)
+			// The collector is the only thing that reclaims disk, so both its successes and its
+			// failures are worth publishing: a run that deletes nothing is normal, a run that
+			// errors means space is being held that should have been freed. Recording only
+			// successes would make the error counter permanently zero and the alert on it dead.
+			if w.metrics != nil {
+				w.metrics.ObserveBlobGC(n, err != nil)
+			}
+			if err != nil {
 				w.log.Error("blob sweep failed", "error", err)
 			} else if n > 0 {
 				w.log.Info("collected orphaned blobs", "count", n)

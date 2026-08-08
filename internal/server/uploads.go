@@ -188,8 +188,26 @@ func (s *Server) handleUploadAbort(w http.ResponseWriter, r *http.Request) {
 }
 
 // writeUploadError maps the package's errors onto the status codes the client branches on.
+//
+// Every upload failure goes through here, which is why the metric is recorded here rather than at
+// each caller: one place to instrument, and no caller can forget. A 409 is counted separately from
+// a real failure — resuming is how chunked uploads are supposed to work, and folding it into the
+// failure rate would make a healthy client look broken.
 func (s *Server) writeUploadError(w http.ResponseWriter, err error) {
 	var conflict *upload.ConflictError
+	if s.deps.Metrics != nil {
+		switch {
+		case errors.As(err, &conflict):
+			s.deps.Metrics.ObserveUpload("conflict")
+		case errors.Is(err, upload.ErrNotFound):
+			s.deps.Metrics.ObserveUpload("session_gone")
+		case errors.Is(err, upload.ErrTooMany):
+			s.deps.Metrics.ObserveUpload("too_many")
+		default:
+			s.deps.Metrics.ObserveUpload("failed")
+		}
+	}
+
 	switch {
 	case errors.As(err, &conflict):
 		// 409 with the true offset: the client resumes from here instead of restarting.

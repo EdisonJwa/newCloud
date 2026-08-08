@@ -35,6 +35,10 @@ func (s *Server) handleThumbnail(w http.ResponseWriter, r *http.Request) {
 	actor, _ := actorFrom(r.Context())
 	rel := r.URL.Query().Get("path")
 
+	// Thumbnails are classified by the outcome the caller sees, and "not an image" is not a
+	// failure: a directory full of PDFs would otherwise look like a broken renderer. The
+	// classification happens at each return rather than from a wrapped ResponseWriter, because
+	// the router already installs one and nesting them makes Flush fragile.
 	nodes, err := s.deps.Meta.Resolve(r.Context(), actor.ID(), rel)
 	if err != nil {
 		s.writeStoreError(w, err)
@@ -42,6 +46,7 @@ func (s *Server) handleThumbnail(w http.ResponseWriter, r *http.Request) {
 	}
 	node := nodes[len(nodes)-1]
 	if node.IsDir() {
+		s.observeThumbnail("not_an_image")
 		writeError(w, http.StatusBadRequest, "is_directory", "a directory has no thumbnail")
 		return
 	}
@@ -60,6 +65,7 @@ func (s *Server) handleThumbnail(w http.ResponseWriter, r *http.Request) {
 	// Refuse early when the stored type says this is not an image, so a request for a PDF
 	// does not open and read it.
 	if kind := previewKindForNode(node.Name, node.Mime); kind != previewImage {
+		s.observeThumbnail("not_an_image")
 		writeError(w, http.StatusUnsupportedMediaType, "not_an_image",
 			"this file has no thumbnail")
 		return
@@ -113,16 +119,28 @@ func (s *Server) handleThumbnail(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", "inline")
 
 	if match := r.Header.Get("If-None-Match"); match != "" && etagMatchesList(match, w.Header().Get("ETag")) {
+		// A cache hit is still a working thumbnail, so it counts as success rather than as a
+		// distinct outcome: the client got what it asked for.
+		s.observeThumbnail("ok")
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
 
 	// HEAD must not write a body, but the headers above are still useful.
 	if r.Method == http.MethodHead {
+		s.observeThumbnail("ok")
 		w.WriteHeader(http.StatusOK)
 		return
 	}
+	s.observeThumbnail("ok")
 	_, _ = w.Write(png)
+}
+
+// observeThumbnail records a thumbnail outcome when metrics are configured.
+func (s *Server) observeThumbnail(result string) {
+	if s.deps.Metrics != nil {
+		s.deps.Metrics.ObserveThumbnail(result)
+	}
 }
 
 // hex8 renders the first four bytes of a hash, enough to be unique per file and short
