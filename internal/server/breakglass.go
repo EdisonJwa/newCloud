@@ -132,6 +132,14 @@ func (s *Server) handleBreakglassLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// §3.3 requires "使用后告警" — an alert after use. An audit row cannot be alerted on from a
+	// scrape, so success is counted here at the same moment the session is created. The kind is
+	// separate from the denial kinds so one rule can page on use and another can watch for a burst
+	// of failed attempts.
+	if s.deps.Metrics != nil {
+		s.deps.Metrics.ObserveAuth("breakglass_ok")
+	}
+
 	token, err := s.deps.Sessions.Mint(r.Context(), user.ID, user.Email, clientIP(r), r.UserAgent())
 	if err != nil {
 		s.deps.Log.Error("break-glass session mint failed", "error", err)
@@ -212,6 +220,11 @@ func (s *Server) verifyBreakglassPassword(secret string) (bool, error) {
 // Best-effort: an audit failure must not turn a refused login into a 500, and a
 // successful login is already recorded inside the provisioning transaction.
 func (s *Server) auditBreakglass(r *http.Request, username, reason string) {
+	// A refused attempt is the signal that someone is trying the local administrator — a
+	// different alert from "it was used successfully", and worth watching on its own.
+	if s.deps.Metrics != nil {
+		s.deps.Metrics.ObserveAuth("breakglass_denied")
+	}
 	_ = s.deps.Meta.WithTx(context.WithoutCancel(r.Context()), func(ctx context.Context, tx store.Tx) error {
 		return tx.Audit(ctx, store.AuditEntry{
 			ActorKind: "anonymous", ActorEmail: username,

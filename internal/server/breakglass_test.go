@@ -13,6 +13,7 @@ import (
 	"github.com/EdisonJwa/newCloud/internal/authz"
 	"github.com/EdisonJwa/newCloud/internal/config"
 	"github.com/EdisonJwa/newCloud/internal/password"
+	"github.com/EdisonJwa/newCloud/internal/server"
 	"github.com/EdisonJwa/newCloud/internal/store"
 )
 
@@ -24,6 +25,12 @@ import (
 
 // breakglassHarness wires a server with the local admin enabled.
 func breakglassHarness(t *testing.T, allowedCIDRs []string) (*harness, string) {
+	t.Helper()
+	return breakglassHarnessTuned(t, allowedCIDRs, nil)
+}
+
+// breakglassHarnessTuned additionally tunes the deps, so a test can attach a metrics registry.
+func breakglassHarnessTuned(t *testing.T, allowedCIDRs []string, tune func(*server.Deps)) (*harness, string) {
 	t.Helper()
 
 	// Write a real Argon2 hash with the production parameters, because the server
@@ -43,12 +50,12 @@ func breakglassHarness(t *testing.T, allowedCIDRs []string) (*harness, string) {
 
 	// The override is applied before the server is built: mutating a harness field
 	// afterwards would change a copy the server has already captured.
-	h := newHarnessWith(t, func(c *config.Config) {
+	h := newHarnessTuned(t, func(c *config.Config) {
 		c.Auth.AllowLocalAdmin = true
 		c.Auth.LocalAdmin = config.LocalAdminConfig{
 			Username: "breakglass-admin", PasswordFile: path, AllowedCIDRs: allowedCIDRs,
 		}
-	})
+	}, tune)
 	return h, path
 }
 

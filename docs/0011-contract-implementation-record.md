@@ -17,6 +17,28 @@
 
 
 
+### §3.3 break-glass 的"使用后告警"（第三十六轮）
+
+遗留清单里 `§3.3 break-glass 的运维面` 那条写着"无 UI"。**先去看需求，再动手**——结果这一条的判断是错的，而且错在两个方向：
+
+需求原文是"强认证、凭据离线保管、**使用后告警**、强制审计、定期恢复演练"。其中"使用后告警"**根本没有实现**：登录成功会写一条 `auth.breakglass.used` 审计记录，被拒绝会写 `auth.breakglass.denied`——但**没有任何东西能对审计表告警**，因为抓取器读的是 `/metrics`，不是数据库。那个要求当时的满足方式是"有人去看日志"，这不是告警。
+
+而"无 UI"本身是**不该做**的：break-glass 是 IdP 挂掉时的恢复入口，给它一个网页界面只会扩大暴露面，与需求里"对公开网络暴露制定独立决策"相悖。所以这一条诊断错了。
+
+**做对的事**：给 registry 加一个按 kind 标注的计数器 `newcloud_auth_events_total`，在 break-glass 的成功与失败两个点各自记录，再配两条规则：
+
+| 规则 | 表达式 | 严重度 |
+| --- | --- | --- |
+| `NewCloudBreakglassUsed` | `increase(...{kind="breakglass_ok"}[5m]) > 0` | critical —— 首次使用就告警，"没人声明的使用"正是这条规则存在的理由 |
+| `NewCloudBreakglassAttemptsFailing` | `increase(...{kind="breakglass_denied"}[15m]) > 5` | warning —— 密码输错很常见，成批才值得看 |
+
+两个 kind 必须分开：合在一起会让"有人被用了"这条永远无法排期，因为"有人在猜"会经常触发。
+
+**测试发现了一个真问题**：`TestAlertRulesNameOnlyMetricsThatExist`（第三十三轮写的守卫）立刻红了，报"规则选了 `kind="breakglass_ok"` 但服务器从来没发出这个值"。它是对的——带标签的计数器只在该标签被观测过之后才存在于暴露里，而我的测试 fixture 从没触发过 break-glass。守卫和以前的自己打了一架，然后我补了 fixture。**这正是那个守卫该做的事。**
+
+`promtool check rules`：12 条规则通过。runbook 新增 `## breakglass` 章节，包含"who/from where"的 SQL、以及"检查它**没有**做什么"——break-glass 刻意不是超级用户，如果审计显示它读取了用户内容，那是权限 bug 而不是凭据事件。
+
+
 ### 遗留清单自身的失效（第三十四/三十五轮）
 
 这一轮开场跑基线，发现**四项测试红了**。查下去不是代码问题：Docker Desktop 整个没在运行，PostgreSQL 容器连不上。启动引擎、拉起源码后 638 个测试全绿。记一笔是因为"基线红"和"代码坏了"是两件事，混为一谈会去改没有坏的东西。
@@ -1281,7 +1303,7 @@ go test ./internal/store -run 'TestPGPurgeTrash|TestPGExpireVersions'
 | §5.3 锁的跨接口语义 | **API 与 DAV 共用同一套深度规则**：目标自身锁 / `Depth: 0` 父锁（成员关系）/ `Depth: infinity` 祖先锁（内容）三者在两侧都实现，均返回 423 且需提交 token；锁到期由 worker 每分钟清扫 | `COPY` 不复制锁（RFC 4918 也不要求），跨账号移动的锁语义未单独测试 |
 | §4.1 ACL 的**界面** | API 完整，**且已有界面**（Access 页的 `FolderAccess`，见下文第三十轮） | 前端的授权操作只覆盖"按路径管理单个目录"；没有跨全账号的授权总览视图（服务端也不提供，这是设计） |
 | §4.2 授权原语粒度 | `read`/`download`、`create`/`overwrite`、`rename` 均已拆开并在对应操作上检查；递归操作检查子树；MOVE 需源 `delete` | 8 处 WebDAV 父目录/LOCK 检查仍用复合 `PermWrite` —— 这是决定，因为一次 PUT 就是"创建或覆盖"的二选一 |
-| §3.3 break-glass 的**运维面** | 登录、网段限制、审计、轮换、CLI 生成哈希均已实现 | 无 UI；`readSecretLine` 不做终端免回显（文档注明从管道读） |
+| §3.3 break-glass 的**运维面** | 登录、网段限制、审计、轮换、CLI 生成哈希均已实现；**"使用后告警"已实现**：`newcloud_auth_events_total{kind}` 记录成功与失败两种事件，配两条告警规则（使用即 critical、15 分钟内失败 >5 才 warning），runbook 有调查步骤 | **刻意没有 UI**：恢复入口的网页界面只会扩大暴露面，与需求"对公开网络暴露制定独立决策"相悖；`readSecretLine` 不做终端免回显（文档注明从管道读） |
 
 | ID-04 JIT 的**界面** | 三种模式 + 域名白名单 + 批准 API（`/api/admin/users`） | 没有界面：批准目前通过 API 完成 |
 | ID-06 群组变更的主动同步 | 降权在**下次登录**时生效（T-02 已验证该路径） | 没有 IdP 事件源或定期轮询，所以"移出组"到"权限消失"之间有一次登录的间隔 |

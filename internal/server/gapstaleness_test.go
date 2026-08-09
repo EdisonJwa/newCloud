@@ -48,7 +48,7 @@ func TestGapTableDoesNotClaimClosedGapsAreOpen(t *testing.T) {
 		{
 			because:  "前端未接入",
 			artefact: "web/src/components/FolderAccess.tsx",
-			row:      "§4.1 ACL 的界面",
+			row:      "§4.1 ACL",
 		},
 		{
 			because:  "没有 UI",
@@ -58,12 +58,12 @@ func TestGapTableDoesNotClaimClosedGapsAreOpen(t *testing.T) {
 		{
 			because:  "没有随附的 Grafana 面板或告警规则",
 			artefact: "deploy/monitoring/alerts.yml",
-			row:      "§11.1 指标的图表",
+			row:      "§11.1 指标",
 		},
 		{
 			because:  "restic 在当前环境没有安装",
 			artefact: "deploy/backup/blob-backup.sh",
-			row:      "INV-08 restic 恢复",
+			row:      "INV-08 restic",
 		},
 	}
 
@@ -84,6 +84,8 @@ func TestGapTableDoesNotClaimClosedGapsAreOpen(t *testing.T) {
 	}
 	table := strings.Join(tableRows, "\n")
 
+	_ = table
+
 	for _, c := range claims {
 		target := filepath.Join(root, filepath.FromSlash(c.artefact))
 		_, statErr := os.Stat(target)
@@ -91,14 +93,45 @@ func TestGapTableDoesNotClaimClosedGapsAreOpen(t *testing.T) {
 		if !exists {
 			continue
 		}
-		// The artefact is there. If a table row still says it is not, that row is stale.
-		if strings.Contains(table, c.because) {
-			t.Fatalf("the gap table still says %q (row: %s), but %s exists.\n\n"+
+		// The artefact is there. If *the row that makes the claim* still says it is not, that row
+		// is stale.
+		//
+		// Matched per row rather than across the whole table: another row can legitimately contain
+		// the same words. The break-glass row says "刻意没有 UI" — a deliberate absence, which is
+		// the opposite of a stale claim — and a document-wide match reported that as the ACL row
+		// being out of date. Scoping to the row named in the claim is what makes this precise.
+		rowText, ok := gapRow(doc, c.row)
+		if !ok {
+			t.Fatalf("the gap table has no row named %q (the claim about %q cannot be checked).\n\n"+
+				"Renaming a row means updating this list, which is intentional: the list is the "+
+				"record of what has been verified.", c.row, c.artefact)
+		}
+		if strings.Contains(rowText, c.because) {
+			t.Fatalf("the gap row %q still says %q, but %s exists.\n\n"+
 				"Update that row: a status document whose \"not done\" column is stale sends the "+
 				"next person to rebuild something that already works.",
-				c.because, c.row, c.artefact)
+				c.row, c.because, c.artefact)
 		}
 	}
+}
+
+// gapRow returns the table row whose requirement cell is exactly name.
+func gapRow(doc, name string) (string, bool) {
+	for _, line := range strings.Split(doc, "\n") {
+		if !strings.HasPrefix(line, "|") {
+			continue
+		}
+		cells := strings.Split(line, "|")
+		if len(cells) < 2 {
+			continue
+		}
+		// Matched by containment, not equality: the requirement cell carries markdown emphasis
+		// (**界面**) and the claim list should not have to reproduce that exactly.
+		if strings.Contains(strings.TrimSpace(cells[1]), name) {
+			return line, true
+		}
+	}
+	return "", false
 }
 
 // TestGapTableRowsAreWellFormed checks the table's shape rather than its content.

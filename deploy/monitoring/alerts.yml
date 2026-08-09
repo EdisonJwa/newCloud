@@ -177,3 +177,39 @@ groups:
             Locks and stale etags, not failures. Worth knowing because the usual cause is one
             badly-behaved client, and the fix is at that client rather than here.
           runbook: "deploy/monitoring/runbook.md#dav-conflicts"
+  - name: newcloud-security
+    interval: 30s
+    rules:
+      # §3.3 requires "使用后告警" — an alert when the local administrator is used.
+      #
+      # This is the one rule here that should reach a human quickly: break-glass exists for
+      # IdP-down recovery, and legitimate use is rare and planned. Use that nobody announced is
+      # the thing this alert is for, so it fires on the first event rather than on a rate.
+      - alert: NewCloudBreakglassUsed
+        expr: increase(newcloud_auth_events_total{kind="breakglass_ok"}[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "the break-glass local administrator was used"
+          description: >-
+            A local administrator signed in at {{ $labels.instance }}. This bypasses the IdP
+            entirely, so it is either a planned recovery or somebody using a credential that
+            should not be in play. Confirm who, then confirm why. The audit log has the source
+            address and user agent for this event (action auth.breakglass.used).
+          runbook: "deploy/monitoring/runbook.md#breakglass"
+
+      # Failures are not page-worthy on their own — a wrong password happens — but a burst is
+      # someone working through guesses against the one account that does not need the IdP.
+      - alert: NewCloudBreakglassAttemptsFailing
+        expr: increase(newcloud_auth_events_total{kind="breakglass_denied"}[15m]) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "repeated failed break-glass attempts ({{ $value }} in 15m)"
+          description: >-
+            Someone is trying the local administrator repeatedly. Check whether the credential
+            needs rotating, and whether the allowed source network is as tight as intended —
+            auth.breakglass.denied rows carry the reason (network_denied, bad_password,
+            unknown_user).
+          runbook: "deploy/monitoring/runbook.md#breakglass"

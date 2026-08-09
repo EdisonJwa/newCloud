@@ -59,6 +59,15 @@ type Registry struct {
 	blobsDeleted atomic.Uint64
 	blobsGCError atomic.Uint64
 
+	// Authentication events that an operator must be able to alert on, keyed by kind.
+	//
+	// Break-glass use is the motivating case: §3.3 requires "使用后告警" — an alert when the local
+	// administrator is used — and an audit row cannot be alerted on from a scrape. Without a
+	// counter the requirement is satisfiable only by someone reading the log, which is not an
+	// alert. The kind is a label rather than a separate counter per event so adding one is a
+	// string at the call site, not a new field and a new exposition block.
+	authEvents sync.Map // map[string]*atomic.Uint64
+
 	// Queue depth, refreshed by the worker on each poll.
 	jobsPending atomic.Int64
 	jobsRunning atomic.Int64
@@ -100,6 +109,15 @@ func (r *Registry) ObserveUpload(result string) {
 // ObserveThumbnail records a thumbnail outcome.
 func (r *Registry) ObserveThumbnail(result string) {
 	counter(&r.thumbnails, result).Add(1)
+}
+
+// ObserveAuth records a security-relevant authentication event, keyed by kind.
+//
+// The kinds are deliberately a small closed set — "breakglass_ok", "breakglass_denied",
+// "login_denied" — because this is an alerting signal, not an analytics feed: a label whose values
+// proliferate makes every alert rule that matches on it fragile.
+func (r *Registry) ObserveAuth(kind string) {
+	counter(&r.authEvents, kind).Add(1)
 }
 
 // SetAudit reports the chain's length and the age of its head.
@@ -200,6 +218,13 @@ func (r *Registry) write(w http.ResponseWriter) {
 	fmt.Fprintf(w, "newcloud_jobs{state=\"pending\"} %d\n", r.jobsPending.Load())
 	fmt.Fprintf(w, "newcloud_jobs{state=\"running\"} %d\n", r.jobsRunning.Load())
 	fmt.Fprintf(w, "newcloud_jobs{state=\"failed\"} %d\n", r.jobsFailed.Load())
+
+	fmt.Fprintln(w, "# HELP newcloud_auth_events_total Authentication events by kind.")
+	fmt.Fprintln(w, "# TYPE newcloud_auth_events_total counter")
+	r.authEvents.Range(func(k, v any) bool {
+		fmt.Fprintf(w, "newcloud_auth_events_total{kind=%q} %d\n", k.(string), v.(*atomic.Uint64).Load())
+		return true
+	})
 
 	fmt.Fprintln(w, "# HELP newcloud_audit_events Events in the audit chain.")
 	fmt.Fprintln(w, "# TYPE newcloud_audit_events gauge")

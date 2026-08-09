@@ -52,6 +52,12 @@ func TestAlertRulesNameOnlyMetricsThatExist(t *testing.T) {
 	for _, class := range []int{200, 404, 500} {
 		h.metrics.ObserveRequest("GET", class, false)
 	}
+	// The auth kinds are the same shape as the request classes: a label value exists in the
+	// exposition only after that kind has been observed. Both kinds the alert rules name must be
+	// present here, or the guard reports a metric the server "never publishes" — which it did the
+	// first time this ran after the break-glass rules were added.
+	h.metrics.ObserveAuth("breakglass_ok")
+	h.metrics.ObserveAuth("breakglass_denied")
 
 	resp, err := http.Get(h.srv.URL + "/metrics")
 	if err != nil {

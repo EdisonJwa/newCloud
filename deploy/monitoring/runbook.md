@@ -146,3 +146,45 @@ Not an outage. This is information.
    per-caller pattern is in the audit log, not in the metrics.
 2. Two clients editing the same tree is the other common cause, and the fix is organisational.
 3. Nothing here needs action at the server. The alert is at `severity: info` for that reason.
+## breakglass
+
+`newcloud_auth_events_total{kind="breakglass_ok"}` increased, or
+`{kind="breakglass_denied"}` increased more than 5 times in 15 minutes.
+
+Break-glass is the local administrator that works when the IdP does not (§3.3). It exists so a
+deployment can be recovered during an outage, which also makes it the credential an attacker most
+wants: it bypasses the IdP entirely and cannot be revoked there.
+
+**Use is expected to be rare and planned.** Investigate immediately — this is the one alert here
+that is worth waking someone for.
+
+1. Identify who and from where. The audit log has both:
+   ```sql
+   SELECT created_at, actor_email, actor_ip, user_agent, metadata
+     FROM audit.events
+    WHERE action = 'auth.breakglass.used'
+    ORDER BY created_at DESC LIMIT 20;
+   ```
+2. Confirm it against the change record. If nobody claims it, treat the credential as compromised:
+   rotate the password file, restart the service, and audit everything the account did afterwards
+   (`actor_email = 'breakglass'`).
+3. **Check what it did not do.** Break-glass is deliberately *not* a superuser (§3.3): it has
+   recovery and configuration rights but no implicit read access to other users' private files. If
+   the audit shows it reading user content, that is a privilege bug, not a credential incident, and
+   is worth its own report.
+
+For a burst of `breakglass_denied`:
+
+1. The `metadata.reason` field separates the cases — `network_denied` means the caller was outside
+   the allowed range (which is the control working), `bad_password` means someone knew the account
+   name.
+2. Repeated `bad_password` from one address is a guessing attempt. Confirm the source network
+   restriction is as tight as intended before rotating the password, because rotating it will not
+   stop the attempts.
+
+## What is deliberately not alerted
+
+- **A single `breakglass_denied`.** Wrong passwords happen and the account is rate-limited by the
+  network restriction. Only a burst is worth waking someone.
+- **Per-user login failure rate.** It would be high-cardinality and the signal is mostly expired
+  sessions. The audit log answers the question when it is actually asked.
