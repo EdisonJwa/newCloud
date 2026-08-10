@@ -61,6 +61,32 @@ type harness struct {
 	// none. Most tests run without it: /metrics is a deployment-time surface, and the branch
 	// where it is absent is itself worth testing.
 	metrics *metrics.Registry
+	// blobRoot is the local content-addressed root, read by tests that reason about what a backup
+	// copy of the blob tree would contain.
+	blobRoot string
+}
+
+// rootNode returns the harness account's root directory.
+func (h *harness) rootNode(t *testing.T) store.Node {
+	t.Helper()
+	var root store.Node
+	if err := h.meta.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+		got, err := tx.EnsureRoot(ctx, h.user.ID)
+		root = got
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return root
+}
+
+// blobRootOf returns the local blob root the server writes to.
+func (h *harness) blobRootOf(t *testing.T) string {
+	t.Helper()
+	if h.blobRoot == "" {
+		t.Fatal("the harness has no blob root; this test needs the local backend")
+	}
+	return h.blobRoot
 }
 
 func newHarness(t *testing.T) *harness {
@@ -101,7 +127,10 @@ func newHarnessTuned(t *testing.T, mutate func(*config.Config), tune func(*serve
 		t.Fatal(err)
 	}
 
-	blobs, err := local.New(t.TempDir())
+	// The blob root is retained: a backup copies this directory, so a test about backup ordering
+	// needs to see exactly what the copy would contain.
+	blobRoot := t.TempDir()
+	blobs, err := local.New(blobRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,6 +192,7 @@ func newHarnessTuned(t *testing.T, mutate func(*config.Config), tune func(*serve
 	h := &harness{t: t, srv: ts, meta: meta, user: user, session: session,
 		mailer: mailer, sessions: sessions, cfg: &cfg, authz: authorizer, uploads: uploads}
 	h.metrics = deps.Metrics
+	h.blobRoot = blobRoot
 	return h
 }
 
