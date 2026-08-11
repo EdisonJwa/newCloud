@@ -275,3 +275,108 @@ func TestBackupDocsStateTheRightOrder(t *testing.T) {
 		}
 	}
 }
+
+// ---- restore-side ordering ----
+//
+// The backup order decides whether bytes were ever captured; that is permanent and is covered
+// above. The RESTORE order is a different question, and my first draft of the documentation
+// overstated it: it claimed restoring in the wrong order "produces the same dangling-reference
+// problem". That is not true, and the difference matters for how an operator triages it.
+//
+// Restoring the database first, then unpacking blobs:
+//
+//	During the window the metadata names files whose bytes are not yet in place, so reads fail
+//	with "blob not found". The system is degraded and obviously broken. When the bytes land, the
+//	same reads succeed. Nothing is lost — the failure is transient and self-healing.
+//
+// Restoring blobs first, then the database:
+//
+//	During the window there is no metadata at all, so nothing is readable. After the database
+//	lands, everything works. This is the better order because it fails closed rather than serving
+//	erroneous 404s, but both orders converge.
+//
+// The reason neither order corrupts anything is a property of the collector: it is
+// metadata-driven. CollectableBlobs selects rows from `blobs` and deletes those that are
+// unreferenced and past their grace period. A blob file on disk with no row is invisible to it, so
+// bytes restored ahead of their metadata cannot be collected as garbage. TestGCIsMetadataDriven
+// pins that, because if the collector ever grew a directory scan the "blobs first" order would
+// start destroying the restore it was meant to be preparing.
+
+// TestGCIsMetadataDriven is the property the restore-order advice depends on.
+//
+// It asserts what the collector reads: rows in the blobs table, not the contents of the blob root.
+// A directory-scanning collector would delete restored bytes that have no metadata yet.
+func TestGCIsMetadataDriven(t *testing.T) {
+	root := repoRoot(t)
+	src, err := os.ReadFile(filepath.Join(root, "internal", "store", "blobgc_pg.go"))
+	if err != nil {
+		// The file name may move; find whichever file defines CollectableBlobs.
+		entries, derr := os.ReadDir(filepath.Join(root, "internal", "store"))
+		if derr != nil {
+			t.Fatalf("read the store package: %v", derr)
+		}
+		found := ""
+		for _, e := range entries {
+			if !strings.HasSuffix(e.Name(), ".go") || strings.HasSuffix(e.Name(), "_test.go") {
+				continue
+			}
+			body, rerr := os.ReadFile(filepath.Join(root, "internal", "store", e.Name()))
+			if rerr == nil && strings.Contains(string(body), "func (t *pgTx) CollectableBlobs(") {
+				src, found = body, e.Name()
+				break
+			}
+		}
+		if found == "" {
+			t.Fatal("could not find CollectableBlobs; the GC design changed and the restore-order " +
+				"advice in deploy/backup/restore-drill.md needs re-deriving")
+		}
+	}
+	text := string(src)
+
+	// The candidate set must be a row scan. If this stops being true, restored-but-unreferenced
+	// bytes become collectable and "blobs first" turns destructive.
+	if !strings.Contains(text, "FROM blobs b") {
+		t.Fatalf("CollectableBlobs no longer selects FROM blobs b. The restore-order guidance in " +
+			"deploy/backup/restore-drill.md is justified by the collector being metadata-driven: " +
+			"a blob file with no row is invisible to it, so bytes restored ahead of their metadata " +
+			"survive. If the collector now scans the blob directory, restoring blobs before the " +
+			"database would have GC delete the entire restore.")
+	}
+	// And it must not consult the filesystem for its candidate set.
+	for _, forbidden := range []string{"ReadDir", "WalkDir", "os.Open("} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("CollectableBlobs now calls %s. The collector must decide from metadata "+
+				"alone; a directory scan would make it delete restored bytes that have no row yet.",
+				forbidden)
+		}
+	}
+}
+
+// TestRestoreOrderAdviceIsNotOverstated checks the document describes the restore order accurately.
+//
+// The first version claimed the wrong restore order produces "the same dangling-reference
+// problem" as the wrong backup order. It does not: a backup-order mistake loses bytes permanently,
+// while a restore-order mistake is a transient window that heals. Overstating it sends an operator
+// hunting for data loss that did not happen.
+func TestRestoreOrderAdviceIsNotOverstated(t *testing.T) {
+	root := repoRoot(t)
+	doc, err := os.ReadFile(filepath.Join(root, "deploy", "backup", "restore-drill.md"))
+	if err != nil {
+		t.Fatalf("read restore-drill.md: %v", err)
+	}
+	text := string(doc)
+
+	// The accurate framing must be present.
+	want := "恢复顺序：先恢复 Blob，再 pg_restore"
+	if !strings.Contains(text, want) {
+		t.Fatalf("restore-drill.md must state the restore order (%q) and say that the wrong order "+
+			"is a transient outage rather than lost data", want)
+	}
+	// The overstatement must not be.
+	if strings.Contains(text, "反过来的话，同样会出现") {
+		t.Fatal("restore-drill.md still claims the wrong restore order produces the same " +
+			"dangling-reference problem as the wrong backup order. It does not: backup order " +
+			"decides whether bytes were captured (permanent), restore order decides when they " +
+			"appear (transient).")
+	}
+}
