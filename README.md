@@ -173,6 +173,7 @@ go run ./tools/uicheck -app http://127.0.0.1:18500 -public-host 127.0.0.1:18600
 - OIDC 密钥轮换无需重启：客户端遇到未知 kid 会重取 JWKS；轮换步骤与九种验证失败的策略见 [deploy/oidc-key-rotation.md](deploy/oidc-key-rotation.md)。已有会话不受轮换影响（会话是自己的凭据，从不问 IdP）。
 - `blobs.size` 曾长期被写成 0（`BlobIDFor` 硬编码），GC 的回收字节统计因此失真；`migrate` 里的 `RepairBlobSizes` 从内容寻址对象回填真实长度（单行缺失只报告、不臆造）。
 - 恢复演练的表清单由 `TestDrillCoversEveryTable` 对着实际 schema 自检——手写清单会腐烂，注释里承诺的检查若不写成代码就等于没有。
+- 备份由 `deploy/backup/backup-all.sh` 一次跑完（**顺序可执行，不靠记忆**）：先 dump 再 blob，中间写 manifest。全链路实测通过：dump → restic → restore（文件名即 SHA-256）→ pg_restore → 交叉校验缺失 0 个。
 - 恢复顺序是**先恢复 Blob，再 pg_restore**（方向与备份相反）。两个顺序最终都会收敛，推荐这一支是因为它**失败关闭**；之所以两个都安全，是因为 GC 遍历 `blobs` 行、从不扫描目录，"有字节但没有行"的文件对 GC 不可见。
 - 备份顺序是**先 pg_dump，再备份 Blob**：依据"内容先落盘、行后写入"这条不变量，窗口内的写入只会留下可回收的孤儿 blob，不会留下悬空引用。（我第一版把顺序写反了，安全方向恰好相反。）
 - 恢复演练已自动化（`newcloud drill`）：**22 张表**（清单由 `TestDrillCoversEveryTable` 对着实际 schema 自检）、元数据行、审计哈希链、以及**每个 blob 的字节**在 dump→restore 后都完整。已反向验证演练**会失败**——篡改一条审计记录、或翻转一个 blob 字节，都会 FAIL。**restic 快照恢复也已实测**：备份全链路 + 恢复到新目录后 blob 的 SHA-256 逐字节一致；`--one-file-system` 在 Windows 上会 panic，脚本已按平台条件添加。规模测量已补：130 KiB / 1.2 MiB / 5.5 MiB 三点，秒/MiB 稳定在 6.9–9.4（43 倍体积无拐点）。未覆盖：真正的 40 TiB——线性外推给出约 92 000 小时，说明该外推路径本身不可用，真实 RTO 必须在等价硬件上重测；PITR。

@@ -49,7 +49,7 @@ SELECT count(*) FROM audit.events;
 SELECT day, encode(head_hash,'hex') FROM audit.anchors ORDER BY day DESC LIMIT 1;
 ```
 
-### 2.5 备份顺序：先 pg_dump，再备份 Blob
+### 2.5 备份顺序：先 pg_dump，再备份 Blob（由 `backup-all.sh` 强制执行）
 
 这个顺序不是风格问题。备份是两个独立时刻的两份产物——数据库 dump 和 blob 目录副本——它们无法原子地同时取到，中间总有一个窗口。窗口里如果有写入，是否会产生"恢复后引用了不存在的字节"，取决于**顺序**，而哪个顺序安全取决于写入路径的一条不变量：
 
@@ -65,6 +65,8 @@ SELECT day, encode(head_hash,'hex') FROM audit.anchors ORDER BY day DESC LIMIT 1
 | 先备份 Blob，再 pg_dump | 行在 dump 里，字节在副本读完之后才落盘 | 恢复后的元数据指向不存在的内容，**每次读取都失败**。恢复看起来是成功的，直到有人打开那个文件 |
 
 所以：**先 dump，再备份 blob**。会留下孤儿 blob，不会留下悬空引用。孤儿 blob 由 GC 回收；悬空引用没有任何机制能修。
+
+**这个顺序由 `deploy/backup/backup-all.sh` 强制执行**，而不是只写在文档里。在此之前，`pg-backup.sh` 与 `blob-backup.sh` 各自正确、互不知情，顺序只存在于这一段文字里——运维的 cron 指向哪一半、以什么顺序，全凭有没有读到这段。`backup-all.sh` 依次调用两者，并在两次之间写一份 manifest 把 dump 与 blob 快照绑在一起；有了它，顺序是**可执行的**而不只是**被记住的**。`TestBackupAllRunsTheDumpBeforeTheBlobs` 守住它（只看可执行行，不看注释——见下）。
 
 **这一条我写错过一次。** 初稿把两个顺序写反了，理由是"先取到的产物更旧更安全"——但没有去确认写入路径里**字节和行哪个先落**。方向搞反的文档比没有文档更糟：它读起来像建议，照着做的运维会精确地制造出上一段表格里那种"恢复成功但每次读取都失败"的状态。`TestBackupDocsStateTheRightOrder` 现在会校验这句话的措辞。
 
@@ -261,3 +263,23 @@ DRILL_DUMP_DSN=... DRILL_RESTORE_DSN=... \
 ### 顺带发现
 
 第一次 seeding 时 `tools/seedscale` 只写了文件元数据、没有写 blob 内容，drill **立刻报 FAIL**：`the restored copy cannot serve it: blob: not found`，100 个文件 0 个可读。这正是 drill 存在的理由——一个"看起来有数据"的数据库和一个真的能服务的数据库，差别只有 drill 会告诉你。
+
+## 首次真正执行备份脚本（第四十轮）
+
+在此之前，三个备份脚本**从未被实际运行过**——它们有测试校验顺序与配置，但没有人真的执行过一次。这一轮装了 `pg_dump`（scoop `postgresql` 18.6）与 `restic`，在一份真实数据上跑通了全链路。
+
+**跑出来的第一个问题**：`pg-backup.sh` 调用的是**裸 `pg_dump`**，它从 `PG*` 环境变量取连接参数，**完全忽略 `DATABASE_URL`**。在没设那些变量的机器上，它会去 dump `localhost:5432` 的 `postgres` 库——或者像这次一样直接失败——而运维会以为自己有一份备份。已改为 `pg_dump --dbname="$CONNECTION"`，`DATABASE_URL`（或 `DSN`）缺失时报错退出而不是静默使用默认值。`TestPgBackupUsesTheConfiguredDatabase` 守住这条。
+
+**实测结果**（`newcloud_bk`，5 账号 / 40 文件 / 200 审计事件）：
+
+| 步骤 | 结果 |
+| --- | --- |
+| `pg_dump` | 88 508 字节，`pg_restore --list` 可读，含 `audit` schema |
+| manifest | 记录了 dump 路径、开始时间、blob 快照、结束时间 |
+| `restic backup` | 8 个 blob，4 521 字节 |
+| `restic check` | `no errors were found` |
+| `restic restore` | 8/8 blob 恢复，**每个文件的 SHA-256 与其文件名一致** |
+| `pg_restore`（在 blob 之后） | 55 节点、200 审计事件 |
+| **交叉校验** | 恢复后的元数据所需的 blob，在恢复的副本里**缺失 0 个** |
+
+这就是"恢复验证不等于有备份文件"要的那个证据：不只是有文件，而是恢复后的库指向的每一个字节都真的在。
