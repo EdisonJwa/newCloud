@@ -17,6 +17,35 @@
 
 
 
+### PITR：从一句说明变成一条实测过的流程（第四十一轮）
+
+`deploy/docker-compose.yml` 早就配了 `archive_mode=on`，`restore-drill.md` 也写着"元数据 RPO ≤ 15 分钟（WAL 归档连续）"。但**没有任何地方说怎么真的做一次时间点恢复**——第 2 节只有一句"如果 RPO 要求回放到故障点，继续应用 WAL 到目标时间"。没人能靠一句话恢复数据库。
+
+**先实测，再写文档。** 起了一个 `archive_mode=on`、`archive_timeout=5s` 的实例，完整走了一遍：
+
+1. 插入两行，记录时刻；
+2. `pg_basebackup` 在线基础备份；
+3. 删掉第二行（模拟误操作）；
+4. 把基础备份解开到新数据目录，写 `restore_command` / `recovery_target_time` / `recovery_target_action=promote`，`touch recovery.signal`；
+5. 启动。
+
+日志：`recovery stopping before commit of transaction 742`。恢复后 `select id from probe` 返回 **1, 2**——被删的那行回来了。`pg_is_in_recovery()` 为 `false`，已提升为可写。
+
+**跑起来才发现，配置里少了一样东西。** `docker-compose.yml` 有 `archive_mode=on`，但**没有 `archive_timeout`**。PostgreSQL 只在 WAL 段**写满 16 MB** 或 `archive_timeout` 触发时才归档。一个安静的部署可能几个小时都不产生 16 MB WAL，于是"RPO ≤ 15 分钟"**只在忙的系统上成立**——而周日凌晨没人盯着的时候，恰恰是最需要备份可信的时候。
+
+补上 `archive_timeout=5min`（不是 15：15 分钟是 RPO 总量，归档只是其中一项，还要留出传输与恢复的时间）。
+
+**顺带确认归档命令的幂等性。** `test ! -f /archive/%f && cp %p /archive/%f` ——这个 `test ! -f` 不是多余的：`archive_command` 失败时 PostgreSQL 会**无限重试**，如果命令在目标已存在时返回非零，归档进程就会一直重试而 `pg_wal` 无限增长，直到磁盘写满。这个故障模式距离引入它的那次改动有几天，所以值得用测试钉住。
+
+**三个配置级测试**（都是删掉对应设置就会红的）：
+
+- `TestComposeEnablesContinuousWalArchiving` —— `archive_mode=on` 与 `archive_timeout` 必须在场，且超时值要小于 RPO；
+- `TestArchiveCommandIsIdempotent` —— 归档命令必须防重；
+- `TestPITRProcedureIsDocumented` —— 文档必须包含 `pg_basebackup`、`recovery_target_time`、`recovery_target_action`、`recovery.signal`、`restore_command` 五样，少一样就不是一份能照着做的流程。
+
+**一个自己写错的小 bug**：第一版超时检查用字符串比较 `value >= "15"`，于是 `"5" >= "15"` 为真，测试对着**正确的配置**报错。改为整数解析后通过。数值比较用字符串是这类检查里的常见陷阱，而它刚好会让检查在正确的时候失败、在错误的时候通过。
+
+
 ### 第一次真正执行备份脚本（第四十轮）
 
 前三轮我写了三个备份脚本的顺序测试、不变量测试、以及恢复侧的性质测试——**但那些脚本从未被真正执行过一次**。测试校验的是"顺序对不对、配置读没读"，不是"它能不能跑"。这一轮装了 `pg_dump`（scoop `postgresql` 18.6）和 `restic`，在一份真实数据上把全链路跑了一遍。
@@ -1393,6 +1422,7 @@ go test ./internal/store -run 'TestPGPurgeTrash|TestPGExpireVersions'
 | --- | --- | --- |
 | 可观测性 | `/metrics` 端到端验证过（路由/中间件/标签）；**告警规则与运行手册已随附**（`deploy/monitoring/`：10 条规则、抓取配置、9 个 runbook 章节），`promtool` 校验通过。三个"从未被写入"的指标（上传、缩略图、GC）已接线，并有结构性测试防止再出现——没人写入的指标格式正确却永远为 0，看起来和健康指标一样 | 阈值是起始值而非实测结论，需要两周真实流量后再调；没有随附 Grafana 面板 |
 | ACL / 账号审批 UI | **ACL 与审批都已有界面**：Access 页管理文件夹授权；账号页有审批队列（待审批/已启用/已停用）与状态切换，导航项仅对管理员出现（服务端仍返回 404，测试覆盖）。两个 Go 测试发出与面板完全相同的请求，防止"两边读同一份规格却理解不同" | 界面只覆盖单目录授权与账号状态；没有批量操作，也没有"谁可以访问这个文件"的反查视图 |
+| PITR（时间点恢复） | **已实测**：`archive_mode=on` 实例上走完 base backup → 误删一行 → 恢复到删除前，日志 `recovery stopping before commit`，被删行回来且实例已 promote。修掉一个真缺陷：`docker-compose.yml` **缺 `archive_timeout`**，导致"RPO ≤ 15 分钟"只在忙系统上成立；补为 `5min`。文档第 2 节从一句说明变成可执行流程，五个关键项有测试 | 未在真实故障（磁盘损坏、机房断电）下演练；WAL 归档盘写满时的行为未测 |
 | 备份脚本**实际执行** | `deploy/backup/backup-all.sh` 按正确顺序调用两个脚本并写 manifest，**实测跑通全链路**：dump 88 508 字节 → restic backup/check → restore 8/8 blob（文件名即 SHA-256）→ pg_restore → 交叉校验缺失 0 个。跑起来才发现 `pg-backup.sh` 用裸 `pg_dump`、**忽略 `DATABASE_URL`**，已修 | 未在 cron/定时任务下长期运行；WAL 归档（PITR）仍未演练 |
 | §11.2-4 备份与恢复的顺序 | 备份顺序固定为**先 pg_dump，再备份 Blob**（依据"内容先落盘、行后写入"）；恢复顺序**先恢复 Blob，再 pg_restore**。两者方向相反、理由也不同：备份搞反会永久丢字节，恢复搞反只是窗口内读取失败、随后自愈。恢复侧之所以安全，依赖 **GC 是元数据驱动**这一性质（遍历行、不扫目录），该性质有源码级与 PostgreSQL 行为级测试，且删掉 node join 会让测试变红 | 仍未做真实并发压测（测试确定性地构造两种顺序的产物状态，而非让真备份与写入赛跑） |
 | INV-08 restic 恢复 | 已实测：`blob-backup.sh` 全链路（backup/forget/prune/check）通过，`restic restore` 后 blob 的 SHA-256 与原件逐字节一致。修掉两个真问题：`--one-file-system` 在 Windows 上 panic；文档里的恢复命令会得到错误的目录布局。**规模测量已补**：130 KiB / 1.2 MiB / 5.5 MiB 三点，秒/MiB 稳定在 6.9–9.4，43 倍体积内无拐点；文档里"约 82 小时"的外推是错的（实为约 92 000 小时），已修正并由 `TestDrillScaleMeasurementsAreConsistent` 守住 | 测量上限只有 5.5 MiB，与 40 TiB 差 7 个数量级，**仍不支持任何 40 TiB 的 RTO 数字**（而且线性外推给出的数字说明该路径本身不可用）；PITR 仍未演练 |

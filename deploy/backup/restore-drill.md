@@ -28,15 +28,51 @@ docker compose up -d postgres
 
 ### 2. 恢复 PostgreSQL
 
+**两条路径，选哪条取决于你要恢复到"备份时刻"还是"故障前一刻"。**
+
+#### 2a. 恢复到备份时刻（简单路径）
+
 ```bash
-# 数据库为空
 pg_restore --clean --if-exists --no-owner \
   -d postgres://newcloud:$PG_PASSWORD@localhost:5432/newcloud \
   /srv/backup/pg/newcloud-<STAMP>.dump
-
-# 如果 RPO 要求回放到故障点，继续应用 WAL 到目标时间。
-# 单机方案下这一步决定你到底丢了 15 分钟还是 24 小时。
 ```
+
+数据回到 dump 的时刻，dump 之后的写入全部丢失。RPO 等于两次 dump 的间隔（默认 24 小时）。
+
+#### 2b. 恢复到某个时刻（PITR，RPO ≤ 15 分钟）
+
+需要三样东西：一份**基础备份**、`archive_mode=on` 的连续 WAL 归档、以及一个**目标时刻**。
+
+```bash
+# 1. 基础备份（在线，不阻塞写入）
+pg_basebackup -h localhost -U newcloud -D /srv/pitr/base -Ft -z -X stream
+
+# 2. 把基础备份解开到数据目录
+mkdir -p /srv/pitr/data
+tar -xzf /srv/pitr/base/base.tar.gz -C /srv/pitr/data
+mkdir -p /srv/pitr/data/pg_wal
+tar -xzf /srv/pitr/base/pg_wal.tar.gz -C /srv/pitr/data/pg_wal
+
+# 3. 指定回放目标
+cat >>/srv/pitr/data/postgresql.auto.conf <<'EOF'
+restore_command = 'cp /mnt/wal-archive/%f %p'
+recovery_target_time = '2026-10-22 09:05:07.74+00'
+recovery_target_action = 'promote'
+EOF
+touch /srv/pitr/data/recovery.signal
+
+# 4. 启动。日志会出现 "recovery stopping before commit of transaction ..."
+pg_ctl -D /srv/pitr/data start
+```
+
+关键点：
+
+- `recovery_target_action = 'promote'` —— 否则实例停在只读状态，恢复完成却用不了。
+- `recovery.signal`（PG12+）—— 文件存在才进入恢复模式；有些老文档写 `recovery.conf`，那条路已经不支持。
+- **目标时刻要落在故障之前**。宁可少回放一点再补数据，也不要越过误操作那一条。
+
+**实测（第四十一轮）**：在一个 `archive_mode=on`、`archive_timeout=5s` 的实例上，插入两行 → 记录时刻 → 删掉第二行 → 用基础备份 + WAL 归档恢复到删除之前。恢复日志 `recovery stopping before commit of transaction 742`，恢复后 `select id from probe` 返回 **1, 2**（删除的那行回来了），`pg_is_in_recovery()` 为 `false`。全流程约 0.3 秒的 redo。
 
 校验：
 

@@ -79,6 +79,17 @@ services:
       # Archive to a path that is NOT on the same disk as the data directory.
       - -c
       - archive_command=test ! -f /archive/%f && cp %p /archive/%f
+      # archive_timeout is what makes the RPO claim true, and it was missing.
+      #
+      # PostgreSQL archives a WAL segment when it fills (16 MB) or when archive_timeout fires,
+      # whichever comes first. Without this setting a quiet deployment can hold an unarchived
+      # segment for hours — so "RPO <= 15 minutes" was only true on a busy system, and the 15
+      # minutes is exactly what a quiet Sunday night needs.
+      #
+      # 5 minutes, not 15: the stated RPO is the total, and archiving is one of its terms. A
+      # 15-minute timeout plus transfer time would exceed the promise rather than meet it.
+      - -c
+      - archive_timeout=5min
       - -c
       - max_connections=100
       - -c
