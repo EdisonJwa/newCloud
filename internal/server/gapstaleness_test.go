@@ -196,3 +196,91 @@ func TestGapTableRowsAreWellFormed(t *testing.T) {
 		t.Fatal("the gap table has no rows; this check would pass vacuously")
 	}
 }
+
+// TestGapTableDoesNotClaimMeasuredThingsAreUnmeasured.
+//
+// The existing staleness check covers "an artefact exists but a row says it does not". This covers
+// the other shape: the document records a MEASUREMENT somewhere, while a gap row still says the
+// measurement was never done. It happened twice — two rows kept saying "PITR 仍未演练" after round
+// 41 performed a point-in-time recovery and wrote it up, because those rows were edited at
+// different times and nobody re-read them.
+//
+// The check is deliberately narrow and evidence-driven: it looks for the specific phrases that
+// mean "not exercised" and fails only when the document also contains the proof that it was. A
+// broader "audit every claim" is not mechanisable, but this specific contradiction is.
+func TestGapTableDoesNotClaimMeasuredThingsAreUnmeasured(t *testing.T) {
+	root := repoRoot(t)
+	raw, err := os.ReadFile(filepath.Join(root, "docs", "0011-contract-implementation-record.md"))
+	if err != nil {
+		t.Fatalf("read the implementation record: %v", err)
+	}
+	doc := string(raw)
+
+	// Only table rows, for the same reason as the other check: the narrative legitimately quotes a
+	// stale claim when explaining that it was fixed.
+	var rows []string
+	for _, line := range strings.Split(doc, "\n") {
+		if strings.HasPrefix(line, "|") {
+			rows = append(rows, line)
+		}
+	}
+	if len(rows) == 0 {
+		t.Fatal("found no table rows; this check would pass vacuously")
+	}
+	table := strings.Join(rows, "\n")
+
+	type evidence struct {
+		// claim is the phrase asserting the work was not done.
+		claim string
+		// proof is text that only appears in this document if the work WAS done.
+		proof string
+		// done names the round, for the failure message.
+		done string
+	}
+
+	checks := []evidence{
+		{
+			claim: "PITR 仍未演练",
+			proof: "recovery stopping before commit",
+			done:  "round 41 performed a point-in-time recovery and quoted the recovery log",
+		},
+		{
+			claim: "仍未做 restic 快照恢复",
+			proof: "no errors were found",
+			done:  "round 29 ran restic backup, check and restore",
+		},
+		{
+			claim: "大库耗时未知",
+			proof: "规模点 1",
+			done:  "round 37 measured the drill at three data volumes",
+		},
+	}
+
+	for _, c := range checks {
+		if !strings.Contains(table, c.claim) {
+			continue // the row has been updated, which is the desired state
+		}
+		// The proof must appear in a ROUND SECTION, not merely anywhere. The narrative legitimately
+		// quotes the state of the world as it was ("PITR 没演练" was true when round 8 was written),
+		// and matching that would make the guard fire on honest history. A round heading is what
+		// marks a later claim: if the proof sits under one, the work happened after the table row
+		// that still denies it.
+		if strings.Contains(roundSections(doc), c.proof) {
+			t.Fatalf("the gap table still claims %q, but the document records the measurement "+
+				"(%s, evidence: %q). One of the two is wrong, and a reader will believe the "+
+				"pessimistic one — then either redo work that is done or distrust the rest of the "+
+				"list.", c.claim, c.done, c.proof)
+		}
+	}
+}
+
+// roundSections returns the document with everything before the first `### ` heading removed.
+//
+// The record is written newest-first, so the rounds are the part that describes what has actually
+// been done; the prose above them is the changelog's own narrative and may quote older states.
+func roundSections(doc string) string {
+	if i := strings.Index(doc, "\n### "); i >= 0 {
+		return doc[i:]
+	}
+	return doc
+}

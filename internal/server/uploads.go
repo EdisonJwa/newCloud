@@ -97,6 +97,23 @@ func (s *Server) handleUploadChunk(w http.ResponseWriter, r *http.Request) {
 	actor, _ := actorFrom(r.Context())
 	id := chi.URLParam(r, "id")
 
+	// The session lookup comes FIRST, before the request is validated at all.
+	//
+	// It used to sit after the Content-Range checks, which meant a request with a malformed range
+	// got 400 without the ownership of the session ever being consulted — a caller could tell a
+	// real endpoint from a fake one by which error came back. The response did not leak content,
+	// so this was never a vulnerability, but "authenticate, then parse" is the rule that keeps it
+	// from becoming one the next time a check is added above the lookup.
+	//
+	// Unknown, expired, finished and foreign sessions all produce the same 404 here, so this is
+	// also the check that makes the route indistinguishable for a session belonging to somebody
+	// else.
+	sess, err := s.deps.Uploads.Get(actor.ID(), id)
+	if err != nil {
+		s.writeUploadError(w, err)
+		return
+	}
+
 	start, end, total, err := parseContentRange(r.Header.Get("Content-Range"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "bad_range", err.Error())
@@ -110,11 +127,6 @@ func (s *Server) handleUploadChunk(w http.ResponseWriter, r *http.Request) {
 
 	if size > s.deps.Config.Limits.MaxFileBytes {
 		writeError(w, http.StatusRequestEntityTooLarge, "too_large", "the chunk exceeds the configured limit")
-		return
-	}
-	sess, err := s.deps.Uploads.Get(actor.ID(), id)
-	if err != nil {
-		s.writeUploadError(w, err)
 		return
 	}
 	if total != sess.Total {

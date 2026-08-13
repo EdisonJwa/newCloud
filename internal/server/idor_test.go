@@ -465,3 +465,45 @@ func idRoutesTakenFromTheServer() []string {
 		"DELETE /api/acl/{id}",
 	}
 }
+
+// TestUploadChunkAuthorisesBeforeParsing pins the order inside the chunk handler.
+//
+// The handler used to validate Content-Range before looking the session up, so a malformed request
+// answered 400 while ownership of the session was never consulted. That is not a leak of content,
+// but it lets a caller distinguish "this endpoint exists and parsed my request" from "this session
+// is not yours" — and it sets a precedent that becomes a vulnerability the first time a check is
+// added above the lookup.
+//
+// Behavioural rather than structural: a foreign session with a malformed range must get the same
+// refusal as a foreign session with a valid one.
+func TestUploadChunkAuthorisesBeforeParsing(t *testing.T) {
+	h := newHarness(t)
+	victim := buildVictim(t, h)
+	_, intruderToken := h.intruder(t, "chunk-intruder")
+
+	cases := []struct {
+		name    string
+		headers map[string]string
+	}{
+		{"no Content-Range at all", nil},
+		{"a malformed Content-Range", map[string]string{"Content-Range": "banana"}},
+		{"a well-formed Content-Range", map[string]string{"Content-Range": "bytes 0-3/1024"}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := h.doAs(t, intruderToken, http.MethodPut,
+				"/api/files/uploads/"+victim.uploadID, strings.NewReader("data"), tc.headers)
+			defer resp.Body.Close()
+
+			// Every shape must be refused identically. If the malformed cases answered 400 while
+			// the valid one answered 404, the difference tells a caller which requests reached the
+			// session layer.
+			if resp.StatusCode != http.StatusNotFound {
+				t.Fatalf("want 404 for a session the caller does not own regardless of how the "+
+					"request is formed, got %d. A 400 here means the range was parsed before the "+
+					"session was looked up.", resp.StatusCode)
+			}
+		})
+	}
+}
