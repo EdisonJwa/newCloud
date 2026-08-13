@@ -173,6 +173,7 @@ go run ./tools/uicheck -app http://127.0.0.1:18500 -public-host 127.0.0.1:18600
 - OIDC 密钥轮换无需重启：客户端遇到未知 kid 会重取 JWKS；轮换步骤与九种验证失败的策略见 [deploy/oidc-key-rotation.md](deploy/oidc-key-rotation.md)。已有会话不受轮换影响（会话是自己的凭据，从不问 IdP）。
 - `blobs.size` 曾长期被写成 0（`BlobIDFor` 硬编码），GC 的回收字节统计因此失真；`migrate` 里的 `RepairBlobSizes` 从内容寻址对象回填真实长度（单行缺失只报告、不臆造）。
 - 恢复演练的表清单由 `TestDrillCoversEveryTable` 对着实际 schema 自检——手写清单会腐烂，注释里承诺的检查若不写成代码就等于没有。
+- WAL 归档失败是**静默的**：`archive_command` 坏了数据库照常服务，只有 `pg_wal` 在涨（实测 49→65→81 MB、零归档），最终填满数据盘。已补三个指标 + 三条告警 + runbook；`failed` 与 `pending` 分别回答"坏过没有"和"盘是不是正在被填满"。
 - PITR 已实测：base backup → 误删 → 恢复到删除前，被删数据回来且实例已 promote。`docker-compose.yml` 补上了缺失的 `archive_timeout`（没有它，"RPO ≤ 15 分钟"只在忙系统上成立）。
 - 备份由 `deploy/backup/backup-all.sh` 一次跑完（**顺序可执行，不靠记忆**）：先 dump 再 blob，中间写 manifest。全链路实测通过：dump → restic → restore（文件名即 SHA-256）→ pg_restore → 交叉校验缺失 0 个。
 - 恢复顺序是**先恢复 Blob，再 pg_restore**（方向与备份相反）。两个顺序最终都会收敛，推荐这一支是因为它**失败关闭**；之所以两个都安全，是因为 GC 遍历 `blobs` 行、从不扫描目录，"有字节但没有行"的文件对 GC 不可见。

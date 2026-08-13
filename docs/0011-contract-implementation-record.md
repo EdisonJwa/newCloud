@@ -17,6 +17,41 @@
 
 
 
+### WAL 归档失败是静默的（第四十二轮）
+
+上一轮把 PITR 跑通了，但留下一条："WAL 归档盘写满时的行为未测"。这一轮把它测了，结论比预想的严重。
+
+**做一个 `archive_command` 必定失败的集群**（写到一个不存在的目录），然后反复写入并强制切换 WAL：
+
+```
+after round 1 : 5 wal files, 49 MB
+after round 2 : 6 wal files, 65 MB
+after round 3 : 7 wal files, 81 MB
+archived successfully: 0
+```
+
+**数据库全程正常工作**：查询能跑、写入能提交、连接正常。`pg_wal` 单调增长，一个字节都没归档出去。日志里只有一串 `LOG: archive command failed with exit code 1`，最后一条 `WARNING: archiving ... failed too many times, will try again later`。
+
+这就是最糟的一种失败形态：**服务健康，灾难恢复保证已经没了**。RPO 从"15 分钟"悄悄变成"那块盘上还剩什么就是什么"，而唯一的症状是 `pg_wal` 在涨——涨到填满数据盘，然后 PostgreSQL 停止接受写入。**那时距离真正的起因已经过去几小时。**
+
+**而 newCloud 什么都没看到**：`internal/metrics` 里没有任何与 WAL 归档相关的指标，`deploy/monitoring/alerts.yml` 里没有任何相关规则。整个失败路径对运维不可见。
+
+**补上**：`worker.SampleWALArchive` 读 `pg_stat_archiver` 并统计 `pg_ls_waldir()` 的积压段数，三个指标——`newcloud_wal_archived_total`、`newcloud_wal_archive_failed_total`、`newcloud_wal_segments_pending`——由 worker 按清理周期采样。三个数字回答三个不同问题：归档到底在不在工作、有没有坏过、**盘是不是正在被填满**（只有第三个能预测故障）。
+
+同一份采样器在两个真实集群上的输出：
+
+```
+健康集群:   archived=0 failed=0  pending=9 lastFailed=""
+故障集群:   archived=0 failed=19 pending=6 lastFailed="000000010000000000000001"
+```
+
+`failed` 与 `lastFailed` 一眼就能分辨，而 `lastFailed` 直接指出是哪一段写不过去。
+
+**三条告警规则**（`promtool` 15 条通过）：失败计数上升 = critical（数据库还在服务，这正是危险之处）；积压超过 64 段 = critical（按默认 16 MB/段，已经一 GB 以上且不会停）；一小时零归档但有积压 = warning（可能是 `archive_mode` 压根没开，那是另一个故障）。runbook 新增 `## wal`，含三段排查 SQL、按可能性排序的四个原因（挂载点消失、磁盘满、权限变化、主机不可达），以及一句必须写下来的话：**这段告警响着期间的所有写入都无法通过 PITR 恢复**——它们还在库里，但盘一坏就没了。
+
+**一个实现上的判断**：`pg_ls_waldir()` 需要特权，普通应用角色可能调不了。这时计数器仍然上报，`Pending` 保持原值而不是清零——**"读不到"和"没有积压"必须是两件事**，把前者报成 0 会让仪表看起来健康。
+
+
 ### PITR：从一句说明变成一条实测过的流程（第四十一轮）
 
 `deploy/docker-compose.yml` 早就配了 `archive_mode=on`，`restore-drill.md` 也写着"元数据 RPO ≤ 15 分钟（WAL 归档连续）"。但**没有任何地方说怎么真的做一次时间点恢复**——第 2 节只有一句"如果 RPO 要求回放到故障点，继续应用 WAL 到目标时间"。没人能靠一句话恢复数据库。
@@ -1422,6 +1457,7 @@ go test ./internal/store -run 'TestPGPurgeTrash|TestPGExpireVersions'
 | --- | --- | --- |
 | 可观测性 | `/metrics` 端到端验证过（路由/中间件/标签）；**告警规则与运行手册已随附**（`deploy/monitoring/`：10 条规则、抓取配置、9 个 runbook 章节），`promtool` 校验通过。三个"从未被写入"的指标（上传、缩略图、GC）已接线，并有结构性测试防止再出现——没人写入的指标格式正确却永远为 0，看起来和健康指标一样 | 阈值是起始值而非实测结论，需要两周真实流量后再调；没有随附 Grafana 面板 |
 | ACL / 账号审批 UI | **ACL 与审批都已有界面**：Access 页管理文件夹授权；账号页有审批队列（待审批/已启用/已停用）与状态切换，导航项仅对管理员出现（服务端仍返回 404，测试覆盖）。两个 Go 测试发出与面板完全相同的请求，防止"两边读同一份规格却理解不同" | 界面只覆盖单目录授权与账号状态；没有批量操作，也没有"谁可以访问这个文件"的反查视图 |
+| WAL 归档失败的可观测性 | **已实测并补齐**：`archive_command` 失败时数据库照常服务、`pg_wal` 单调增长（实测 49→65→81 MB，零归档）。新增三个指标（archived/failed/pending）由 worker 采样 `pg_stat_archiver`，三条告警规则 + `## wal` runbook。同一采样器在健康集群报 `failed=0`、故障集群报 `failed=19` 并指名失败段 | `pg_ls_waldir()` 需要特权，普通角色读不到时 `Pending` 保持原值（刻意不报 0）；归档恢复后自动重试排空这一行为未单独测试 |
 | PITR（时间点恢复） | **已实测**：`archive_mode=on` 实例上走完 base backup → 误删一行 → 恢复到删除前，日志 `recovery stopping before commit`，被删行回来且实例已 promote。修掉一个真缺陷：`docker-compose.yml` **缺 `archive_timeout`**，导致"RPO ≤ 15 分钟"只在忙系统上成立；补为 `5min`。文档第 2 节从一句说明变成可执行流程，五个关键项有测试 | 未在真实故障（磁盘损坏、机房断电）下演练；WAL 归档盘写满时的行为未测 |
 | 备份脚本**实际执行** | `deploy/backup/backup-all.sh` 按正确顺序调用两个脚本并写 manifest，**实测跑通全链路**：dump 88 508 字节 → restic backup/check → restore 8/8 blob（文件名即 SHA-256）→ pg_restore → 交叉校验缺失 0 个。跑起来才发现 `pg-backup.sh` 用裸 `pg_dump`、**忽略 `DATABASE_URL`**，已修 | 未在 cron/定时任务下长期运行；WAL 归档（PITR）仍未演练 |
 | §11.2-4 备份与恢复的顺序 | 备份顺序固定为**先 pg_dump，再备份 Blob**（依据"内容先落盘、行后写入"）；恢复顺序**先恢复 Blob，再 pg_restore**。两者方向相反、理由也不同：备份搞反会永久丢字节，恢复搞反只是窗口内读取失败、随后自愈。恢复侧之所以安全，依赖 **GC 是元数据驱动**这一性质（遍历行、不扫目录），该性质有源码级与 PostgreSQL 行为级测试，且删掉 node join 会让测试变红 | 仍未做真实并发压测（测试确定性地构造两种顺序的产物状态，而非让真备份与写入赛跑） |

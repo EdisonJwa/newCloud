@@ -213,3 +213,58 @@ groups:
             auth.breakglass.denied rows carry the reason (network_denied, bad_password,
             unknown_user).
           runbook: "deploy/monitoring/runbook.md#breakglass"
+  - name: newcloud-wal
+    interval: 30s
+    rules:
+      # The disaster-recovery guarantee failing quietly.
+      #
+      # When archive_command fails, PostgreSQL keeps serving and keeps accepting writes. The
+      # deployment looks healthy while the RPO silently degrades from minutes to "whatever is
+      # still on that disk". Measured in round 42: pg_wal grew 49 -> 65 -> 81 MB across three
+      # rounds of writes with zero segments archived.
+      - alert: NewCloudWALArchiveFailing
+        expr: increase(newcloud_wal_archive_failed_total[15m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "WAL archiving is failing — the point-in-time recovery guarantee has stopped"
+          description: >-
+            {{ $value }} archive attempts failed in the last 15 minutes. The database is still
+            serving, which is what makes this dangerous: writes continue while the recovery point
+            slides backward. Check that the archive destination is mounted and writable, then
+            check free space on it. Nothing recovers automatically.
+          runbook: "deploy/monitoring/runbook.md#wal"
+
+      # Pending segments is the gauge that predicts an outage rather than describing one. Each
+      # segment is 16 MB by default, so this is also a disk-space countdown.
+      - alert: NewCloudWALBacklogGrowing
+        expr: newcloud_wal_segments_pending > 64
+        for: 30m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $value }} WAL segments are waiting to be archived"
+          description: >-
+            Unarchived segments accumulate in pg_wal and cannot be recycled until they are
+            archived. At the default 16 MB per segment this is over a gigabyte of growth that will
+            not stop. When the disk fills, PostgreSQL stops accepting writes — and the cause will
+            be an archive command that has been failing for hours.
+          runbook: "deploy/monitoring/runbook.md#wal"
+
+      # archived_count is a counter that should keep rising on any deployment with archiving on.
+      # Flat means the archiver is not running at all — a different fault from a failing command.
+      - alert: NewCloudWALArchiveStalled
+        expr: >-
+          increase(newcloud_wal_archived_total[1h]) == 0
+          and newcloud_wal_segments_pending > 8
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "no WAL segment has been archived for an hour while segments are pending"
+          description: >-
+            Either archive_mode is off (in which case there is no point-in-time recovery at all
+            and the RPO is the dump interval), or the archiver is wedged. Check
+            `SHOW archive_mode` before anything else.
+          runbook: "deploy/monitoring/runbook.md#wal"

@@ -117,6 +117,10 @@ func (w *Worker) Run(ctx context.Context) {
 	defer jobs.Stop()
 	anchors := time.NewTicker(w.anchorInterval)
 	defer anchors.Stop()
+	// Archiving health changes slowly but its consequences are severe: a broken archive_command
+	// leaves pg_wal growing until the disk fills. Sampled on the sweep cadence.
+	walSample := time.NewTicker(w.sweepInterval)
+	defer walSample.Stop()
 
 	w.log.Info("worker started",
 		"lock_interval", w.lockInterval, "sweep_interval", w.sweepInterval,
@@ -167,6 +171,11 @@ func (w *Worker) Run(ctx context.Context) {
 			} else if n > 0 {
 				w.log.Info("collected orphaned blobs", "count", n)
 			}
+		case <-walSample.C:
+			// A broken archiver does not surface anywhere else: the database keeps serving, the
+			// application keeps writing, and the only visible symptom is pg_wal growing until the
+			// disk fills. Sampling on its own timer is what turns that into an alert.
+			w.sampleWALArchive(ctx)
 		case <-anchors.C:
 			if err := w.anchorOnce(ctx); err != nil {
 				w.log.Error("audit anchoring failed", "error", err)

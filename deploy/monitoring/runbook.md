@@ -188,3 +188,47 @@ For a burst of `breakglass_denied`:
   network restriction. Only a burst is worth waking someone.
 - **Per-user login failure rate.** It would be high-cardinality and the signal is mostly expired
   sessions. The audit log answers the question when it is actually asked.
+## wal
+
+WAL archiving is failing, backing up, or has stalled.
+
+This is the quietest way for a deployment to lose its disaster-recovery guarantee. When
+`archive_command` fails, PostgreSQL **keeps serving**. It logs, it retries, and it keeps accepting
+writes — so the service looks perfectly healthy while the recovery point slides backward and
+`pg_wal` grows.
+
+1. Look at the numbers first:
+   ```sql
+   SELECT archived_count, failed_count, last_failed_wal, last_failed_time
+     FROM pg_stat_archiver;
+   ```
+   `failed_count` rising with `archived_count` flat is the signature. `last_failed_wal` names the
+   segment that could not be written.
+
+2. Check the destination, not the database. The archive path is usually a separate mount
+   (`/mnt/wal-archive` in the compose file) and the usual causes are, in order: **the mount is
+   gone**, **the disk is full**, **permissions changed**, **the host is unreachable**.
+
+3. Watch `pg_wal` while fixing it:
+   ```sql
+   SELECT count(*) FROM pg_ls_waldir();     -- each segment is 16 MB
+   ```
+   These segments cannot be recycled until they are archived. A backlog that keeps growing will
+   fill the data disk, and *then* PostgreSQL stops accepting writes — an outage whose cause is an
+   archive command that failed hours earlier.
+
+4. After fixing the cause, do nothing further: the archiver retries on its own and the backlog
+   drains. Confirm by watching `archived_count` rise.
+
+**What you have lost while this alert was firing:** every write since the last successfully
+archived segment is not recoverable by point-in-time recovery. It is still in the database — this
+is not data loss yet — but if the disk dies now, the restore point is wherever the archive stops.
+Take a fresh `pg_basebackup` once archiving is healthy again, so the base stops depending on a
+long replay.
+
+## What is deliberately not alerted
+
+- **A single failed archive attempt.** PostgreSQL retries by design; one failure followed by a
+  success is a flaky NFS mount, not an incident. The alert needs a sustained increase.
+- **`pending > 0`.** A handful of segments waiting is normal — a segment is archived when it fills
+  or when `archive_timeout` fires. Only a backlog that is not draining is worth waking someone.

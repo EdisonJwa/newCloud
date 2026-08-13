@@ -59,6 +59,17 @@ type Registry struct {
 	blobsDeleted atomic.Uint64
 	blobsGCError atomic.Uint64
 
+	// WAL archiving health, pushed by the worker from pg_stat_archiver.
+	//
+	// This is the signal that the disaster-recovery story has quietly stopped working. When
+	// archive_command fails, PostgreSQL keeps running, keeps accepting writes, and keeps the
+	// unarchived segments in pg_wal — so the deployment looks healthy while the RPO silently
+	// degrades from minutes to "whatever is still on that disk". Measured (round 42): pg_wal grew
+	// 49 -> 65 -> 81 MB across three rounds of writes with zero segments archived.
+	walArchived atomic.Uint64
+	walFailed   atomic.Uint64
+	walPending  atomic.Int64
+
 	// Authentication events that an operator must be able to alert on, keyed by kind.
 	//
 	// Break-glass use is the motivating case: §3.3 requires "使用后告警" — an alert when the local
@@ -109,6 +120,14 @@ func (r *Registry) ObserveUpload(result string) {
 // ObserveThumbnail records a thumbnail outcome.
 func (r *Registry) ObserveThumbnail(result string) {
 	counter(&r.thumbnails, result).Add(1)
+}
+
+// SetWALArchive reports the WAL archiver's state: segments archived, segments failed, and how
+// many are waiting for a successful archive. The third is the one that grows toward a full disk.
+func (r *Registry) SetWALArchive(archived, failed uint64, pending int64) {
+	r.walArchived.Store(archived)
+	r.walFailed.Store(failed)
+	r.walPending.Store(pending)
 }
 
 // ObserveAuth records a security-relevant authentication event, keyed by kind.
@@ -218,6 +237,16 @@ func (r *Registry) write(w http.ResponseWriter) {
 	fmt.Fprintf(w, "newcloud_jobs{state=\"pending\"} %d\n", r.jobsPending.Load())
 	fmt.Fprintf(w, "newcloud_jobs{state=\"running\"} %d\n", r.jobsRunning.Load())
 	fmt.Fprintf(w, "newcloud_jobs{state=\"failed\"} %d\n", r.jobsFailed.Load())
+
+	fmt.Fprintln(w, "# HELP newcloud_wal_archived_total WAL segments archived successfully.")
+	fmt.Fprintln(w, "# TYPE newcloud_wal_archived_total counter")
+	fmt.Fprintf(w, "newcloud_wal_archived_total %d\n", r.walArchived.Load())
+	fmt.Fprintln(w, "# HELP newcloud_wal_archive_failed_total WAL archive attempts that failed.")
+	fmt.Fprintln(w, "# TYPE newcloud_wal_archive_failed_total counter")
+	fmt.Fprintf(w, "newcloud_wal_archive_failed_total %d\n", r.walFailed.Load())
+	fmt.Fprintln(w, "# HELP newcloud_wal_segments_pending WAL segments waiting to be archived.")
+	fmt.Fprintln(w, "# TYPE newcloud_wal_segments_pending gauge")
+	fmt.Fprintf(w, "newcloud_wal_segments_pending %d\n", r.walPending.Load())
 
 	fmt.Fprintln(w, "# HELP newcloud_auth_events_total Authentication events by kind.")
 	fmt.Fprintln(w, "# TYPE newcloud_auth_events_total counter")
