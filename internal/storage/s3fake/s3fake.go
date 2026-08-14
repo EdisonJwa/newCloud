@@ -56,6 +56,9 @@ type Server struct {
 	// FailNext makes the next matching request return an error, for testing the backend's
 	// error handling.
 	failNext map[string]bool
+	// failAlways is the persistent form: every matching request fails, so a client's retry does
+	// not paper over the injection.
+	failAlways map[string]bool
 }
 
 type multipartUpload struct {
@@ -79,6 +82,31 @@ func New(bucket string) *Server {
 // Endpoint returns the host:port minio-go expects (no scheme).
 func (s *Server) Endpoint() string {
 	return strings.TrimPrefix(s.Server.URL, "http://")
+}
+
+// FailAlwaysOn makes EVERY request whose method matches fail, until ClearFailures.
+//
+// FailNextOn is not enough for testing a real client's error handling: minio-go retries 5xx by
+// default, so "the next request fails" is satisfied by the first attempt and then the retry
+// succeeds — the caller never sees an error. A test written against FailNextOn asserts the happy
+// path while appearing to test failure. This is the mode that actually produces one.
+func (s *Server) FailAlwaysOn(method string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.failAlways == nil {
+		s.failAlways = map[string]bool{}
+	}
+	s.failAlways[method] = true
+}
+
+// ClearFailures stops all injected failures.
+func (s *Server) ClearFailures() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failAlways = nil
+	for k := range s.failNext {
+		delete(s.failNext, k)
+	}
 }
 
 // FailNextOn makes the next request whose method matches fail with a 500.
@@ -109,6 +137,9 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	fail := s.failNext[r.Method]
 	if fail {
 		s.failNext[r.Method] = false
+	}
+	if s.failAlways[r.Method] {
+		fail = true
 	}
 	s.mu.Unlock()
 	if fail {
