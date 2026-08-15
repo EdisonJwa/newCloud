@@ -622,6 +622,35 @@ func (s *Server) abortMultipart(w http.ResponseWriter, r *http.Request, bucket, 
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// StartMultipartForTest records an in-progress upload and returns its id, so a test can exercise
+// the abort path without speaking the S3 protocol by hand.
+func (s *Server) StartMultipartForTest(bucket, key string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id := "test-upload-" + key
+	s.uploads[id] = &multipartUpload{key: key, parts: map[int][]byte{}}
+	return id
+}
+
+// AbortMultipartForTest drops an in-progress upload, as AbortMultipartUpload would.
+func (s *Server) AbortMultipartForTest(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.uploads, id)
+}
+
+// PendingMultipart reports how many multipart uploads were started but neither completed nor
+// aborted.
+//
+// A stranded upload is invisible in object listings and costs the bucket storage it will never
+// reclaim; S3 bills for the parts indefinitely and their lifecycle rules are the only cleanup.
+// Exposing the count is what makes "the client gave up and nothing cleaned up" observable.
+func (s *Server) PendingMultipart() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.uploads)
+}
+
 // PutDirect stores an object without going through HTTP, for test setup.
 func (s *Server) PutDirect(bucket, key string, data []byte) {
 	s.mu.Lock()

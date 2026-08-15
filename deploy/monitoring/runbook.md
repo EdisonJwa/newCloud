@@ -188,6 +188,7 @@ For a burst of `breakglass_denied`:
   network restriction. Only a burst is worth waking someone.
 - **Per-user login failure rate.** It would be high-cardinality and the signal is mostly expired
   sessions. The audit log answers the question when it is actually asked.
+
 ## wal
 
 WAL archiving is failing, backing up, or has stalled.
@@ -232,3 +233,83 @@ long replay.
   success is a flaky NFS mount, not an incident. The alert needs a sustained increase.
 - **`pending > 0`.** A handful of segments waiting is normal — a segment is archived when it fills
   or when `archive_timeout` fires. Only a backlog that is not draining is worth waking someone.
+
+## blob storage operations
+
+Two things only an operator can do, because they are outside what the process sees.
+
+### Stranded multipart uploads
+
+A multipart upload claims storage for its parts as they arrive, and that storage returns only when
+the upload completes or is explicitly aborted. A client that gives up — dropped connection, crash, a
+5xx from the endpoint — leaves the parts behind. On S3 they are billed and reclaimed only by a
+lifecycle rule; on a self-hosted backend they are simply leaked disk, invisible in any object
+listing.
+
+**Measured (round 46):** with every part upload failing, `Put` returned an error and left **zero**
+stranded uploads — minio-go aborts its own upload before returning. So the common case is handled,
+and this section exists for the cases it is not: a process killed mid-upload, or a client that
+disappears between parts.
+
+Check for them at the backend, since the application cannot:
+
+```sh
+# S3 / MinIO: list in-progress uploads
+aws s3api list-multipart-uploads --bucket <bucket>
+# MinIO client
+mc admin trace --verbose <alias>
+```
+
+Remedy: abort them. They are unreferenced by definition — nothing has a key for them yet — so
+aborting is always safe and never loses a committed file.
+
+```sh
+aws s3api abort-multipart-upload --bucket <bucket> --key <key> --upload-id <id>
+```
+
+A lifecycle rule that aborts incomplete uploads after a day is the standing fix and costs nothing.
+
+### A known upstream race in minio-go's multipart retry
+
+While adding these tests, a genuine data race was found in **minio-go v7.4.1**, not in newCloud.
+
+`hookReader` wraps the caller's reader so retries can rewind it. In the multipart path
+(`api-put-object-streaming.go`), when a part upload is retried, the retry goroutine writes the
+hook buffer while the previous attempt is still reading it:
+
+```
+WARNING: DATA RACE
+Write at ... by goroutine N:
+  minio-go/v7/hook-reader.go:50
+  minio-go/v7/api.go:747
+  minio-go/v7/api-put-object-streaming.go:727
+```
+
+**Reachable in production**, not just in tests: it needs an object larger than the 16 MiB part size
+and one retried part — that is, a normal large upload crossing a transient S3 error. `NumThreads: 1`
+does not avoid it; the race is in the retry path, not in concurrency.
+
+**What it means in practice.** The practical consequence is a garbled part rather than a crashed
+process: two goroutines race on the same buffer, so the bytes sent on the retry may not be the bytes
+in the file. The defence is already in place and is what keeps the damage contained — `Put` hashes
+the content and compares against the expected address **before** uploading, so a corrupt transfer is
+rejected locally with `ErrHashMismatch` rather than stored under an address it does not match. An
+upload that trips the race fails; it does not poison the blob store.
+
+**What to do about it.** Track upstream; this is not fixable from the call site. If a deployment
+sees repeated `ErrHashMismatch` on large uploads against a flaky endpoint, that is this race, and
+the remediation is to retry the upload from the client rather than to investigate the file.
+
+### Orphan blobs after a restore
+
+Restoring blobs before the database (see `deploy/backup/restore-drill.md` §2.6) is the safe order,
+and its cost is blobs with no row: the window's writes land as bytes that no metadata references.
+
+These are reclaimed by the normal collector, because it is metadata-driven — it selects rows from
+`blobs` and deletes those that are unreferenced and past their grace period. **A blob file with no
+row at all is invisible to it**, which is exactly why the restore order is safe, and also why an
+orphan from *outside* the database's knowledge is never collected automatically.
+
+If a restore leaves the store larger than the metadata accounts for, reconcile it by comparing the
+blob root against `SELECT encode(sha256,'hex') FROM blobs` and removing the difference **after
+confirming the restore is complete and the audit chain verifies**.
