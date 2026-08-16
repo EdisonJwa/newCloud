@@ -76,3 +76,28 @@ func (t *pgTx) BlobHash(ctx context.Context, id uuid.UUID) ([]byte, error) {
 	}
 	return sum, nil
 }
+
+// SampleBlobHashes returns up to limit content addresses from the blobs table.
+func (t *pgTx) SampleBlobHashes(ctx context.Context, limit int) ([][32]byte, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	const q = `SELECT sha256 FROM blobs ORDER BY id LIMIT $1`
+	rows, err := t.tx.Query(ctx, q, limit)
+	if err != nil {
+		return nil, translate(err)
+	}
+	defer rows.Close()
+
+	var out [][32]byte
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			return nil, err
+		}
+		var h [32]byte
+		copy(h[:], raw)
+		out = append(out, h)
+	}
+	return out, translate(rows.Err())
+}

@@ -77,3 +77,20 @@ func (t *memTx) BlobHash(ctx context.Context, id uuid.UUID) ([]byte, error) {
 	}
 	return nil, ErrNotFound
 }
+
+// SampleBlobHashes returns up to limit content addresses from the in-memory blobs.
+func (t *memTx) SampleBlobHashes(ctx context.Context, limit int) ([][32]byte, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	// The memory store indexes content addresses in blobIDs, which is the map the scrub needs:
+	// the keys ARE the hashes.
+	var out [][32]byte
+	for h := range t.m.blobIDs {
+		if len(out) >= limit {
+			break
+		}
+		out = append(out, h)
+	}
+	return out, nil
+}

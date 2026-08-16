@@ -289,12 +289,31 @@ Write at ... by goroutine N:
 and one retried part — that is, a normal large upload crossing a transient S3 error. `NumThreads: 1`
 does not avoid it; the race is in the retry path, not in concurrency.
 
-**What it means in practice.** The practical consequence is a garbled part rather than a crashed
-process: two goroutines race on the same buffer, so the bytes sent on the retry may not be the bytes
-in the file. The defence is already in place and is what keeps the damage contained — `Put` hashes
-the content and compares against the expected address **before** uploading, so a corrupt transfer is
-rejected locally with `ErrHashMismatch` rather than stored under an address it does not match. An
-upload that trips the race fails; it does not poison the blob store.
+**What it means in practice.** Two goroutines race on the same buffer, so the bytes sent on a retried
+part may not be the bytes that were read from the file.
+
+**A correction to what this section said first.** The earlier version claimed the local hash check
+contained the damage — that a corrupt transfer would be rejected with `ErrHashMismatch` and never
+stored. That is not what the check does. `Put` hashes the **input reader** and compares it to the
+expected address *before* handing anything to minio; it never looks at what minio actually sent, and
+there is no read-back afterwards. So the hash check protects against a corrupt *source*, not against
+a transport that garbles bytes mid-flight. If the race ever did corrupt a part, nothing at write time
+would notice: the object would land under a valid address with the wrong bytes.
+
+**Measured (round 47), and the honest conclusion.** Under `-race`, 48 MiB uploads with four injected
+part failures reproduce the race reliably, and in twelve attempts the stored bytes hashed correctly
+every time. So the window is narrow enough that it has not produced corruption in this test — which
+is not the same as proving it cannot. The residual risk is real and unquantified.
+
+**What actually limits it.** Content addressing bounds the blast radius rather than preventing it: a
+corrupted blob sits under an address it does not match, so `newcloud drill` — which compares restored
+bytes against the hash recorded in `blobs.sha256` — reports it as a failure rather than serving it
+silently. That is detection after the fact, not prevention.
+
+**What to do about it.** Track upstream; v7.4.1 is the current release and this is not fixable from
+the call site (hiding `io.Seeker` to suppress retries does not help — minio buffers and retries
+anyway, measured). A deployment that sees `ErrHashMismatch`, or a drill failure naming a blob, on
+large uploads against an unstable endpoint should treat it as this and re-upload from the client.
 
 **What to do about it.** Track upstream; this is not fixable from the call site. If a deployment
 sees repeated `ErrHashMismatch` on large uploads against a flaky endpoint, that is this race, and
@@ -313,3 +332,40 @@ orphan from *outside* the database's knowledge is never collected automatically.
 If a restore leaves the store larger than the metadata accounts for, reconcile it by comparing the
 blob root against `SELECT encode(sha256,'hex') FROM blobs` and removing the difference **after
 confirming the restore is complete and the audit chain verifies**.
+
+## blob-corruption
+
+The integrity scrub found blobs whose bytes do not match their address, or blobs the metadata
+references that storage does not have.
+
+Content addressing makes this check exact: a blob's file name **is** the SHA-256 of its contents, so
+a mismatch needs no interpretation. The scrub logs both hashes.
+
+**Corrupted (`newcloud_blob_scrub_corrupt`).**
+
+Storage damaged the data — a bad sector, a failed disk, or a transfer that wrote the wrong bytes.
+(a known upstream minio-go race can garble a retried multipart part; see
+[above](#a-known-upstream-race-in-minio-gos-multipart-retry)).
+
+1. **Do not delete the blob.** The metadata references it, so deleting turns corruption into data
+   loss and removes the evidence.
+2. Restore that blob from a backup — `restic restore` for a specific path, or the dump for the
+   database side.
+3. Verify after restoring: its hash must equal its name, which is a one-line check and needs no
+   tooling.
+4. If several blobs are corrupt, check the disk (`smartctl`, kernel log) before restoring. Restoring
+   onto failing hardware repeats the exercise.
+
+**Missing (`newcloud_blob_scrub_missing`).**
+
+Something removed content the database still points at. The usual causes, in order: an interrupted
+restore (blobs are restored before the database — see
+`deploy/backup/restore-drill.md` §2.6 — so a restore that stopped halfway leaves rows without
+bytes); a collector run against the wrong database; or manual deletion.
+
+Restoring the blob is always safe. Deleting the row is not: it discards the file.
+
+**Why the scrub samples rather than sweeps.** Reading every byte of a 40 TiB store on a timer is a
+second full-time workload. The scrub verifies a bounded number of blobs per pass and logs the total
+it read, so its cost is visible. A pass that finds nothing is not proof of health — it is the absence
+of evidence in that sample, which is why the interval matters more than the limit.

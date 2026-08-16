@@ -285,6 +285,12 @@ type Tx interface {
 	// BlobHash returns the content address recorded for a blob, for verification that does
 	// not trust either copy on disk.
 	BlobHash(ctx context.Context, id uuid.UUID) ([]byte, error)
+	// SampleBlobHashes returns up to limit content addresses, for an integrity scrub.
+	//
+	// It reads the metadata rather than the storage directory because the metadata is what knows
+	// which blobs are SUPPOSED to exist — a directory scan verifies exactly the blobs that are
+	// easy to find and misses a row whose bytes are gone.
+	SampleBlobHashes(ctx context.Context, limit int) ([][32]byte, error)
 
 	// AuthorizeDownload opens or joins the download session for a shared file,
 	// charging the share at most once per logical download.

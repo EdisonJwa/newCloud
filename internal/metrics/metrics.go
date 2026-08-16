@@ -59,6 +59,15 @@ type Registry struct {
 	blobsDeleted atomic.Uint64
 	blobsGCError atomic.Uint64
 
+	// Blob integrity scrub, pushed by the worker.
+	//
+	// corrupt and missing are the two numbers that matter: they mean storage is damaging data, or
+	// that content the metadata references is gone. Nothing else in the system reads live blobs
+	// back, so without these a corrupted file is discovered by a user.
+	scrubChecked atomic.Int64
+	scrubCorrupt atomic.Int64
+	scrubMissing atomic.Int64
+
 	// WAL archiving health, pushed by the worker from pg_stat_archiver.
 	//
 	// This is the signal that the disaster-recovery story has quietly stopped working. When
@@ -120,6 +129,14 @@ func (r *Registry) ObserveUpload(result string) {
 // ObserveThumbnail records a thumbnail outcome.
 func (r *Registry) ObserveThumbnail(result string) {
 	counter(&r.thumbnails, result).Add(1)
+}
+
+// SetBlobScrub reports the last integrity pass: how many blobs were read, how many disagreed with
+// their address, and how many were referenced but absent.
+func (r *Registry) SetBlobScrub(checked, corrupt, missing int) {
+	r.scrubChecked.Store(int64(checked))
+	r.scrubCorrupt.Store(int64(corrupt))
+	r.scrubMissing.Store(int64(missing))
 }
 
 // SetWALArchive reports the WAL archiver's state: segments archived, segments failed, and how
@@ -237,6 +254,16 @@ func (r *Registry) write(w http.ResponseWriter) {
 	fmt.Fprintf(w, "newcloud_jobs{state=\"pending\"} %d\n", r.jobsPending.Load())
 	fmt.Fprintf(w, "newcloud_jobs{state=\"running\"} %d\n", r.jobsRunning.Load())
 	fmt.Fprintf(w, "newcloud_jobs{state=\"failed\"} %d\n", r.jobsFailed.Load())
+
+	fmt.Fprintln(w, "# HELP newcloud_blob_scrub_corrupt Blobs whose bytes do not match their address.")
+	fmt.Fprintln(w, "# TYPE newcloud_blob_scrub_corrupt gauge")
+	fmt.Fprintf(w, "newcloud_blob_scrub_corrupt %d\n", r.scrubCorrupt.Load())
+	fmt.Fprintln(w, "# HELP newcloud_blob_scrub_missing Blobs referenced by metadata but absent from storage.")
+	fmt.Fprintln(w, "# TYPE newcloud_blob_scrub_missing gauge")
+	fmt.Fprintf(w, "newcloud_blob_scrub_missing %d\n", r.scrubMissing.Load())
+	fmt.Fprintln(w, "# HELP newcloud_blob_scrub_checked Blobs verified in the last integrity pass.")
+	fmt.Fprintln(w, "# TYPE newcloud_blob_scrub_checked gauge")
+	fmt.Fprintf(w, "newcloud_blob_scrub_checked %d\n", r.scrubChecked.Load())
 
 	fmt.Fprintln(w, "# HELP newcloud_wal_archived_total WAL segments archived successfully.")
 	fmt.Fprintln(w, "# TYPE newcloud_wal_archived_total counter")

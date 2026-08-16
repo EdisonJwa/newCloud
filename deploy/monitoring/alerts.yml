@@ -268,3 +268,48 @@ groups:
             and the RPO is the dump interval), or the archiver is wedged. Check
             `SHOW archive_mode` before anything else.
           runbook: "deploy/monitoring/runbook.md#wal"
+  - name: newcloud-integrity-scrub
+    interval: 30s
+    rules:
+      # The blob scrub is the only thing that reads live content back. Content addressing makes
+      # the check exact: the file name is the hash of its bytes, so a mismatch is corruption with
+      # no interpretation needed.
+      - alert: NewCloudBlobCorrupted
+        expr: newcloud_blob_scrub_corrupt > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $value }} blob(s) on disk do not match their content address"
+          description: >-
+            Storage has damaged data, or a transfer wrote the wrong bytes. The blobs are named in
+            the log with both hashes. Restore them from a backup; do not delete them, because the
+            metadata still references them and a delete would turn corruption into data loss.
+          runbook: "deploy/monitoring/runbook.md#blob-corruption"
+
+      - alert: NewCloudBlobMissing
+        expr: newcloud_blob_scrub_missing > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $value }} blob(s) are referenced by metadata but absent from storage"
+          description: >-
+            Different from corruption: something deleted content that the database still points
+            at. Check whether a restore was interrupted, or whether a collector ran against a
+            database it did not belong to. Restoring the blob is safe; deleting the row loses the
+            file.
+          runbook: "deploy/monitoring/runbook.md#blob-corruption"
+
+      # A scrub that never runs looks identical to one that finds nothing. Without this, disabling
+      # the scrub silently removes the only integrity signal in the system.
+      - alert: NewCloudBlobScrubNotRunning
+        expr: newcloud_blob_scrub_checked == 0 and newcloud_audit_events > 0
+        for: 6h
+        labels:
+          severity: warning
+        annotations:
+          summary: "the blob integrity scrub has not verified anything for 6 hours"
+          description: >-
+            Either the scrub is disabled (it needs an explicit limit and the content store), or it
+            is failing. Both mean nothing is checking that stored bytes still match their
+            addresses — which is the one thing that catches silent corruption before a user does.
+          runbook: "deploy/monitoring/runbook.md#blob-corruption"

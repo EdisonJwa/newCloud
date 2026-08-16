@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/EdisonJwa/newCloud/internal/auditverify"
+	"github.com/EdisonJwa/newCloud/internal/blob"
 	"github.com/EdisonJwa/newCloud/internal/metrics"
 	"github.com/EdisonJwa/newCloud/internal/store"
 )
@@ -22,6 +23,13 @@ import (
 type Worker struct {
 	meta store.Store
 	log  *slog.Logger
+	// blobs is the content store, needed by the integrity scrub. Optional: a worker without it
+	// simply does not scrub, and every other duty is unaffected.
+	blobs blob.Store
+	// scrubLimit is how many blobs one pass verifies. Zero disables the scrub, which is the safe
+	// reading of "unset" — defaulting to "everything" would make enabling it a surprise full read
+	// of the store.
+	scrubLimit int
 	// intervals are configurable so tests can run them fast.
 	lockInterval  time.Duration
 	sweepInterval time.Duration
@@ -63,6 +71,17 @@ type Worker struct {
 
 	// metrics is optional; nil means nothing is recorded.
 	metrics *metrics.Registry
+}
+
+// WithBlobScrub enables the integrity scrub over blobs, verifying up to limit blobs per pass.
+//
+// Kept separate from WithMetrics because it needs the content store, which the worker otherwise
+// does not touch — and because a deployment that has not thought about the read cost should not get
+// a scrub by accident.
+func (w *Worker) WithBlobScrub(blobs blob.Store, limit int) *Worker {
+	w.blobs = blobs
+	w.scrubLimit = limit
+	return w
 }
 
 // WithMetrics attaches a metrics registry.
@@ -121,6 +140,10 @@ func (w *Worker) Run(ctx context.Context) {
 	// leaves pg_wal growing until the disk fills. Sampled on the sweep cadence.
 	walSample := time.NewTicker(w.sweepInterval)
 	defer walSample.Stop()
+	// The scrub is the only check that reads live content back. It runs on the sweep cadence
+	// because a corrupted blob is a storage problem, not a latency one.
+	scrubs := time.NewTicker(w.sweepInterval)
+	defer scrubs.Stop()
 
 	w.log.Info("worker started",
 		"lock_interval", w.lockInterval, "sweep_interval", w.sweepInterval,
@@ -300,4 +323,35 @@ func (w *Worker) SweepBlobs(ctx context.Context) (int, error) {
 		removed++
 	}
 	return removed, nil
+}
+
+// runScrub performs one integrity pass and reports it.
+//
+// Corruption is logged at error level and never swallowed: the whole value of the scrub is that
+// somebody finds out. A missing blob is logged separately because it means something deleted
+// content the metadata still references, which is a different investigation.
+func (w *Worker) runScrub(ctx context.Context) {
+	if w.blobs == nil || w.scrubLimit <= 0 {
+		return
+	}
+	res, err := w.ScrubBlobs(ctx, w.blobs, w.scrubLimit)
+	if err != nil {
+		w.log.Error("blob integrity scrub failed", "error", err)
+		return
+	}
+	if w.metrics != nil {
+		w.metrics.SetBlobScrub(res.Checked, len(res.Corrupt), len(res.Missing))
+	}
+	for _, c := range res.Corrupt {
+		w.log.Error("blob content does not match its address",
+			"blob", c.Hash.String(), "actual_sha256", fmt.Sprintf("%x", c.Actual[:]),
+			"size", c.Size)
+	}
+	for _, m := range res.Missing {
+		w.log.Error("blob is referenced by metadata but absent from storage", "blob", m)
+	}
+	if res.Checked > 0 {
+		w.log.Debug("blob integrity scrub", "checked", res.Checked, "bytes", res.Bytes,
+			"corrupt", len(res.Corrupt), "missing", len(res.Missing))
+	}
 }
