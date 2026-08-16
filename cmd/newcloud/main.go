@@ -222,7 +222,7 @@ func serve() error {
 	// Open the content store and run its startup self-checks before accepting a
 	// single request. Discovering a split filesystem at 3am while a 100 GiB upload
 	// is mid-flight is not an option.
-	content, err := openStorage(cfg, meta, log)
+	content, blobStore, err := openStorage(cfg, meta, log)
 	if err != nil {
 		return fmt.Errorf("startup self-check failed: %w", err)
 	}
@@ -343,6 +343,21 @@ func serve() error {
 	// anything here; the queries are written to tolerate it.
 	wk := worker.New(meta, log).WithRetention(cfg.Limits.VersionRetention(), cfg.Limits.TrashRetention())
 	wk.WithMetrics(reg)
+	if n := cfg.Limits.BlobScrubPerPass; n > 0 {
+		// The scrub is the only thing that reads stored content back. Without it, a blob
+		// corrupted in place is invisible until a user opens the file — or until a restore
+		// drill, months later, reports it as a backup problem.
+		wk.WithBlobScrub(blobStore, n)
+		if iv := cfg.Limits.BlobScrubInterval(); iv > 0 {
+			wk.WithScrubInterval(iv)
+		}
+		log.Info("blob integrity scrub enabled", "blobs_per_pass", n)
+	} else {
+		// Named at startup for the same reason as audit anchoring: an operator who believes
+		// the scrub is running and one who never enabled it look identical from outside.
+		log.Warn("blob integrity scrub is disabled: silent corruption will not be detected",
+			"hint", "set limits.blob_scrub_per_pass to the number of blobs to verify per cycle")
+	}
 	if cfg.Audit.AnchorDir != "" {
 		if err := wk.EnableAnchoring(cfg.Audit.AnchorDir, meta); err != nil {
 			log.Error("audit anchoring is configured but unusable", "dir", cfg.Audit.AnchorDir, "error", err)
@@ -422,7 +437,7 @@ func openMetadata(ctx context.Context, log *slog.Logger) (storepkg.Store, func()
 // The layout is still the content-addressed one: the bucket holds blobs keyed by hash, and the
 // tree layout is rejected in openStorage because it is a filesystem mirror by definition. That
 // keeps the two axes independent exactly as they are for local disk.
-func openS3Storage(cfg config.Config, meta storepkg.Store, log *slog.Logger) (layout.ContentStore, error) {
+func openS3Storage(cfg config.Config, meta storepkg.Store, log *slog.Logger) (layout.ContentStore, blob.Store, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
@@ -437,7 +452,7 @@ func openS3Storage(cfg config.Config, meta storepkg.Store, log *slog.Logger) (la
 		Prefix:    s3cfg.Prefix,
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	log.Info("storage ready",
@@ -447,12 +462,12 @@ func openS3Storage(cfg config.Config, meta storepkg.Store, log *slog.Logger) (la
 
 	adapter, err := blobstore.New(store, &resolverAdapter{r: meta.Resolver()})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	// Uploads stage on local disk even when the bytes land in a bucket: the hash is needed
 	// before the object can be named.
 	adapter = adapter.WithSpoolDir(cfg.Storage.Local.Root)
-	return adapter, nil
+	return adapter, store, nil
 }
 
 // openStorage builds the content store for the configured backend and layout.
@@ -464,21 +479,31 @@ func openS3Storage(cfg config.Config, meta storepkg.Store, log *slog.Logger) (la
 //
 // Only local+blob and local+tree are implemented; S3 is rejected with a clear
 // message rather than half-working.
-func openStorage(cfg config.Config, meta storepkg.Store, log *slog.Logger) (layout.ContentStore, error) {
+// openStorage builds the content store and, when the layout is content-addressed, the underlying
+// blob store as well.
+//
+// The second return value exists for the integrity scrub, which reads blobs back by their hash.
+// layout.ContentStore addresses files by owner+path, which is the wrong question for a scrub: it
+// would verify the files that happen to be easy to name and miss rows whose bytes are gone. The
+// blob store addresses by content hash, which is exactly what the scrub compares against. It is nil
+// for the tree layout, where the naming is a path rather than a hash and the check does not apply.
+func openStorage(cfg config.Config, meta storepkg.Store, log *slog.Logger) (layout.ContentStore, blob.Store, error) {
 	if cfg.Storage.Layout == config.LayoutTree {
 		if cfg.Storage.Backend != "local" {
-			return nil, fmt.Errorf("layout %q requires the local backend", cfg.Storage.Layout)
+			return nil, nil, fmt.Errorf("layout %q requires the local backend", cfg.Storage.Layout)
 		}
 		s, err := tree.New(cfg.Storage.Local.Root)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		caps := s.Capabilities()
 		log.Info("storage ready",
 			"backend", cfg.Storage.Backend, "layout", string(s.Mode()),
 			"root", cfg.Storage.Local.Root,
 			"deduplicated", caps.Deduplicated, "inspectable", caps.DirectFSInspect)
-		return s, nil
+		// The tree layout names files by path, not by hash, so there is nothing for the scrub to
+		// compare against and no blob store to hand it.
+		return s, nil, nil
 	}
 
 	if cfg.Storage.Backend == "s3" {
@@ -486,18 +511,18 @@ func openStorage(cfg config.Config, meta storepkg.Store, log *slog.Logger) (layo
 	}
 
 	if cfg.Storage.Backend != "local" {
-		return nil, fmt.Errorf("storage backend %q is not supported; use \"local\" or \"s3\"", cfg.Storage.Backend)
+		return nil, nil, fmt.Errorf("storage backend %q is not supported; use \"local\" or \"s3\"", cfg.Storage.Backend)
 	}
 
 	ls, err := local.New(cfg.Storage.Local.Root)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	// Prove a blob can be published with a single rename before serving traffic.
 	// Splitting tmp and content across filesystems degrades that to a full copy,
 	// which at scale is an outage rather than a slowdown.
 	if err := ls.CheckSameFilesystem(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	log.Info("storage ready",
@@ -508,9 +533,9 @@ func openStorage(cfg config.Config, meta storepkg.Store, log *slog.Logger) (layo
 	// staging on another filesystem would turn the publish into a full copy.
 	adapter, err := blobstore.New(ls, &resolverAdapter{r: meta.Resolver()})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return adapter.WithSpoolDir(filepath.Join(cfg.Storage.Local.Root, "tmp")), nil
+	return adapter.WithSpoolDir(filepath.Join(cfg.Storage.Local.Root, "tmp")), ls, nil
 }
 
 // authzAccessor adapts the metadata store to the authorizer's needs.

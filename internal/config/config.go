@@ -163,6 +163,22 @@ type LimitsConfig struct {
 	DefaultFileQuotaBytes int64 `yaml:"default_file_quota_bytes"`
 	MaxProfindChildren    int   `yaml:"max_propfind_children"`
 	UploadChunkBytes      int64 `yaml:"upload_chunk_bytes"`
+	// BlobScrubPerPass is how many blobs the integrity scrub reads per cycle. Zero disables it.
+	//
+	// This is a count rather than a schedule because the cost is proportional to bytes read, not
+	// to elapsed time: a small store is fully covered every cycle, and a large one is sampled. Set
+	// it to roughly "how many blobs you are willing to read per sweep interval", which for a
+	// multi-terabyte store is a few hundred.
+	//
+	// Zero is the default and means no scrub. That is deliberate: reading stored content back is
+	// real I/O, and a deployment should opt into it rather than discover it.
+	BlobScrubPerPass int `yaml:"blob_scrub_per_pass"`
+	// BlobScrubIntervalSeconds is how often the scrub runs. Zero uses the sweep cadence (6h).
+	//
+	// Separate from the sweep because corrupted content is urgent in a way unreferenced content is
+	// not: a user cannot open the file either way, and the question is only how long until somebody
+	// knows. Six hours is the floor set by the default; an hour is a reasonable production value.
+	BlobScrubIntervalSeconds int `yaml:"blob_scrub_interval_seconds"`
 
 	// Retention (§8.2). Every value here was previously either missing or a
 	// constant inside a handler, which meant an operator could not state a data
@@ -576,4 +592,12 @@ func roleRank(r Role) int {
 	default:
 		return 0
 	}
+}
+
+// BlobScrubInterval is the scrub period, defaulting to zero (the worker's sweep cadence).
+func (l LimitsConfig) BlobScrubInterval() time.Duration {
+	if l.BlobScrubIntervalSeconds <= 0 {
+		return 0
+	}
+	return time.Duration(l.BlobScrubIntervalSeconds) * time.Second
 }

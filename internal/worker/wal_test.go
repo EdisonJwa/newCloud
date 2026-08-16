@@ -16,6 +16,9 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -124,4 +127,62 @@ func TestSampleWALArchiveReportsPendingSegments(t *testing.T) {
 	if want == 0 {
 		t.Fatal("pg_ls_waldir returned no segments, which is not possible on a running cluster")
 	}
+}
+
+// TestEveryTickerHasASelectCase.
+//
+// The integrity scrub was written, wired into main, logged at startup — and never ran, because the
+// `case <-scrubs.C:` arm of the worker's select was missing. The ticker was created and stopped, and
+// nothing read from it. It took a live end-to-end run with a deliberately corrupted blob to notice,
+// because every unit test called ScrubBlobs directly and every log line looked right.
+//
+// This is the structural check that would have caught it: a ticker declared in Run must be read in
+// Run's select. It is a source-shape test, which is unusual, but the defect it guards is a shape —
+// there is no runtime behaviour to observe when the code never executes.
+func TestEveryTickerHasASelectCase(t *testing.T) {
+	root := repoRootForWorker(t)
+	src, err := os.ReadFile(filepath.Join(root, "internal", "worker", "worker.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(src)
+
+	// Tickers declared with `name := time.NewTicker(...)`.
+	declared := map[string]bool{}
+	for _, m := range regexp.MustCompile(`(\w+)\s*:=\s*time\.NewTicker\(`).FindAllStringSubmatch(text, -1) {
+		declared[m[1]] = true
+	}
+	if len(declared) == 0 {
+		t.Fatal("found no tickers; this check would pass vacuously")
+	}
+
+	for name := range declared {
+		// The ticker must be received from somewhere, which is what makes it fire.
+		if !strings.Contains(text, "<-"+name+".C") {
+			t.Fatalf("ticker %q is created but nothing receives from %q.C: the task it drives never "+
+				"runs. A background job that is declared, logged and never invoked is worse than a "+
+				"missing one, because the startup log says it is enabled.", name, name)
+		}
+	}
+}
+
+// repoRootForWorker walks up to the module root.
+func repoRootForWorker(t *testing.T) string {
+	t.Helper()
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 8; i++ {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	t.Fatal("could not find the module root")
+	return ""
 }

@@ -52,7 +52,7 @@ storage:
   #       rsync-friendly, but no deduplication and each version is a full copy.
   #
   # This is a deployment decision, not a per-user toggle: switching after data
-  # exists requires a migration. See docs/0003-storage-layout.md.
+  # exists requires a migration. See docs/adr/0003-storage-layout.md.
   backend: "local"
   layout: "blob"
   local:
@@ -91,6 +91,19 @@ limits:
   default_file_quota_bytes: 10737418240 # 10 GiB default per-user soft cap
   max_propfind_children: 100000        # protects a single huge directory
   upload_chunk_bytes: 268435456        # 256 MiB chunks
+
+  # Integrity scrub: how many blobs to read back and verify against their content
+  # address each cycle. 0 disables it.
+  #
+  # Content addressing makes this check exact — a blob's name IS the SHA-256 of its
+  # contents — so a mismatch means storage damaged the data. Nothing else in the system
+  # reads stored content back, so without this a corrupted file is found by a user, or by
+  # a restore drill months later.
+  #
+  # The cost is real: each pass reads this many blobs in full. Size it to your store and
+  # your tolerance — a few hundred per cycle keeps a multi-terabyte store covered over
+  # days, and a small deployment can set it high enough to cover everything.
+  blob_scrub_per_pass: 0
 
   # Data retention. 0 means "keep forever", which is the default and the only safe
   # default: a deployment that has not decided a policy must not silently delete a

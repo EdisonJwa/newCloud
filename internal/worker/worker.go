@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/EdisonJwa/newCloud/internal/auditverify"
-	"github.com/EdisonJwa/newCloud/internal/blob"
 	"github.com/EdisonJwa/newCloud/internal/metrics"
 	"github.com/EdisonJwa/newCloud/internal/store"
 )
@@ -25,11 +24,16 @@ type Worker struct {
 	log  *slog.Logger
 	// blobs is the content store, needed by the integrity scrub. Optional: a worker without it
 	// simply does not scrub, and every other duty is unaffected.
-	blobs blob.Store
+	blobs BlobReader
 	// scrubLimit is how many blobs one pass verifies. Zero disables the scrub, which is the safe
 	// reading of "unset" — defaulting to "everything" would make enabling it a surprise full read
 	// of the store.
 	scrubLimit int
+	// scrubInterval is how often a pass runs. Separate from the sweep because the two have
+	// different costs and different urgency: the sweep reclaims unreferenced bytes and can wait
+	// six hours, while a corrupted blob is a file a user cannot open, and finding it within the
+	// hour is the difference between "we caught it" and "the backups were never valid".
+	scrubInterval time.Duration
 	// intervals are configurable so tests can run them fast.
 	lockInterval  time.Duration
 	sweepInterval time.Duration
@@ -78,9 +82,15 @@ type Worker struct {
 // Kept separate from WithMetrics because it needs the content store, which the worker otherwise
 // does not touch — and because a deployment that has not thought about the read cost should not get
 // a scrub by accident.
-func (w *Worker) WithBlobScrub(blobs blob.Store, limit int) *Worker {
+func (w *Worker) WithBlobScrub(blobs BlobReader, limit int) *Worker {
 	w.blobs = blobs
 	w.scrubLimit = limit
+	return w
+}
+
+// WithScrubInterval sets how often the integrity scrub runs. Zero keeps the sweep cadence.
+func (w *Worker) WithScrubInterval(d time.Duration) *Worker {
+	w.scrubInterval = d
 	return w
 }
 
@@ -142,7 +152,11 @@ func (w *Worker) Run(ctx context.Context) {
 	defer walSample.Stop()
 	// The scrub is the only check that reads live content back. It runs on the sweep cadence
 	// because a corrupted blob is a storage problem, not a latency one.
-	scrubs := time.NewTicker(w.sweepInterval)
+	scrubEvery := w.scrubInterval
+	if scrubEvery <= 0 {
+		scrubEvery = w.sweepInterval
+	}
+	scrubs := time.NewTicker(scrubEvery)
 	defer scrubs.Stop()
 
 	w.log.Info("worker started",
@@ -180,6 +194,11 @@ func (w *Worker) Run(ctx context.Context) {
 			} else if n > 0 {
 				w.log.Info("expired download sessions", "count", n)
 			}
+		case <-scrubs.C:
+			// Integrity: read a sample of live blobs and compare to their addresses. Distinct
+			// from the sweep, which reclaims UNREFERENCED content — this looks for content that
+			// is referenced and WRONG, which the sweep cannot see by construction.
+			w.runScrub(ctx)
 		case <-sweeps.C:
 			n, err := w.SweepBlobs(ctx)
 			// The collector is the only thing that reclaims disk, so both its successes and its

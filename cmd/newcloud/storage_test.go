@@ -30,7 +30,7 @@ func TestOpenStorageRejectsTreeOnS3(t *testing.T) {
 	cfg.Storage.Local.Root = t.TempDir()
 	cfg.Storage.S3 = config.S3Storage{Endpoint: "minio.example.com", Bucket: "b"}
 
-	if _, err := openStorage(cfg, storepkg.NewMemory(), testLogger()); err == nil {
+	if _, _, err := openStorage(cfg, storepkg.NewMemory(), testLogger()); err == nil {
 		t.Fatal("tree layout on the s3 backend must be rejected")
 	}
 }
@@ -72,7 +72,7 @@ func TestOpenStorageBuildsS3(t *testing.T) {
 		Prefix:    "wiring",
 	}
 
-	cs, err := openStorage(cfg, storepkg.NewMemory(), testLogger())
+	cs, _, err := openStorage(cfg, storepkg.NewMemory(), testLogger())
 	if err != nil {
 		t.Fatalf("openStorage: %v", err)
 	}
@@ -106,7 +106,7 @@ func TestOpenStorageRejectsUnknownBackend(t *testing.T) {
 	cfg.Storage.Layout = config.LayoutBlob
 	cfg.Storage.Local.Root = t.TempDir()
 
-	if _, err := openStorage(cfg, storepkg.NewMemory(), testLogger()); err == nil {
+	if _, _, err := openStorage(cfg, storepkg.NewMemory(), testLogger()); err == nil {
 		t.Fatal("an unknown backend must be rejected")
 	}
 }

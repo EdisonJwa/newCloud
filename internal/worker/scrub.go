@@ -25,6 +25,17 @@ import (
 	"github.com/EdisonJwa/newCloud/internal/store"
 )
 
+// BlobReader is the one thing the scrub needs from storage: the ability to read a blob back by its
+// address.
+//
+// Stated as a one-method interface rather than as blob.Store or layout.ContentStore because the
+// scrub genuinely needs nothing else, and both of those interfaces are much larger. It also means a
+// caller can hand the scrub whichever store the deployment actually has — the local content-
+// addressed backend and the S3 one speak different interfaces above this line.
+type BlobReader interface {
+	Open(ctx context.Context, h blob.Hash) (io.ReadSeekCloser, error)
+}
+
 // ScrubResult is what one scrub pass found.
 type ScrubResult struct {
 	// Checked is how many blobs were read and hashed.
@@ -50,7 +61,7 @@ type CorruptBlob struct {
 // limit bounds the pass. A limit of zero checks nothing, which is the safe reading of "unset" — a
 // scrub that defaulted to "everything" would become a surprise full read of the store the first
 // time somebody enabled it.
-func (w *Worker) ScrubBlobs(ctx context.Context, store blob.Store, limit int) (ScrubResult, error) {
+func (w *Worker) ScrubBlobs(ctx context.Context, store BlobReader, limit int) (ScrubResult, error) {
 	var res ScrubResult
 	if store == nil || limit <= 0 {
 		return res, nil
