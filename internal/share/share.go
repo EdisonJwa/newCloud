@@ -235,15 +235,64 @@ func (s *Service) Resolve(ctx context.Context, token string) (store.Share, error
 		return store.Share{}, err
 	}
 
+	if err := s.gate(sh); err != nil {
+		return store.Share{}, err
+	}
+	return sh, nil
+}
+
+// ResolveForDownload resolves a token without applying the download cap.
+//
+// The download handler needs this because "the share is exhausted" is the wrong question
+// for a request that is a CONTINUATION of a download already paid for. A media player
+// seeking through a shared video issues one Range request per seek; with the cap applied
+// here, the second seek is refused even though it should ride the session created by the
+// first — which is requirement line 217's exact concern ("最大下载次数 must not be counted
+// per HTTP request").
+//
+// So the cap is still enforced, but by the session logic: AuthorizeDownload charges a new
+// download atomically and refuses when the cap is reached, and lets a continuation of an
+// existing session through for free. Revocation and expiry are still applied here, because
+// those mean the share must stop working entirely and a continuation is no exception.
+//
+// Callers that are not the download handler must keep using Resolve: for them "exhausted"
+// really does mean "not usable".
+func (s *Service) ResolveForDownload(ctx context.Context, token string) (store.Share, error) {
+	hash := tokenHash(token)
+
+	var sh store.Share
+	err := s.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		found, err := tx.ShareByTokenHash(ctx, hash)
+		if err != nil {
+			return err
+		}
+		sh = found
+		return nil
+	})
+	if err != nil {
+		return store.Share{}, err
+	}
+
 	switch {
 	case sh.RevokedAt != nil:
 		return store.Share{}, store.ErrShareRevoked
 	case sh.Expired(s.now()):
 		return store.Share{}, store.ErrShareExpired
-	case sh.Exhausted():
-		return store.Share{}, store.ErrShareExhausted
 	}
 	return sh, nil
+}
+
+// gate applies the checks that make a share unusable regardless of the request.
+func (s *Service) gate(sh store.Share) error {
+	switch {
+	case sh.RevokedAt != nil:
+		return store.ErrShareRevoked
+	case sh.Expired(s.now()):
+		return store.ErrShareExpired
+	case sh.Exhausted():
+		return store.ErrShareExhausted
+	}
+	return nil
 }
 
 // VerifyPassword checks a presented password in constant time at the KDF level.

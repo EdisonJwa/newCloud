@@ -139,7 +139,11 @@ func (s *Server) handleSharePage(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleShareDownload(w http.ResponseWriter, r *http.Request) {
 	token := chiURLParam(r, "token")
 
-	sh, err := s.deps.Shares.Resolve(r.Context(), token)
+	// ResolveForDownload, not Resolve: the download cap is enforced by the session logic
+	// below, which can tell a continuation from a new download. Applying it here would
+	// refuse a Range request that belongs to a download already paid for — and a media
+	// player seeking through a shared video issues one of those per seek.
+	sh, err := s.deps.Shares.ResolveForDownload(r.Context(), token)
 	if err != nil {
 		s.renderShareError(w, r, err)
 		return

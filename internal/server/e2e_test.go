@@ -794,3 +794,142 @@ func (h *harness) mkdir(t *testing.T, path string) {
 		t.Fatalf("mkdir %q: want 201, got %d", path, resp.StatusCode)
 	}
 }
+
+// TestShareRangeRequestsDoNotConsumeDownloads is requirement line 217:
+//
+//	分享链接的"最大下载次数"不能简单地按 HTTP 请求数计费，因为一次媒体播放或断点续传
+//	可能产生多个 Range 请求。
+//
+// A media player seeking through a shared video issues one Range request per seek, and a
+// resumed download is another request for the same bytes. Charging each one consumed a
+// limited share almost immediately — "usable 3 times" became "usable for one playback".
+//
+// This is the behaviour the download-session table exists for, and no server-level test
+// covered it: the existing limit test only issues plain GETs, where request count and
+// download count happen to coincide.
+func TestShareRangeRequestsDoNotConsumeDownloads(t *testing.T) {
+	h := newHarness(t)
+
+	// Big enough to have interesting ranges.
+	content := strings.Repeat("abcdefgh", 4096) // 32 KiB
+	body := &bytes.Buffer{}
+	mw := multipart.NewWriter(body)
+	_ = mw.WriteField("path", "")
+	fw, _ := mw.CreateFormFile("file", "video.bin")
+	_, _ = io.WriteString(fw, content)
+	_ = mw.Close()
+	h.do(http.MethodPost, "/api/files/upload", body,
+		map[string]string{"Content-Type": mw.FormDataContentType()}).Body.Close()
+
+	// Exactly one download allowed: any request that is charged a second time fails.
+	resp := h.do(http.MethodPost, "/api/shares/",
+		strings.NewReader(`{"path":"video.bin","kind":"link","max_downloads":1}`),
+		map[string]string{"Content-Type": "application/json"})
+	created := decode(t, resp)
+	token, _ := created["token"].(string)
+	url := h.srv.URL + "/s/" + token + "/download"
+
+	// The first request pays for the download. A Range on the very first request is also
+	// a first download — the session does not exist yet, so it must be charged, and that
+	// is what makes the line below meaningful rather than trivially true.
+	first, err := http.Get(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Body.Close()
+	if first.StatusCode != http.StatusOK {
+		t.Fatalf("first download: want 200, got %d", first.StatusCode)
+	}
+
+	// Every subsequent seek and resume rides the session and must not cost anything.
+	ranges := []string{"bytes=0-1023", "bytes=8192-16383", "bytes=16384-", "bytes=0-"}
+	for _, rng := range ranges {
+		req, err := http.NewRequest(http.MethodGet, url, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Range", rng)
+		r, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Body.Close()
+		if r.StatusCode != http.StatusPartialContent && r.StatusCode != http.StatusOK {
+			t.Fatalf("range %q: want 206 or 200, got %d. A Range request consumed the "+
+				"share's single download, which is the over-counting the download-session "+
+				"mechanism exists to prevent — a video seek would exhaust a limited share.", rng, r.StatusCode)
+		}
+	}
+
+	// And the limit is still real: a genuine second full download is refused.
+	second, err := http.Get(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second.Body.Close()
+	if second.StatusCode != http.StatusNotFound {
+		t.Fatalf("a second FULL download of an exhausted share: want 404, got %d. Range "+
+			"requests must be free, but a fresh download must still be charged.", second.StatusCode)
+	}
+}
+
+// TestRangeReuseIsPerVisitor is the other half of the previous test, and the reason the
+// session is keyed by visitor grant rather than by share alone.
+//
+// Making Range requests free must not make an exhausted share downloadable by everyone:
+// a continuation rides a session that a *specific* visitor paid for. A different visitor
+// has no session, so the same Range request is a first download and must be charged —
+// and refused once the cap is spent.
+//
+// Without this, the fix for the previous test would be indistinguishable from "ignore the
+// download limit when the request has a Range header", which is much worse than the bug.
+func TestRangeReuseIsPerVisitor(t *testing.T) {
+	h := newHarness(t)
+
+	content := strings.Repeat("0123456789", 4096) // 40 KiB
+	body := &bytes.Buffer{}
+	mw := multipart.NewWriter(body)
+	_ = mw.WriteField("path", "")
+	fw, _ := mw.CreateFormFile("file", "shared.bin")
+	_, _ = io.WriteString(fw, content)
+	_ = mw.Close()
+	h.do(http.MethodPost, "/api/files/upload", body,
+		map[string]string{"Content-Type": mw.FormDataContentType()}).Body.Close()
+
+	resp := h.do(http.MethodPost, "/api/shares/",
+		strings.NewReader(`{"path":"shared.bin","kind":"link","max_downloads":1}`),
+		map[string]string{"Content-Type": "application/json"})
+	created := decode(t, resp)
+	token, _ := created["token"].(string)
+	url := h.srv.URL + "/s/" + token + "/download"
+
+	// Visitor A pays for the download with a plain GET.
+	first, err := http.Get(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Body.Close()
+	if first.StatusCode != http.StatusOK {
+		t.Fatalf("first download: want 200, got %d", first.StatusCode)
+	}
+
+	// Visitor B is a different client: different User-Agent, which is part of the
+	// anonymous grant. Their Range request is a FIRST download, not a continuation.
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Range", "bytes=0-1023")
+	req.Header.Set("User-Agent", "a-different-visitor/1.0")
+	other, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other.Body.Close()
+
+	if other.StatusCode == http.StatusPartialContent || other.StatusCode == http.StatusOK {
+		t.Fatalf("a different visitor downloaded from an exhausted share with range status %d. "+
+			"Range requests are free only for the visitor whose session paid for them; otherwise "+
+			"the download limit can be bypassed by adding a Range header.", other.StatusCode)
+	}
+}
