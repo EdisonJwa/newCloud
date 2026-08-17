@@ -933,3 +933,64 @@ func TestRangeReuseIsPerVisitor(t *testing.T) {
 			"the download limit can be bypassed by adding a Range header.", other.StatusCode)
 	}
 }
+
+// TestRequestShareEnforcesTotalSpace is SHARE-05's 总空间 limit.
+//
+// The requirement asks for five limits on an upload link: file count, per-file size, total
+// space, rate, and retention. The first two existed; the total did not, so a drop box with
+// max_uploads=100 and max_bytes_per_file=10 MiB accepted a gigabyte — the count and the
+// per-file cap were both satisfied while the number the owner actually cares about was
+// unbounded.
+//
+// This test fills a small total cap one file at a time and requires the delivery that would
+// cross it to be refused.
+func TestRequestShareEnforcesTotalSpace(t *testing.T) {
+	h := newHarness(t)
+
+	resp := h.do(http.MethodPost, "/api/files/mkdir",
+		strings.NewReader(`{"path":"inbox"}`), map[string]string{"Content-Type": "application/json"})
+	resp.Body.Close()
+
+	// A 100-byte total, in a link that allows plenty of files.
+	resp = h.do(http.MethodPost, "/api/shares/",
+		strings.NewReader(`{"path":"inbox","kind":"request","hide_contents":true,`+
+			`"max_uploads":50,"max_total_bytes":100}`),
+		map[string]string{"Content-Type": "application/json"})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create request share: %d %s", resp.StatusCode, readBody(resp))
+	}
+	created := decode(t, resp)
+	token, _ := created["token"].(string)
+
+	deliver := func(name string, size int) int {
+		body := &bytes.Buffer{}
+		mw := multipart.NewWriter(body)
+		fw, _ := mw.CreateFormFile("file", name)
+		_, _ = io.WriteString(fw, strings.Repeat("x", size))
+		_ = mw.Close()
+		up, err := http.Post(h.srv.URL+"/s/"+token+"/upload", mw.FormDataContentType(), body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer up.Body.Close()
+		return up.StatusCode
+	}
+
+	// 60 bytes fits under the 100-byte cap.
+	if code := deliver("first.bin", 60); code != http.StatusCreated {
+		t.Fatalf("first delivery (60 of 100 bytes): want 201, got %d", code)
+	}
+
+	// Another 60 crosses it. The count is still well under max_uploads, so only the byte
+	// total can refuse this — which is exactly the limit that did not exist.
+	if code := deliver("second.bin", 60); code == http.StatusCreated {
+		t.Fatal("a delivery that exceeds the link's total-space cap was accepted. With " +
+			"max_uploads=50 a drop box would accept 50 files of any permitted size; the " +
+			"total is the only limit that bounds the space an anonymous visitor can occupy.")
+	}
+
+	// And 40 more still fits: the cap is a sum, not a per-request threshold.
+	if code := deliver("third.bin", 40); code != http.StatusCreated {
+		t.Fatalf("a delivery that exactly reaches the cap: want 201, got %d", code)
+	}
+}

@@ -13,7 +13,8 @@ import (
 
 const shareColumns = `id, node_id, owner_id, kind, label, token_hash, password_hash,
 	expires_at, max_downloads, download_count, max_uploads, upload_count,
-	max_bytes_per_file, allowed_mime, permissions, hide_contents, created_at, revoked_at`
+	max_bytes_per_file, allowed_mime, permissions, hide_contents, created_at, revoked_at,
+	max_total_bytes, received_bytes, retention_seconds`
 
 func scanShare(row pgx.Row) (Share, error) {
 	var s Share
@@ -21,7 +22,8 @@ func scanShare(row pgx.Row) (Share, error) {
 	err := row.Scan(&s.ID, &s.NodeID, &s.OwnerID, &kind, &s.Label, &s.TokenHash,
 		&s.PasswordHash, &s.ExpiresAt, &s.MaxDownloads, &s.DownloadCount,
 		&s.MaxUploads, &s.UploadCount, &s.MaxBytesPerFile, &s.AllowedMIME,
-		&s.Permissions, &s.HideContents, &s.CreatedAt, &s.RevokedAt)
+		&s.Permissions, &s.HideContents, &s.CreatedAt, &s.RevokedAt,
+		&s.MaxTotalBytes, &s.ReceivedBytes, &s.RetentionSeconds)
 	if err != nil {
 		return Share{}, translate(err)
 	}
@@ -32,12 +34,13 @@ func scanShare(row pgx.Row) (Share, error) {
 func (t *pgTx) CreateShare(ctx context.Context, s Share) (Share, error) {
 	const q = `INSERT INTO shares (node_id, owner_id, kind, label, token_hash, password_hash,
 			expires_at, max_downloads, max_uploads, max_bytes_per_file, allowed_mime,
-			permissions, hide_contents)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+			permissions, hide_contents, max_total_bytes, retention_seconds)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
 		RETURNING ` + shareColumns
 	return scanShare(t.tx.QueryRow(ctx, q, s.NodeID, s.OwnerID, string(s.Kind), s.Label,
 		s.TokenHash, s.PasswordHash, s.ExpiresAt, s.MaxDownloads, s.MaxUploads,
-		s.MaxBytesPerFile, s.AllowedMIME, s.Permissions, s.HideContents))
+		s.MaxBytesPerFile, s.AllowedMIME, s.Permissions, s.HideContents,
+		s.MaxTotalBytes, s.RetentionSeconds))
 }
 
 func (t *pgTx) ShareByTokenHash(ctx context.Context, hash []byte) (Share, error) {
@@ -51,14 +54,18 @@ func (t *pgTx) ShareByID(ctx context.Context, id uuid.UUID) (Share, error) {
 }
 
 func (t *pgTx) UpdateShare(ctx context.Context, s Share) (Share, error) {
+	// received_bytes is deliberately not settable here: it is a running total maintained by
+	// IncrementUpload, and letting an owner edit it would let them reset a cap they had
+	// already reached.
 	const q = `UPDATE shares SET label=$2, password_hash=$3, expires_at=$4,
 			max_downloads=$5, max_uploads=$6, max_bytes_per_file=$7,
-			allowed_mime=$8, permissions=$9, hide_contents=$10
+			allowed_mime=$8, permissions=$9, hide_contents=$10,
+			max_total_bytes=$11, retention_seconds=$12
 		WHERE id = $1 AND revoked_at IS NULL
 		RETURNING ` + shareColumns
 	return scanShare(t.tx.QueryRow(ctx, q, s.ID, s.Label, s.PasswordHash, s.ExpiresAt,
 		s.MaxDownloads, s.MaxUploads, s.MaxBytesPerFile, s.AllowedMIME, s.Permissions,
-		s.HideContents))
+		s.HideContents, s.MaxTotalBytes, s.RetentionSeconds))
 }
 
 func (t *pgTx) RevokeShare(ctx context.Context, id uuid.UUID) error {
@@ -96,15 +103,17 @@ func (t *pgTx) IncrementDownload(ctx context.Context, id uuid.UUID) error {
 	return nil
 }
 
-func (t *pgTx) IncrementUpload(ctx context.Context, id uuid.UUID) error {
-	const q = `UPDATE shares SET upload_count = upload_count + 1
+func (t *pgTx) IncrementUpload(ctx context.Context, id uuid.UUID, size int64) error {
+	const q = `UPDATE shares SET upload_count = upload_count + 1,
+		       received_bytes = received_bytes + $2
 		WHERE id = $1
 		  AND revoked_at IS NULL
 		  AND (expires_at IS NULL OR expires_at > now())
 		  AND (max_uploads IS NULL OR upload_count < max_uploads)
+		  AND (max_total_bytes IS NULL OR received_bytes + $2 <= max_total_bytes)
 		RETURNING upload_count`
 	var n int
-	if err := t.tx.QueryRow(ctx, q, id).Scan(&n); err != nil {
+	if err := t.tx.QueryRow(ctx, q, id, size).Scan(&n); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrShareExhausted
 		}

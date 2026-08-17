@@ -80,9 +80,13 @@ type NewShare struct {
 	MaxDownloads    *int
 	MaxUploads      *int
 	MaxBytesPerFile *int64
-	AllowedMIME     []string
-	Permissions     []string
-	Recipients      []string
+	// MaxTotalBytes caps what the link may receive in total (SHARE-05 总空间).
+	MaxTotalBytes *int64
+	// RetentionSeconds is how long delivered data is kept (SHARE-05 保留期限).
+	RetentionSeconds *int64
+	AllowedMIME      []string
+	Permissions      []string
+	Recipients       []string
 }
 
 // Created is the result of creating a share: the plaintext token appears exactly
@@ -128,19 +132,21 @@ func (s *Service) Create(ctx context.Context, in NewShare) (Created, error) {
 	}
 
 	sh := store.Share{
-		NodeID:          in.NodeID,
-		OwnerID:         in.OwnerID,
-		Kind:            kind,
-		Label:           in.Label,
-		TokenHash:       tokenHash,
-		PasswordHash:    passwordHash,
-		ExpiresAt:       expires,
-		MaxDownloads:    in.MaxDownloads,
-		MaxUploads:      in.MaxUploads,
-		MaxBytesPerFile: in.MaxBytesPerFile,
-		AllowedMIME:     in.AllowedMIME,
-		Permissions:     perms,
-		HideContents:    kind == store.ShareRequest,
+		NodeID:           in.NodeID,
+		OwnerID:          in.OwnerID,
+		Kind:             kind,
+		Label:            in.Label,
+		TokenHash:        tokenHash,
+		PasswordHash:     passwordHash,
+		ExpiresAt:        expires,
+		MaxDownloads:     in.MaxDownloads,
+		MaxUploads:       in.MaxUploads,
+		MaxBytesPerFile:  in.MaxBytesPerFile,
+		MaxTotalBytes:    in.MaxTotalBytes,
+		RetentionSeconds: in.RetentionSeconds,
+		AllowedMIME:      in.AllowedMIME,
+		Permissions:      perms,
+		HideContents:     kind == store.ShareRequest,
 	}
 
 	var created store.Share
@@ -344,7 +350,10 @@ func (s *Service) RecordDownload(ctx context.Context, sh store.Share, meta Downl
 // RecordUpload counts an accepted upload and audits it.
 func (s *Service) RecordUpload(ctx context.Context, sh store.Share, meta DownloadMeta) error {
 	return s.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
-		if err := tx.IncrementUpload(ctx, sh.ID); err != nil {
+		// The byte total moves with the count in the same guarded UPDATE: a cap on total
+		// space checked separately from the increment would be racy, and a rejected upload
+		// must not leave received_bytes inflated.
+		if err := tx.IncrementUpload(ctx, sh.ID, meta.Bytes); err != nil {
 			return err
 		}
 		bytes := meta.Bytes

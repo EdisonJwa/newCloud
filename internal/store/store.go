@@ -266,7 +266,7 @@ type Tx interface {
 	UpdateShare(ctx context.Context, s Share) (Share, error)
 	RevokeShare(ctx context.Context, id uuid.UUID) error
 	IncrementDownload(ctx context.Context, id uuid.UUID) error
-	IncrementUpload(ctx context.Context, id uuid.UUID) error
+	IncrementUpload(ctx context.Context, id uuid.UUID, size int64) error
 	SharesForNode(ctx context.Context, nodeID uuid.UUID) ([]Share, error)
 	SharesByOwner(ctx context.Context, ownerID uuid.UUID) ([]Share, error)
 	AddRecipient(ctx context.Context, r ShareRecipient) error

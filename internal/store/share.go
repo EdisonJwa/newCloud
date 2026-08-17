@@ -42,11 +42,21 @@ type Share struct {
 	MaxUploads      *int
 	UploadCount     int
 	MaxBytesPerFile *int64
-	AllowedMIME     []string
-	Permissions     []string // "read", "create"
-	HideContents    bool
-	CreatedAt       time.Time
-	RevokedAt       *time.Time
+	// MaxTotalBytes caps the sum of everything delivered through this link (SHARE-05 总空间).
+	// Without it, a link with a per-file cap and a count cap accepts
+	// max_uploads × max_bytes_per_file, which is not the number the owner set.
+	MaxTotalBytes *int64
+	// ReceivedBytes is the running total, maintained by the same guarded UPDATE that
+	// increments UploadCount so the two cannot disagree.
+	ReceivedBytes int64
+	// RetentionSeconds is how long data delivered through this link is kept (SHARE-05 保留期限).
+	// Nil means the owner keeps it until they delete it.
+	RetentionSeconds *int64
+	AllowedMIME      []string
+	Permissions      []string // "read", "create"
+	HideContents     bool
+	CreatedAt        time.Time
+	RevokedAt        *time.Time
 }
 
 // CanRead reports whether the share grants read access.
@@ -137,7 +147,7 @@ type ShareTx interface {
 	// not both succeed, and doing it as read-then-write guarantees they would.
 	IncrementDownload(ctx context.Context, id uuid.UUID) error
 	// IncrementUpload counts an accepted upload against the cap.
-	IncrementUpload(ctx context.Context, id uuid.UUID) error
+	IncrementUpload(ctx context.Context, id uuid.UUID, size int64) error
 	SharesForNode(ctx context.Context, nodeID uuid.UUID) ([]Share, error)
 	SharesByOwner(ctx context.Context, ownerID uuid.UUID) ([]Share, error)
 

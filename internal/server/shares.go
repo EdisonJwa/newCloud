@@ -81,8 +81,10 @@ func (s *Server) handleShareCreate(w http.ResponseWriter, r *http.Request) {
 		// The per-share upload limits. They were enforced on the read path but
 		// could not be set here, so a drop box could never actually be limited —
 		// decodeJSON rejects unknown fields, so sending them was a 400.
-		MaxBytesPerFile *int64   `json:"max_bytes_per_file"`
-		AllowedMIME     []string `json:"allowed_mime"`
+		MaxBytesPerFile  *int64   `json:"max_bytes_per_file"`
+		MaxTotalBytes    *int64   `json:"max_total_bytes"`
+		RetentionSeconds *int64   `json:"retention_seconds"`
+		AllowedMIME      []string `json:"allowed_mime"`
 		// HideContents is accepted but not trusted: the service forces it on for request
 		// shares. It is in the struct anyway because the client sends it, and
 		// decodeJSON rejects unknown fields — omitting it here made every "create a drop
@@ -139,7 +141,7 @@ func (s *Server) handleShareCreate(w http.ResponseWriter, r *http.Request) {
 		NodeID: node.ID, OwnerID: actor.ID(), OwnerEmail: actor.Email(), NodePath: strings.TrimPrefix(body.Path, "/"), Kind: kind,
 		Label: body.Label, Password: body.Password, TTL: ttl,
 		MaxDownloads: body.MaxDownloads, MaxUploads: body.MaxUploads,
-		MaxBytesPerFile: body.MaxBytesPerFile, AllowedMIME: body.AllowedMIME,
+		MaxBytesPerFile: body.MaxBytesPerFile, MaxTotalBytes: body.MaxTotalBytes, RetentionSeconds: body.RetentionSeconds, AllowedMIME: body.AllowedMIME,
 		Permissions: body.Permissions, Recipients: body.Recipients,
 	})
 	if err != nil {

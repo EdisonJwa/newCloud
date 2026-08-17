@@ -70,6 +70,8 @@ func (t *memTx) UpdateShare(ctx context.Context, s Share) (Share, error) {
 	cur.MaxDownloads = s.MaxDownloads
 	cur.MaxUploads = s.MaxUploads
 	cur.MaxBytesPerFile = s.MaxBytesPerFile
+	cur.MaxTotalBytes = s.MaxTotalBytes
+	cur.RetentionSeconds = s.RetentionSeconds
 	cur.AllowedMIME = s.AllowedMIME
 	cur.Permissions = s.Permissions
 	cur.HideContents = s.HideContents
@@ -108,7 +110,7 @@ func (t *memTx) IncrementDownload(ctx context.Context, id uuid.UUID) error {
 	return nil
 }
 
-func (t *memTx) IncrementUpload(ctx context.Context, id uuid.UUID) error {
+func (t *memTx) IncrementUpload(ctx context.Context, id uuid.UUID, size int64) error {
 	s, ok := t.m.shares[id]
 	if !ok {
 		return ErrNotFound
@@ -123,7 +125,15 @@ func (t *memTx) IncrementUpload(ctx context.Context, id uuid.UUID) error {
 	if s.MaxUploads != nil && s.UploadCount >= *s.MaxUploads {
 		return ErrShareExhausted
 	}
+	// The same guard the SQL has, in the same place: the byte total and the count move
+	// together or neither moves, so a rejected upload cannot leave received_bytes
+	// inflated. Checking this separately from the count would let a caller that checks one
+	// and not the other drift from PostgreSQL.
+	if s.MaxTotalBytes != nil && s.ReceivedBytes+size > *s.MaxTotalBytes {
+		return ErrShareExhausted
+	}
 	s.UploadCount++
+	s.ReceivedBytes += size
 	return nil
 }
 
