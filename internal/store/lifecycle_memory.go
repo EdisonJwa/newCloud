@@ -111,3 +111,26 @@ func (t *memTx) ExpireVersions(ctx context.Context, retention time.Duration) (in
 }
 
 var _ LifecycleTx = (*memTx)(nil)
+
+// ExpireRetained moves nodes whose retention has lapsed into the trash.
+//
+// Mirrors the PostgreSQL statement: eligible when retain_until is in the past and the node is not
+// already trashed. Trash rather than delete, so the recovery window still applies.
+func (t *memTx) ExpireRetained(ctx context.Context) (int, error) {
+	now := t.m.now()
+	n := 0
+	for id, rec := range t.m.nodes {
+		if rec.node.RetainUntil == nil || rec.node.TrashedAt != nil {
+			continue
+		}
+		if rec.node.RetainUntil.After(now) {
+			continue
+		}
+		ts := now
+		rec.node.TrashedAt = &ts
+		rec.node.ModifiedAt = now
+		t.m.nodes[id] = rec
+		n++
+	}
+	return n, nil
+}

@@ -65,7 +65,7 @@ func (s *PG) RecentFiles(ctx context.Context, ownerID uuid.UUID, limit int) ([]R
 		var path string
 		if err := rows.Scan(&n.ID, &n.ParentID, &n.OwnerID, new(*uuid.UUID), &n.Name, &kind,
 			&n.Size, &n.Mime, &n.ETag, &n.BlobID, &n.CreatedAt, &n.ModifiedAt, &n.TrashedAt,
-			&path); err != nil {
+			&n.RetainUntil, &path); err != nil {
 			return nil, translate(err)
 		}
 		n.Kind = Kind(kind)

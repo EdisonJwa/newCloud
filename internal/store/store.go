@@ -40,6 +40,9 @@ type Node struct {
 	TrashedAt  *time.Time
 	CreatedAt  time.Time
 	ModifiedAt time.Time
+	// RetainUntil is when this node is purged, set at delivery time from the share that
+	// accepted it (SHARE-05 保留期限). Nil means no retention was in force.
+	RetainUntil *time.Time
 }
 
 // IsDir reports whether the node is a directory.
@@ -335,6 +338,11 @@ type Tx interface {
 
 	// Retention: permanent deletion of expired trash and versions.
 	PurgeTrash(ctx context.Context, retention time.Duration) (PurgeResult, error)
+	// ExpireRetained moves nodes whose share retention has lapsed into the trash.
+	//
+	// Into the trash, not out of the database: retention is a policy about how long deliveries
+	// are kept, not an instruction to destroy them irrecoverably. The trash window still applies.
+	ExpireRetained(ctx context.Context) (int, error)
 	ExpireVersions(ctx context.Context, retention time.Duration) (int, error)
 
 	// Enqueue adds an asynchronous job in the same transaction.
@@ -368,6 +376,13 @@ type NewFile struct {
 	BlobID       uuid.UUID
 	// BlobHash is the content address, needed to keep dedup accounting correct.
 	BlobHash [32]byte
+	// RetainUntil stamps the retention that applied when the file arrived (SHARE-05 保留期限).
+	//
+	// It is set from the share at delivery time rather than derived from the share later,
+	// because the policy in force when the bytes arrived is the one the owner agreed to. A
+	// link whose retention is shortened afterwards must not retroactively delete older
+	// deliveries; lengthening it must not extend them either.
+	RetainUntil *time.Time
 }
 
 // UpdateFile replaces a file's content.

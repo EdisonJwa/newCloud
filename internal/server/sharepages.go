@@ -371,11 +371,19 @@ func (s *Server) handleShareUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	err = s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
+		// Stamp the retention in force NOW, not a reference to the share's current policy.
+		// A link whose retention is shortened later must not retroactively delete deliveries
+		// made under the old one, and lengthening it must not extend them either.
+		var retainUntil *time.Time
+		if sh.RetentionSeconds != nil && *sh.RetentionSeconds > 0 {
+			t := time.Now().Add(time.Duration(*sh.RetentionSeconds) * time.Second)
+			retainUntil = &t
+		}
 		n, cerr := tx.CreateFile(ctx, store.NewFile{
 			OwnerID: sh.OwnerID, ParentID: root.ID, Name: finalName,
 			Size: res.Size, Mime: header.Header.Get("Content-Type"),
 			ETag: etagFor(res.Hash), BlobID: s.deps.Meta.BlobIDFor(ctx, res.Hash, res.Size),
-			BlobHash: res.Hash,
+			BlobHash: res.Hash, RetainUntil: retainUntil,
 		})
 		if cerr != nil {
 			return cerr

@@ -33,6 +33,10 @@ type fileJSON struct {
 	ModifiedAt string `json:"modified_at"`
 	CreatedAt  string `json:"created_at"`
 	Trashed    bool   `json:"trashed,omitempty"`
+	// RetainUntil is when this file is due to move to the trash because of the share it was
+	// delivered through (SHARE-05 保留期限). Exposed so a user whose delivery disappears can see
+	// why, rather than concluding the file was lost.
+	RetainUntil string `json:"retain_until,omitempty"`
 	// Preview tells the client which renderer to use, or omits the field when the file
 	// downloads instead. It is advisory: the download endpoint re-checks the type and the
 	// bytes, so a stale value cannot make the server inline something it refuses.
@@ -51,17 +55,18 @@ func toFileJSON(n store.Node, rel string) fileJSON {
 		preview = string(previewKindForNode(n.Name, n.Mime))
 	}
 	return fileJSON{
-		Preview:    preview,
-		ID:         n.ID.String(),
-		Name:       n.Name,
-		Path:       path.Join("/", rel),
-		Kind:       string(n.Kind),
-		Size:       n.Size,
-		Mime:       n.Mime,
-		ETag:       n.ETag,
-		ModifiedAt: n.ModifiedAt.UTC().Format("2006-01-02T15:04:05Z07:00"),
-		CreatedAt:  n.CreatedAt.UTC().Format("2006-01-02T15:04:05Z07:00"),
-		Trashed:    n.TrashedAt != nil,
+		Preview:     preview,
+		ID:          n.ID.String(),
+		Name:        n.Name,
+		Path:        path.Join("/", rel),
+		Kind:        string(n.Kind),
+		Size:        n.Size,
+		Mime:        n.Mime,
+		ETag:        n.ETag,
+		ModifiedAt:  n.ModifiedAt.UTC().Format("2006-01-02T15:04:05Z07:00"),
+		CreatedAt:   n.CreatedAt.UTC().Format("2006-01-02T15:04:05Z07:00"),
+		Trashed:     n.TrashedAt != nil,
+		RetainUntil: formatRetainUntil(n.RetainUntil),
 	}
 }
 
@@ -1117,4 +1122,12 @@ func (s *Server) existingFile(ctx context.Context, ownerID uuid.UUID, rel string
 		return false, store.Node{}, err
 	}
 	return !node.IsDir(), node, nil
+}
+
+// formatRetainUntil renders the retention deadline, or "" when none applies.
+func formatRetainUntil(t *time.Time) string {
+	if t == nil {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339)
 }

@@ -142,6 +142,8 @@ func (w *Worker) Run(ctx context.Context) {
 	defer sweeps.Stop()
 	purges := time.NewTicker(w.purgeInterval)
 	defer purges.Stop()
+	retention := time.NewTicker(w.purgeInterval)
+	defer retention.Stop()
 	jobs := time.NewTicker(w.jobInterval)
 	defer jobs.Stop()
 	anchors := time.NewTicker(w.anchorInterval)
@@ -230,6 +232,11 @@ func (w *Worker) Run(ctx context.Context) {
 			} else if n > 0 {
 				w.log.Debug("processed jobs", "count", n)
 			}
+		case <-retention.C:
+			// Share retention (SHARE-05 保留期限). Separate from PurgeTrash: this moves
+			// expired deliveries to the trash, and the trash window still applies before
+			// anything is destroyed.
+			w.expireRetained(ctx)
 		case <-purges.C:
 			if res, err := w.PurgeTrash(ctx); err != nil {
 				w.log.Error("trash purge failed", "error", err)
@@ -372,5 +379,25 @@ func (w *Worker) runScrub(ctx context.Context) {
 	if res.Checked > 0 {
 		w.log.Debug("blob integrity scrub", "checked", res.Checked, "bytes", res.Bytes,
 			"corrupt", len(res.Corrupt), "missing", len(res.Missing))
+	}
+}
+
+// expireRetained enforces share retention (SHARE-05 保留期限).
+func (w *Worker) expireRetained(ctx context.Context) {
+	var n int
+	err := w.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		got, eerr := tx.ExpireRetained(ctx)
+		n = got
+		return eerr
+	})
+	if err != nil {
+		w.log.Error("share retention sweep failed", "error", err)
+		return
+	}
+	if n > 0 {
+		// Logged rather than silent: data moving to the trash because a policy expired is
+		// something an operator may need to explain to a user, and "it vanished" is not an
+		// answer.
+		w.log.Info("share retention expired deliveries", "moved_to_trash", n)
 	}
 }

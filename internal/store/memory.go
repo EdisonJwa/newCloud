@@ -440,7 +440,7 @@ func (t *memTx) CreateFile(ctx context.Context, n NewFile) (Node, error) {
 	node := Node{
 		ID: newID(), ParentID: &parent, OwnerID: n.OwnerID,
 		Name: n.Name, Kind: KindFile, Size: n.Size, Mime: n.Mime, ETag: n.ETag,
-		BlobID: &blobID, CreatedAt: now, ModifiedAt: now,
+		BlobID: &blobID, CreatedAt: now, ModifiedAt: now, RetainUntil: n.RetainUntil,
 	}
 	t.m.nodes[node.ID] = &memNode{node: node, blob: n.BlobHash}
 	t.attach(n.ParentID, node)

@@ -227,3 +227,37 @@ func (t *pgTx) ExpireVersions(ctx context.Context, retention time.Duration) (int
 var _ LifecycleTx = (*pgTx)(nil)
 var _ = errors.Is
 var _ = pgx.ErrNoRows
+
+// ExpireRetained moves nodes whose retention has lapsed into the trash.
+//
+// Deliberately into the trash rather than out of the database: a share's retention is a policy
+// ("do not keep deliveries past 30 days"), not an instruction to destroy data irrecoverably. The
+// trash window still applies, so an owner who finds a delivery gone can recover it, and the normal
+// purge removes it afterwards. Deleting directly would make a misconfigured retention_seconds
+// unrecoverable.
+//
+// A node is eligible when retain_until is in the past and it is not already trashed. The whole
+// subtree is not taken: retention is stamped per delivered file, and a delivered directory is not
+// a case this schema creates.
+func (t *pgTx) ExpireRetained(ctx context.Context) (int, error) {
+	const q = `UPDATE nodes
+		SET trashed_at = now(), modified_at = now()
+		WHERE retain_until IS NOT NULL
+		  AND retain_until <= now()
+		  AND trashed_at IS NULL
+		RETURNING id`
+	rows, err := t.tx.Query(ctx, q)
+	if err != nil {
+		return 0, translate(err)
+	}
+	defer rows.Close()
+
+	n := 0
+	for rows.Next() {
+		n++
+	}
+	if err := rows.Err(); err != nil {
+		return 0, translate(err)
+	}
+	return n, nil
+}

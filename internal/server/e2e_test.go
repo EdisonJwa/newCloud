@@ -994,3 +994,150 @@ func TestRequestShareEnforcesTotalSpace(t *testing.T) {
 		t.Fatalf("a delivery that exactly reaches the cap: want 201, got %d", code)
 	}
 }
+
+// TestRequestShareStampsRetention is SHARE-05's 保留期限 limit.
+//
+// retention_seconds was stored, returned by the API, and enforced nowhere: a column with no
+// behaviour, which reads as a working feature from every angle an operator can see. This is the
+// same defect class as a background job that is declared and never invoked.
+//
+// The stamp has to be taken at delivery time rather than derived from the share later, because the
+// policy in force when the bytes arrived is the one the owner agreed to.
+func TestRequestShareStampsRetention(t *testing.T) {
+	h := newHarness(t)
+
+	resp := h.do(http.MethodPost, "/api/files/mkdir",
+		strings.NewReader(`{"path":"inbox"}`), map[string]string{"Content-Type": "application/json"})
+	resp.Body.Close()
+
+	resp = h.do(http.MethodPost, "/api/shares/",
+		strings.NewReader(`{"path":"inbox","kind":"request","hide_contents":true,`+
+			`"retention_seconds":3600}`),
+		map[string]string{"Content-Type": "application/json"})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create request share: %d %s", resp.StatusCode, readBody(resp))
+	}
+	created := decode(t, resp)
+	token, _ := created["token"].(string)
+
+	body := &bytes.Buffer{}
+	mw := multipart.NewWriter(body)
+	fw, _ := mw.CreateFormFile("file", "delivered.bin")
+	_, _ = io.WriteString(fw, "bytes")
+	_ = mw.Close()
+	up, err := http.Post(h.srv.URL+"/s/"+token+"/upload", mw.FormDataContentType(), body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	up.Body.Close()
+	if up.StatusCode != http.StatusCreated {
+		t.Fatalf("delivery: want 201, got %d", up.StatusCode)
+	}
+
+	// The delivered node must carry the retention. Reading it back through the API is the
+	// only check that proves the value reached the row rather than living in the response.
+	listing := h.do(http.MethodGet, "/api/files/?path=inbox", nil, nil)
+	raw := decode(t, listing)
+	files, _ := raw["children"].([]any)
+	if len(files) != 1 {
+		t.Fatalf("want 1 delivered file, got %d", len(files))
+	}
+	entry, _ := files[0].(map[string]any)
+	if entry["retain_until"] == nil {
+		t.Fatal("the delivered file has no retain_until, so the link's retention_seconds did " +
+			"nothing. A limit that is stored and never enforced is worse than an absent one: the " +
+			"API reports it as set.")
+	}
+}
+
+// TestRetentionSweepTrashesExpiredDeliveries covers the sweep, not just the stamp.
+//
+// The stamp is only half the feature: without something that acts on it, retain_until is a
+// timestamp nobody reads. The sweep moves a lapsed delivery into the TRASH rather than deleting it,
+// because a retention setting is a policy about how long deliveries are kept — not an instruction
+// to destroy them irrecoverably. A misconfigured retention_seconds must still be recoverable.
+func TestRetentionSweepTrashesExpiredDeliveries(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	resp := h.do(http.MethodPost, "/api/files/mkdir",
+		strings.NewReader(`{"path":"inbox"}`), map[string]string{"Content-Type": "application/json"})
+	resp.Body.Close()
+
+	// A delivery that is already due: a one-second retention, then a sweep with the clock
+	// effectively in the future is not required — the store compares against now(), and the
+	// test creates the node with a past deadline directly so it does not have to sleep.
+	// Resolve the directory through the same path the API used, so this fails loudly if the
+	// name is wrong rather than silently creating nodes somewhere unexpected.
+	rootNodes, err := h.meta.Resolve(ctx, h.user.ID, "inbox")
+	if err != nil {
+		t.Fatalf("resolve inbox: %v", err)
+	}
+	inbox := rootNodes[len(rootNodes)-1]
+
+	past := time.Now().Add(-time.Hour)
+	var expiredID, liveID uuid.UUID
+	err = h.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		e, cerr := tx.CreateFile(ctx, store.NewFile{
+			OwnerID: h.user.ID, ParentID: inbox.ID, Name: "expired.bin",
+			Size: 1, Mime: "application/octet-stream", ETag: `"e1"`,
+			BlobID: h.meta.BlobIDFor(ctx, [32]byte{1}, 1), BlobHash: [32]byte{1},
+			RetainUntil: &past,
+		})
+		if cerr != nil {
+			return cerr
+		}
+		expiredID = e.ID
+
+		future := time.Now().Add(24 * time.Hour)
+		l, cerr := tx.CreateFile(ctx, store.NewFile{
+			OwnerID: h.user.ID, ParentID: inbox.ID, Name: "kept.bin",
+			Size: 1, Mime: "application/octet-stream", ETag: `"e2"`,
+			BlobID: h.meta.BlobIDFor(ctx, [32]byte{2}, 1), BlobHash: [32]byte{2},
+			RetainUntil: &future,
+		})
+		if cerr != nil {
+			return cerr
+		}
+		liveID = l.ID
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var moved int
+	err = h.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		n, eerr := tx.ExpireRetained(ctx)
+		moved = n
+		return eerr
+	})
+	if err != nil {
+		t.Fatalf("expire: %v", err)
+	}
+	if moved != 1 {
+		t.Fatalf("swept %d nodes, want 1 (the one past its retain_until)", moved)
+	}
+
+	// The expired one is in the trash, not gone: recoverable by its owner.
+	var expired, kept store.Node
+	err = h.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		var e1, e2 error
+		// Node() deliberately hides trashed rows, so the swept node has to be read through
+		// NodeIncludingTrashed — which is also the function the restore flow uses, so this
+		// asserts the recovery path exists rather than merely that a flag flipped.
+		expired, e1 = tx.NodeIncludingTrashed(ctx, expiredID)
+		kept, e2 = tx.NodeIncludingTrashed(ctx, liveID)
+		return errors.Join(e1, e2)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if expired.TrashedAt == nil {
+		t.Fatal("a delivery past its retain_until was not moved to the trash, so the retention " +
+			"policy is stored and never applied")
+	}
+	if kept.TrashedAt != nil {
+		t.Fatal("a delivery still inside its retention window was trashed")
+	}
+}

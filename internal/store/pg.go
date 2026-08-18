@@ -119,7 +119,7 @@ func translate(err error) error {
 }
 
 const nodeColumns = `id, parent_id, owner_id, owner_group_id, name, kind, size,
-	mime, etag, blob_id, created_at, modified_at, trashed_at`
+	mime, etag, blob_id, created_at, modified_at, trashed_at, retain_until`
 
 // nodeColumnsQualified is nodeColumns with every name prefixed by alias.
 //
@@ -138,7 +138,8 @@ func scanNode(row pgx.Row) (Node, error) {
 	var n Node
 	var kind string
 	err := row.Scan(&n.ID, &n.ParentID, &n.OwnerID, new(*uuid.UUID), &n.Name, &kind,
-		&n.Size, &n.Mime, &n.ETag, &n.BlobID, &n.CreatedAt, &n.ModifiedAt, &n.TrashedAt)
+		&n.Size, &n.Mime, &n.ETag, &n.BlobID, &n.CreatedAt, &n.ModifiedAt, &n.TrashedAt,
+		&n.RetainUntil)
 	if err != nil {
 		return Node{}, translate(err)
 	}
@@ -255,12 +256,12 @@ func (t *pgTx) CreateFile(ctx context.Context, n NewFile) (Node, error) {
 	}
 
 	// Reference the blob row for referential integrity and refcount.
-	const q = `INSERT INTO nodes (parent_id, owner_id, owner_group_id, name, name_key, kind, size, mime, etag, blob_id)
-		VALUES ($1, $2, $3, $4, $5, 'file', $6, $7, $8, $9)
+	const q = `INSERT INTO nodes (parent_id, owner_id, owner_group_id, name, name_key, kind, size, mime, etag, blob_id, retain_until)
+		VALUES ($1, $2, $3, $4, $5, 'file', $6, $7, $8, $9, $10)
 		RETURNING ` + nodeColumns
 	node, err := scanNode(t.tx.QueryRow(ctx, q,
 		n.ParentID, n.OwnerID, n.OwnerGroupID, n.Name, nameKey(n.Name),
-		n.Size, n.Mime, n.ETag, n.BlobID))
+		n.Size, n.Mime, n.ETag, n.BlobID, n.RetainUntil))
 	if err != nil {
 		return Node{}, err
 	}
