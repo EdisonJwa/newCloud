@@ -1141,3 +1141,130 @@ func TestRetentionSweepTrashesExpiredDeliveries(t *testing.T) {
 		t.Fatal("a delivery still inside its retention window was trashed")
 	}
 }
+
+// TestRequestShareEnforcesUploadRate is SHARE-05's 速率 limit, the fifth and last.
+//
+// A rate is different in kind from the other four limits. Those are totals, and a column with a
+// guard in the same UPDATE keeps them exact. A rate is a rolling window: no column can hold "how
+// many arrived in the last N minutes", because the answer changes as time passes with no write
+// happening. So the events are recorded and counted.
+//
+// This test also covers the distinction the implementation has to get right: hitting the rate is
+// NOT the same as exhausting the allowance. A visitor over the rate must be told to slow down
+// (429), not that the link is used up (404) — the allowance is intact, only the window is full.
+func TestRequestShareEnforcesUploadRate(t *testing.T) {
+	h := newHarness(t)
+
+	resp := h.do(http.MethodPost, "/api/files/mkdir",
+		strings.NewReader(`{"path":"inbox"}`), map[string]string{"Content-Type": "application/json"})
+	resp.Body.Close()
+
+	// Two uploads per hour, with no count cap at all: only the rate can refuse the third.
+	resp = h.do(http.MethodPost, "/api/shares/",
+		strings.NewReader(`{"path":"inbox","kind":"request","hide_contents":true,`+
+			`"max_upload_rate":2,"upload_rate_window_seconds":3600}`),
+		map[string]string{"Content-Type": "application/json"})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create request share: %d %s", resp.StatusCode, readBody(resp))
+	}
+	created := decode(t, resp)
+	token, _ := created["token"].(string)
+
+	deliver := func(name string) (int, http.Header) {
+		body := &bytes.Buffer{}
+		mw := multipart.NewWriter(body)
+		fw, _ := mw.CreateFormFile("file", name)
+		_, _ = io.WriteString(fw, "x")
+		_ = mw.Close()
+		up, err := http.Post(h.srv.URL+"/s/"+token+"/upload", mw.FormDataContentType(), body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer up.Body.Close()
+		_, _ = io.Copy(io.Discard, up.Body)
+		return up.StatusCode, up.Header
+	}
+
+	if code, _ := deliver("one.bin"); code != http.StatusCreated {
+		t.Fatalf("first delivery: want 201, got %d", code)
+	}
+	if code, _ := deliver("two.bin"); code != http.StatusCreated {
+		t.Fatalf("second delivery: want 201, got %d", code)
+	}
+
+	code, hdr := deliver("three.bin")
+	if code == http.StatusCreated {
+		t.Fatal("a third delivery was accepted through a link limited to two per hour. Unlike " +
+			"the totals, this limit cannot be a column: the count has to be measured over a " +
+			"rolling window, which means recording the events.")
+	}
+	// 429, not 404: the link is alive and the allowance is intact. Telling a visitor their link
+	// is gone when they merely need to wait is a worse answer than telling them to wait.
+	if code != http.StatusTooManyRequests {
+		t.Fatalf("rate-limited delivery: want 429, got %d. Reporting the rate as 404 would tell "+
+			"a legitimate visitor their link is dead.", code)
+	}
+	if hdr.Get("Retry-After") == "" {
+		t.Fatal("a 429 without Retry-After gives the client nothing to back off with, so it " +
+			"retries immediately into the same limit")
+	}
+}
+
+// TestUploadRateWindowSlides is what separates a rate limit from a total.
+//
+// A limiter that never forgets is not a rate: it is the same as max_uploads with extra steps, and
+// it would refuse a visitor forever after one burst. The window has to actually advance, so this
+// test moves the store's clock rather than sleeping.
+func TestUploadRateWindowSlides(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	resp := h.do(http.MethodPost, "/api/files/mkdir",
+		strings.NewReader(`{"path":"inbox"}`), map[string]string{"Content-Type": "application/json"})
+	resp.Body.Close()
+
+	resp = h.do(http.MethodPost, "/api/shares/",
+		strings.NewReader(`{"path":"inbox","kind":"request","hide_contents":true,`+
+			`"max_upload_rate":1,"upload_rate_window_seconds":60}`),
+		map[string]string{"Content-Type": "application/json"})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create request share: %d %s", resp.StatusCode, readBody(resp))
+	}
+	created := decode(t, resp)
+	token, _ := created["token"].(string)
+	shareID := created["share"].(map[string]any)["id"].(string)
+
+	deliver := func() int {
+		body := &bytes.Buffer{}
+		mw := multipart.NewWriter(body)
+		fw, _ := mw.CreateFormFile("file", "x.bin")
+		_, _ = io.WriteString(fw, "x")
+		_ = mw.Close()
+		up, err := http.Post(h.srv.URL+"/s/"+token+"/upload", mw.FormDataContentType(), body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer up.Body.Close()
+		_, _ = io.Copy(io.Discard, up.Body)
+		return up.StatusCode
+	}
+
+	if code := deliver(); code != http.StatusCreated {
+		t.Fatalf("first delivery: want 201, got %d", code)
+	}
+	if code := deliver(); code != http.StatusTooManyRequests {
+		t.Fatalf("second delivery inside a one-per-minute window: want 429, got %d", code)
+	}
+
+	// Advance the store's clock past the window. Without this, "the limit is a rolling
+	// window" is a claim nothing checks, and a limiter that never forgets would pass the
+	// first test in this pair.
+	_ = shareID
+	h.meta.AdvanceForTest(2 * time.Minute)
+
+	if code := deliver(); code != http.StatusCreated {
+		t.Fatalf("a delivery after the window elapsed: want 201, got %d. A limiter that never "+
+			"forgets is not a rate — it is a permanent ban after one burst.", code)
+	}
+	_ = ctx
+}

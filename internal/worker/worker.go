@@ -144,6 +144,8 @@ func (w *Worker) Run(ctx context.Context) {
 	defer purges.Stop()
 	retention := time.NewTicker(w.purgeInterval)
 	defer retention.Stop()
+	ratePrune := time.NewTicker(w.purgeInterval)
+	defer ratePrune.Stop()
 	jobs := time.NewTicker(w.jobInterval)
 	defer jobs.Stop()
 	anchors := time.NewTicker(w.anchorInterval)
@@ -232,6 +234,8 @@ func (w *Worker) Run(ctx context.Context) {
 			} else if n > 0 {
 				w.log.Debug("processed jobs", "count", n)
 			}
+		case <-ratePrune.C:
+			w.pruneRateLimitRows(ctx)
 		case <-retention.C:
 			// Share retention (SHARE-05 保留期限). Separate from PurgeTrash: this moves
 			// expired deliveries to the trash, and the trash window still applies before
@@ -399,5 +403,36 @@ func (w *Worker) expireRetained(ctx context.Context) {
 		// something an operator may need to explain to a user, and "it vanished" is not an
 		// answer.
 		w.log.Info("share retention expired deliveries", "moved_to_trash", n)
+	}
+}
+
+// pruneRateLimitRows bounds the two append-only tables that rate limiting depends on.
+//
+// Both were defined and neither was ever called, which makes them a slow disk leak: a row per
+// OTP attempt and a row per accepted upload, forever. Pruning is what turns "we record events to
+// enforce a window" into something that does not grow without limit.
+//
+// The retention is deliberately generous — an hour past the longest window any share can set,
+// which is far longer than any window in use — because deleting a row that is still inside a
+// window would weaken the limit it exists to enforce. Being slightly late costs disk; being early
+// costs correctness.
+func (w *Worker) PruneRateLimitRows(ctx context.Context) { w.pruneRateLimitRows(ctx) }
+
+func (w *Worker) pruneRateLimitRows(ctx context.Context) {
+	const keep = 24 * time.Hour
+
+	var otp, uploads int
+	err := w.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		var e1, e2 error
+		otp, e1 = tx.PruneOTPAttempts(ctx, keep)
+		uploads, e2 = tx.PruneShareUploadEvents(ctx, keep)
+		return errors.Join(e1, e2)
+	})
+	if err != nil {
+		w.log.Error("prune rate-limit rows failed", "error", err)
+		return
+	}
+	if otp > 0 || uploads > 0 {
+		w.log.Debug("pruned rate-limit rows", "otp_attempts", otp, "upload_events", uploads)
 	}
 }

@@ -343,6 +343,8 @@ type Tx interface {
 	// Into the trash, not out of the database: retention is a policy about how long deliveries
 	// are kept, not an instruction to destroy them irrecoverably. The trash window still applies.
 	ExpireRetained(ctx context.Context) (int, error)
+	// ShareRateTx is the upload rate limit (SHARE-05 速率).
+	ShareRateTx
 	ExpireVersions(ctx context.Context, retention time.Duration) (int, error)
 
 	// Enqueue adds an asynchronous job in the same transaction.

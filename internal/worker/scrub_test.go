@@ -23,6 +23,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/EdisonJwa/newCloud/internal/blob"
 	"github.com/EdisonJwa/newCloud/internal/blob/local"
 	"github.com/EdisonJwa/newCloud/internal/store"
@@ -225,3 +227,67 @@ func TestScrubWithNoBlobsIsNotAnError(t *testing.T) {
 	}
 	_ = time.Second
 }
+
+// TestPruneRateLimitRowsActuallyRuns is the check that both prune functions are reachable.
+//
+// PruneOTPAttempts had existed since OTP codes were added and was never called: a row per
+// verification attempt, forever. PruneShareUploadEvents would have repeated it. The ticker guard
+// catches a missing select arm, but not a function that no arm calls — so this drives the method
+// and requires it to remove what it should.
+func TestPruneRateLimitRowsActuallyRuns(t *testing.T) {
+	meta := store.NewMemory()
+	w := worker.New(meta, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ctx := context.Background()
+
+	// Record an event and move the clock past the keep window.
+	user := meta.AddUser(store.User{Username: "p", Email: "p@example.test", Role: "user"})
+	if _, err := meta.EnsureRoot(ctx, user.ID); err != nil {
+		t.Fatal(err)
+	}
+	var shareID uuid.UUID
+	err := meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		// CreateShare references the node and owner, so both have to exist: a share pointing at
+		// a node that was never created is rejected, which is what "not found" here meant.
+		root, rerr := tx.EnsureRoot(ctx, user.ID)
+		if rerr != nil {
+			return rerr
+		}
+		s, cerr := tx.CreateShare(ctx, store.Share{
+			NodeID: root.ID, OwnerID: user.ID, Kind: store.ShareLink,
+			Label: "x", TokenHash: []byte{1, 2, 3}, Permissions: []string{"read"},
+			MaxUploadRate: int64ptr(1),
+		})
+		if cerr != nil {
+			return cerr
+		}
+		shareID = s.ID
+		return tx.AllowShareUpload(ctx, s.ID, 1, time.Minute, "127.0.0.1", 10)
+	})
+	if err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	_ = shareID
+
+	// Inside the window the limiter must still refuse a second upload.
+	err = meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		return tx.AllowShareUpload(ctx, shareID, 1, time.Minute, "127.0.0.1", 10)
+	})
+	if err == nil {
+		t.Fatal("the limiter did not refuse a second upload inside the window, so the cell under " +
+			"test is not the limiter at all")
+	}
+
+	meta.AdvanceForTest(48 * time.Hour)
+	w.PruneRateLimitRows(ctx)
+
+	// After pruning and with the clock advanced, the row is gone and an upload is allowed again.
+	err = meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		return tx.AllowShareUpload(ctx, shareID, 1, time.Minute, "127.0.0.1", 10)
+	})
+	if err != nil {
+		t.Fatalf("after pruning rows older than the keep window, an upload was still refused: %v. "+
+			"Either the row survived or the clock advance did not take effect.", err)
+	}
+}
+
+func int64ptr(v int64) *int64 { return &v }

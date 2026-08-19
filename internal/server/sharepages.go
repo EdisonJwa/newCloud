@@ -407,8 +407,20 @@ func (s *Server) handleShareUpload(w http.ResponseWriter, r *http.Request) {
 
 // renderShareError produces the single response shape every share failure uses.
 func (s *Server) renderShareError(w http.ResponseWriter, r *http.Request, err error) {
-	// Every cause looks identical from outside. Distinguishing "expired" from
-	// "revoked" from "never existed" turns the endpoint into a token oracle.
+	// Rate limiting is the one cause that is reported distinctly, and deliberately so.
+	//
+	// Every other cause looks identical from outside, because distinguishing "expired" from
+	// "revoked" from "never existed" turns the endpoint into a token oracle. A rate limit is
+	// different in kind: the caller already proved they hold a working link by triggering it, so
+	// nothing is leaked, and a 404 with "this link is not available" would tell a legitimate
+	// visitor their link is dead when the correct instruction is "try again shortly". Answering 429
+	// also lets a client back off instead of retrying into the limit.
+	if errors.Is(err, store.ErrShareRateLimited) {
+		w.Header().Set("Retry-After", "60")
+		writeError(w, http.StatusTooManyRequests, "rate_limited",
+			"too many uploads through this link; try again shortly")
+		return
+	}
 	writeError(w, http.StatusNotFound, "not_found", "this link is not available")
 }
 

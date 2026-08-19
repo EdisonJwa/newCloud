@@ -83,10 +83,12 @@ type NewShare struct {
 	// MaxTotalBytes caps what the link may receive in total (SHARE-05 总空间).
 	MaxTotalBytes *int64
 	// RetentionSeconds is how long delivered data is kept (SHARE-05 保留期限).
-	RetentionSeconds *int64
-	AllowedMIME      []string
-	Permissions      []string
-	Recipients       []string
+	RetentionSeconds        *int64
+	MaxUploadRate           *int64
+	UploadRateWindowSeconds *int64
+	AllowedMIME             []string
+	Permissions             []string
+	Recipients              []string
 }
 
 // Created is the result of creating a share: the plaintext token appears exactly
@@ -132,21 +134,23 @@ func (s *Service) Create(ctx context.Context, in NewShare) (Created, error) {
 	}
 
 	sh := store.Share{
-		NodeID:           in.NodeID,
-		OwnerID:          in.OwnerID,
-		Kind:             kind,
-		Label:            in.Label,
-		TokenHash:        tokenHash,
-		PasswordHash:     passwordHash,
-		ExpiresAt:        expires,
-		MaxDownloads:     in.MaxDownloads,
-		MaxUploads:       in.MaxUploads,
-		MaxBytesPerFile:  in.MaxBytesPerFile,
-		MaxTotalBytes:    in.MaxTotalBytes,
-		RetentionSeconds: in.RetentionSeconds,
-		AllowedMIME:      in.AllowedMIME,
-		Permissions:      perms,
-		HideContents:     kind == store.ShareRequest,
+		NodeID:                  in.NodeID,
+		OwnerID:                 in.OwnerID,
+		Kind:                    kind,
+		Label:                   in.Label,
+		TokenHash:               tokenHash,
+		PasswordHash:            passwordHash,
+		ExpiresAt:               expires,
+		MaxDownloads:            in.MaxDownloads,
+		MaxUploads:              in.MaxUploads,
+		MaxBytesPerFile:         in.MaxBytesPerFile,
+		MaxTotalBytes:           in.MaxTotalBytes,
+		RetentionSeconds:        in.RetentionSeconds,
+		MaxUploadRate:           in.MaxUploadRate,
+		UploadRateWindowSeconds: in.UploadRateWindowSeconds,
+		AllowedMIME:             in.AllowedMIME,
+		Permissions:             perms,
+		HideContents:            kind == store.ShareRequest,
 	}
 
 	var created store.Share
@@ -350,6 +354,24 @@ func (s *Service) RecordDownload(ctx context.Context, sh store.Share, meta Downl
 // RecordUpload counts an accepted upload and audits it.
 func (s *Service) RecordUpload(ctx context.Context, sh store.Share, meta DownloadMeta) error {
 	return s.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		// Rate first, then the totals.
+		//
+		// Order matters for the failure a visitor sees: a burst that is over the rate should be
+		// told "slow down", not "this link is used up", because the second is false — the
+		// allowance is intact, the window is not. Checking the rate first means a visitor who
+		// retries after the window passes succeeds, whereas consuming the count first would spend
+		// an upload from the allowance on a request that was refused for a different reason.
+		if sh.MaxUploadRate != nil && *sh.MaxUploadRate > 0 {
+			window := defaultUploadRateWindow
+			if sh.UploadRateWindowSeconds != nil && *sh.UploadRateWindowSeconds > 0 {
+				window = time.Duration(*sh.UploadRateWindowSeconds) * time.Second
+			}
+			if err := tx.AllowShareUpload(ctx, sh.ID, *sh.MaxUploadRate, window,
+				meta.ActorIP, meta.Bytes); err != nil {
+				return err
+			}
+		}
+
 		// The byte total moves with the count in the same guarded UPDATE: a cap on total
 		// space checked separately from the increment would be racy, and a rejected upload
 		// must not leave received_bytes inflated.
@@ -462,3 +484,10 @@ func (s *Service) HashPassword(secret string) ([]byte, error) {
 func (s *Service) checkPassword(secret string, stored []byte) bool {
 	return password.Verify(secret, stored, s.argonParams)
 }
+
+// defaultUploadRateWindow is the window when a share sets a rate but no window.
+//
+// One hour: the requirement says "rate" without a period, and a share's other limits are per-link
+// totals rather than per-second budgets. An hour is slow enough to stop a flood and fast enough that
+// a legitimate visitor who hit it can try again in the same session.
+const defaultUploadRateWindow = time.Hour

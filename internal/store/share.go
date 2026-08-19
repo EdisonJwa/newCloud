@@ -52,11 +52,15 @@ type Share struct {
 	// RetentionSeconds is how long data delivered through this link is kept (SHARE-05 保留期限).
 	// Nil means the owner keeps it until they delete it.
 	RetentionSeconds *int64
-	AllowedMIME      []string
-	Permissions      []string // "read", "create"
-	HideContents     bool
-	CreatedAt        time.Time
-	RevokedAt        *time.Time
+	// MaxUploadRate and UploadRateWindowSeconds are the rolling-window rate limit
+	// (SHARE-05 速率): at most MaxUploadRate uploads per window. Nil means no limit.
+	MaxUploadRate           *int64
+	UploadRateWindowSeconds *int64
+	AllowedMIME             []string
+	Permissions             []string // "read", "create"
+	HideContents            bool
+	CreatedAt               time.Time
+	RevokedAt               *time.Time
 }
 
 // CanRead reports whether the share grants read access.

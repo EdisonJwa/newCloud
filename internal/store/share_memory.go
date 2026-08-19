@@ -72,6 +72,8 @@ func (t *memTx) UpdateShare(ctx context.Context, s Share) (Share, error) {
 	cur.MaxBytesPerFile = s.MaxBytesPerFile
 	cur.MaxTotalBytes = s.MaxTotalBytes
 	cur.RetentionSeconds = s.RetentionSeconds
+	cur.MaxUploadRate = s.MaxUploadRate
+	cur.UploadRateWindowSeconds = s.UploadRateWindowSeconds
 	cur.AllowedMIME = s.AllowedMIME
 	cur.Permissions = s.Permissions
 	cur.HideContents = s.HideContents

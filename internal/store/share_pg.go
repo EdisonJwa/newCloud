@@ -14,7 +14,8 @@ import (
 const shareColumns = `id, node_id, owner_id, kind, label, token_hash, password_hash,
 	expires_at, max_downloads, download_count, max_uploads, upload_count,
 	max_bytes_per_file, allowed_mime, permissions, hide_contents, created_at, revoked_at,
-	max_total_bytes, received_bytes, retention_seconds`
+	max_total_bytes, received_bytes, retention_seconds,
+	max_upload_rate, upload_rate_window_seconds`
 
 func scanShare(row pgx.Row) (Share, error) {
 	var s Share
@@ -23,7 +24,8 @@ func scanShare(row pgx.Row) (Share, error) {
 		&s.PasswordHash, &s.ExpiresAt, &s.MaxDownloads, &s.DownloadCount,
 		&s.MaxUploads, &s.UploadCount, &s.MaxBytesPerFile, &s.AllowedMIME,
 		&s.Permissions, &s.HideContents, &s.CreatedAt, &s.RevokedAt,
-		&s.MaxTotalBytes, &s.ReceivedBytes, &s.RetentionSeconds)
+		&s.MaxTotalBytes, &s.ReceivedBytes, &s.RetentionSeconds,
+		&s.MaxUploadRate, &s.UploadRateWindowSeconds)
 	if err != nil {
 		return Share{}, translate(err)
 	}
@@ -34,13 +36,14 @@ func scanShare(row pgx.Row) (Share, error) {
 func (t *pgTx) CreateShare(ctx context.Context, s Share) (Share, error) {
 	const q = `INSERT INTO shares (node_id, owner_id, kind, label, token_hash, password_hash,
 			expires_at, max_downloads, max_uploads, max_bytes_per_file, allowed_mime,
-			permissions, hide_contents, max_total_bytes, retention_seconds)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+			permissions, hide_contents, max_total_bytes, retention_seconds,
+			max_upload_rate, upload_rate_window_seconds)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
 		RETURNING ` + shareColumns
 	return scanShare(t.tx.QueryRow(ctx, q, s.NodeID, s.OwnerID, string(s.Kind), s.Label,
 		s.TokenHash, s.PasswordHash, s.ExpiresAt, s.MaxDownloads, s.MaxUploads,
 		s.MaxBytesPerFile, s.AllowedMIME, s.Permissions, s.HideContents,
-		s.MaxTotalBytes, s.RetentionSeconds))
+		s.MaxTotalBytes, s.RetentionSeconds, s.MaxUploadRate, s.UploadRateWindowSeconds))
 }
 
 func (t *pgTx) ShareByTokenHash(ctx context.Context, hash []byte) (Share, error) {
@@ -60,12 +63,14 @@ func (t *pgTx) UpdateShare(ctx context.Context, s Share) (Share, error) {
 	const q = `UPDATE shares SET label=$2, password_hash=$3, expires_at=$4,
 			max_downloads=$5, max_uploads=$6, max_bytes_per_file=$7,
 			allowed_mime=$8, permissions=$9, hide_contents=$10,
-			max_total_bytes=$11, retention_seconds=$12
+			max_total_bytes=$11, retention_seconds=$12,
+			max_upload_rate=$13, upload_rate_window_seconds=$14
 		WHERE id = $1 AND revoked_at IS NULL
 		RETURNING ` + shareColumns
 	return scanShare(t.tx.QueryRow(ctx, q, s.ID, s.Label, s.PasswordHash, s.ExpiresAt,
 		s.MaxDownloads, s.MaxUploads, s.MaxBytesPerFile, s.AllowedMIME, s.Permissions,
-		s.HideContents, s.MaxTotalBytes, s.RetentionSeconds))
+		s.HideContents, s.MaxTotalBytes, s.RetentionSeconds,
+		s.MaxUploadRate, s.UploadRateWindowSeconds))
 }
 
 func (t *pgTx) RevokeShare(ctx context.Context, id uuid.UUID) error {
