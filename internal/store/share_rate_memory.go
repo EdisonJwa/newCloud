@@ -50,8 +50,14 @@ func (t *memTx) PruneShareUploadEvents(ctx context.Context, olderThan time.Durat
 	cutoff := t.m.now().Add(-olderThan)
 	kept := t.m.shareUploadEvents[:0]
 	removed := 0
+	// "<=", not "<", to match the SQL's `occurred_at <= now() - interval`.
+	//
+	// The difference is a real divergence, not a nit: PostgreSQL's now() advances between the
+	// insert and the delete, so a zero keep window removes everything. The in-memory store's clock
+	// is frozen for determinism, so an event created "now" and pruned "now" compares EQUAL — and a
+	// strict "<" would keep it, leaving the table growing forever while PostgreSQL emptied it.
 	for _, e := range t.m.shareUploadEvents {
-		if e.OccurredAt.Before(cutoff) {
+		if !e.OccurredAt.After(cutoff) {
 			removed++
 			continue
 		}

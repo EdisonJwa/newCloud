@@ -671,6 +671,13 @@ func Run(t *testing.T, factory Factory, opts Options) {
 		})
 	})
 
+	// SHARE-05 速率: the upload rate limit. On both backends, because the PostgreSQL version is a
+	// single statement with an advisory lock while the in-memory one counts a slice, and the
+	// server tests exercise only the memory backend.
+	t.Run("ShareRate", func(t *testing.T) {
+		shareRateSuite(t, factory)
+	})
+
 	// Blob deduplication across transactions (INV-07 / T-20).
 	//
 	// BlobIDFor maps a content address to one row id. If that mapping is not stable across
@@ -948,7 +955,7 @@ func Run(t *testing.T, factory Factory, opts Options) {
 			}
 			if contains(seen, "b") {
 				t.Fatal("the documented limitation changed: a row renamed behind the cursor is now seen; " +
-					"update the contract in docs/0012-cursor-contract.md and this test together")
+					"update the contract in docs/adr/0012-cursor-contract.md and this test together")
 			}
 			// But it is not lost: a fresh listing finds it.
 			var found bool
@@ -2579,4 +2586,144 @@ func contains(ss []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// shareRateSuite exercises the upload rate limit on both backends.
+//
+// It lives in the shared suite rather than in the server's tests because the limiter is a property
+// of the store: the PostgreSQL version is a single statement with an advisory lock, the in-memory
+// version is a count over a slice, and those are different enough that "the server test passes"
+// says nothing about production. The server tests run against the memory backend only.
+func shareRateSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.UUID)) {
+	t.Helper()
+
+	newRateShare := func(t *testing.T, s store.Store, owner, nodeID uuid.UUID,
+		rate int64, window time.Duration) store.Share {
+		t.Helper()
+		var sh store.Share
+		windowSecs := int64(window / time.Second)
+		err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			c, cerr := tx.CreateShare(ctx, store.Share{
+				NodeID: nodeID, OwnerID: owner, Kind: store.ShareRequest,
+				TokenHash: []byte(uuid.New().String()), Permissions: []string{"create"},
+				// A request share must hide its contents — the schema enforces it with a check
+				// constraint. Without this the insert is rejected with "invalid name:
+				// shares_check", which is the constraint speaking, not a naming problem.
+				HideContents:  true,
+				MaxUploadRate: &rate, UploadRateWindowSeconds: &windowSecs,
+			})
+			sh = c
+			return cerr
+		})
+		if err != nil {
+			t.Fatalf("create rate-limited share: %v", err)
+		}
+		return sh
+	}
+
+	allow := func(s store.Store, sh store.Share, rate int64, window time.Duration) error {
+		return s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.AllowShareUpload(ctx, sh.ID, rate, window, "127.0.0.1", 10)
+		})
+	}
+
+	t.Run("AllowsUpToTheRateThenRefuses", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		sh := newRateShare(t, s, owner, r.ID, 3, time.Hour)
+
+		for i := 0; i < 3; i++ {
+			if err := allow(s, sh, 3, time.Hour); err != nil {
+				t.Fatalf("upload %d of 3 must be accepted: %v", i+1, err)
+			}
+		}
+		err := allow(s, sh, 3, time.Hour)
+		if !errors.Is(err, store.ErrShareRateLimited) {
+			t.Fatalf("the fourth upload through a 3/hour limit: want ErrShareRateLimited, got %v."+
+				" A rate limit that does not refuse is not a limit.", err)
+		}
+	})
+
+	t.Run("RateIsTheDistinctErrorFromExhaustion", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		sh := newRateShare(t, s, owner, r.ID, 1, time.Hour)
+
+		if err := allow(s, sh, 1, time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		err := allow(s, sh, 1, time.Hour)
+		if errors.Is(err, store.ErrShareExhausted) {
+			t.Fatal("a rate-limited upload was reported as exhausted. Exhausted means the " +
+				"allowance is gone for good and rate means wait: they lead a visitor to different " +
+				"next steps and an operator to different causes.")
+		}
+		if !errors.Is(err, store.ErrShareRateLimited) {
+			t.Fatalf("want ErrShareRateLimited, got %v", err)
+		}
+	})
+
+	t.Run("ZeroRateIsUnlimited", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		sh := newRateShare(t, s, owner, r.ID, 0, time.Hour)
+
+		// A share with no rate configured must not accumulate rows for a limit nobody set.
+		for i := 0; i < 20; i++ {
+			if err := allow(s, sh, 0, time.Hour); err != nil {
+				t.Fatalf("an unset rate must accept everything: %v", err)
+			}
+		}
+	})
+
+	t.Run("RateIsScopedToTheShare", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		a := newRateShare(t, s, owner, r.ID, 1, time.Hour)
+		b := newRateShare(t, s, owner, r.ID, 1, time.Hour)
+
+		if err := allow(s, a, 1, time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		// Filling one share's window must not affect another's: the limits are per-link, and a
+		// global limiter would let one busy drop box throttle every other link on the instance.
+		if err := allow(s, b, 1, time.Hour); err != nil {
+			t.Fatalf("a second share was rate-limited by the first share's traffic: %v", err)
+		}
+	})
+
+	t.Run("PruneRemovesOnlyOldEvents", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		sh := newRateShare(t, s, owner, r.ID, 2, time.Hour)
+
+		if err := allow(s, sh, 2, time.Hour); err != nil {
+			t.Fatal(err)
+		}
+
+		// Pruning nothing (a keep window far longer than the events) must not free the budget.
+		var removed int
+		_ = s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			n, err := tx.PruneShareUploadEvents(ctx, 24*time.Hour)
+			removed = n
+			return err
+		})
+		if removed != 0 {
+			t.Fatalf("pruning with a 24h keep window removed %d fresh rows", removed)
+		}
+		if err := allow(s, sh, 2, time.Hour); err != nil {
+			t.Fatalf("the second of two uploads was refused after a non-destructive prune: %v", err)
+		}
+
+		// Pruning everything (a zero keep window) must free it.
+		_ = s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			n, err := tx.PruneShareUploadEvents(ctx, 0)
+			removed = n
+			return err
+		})
+		if removed == 0 {
+			t.Fatal("pruning with a zero keep window removed nothing, so the table would grow " +
+				"without bound")
+		}
+	})
 }
