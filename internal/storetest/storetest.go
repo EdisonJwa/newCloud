@@ -678,6 +678,10 @@ func Run(t *testing.T, factory Factory, opts Options) {
 		shareRateSuite(t, factory)
 	})
 
+	t.Run("Retention", func(t *testing.T) {
+		retentionSuite(t, factory)
+	})
+
 	// Blob deduplication across transactions (INV-07 / T-20).
 	//
 	// BlobIDFor maps a content address to one row id. If that mapping is not stable across
@@ -2724,6 +2728,123 @@ func shareRateSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.
 		if removed == 0 {
 			t.Fatal("pruning with a zero keep window removed nothing, so the table would grow " +
 				"without bound")
+		}
+	})
+}
+
+// retentionSuite exercises ExpireRetained on both backends.
+//
+// It belongs in the shared suite for the same reason the rate limiter does: the PostgreSQL version
+// is a single UPDATE with a predicate over timestamptz, the in-memory version compares time.Time
+// values, and those disagree at boundaries easily. The server test for retention runs against the
+// memory backend, so the SQL had never executed under test.
+func retentionSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.UUID)) {
+	t.Helper()
+
+	// mkDelivered creates a file with a retention deadline, returning it.
+	mkDelivered := func(t *testing.T, s store.Store, owner, parentID uuid.UUID,
+		name string, retain *time.Time) store.Node {
+		t.Helper()
+		var n store.Node
+		err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			c, cerr := tx.CreateFile(ctx, store.NewFile{
+				OwnerID: owner, ParentID: parentID, Name: name, Size: 1,
+				Mime: "application/octet-stream", ETag: `"x"`,
+				BlobID: newBlobHook(t), BlobHash: [32]byte{byte(len(name))},
+				RetainUntil: retain,
+			})
+			n = c
+			return cerr
+		})
+		if err != nil {
+			t.Fatalf("create %s: %v", name, err)
+		}
+		return n
+	}
+
+	expire := func(s store.Store) int {
+		var n int
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			got, err := tx.ExpireRetained(ctx)
+			n = got
+			return err
+		}); err != nil {
+			t.Fatalf("expire: %v", err)
+		}
+		return n
+	}
+
+	t.Run("OnlyPastDeadlinesAreTrashed", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+
+		past := time.Now().Add(-time.Hour)
+		future := time.Now().Add(24 * time.Hour)
+		expired := mkDelivered(t, s, owner, r.ID, "expired.bin", &past)
+		kept := mkDelivered(t, s, owner, r.ID, "kept.bin", &future)
+		none := mkDelivered(t, s, owner, r.ID, "none.bin", nil)
+
+		if n := expire(s); n != 1 {
+			t.Fatalf("expired %d nodes, want 1", n)
+		}
+
+		var gotExpired, gotKept, gotNone store.Node
+		_ = s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			var e1, e2, e3 error
+			gotExpired, e1 = tx.NodeIncludingTrashed(ctx, expired.ID)
+			gotKept, e2 = tx.NodeIncludingTrashed(ctx, kept.ID)
+			gotNone, e3 = tx.NodeIncludingTrashed(ctx, none.ID)
+			return errors.Join(e1, e2, e3)
+		})
+		if gotExpired.TrashedAt == nil {
+			t.Fatal("a delivery past its deadline was not trashed")
+		}
+		if gotKept.TrashedAt != nil {
+			t.Fatal("a delivery still inside its window was trashed")
+		}
+		if gotNone.TrashedAt != nil {
+			t.Fatal("a file with no retention at all was trashed")
+		}
+	})
+
+	t.Run("TrashingDoesNotDeleteContent", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		past := time.Now().Add(-time.Hour)
+		n := mkDelivered(t, s, owner, r.ID, "recoverable.bin", &past)
+
+		expire(s)
+
+		// The point of trashing rather than deleting: the row still exists and the owner can
+		// restore it. Deleting outright would make a misconfigured retention_seconds
+		// unrecoverable, which is a much worse failure than keeping data too long.
+		var got store.Node
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			found, err := tx.NodeIncludingTrashed(ctx, n.ID)
+			got = found
+			return err
+		}); err != nil {
+			t.Fatalf("the expired delivery is gone entirely, not trashed: %v", err)
+		}
+		if got.TrashedAt == nil {
+			t.Fatal("want the node trashed so it is recoverable")
+		}
+	})
+
+	t.Run("SecondRunIsIdempotent", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		past := time.Now().Add(-time.Hour)
+		mkDelivered(t, s, owner, r.ID, "once.bin", &past)
+
+		if n := expire(s); n != 1 {
+			t.Fatalf("first run expired %d, want 1", n)
+		}
+		// A second sweep must not re-count the same node: the predicate excludes already-trashed
+		// rows, and a worker running every six hours would otherwise report perpetual activity.
+		if n := expire(s); n != 0 {
+			t.Fatalf("second run expired %d, want 0 — an already-trashed node must not be counted "+
+				"again", n)
 		}
 	})
 }
