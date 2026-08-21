@@ -722,8 +722,73 @@ func (t *memTx) Versions(ctx context.Context, nodeID uuid.UUID, limit int) ([]Ve
 	return out, nil
 }
 
+// RestoreVersion makes an old version current, keeping the current content as a new version.
+//
+// This was a stub returning errNotImplemented, which the shared conformance suite caught as soon
+// as RestoreVersion got a case there. Left alone, the two backends disagreed on whether the feature
+// existed at all — and every test passed, because no test ran the feature on this backend.
+//
+// The semantics mirror the PostgreSQL path exactly, including the two things that are easy to get
+// wrong: the content being replaced is KEPT as a version (otherwise "restore" destroys the newer
+// content), and the restored content becomes current with an ETag derived from it rather than left
+// stale.
 func (t *memTx) RestoreVersion(ctx context.Context, nodeID uuid.UUID, versionNo int) (Node, error) {
-	return Node{}, errNotImplemented
+	rec, ok := t.m.nodes[nodeID]
+	if !ok || rec.node.TrashedAt != nil {
+		return Node{}, ErrNotFound
+	}
+
+	// Find the requested version.
+	idx := -1
+	for i, v := range rec.versions {
+		if v.VersionNo == versionNo {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return Node{}, ErrNotFound
+	}
+	victim := rec.versions[idx]
+
+	// Keep what is currently live, so undo is not destructive.
+	if rec.node.BlobID != nil {
+		rec.versions = append(rec.versions, Version{
+			ID: newID(), NodeID: rec.node.ID,
+			VersionNo: len(rec.versions) + 1,
+			BlobID:    *rec.node.BlobID,
+			Size:      rec.node.Size,
+			CreatedAt: rec.node.ModifiedAt,
+		})
+	}
+
+	// The restored version row is KEPT, matching PostgreSQL.
+	//
+	// It is tempting to remove it — the content is current again, so the history entry looks
+	// redundant. But PostgreSQL leaves it, and a divergence here is visible to a user: the version
+	// list after a restore would have a different length depending on which backend served the
+	// request. Keeping it also preserves the record that the file was at this content before.
+	// Quota follows the size change, exactly as an ordinary update would. Leaving usage untouched
+	// would let restore-to-a-larger-version silently exceed the owner's quota.
+	delta := victim.Size - rec.node.Size
+	if delta > 0 {
+		if err := t.checkQuota(rec.node.OwnerID, delta); err != nil {
+			return Node{}, err
+		}
+	}
+
+	blobID := victim.BlobID
+	rec.node.BlobID = &blobID
+	rec.node.Size = victim.Size
+	rec.node.ETag = etagForBlob(blobID.String())
+	rec.node.ModifiedAt = t.m.now()
+	if delta > 0 {
+		t.m.usage[rec.node.OwnerID] += delta
+	} else {
+		t.m.usage[rec.node.OwnerID] += delta
+	}
+
+	return rec.node, nil
 }
 
 func (t *memTx) Audit(ctx context.Context, e AuditEntry) error {

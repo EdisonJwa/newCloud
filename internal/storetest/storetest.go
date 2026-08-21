@@ -686,6 +686,10 @@ func Run(t *testing.T, factory Factory, opts Options) {
 		otpSuite(t, factory)
 	})
 
+	t.Run("VersionLifecycle", func(t *testing.T) {
+		versionLifecycleSuite(t, factory)
+	})
+
 	// Blob deduplication across transactions (INV-07 / T-20).
 	//
 	// BlobIDFor maps a content address to one row id. If that mapping is not stable across
@@ -3017,6 +3021,166 @@ func otpSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.UUID))
 		}
 		if r.VerifiedAt == nil {
 			t.Fatal("the recipient was not marked verified")
+		}
+	})
+}
+
+// versionLifecycleSuite covers RestoreVersion and ExpireVersions.
+//
+// ExpireVersions had a PostgreSQL-only test (lifecycle_pg_test.go) and RestoreVersion had none
+// anywhere. Both are reachable by a user: version history is a feature, and a restore that
+// silently loses the current content is data loss. A behaviour both stores must share belongs in
+// the shared suite.
+//
+// Note on scope: the in-memory store deliberately does not model blob lifecycle (its
+// CollectableBlobs returns an error rather than an empty list, precisely so the gap is not
+// mistaken for "nothing to do"). These cases therefore assert the version ROWS, which both
+// backends maintain, and not the refcount, which only PostgreSQL has.
+func versionLifecycleSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.UUID)) {
+	t.Helper()
+
+	// versionsOf reads the version list for a node.
+	versionsOf := func(t *testing.T, s store.Store, nodeID uuid.UUID) []store.Version {
+		t.Helper()
+		var out []store.Version
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			v, err := tx.Versions(ctx, nodeID, 0)
+			out = v
+			return err
+		}); err != nil {
+			t.Fatalf("list versions: %v", err)
+		}
+		return out
+	}
+
+	// writeVersion replaces a file's content, keeping the previous content as a version.
+	writeVersion := func(t *testing.T, s store.Store, owner, nodeID uuid.UUID, tag int) {
+		t.Helper()
+		var hash [32]byte
+		hash[0] = byte(tag)
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			_, err := tx.UpdateFile(ctx, store.UpdateFile{
+				NodeID: nodeID, Size: int64(10 + tag), ETag: "e" + string(rune('a'+tag)),
+				BlobID: newBlobHook(t), BlobHash: hash,
+				KeepVersion: true, MaxVersions: 10,
+			})
+			return err
+		}); err != nil {
+			t.Fatalf("write version %d: %v", tag, err)
+		}
+	}
+
+	t.Run("RestoreVersionSwapsCurrentAndKeepsIt", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		file := mkfile(t, s, owner, r.ID, "v.txt", 10)
+
+		writeVersion(t, s, owner, file.ID, 1)
+		writeVersion(t, s, owner, file.ID, 2)
+
+		vs := versionsOf(t, s, file.ID)
+		if len(vs) != 2 {
+			t.Fatalf("want 2 versions before restore, got %d", len(vs))
+		}
+
+		// The oldest kept version.
+		oldest := vs[len(vs)-1].VersionNo
+		var restored store.Node
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			n, err := tx.RestoreVersion(ctx, file.ID, oldest)
+			restored = n
+			return err
+		}); err != nil {
+			t.Fatalf("restore version %d: %v", oldest, err)
+		}
+
+		// The restored content is now current.
+		var cur store.Node
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			n, err := tx.Node(ctx, file.ID)
+			cur = n
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if cur.Size != restored.Size {
+			t.Fatalf("current size %d does not match the restored version %d", cur.Size, restored.Size)
+		}
+
+		// And the content it replaced is now a version. Restoring must never destroy the
+		// current content: that would make "restore an old version" a way to lose the new one.
+		// Two versions before, plus the content the restore replaced: 3. Restoring must never
+		// destroy the content it displaced, or "restore an old version" becomes a way to lose the
+		// new one — which is the opposite of what undo means.
+		after := versionsOf(t, s, file.ID)
+		if len(after) != 3 {
+			t.Fatalf("after restoring, want 3 versions (2 kept + the replaced current one), got %d. "+
+				"A restore that discards the content it replaced turns version history into a way "+
+				"to destroy data.", len(after))
+		}
+	})
+
+	t.Run("RestoreVersionRejectsAnUnknownVersion", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		file := mkfile(t, s, owner, r.ID, "missing.txt", 10)
+		writeVersion(t, s, owner, file.ID, 1)
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			_, err := tx.RestoreVersion(ctx, file.ID, 9999)
+			return err
+		}); err == nil {
+			t.Fatal("restoring a version number that does not exist succeeded")
+		}
+	})
+
+	t.Run("ExpireVersionsKeepsRecentAndRemovesOld", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		file := mkfile(t, s, owner, r.ID, "age.txt", 10)
+		writeVersion(t, s, owner, file.ID, 1)
+		writeVersion(t, s, owner, file.ID, 2)
+
+		before := versionsOf(t, s, file.ID)
+		if len(before) != 2 {
+			t.Fatalf("want 2 versions, got %d", len(before))
+		}
+
+		// A retention longer than the versions' age removes nothing. This is the safe direction:
+		// a misconfigured retention must not delete history that is inside its window.
+		var removed int
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			n, err := tx.ExpireVersions(ctx, 365*24*time.Hour)
+			removed = n
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if removed != 0 {
+			t.Fatalf("a one-year retention removed %d fresh versions", removed)
+		}
+		if got := versionsOf(t, s, file.ID); len(got) != 2 {
+			t.Fatalf("versions disappeared under a retention they are well inside of: %d", len(got))
+		}
+
+		// A retention of zero means "never expire", NOT "expire everything". That is a
+		// deliberate data-loss guard, the same one PurgeTrash uses: an omitted or zero retention
+		// must not delete a user's history, so a deployment that has not decided a policy keeps
+		// everything. Asserting the opposite here would have encoded a data-loss bug as expected
+		// behaviour.
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			n, err := tx.ExpireVersions(ctx, 0)
+			removed = n
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if removed != 0 {
+			t.Fatalf("a zero retention removed %d versions. Zero means \"keep forever\": it is "+
+				"the safe default for a setting that deletes history.", removed)
+		}
+		if got := versionsOf(t, s, file.ID); len(got) != 2 {
+			t.Fatalf("a zero retention removed versions: %d remain, want 2", len(got))
 		}
 	})
 }
