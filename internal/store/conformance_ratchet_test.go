@@ -32,13 +32,12 @@ import (
 // Each entry is a method whose behaviour is currently verified by at most one backend. Paying this
 // down means writing a case in the shared suite and deleting the name here.
 var knownUncovered = []string{
-	"AddRecipient", "AllRoots", "AppPasswordByHash", "BlobHash", "CollectableBlobs",
-	"ConsumeRecipientCode", "DeadProps", "DeleteBlob", "DeleteDeadProp", "DeleteLock",
+	"AllRoots", "AppPasswordByHash", "BlobHash", "CollectableBlobs",
+	"DeadProps", "DeleteBlob", "DeleteDeadProp", "DeleteLock",
 	"Descendants", "ExpireDownloadSessions", "ExpireVersions", "GroupByID", "GroupByName",
 	"GroupMembers", "GroupsForUser", "IncrementDownload", "IncrementUpload", "LocksForUser",
-	"MarkRecipientAccess", "MarkRecipientVerified", "OTPFailureCount", "PruneOTPAttempts",
-	"PurgeTrash", "ReapExpiredLeases", "RecipientFor", "RecipientsFor", "RecordOTPAttempt",
-	"RefreshLock", "RemoveGroupMember", "RestoreVersion", "RevokeAppPassword", "RevokeSession",
+	"MarkRecipientAccess", "PruneOTPAttempts",
+	"PurgeTrash", "ReapExpiredLeases", "RecipientsFor", "RefreshLock", "RemoveGroupMember", "RestoreVersion", "RevokeAppPassword", "RevokeSession",
 	"RevokeShare", "RevokeUserAppPasswords", "RevokeUserSessions", "SampleBlobHashes",
 	"SetDeadProp", "ShareByTokenHash", "SharesByOwner", "SharesForNode", "TouchAppPassword",
 	"UpdateShare", "UserByEmail", "UserByIdPSubject", "UserByUsername",

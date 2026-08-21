@@ -682,6 +682,10 @@ func Run(t *testing.T, factory Factory, opts Options) {
 		retentionSuite(t, factory)
 	})
 
+	t.Run("OTP", func(t *testing.T) {
+		otpSuite(t, factory)
+	})
+
 	// Blob deduplication across transactions (INV-07 / T-20).
 	//
 	// BlobIDFor maps a content address to one row id. If that mapping is not stable across
@@ -2845,6 +2849,174 @@ func retentionSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.
 		if n := expire(s); n != 0 {
 			t.Fatalf("second run expired %d, want 0 — an already-trashed node must not be counted "+
 				"again", n)
+		}
+	})
+}
+
+// otpSuite exercises the verification throttle and single-use codes on both backends.
+//
+// These are security invariants, not convenience features: ConsumeRecipientCode is the only thing
+// stopping a captured code from being replayed, and OTPFailureCount is the only thing limiting
+// online guessing. Both were exercised solely through the share service's tests, which run against
+// the in-memory backend — so the PostgreSQL statements had never been executed under test. A
+// divergence here would not be a rendering bug; it would be an authentication bypass on one
+// backend and not the other.
+func otpSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.UUID)) {
+	t.Helper()
+
+	const email = "recipient@example.test"
+
+	// newEmailShare creates a share with one invited recipient.
+	newEmailShare := func(t *testing.T, s store.Store, owner uuid.UUID) store.Share {
+		t.Helper()
+		var sh store.Share
+		err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			r, rerr := tx.EnsureRoot(ctx, owner)
+			if rerr != nil {
+				return rerr
+			}
+			c, cerr := tx.CreateShare(ctx, store.Share{
+				NodeID: r.ID, OwnerID: owner, Kind: store.ShareEmail,
+				TokenHash: []byte(uuid.New().String()), Permissions: []string{"read"},
+			})
+			if cerr != nil {
+				return cerr
+			}
+			sh = c
+			return tx.AddRecipient(ctx, store.ShareRecipient{ShareID: c.ID, Email: email})
+		})
+		if err != nil {
+			t.Fatalf("create email share: %v", err)
+		}
+		return sh
+	}
+
+	t.Run("ConsumeRecipientCodeIsSingleUse", func(t *testing.T) {
+		s, owner := factory(t)
+		sh := newEmailShare(t, s, owner)
+
+		// The first consumption succeeds.
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.ConsumeRecipientCode(ctx, sh.ID, email)
+		}); err != nil {
+			t.Fatalf("first use of a fresh code: %v", err)
+		}
+
+		// The second must fail. This is replay protection: without it a code that leaked from a
+		// mailbox, a mail scanner's link prefetch, or a shared terminal keeps working.
+		err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.ConsumeRecipientCode(ctx, sh.ID, email)
+		})
+		if !errors.Is(err, store.ErrCodeConsumed) {
+			t.Fatalf("reusing a consumed code: want ErrCodeConsumed, got %v. A code that can be "+
+				"replayed is not a one-time code.", err)
+		}
+	})
+
+	t.Run("ConsumeRecipientCodeRequiresAnInvitation", func(t *testing.T) {
+		s, owner := factory(t)
+		sh := newEmailShare(t, s, owner)
+
+		// An address that was never invited must not be consumable: the UPDATE matches no row,
+		// which has to be a refusal rather than a silent success.
+		err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.ConsumeRecipientCode(ctx, sh.ID, "stranger@example.test")
+		})
+		if err == nil {
+			t.Fatal("consuming a code for an address that was never invited succeeded")
+		}
+	})
+
+	t.Run("FailureCountCountsOnlyFailuresInsideTheWindow", func(t *testing.T) {
+		s, owner := factory(t)
+		sh := newEmailShare(t, s, owner)
+		ctx := context.Background()
+
+		count := func() int {
+			var n int
+			if err := s.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+				got, err := tx.OTPFailureCount(ctx, sh.ID, email, time.Hour)
+				n = got
+				return err
+			}); err != nil {
+				t.Fatalf("count: %v", err)
+			}
+			return n
+		}
+
+		if n := count(); n != 0 {
+			t.Fatalf("a fresh share reports %d failures", n)
+		}
+
+		// Two failures and one success.
+		for _, success := range []bool{false, false, true} {
+			if err := s.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+				return tx.RecordOTPAttempt(ctx, store.OTPAttempt{
+					ShareID: sh.ID, Email: email, IP: "127.0.0.1",
+					Success: success, Reason: "test",
+				})
+			}); err != nil {
+				t.Fatalf("record: %v", err)
+			}
+		}
+
+		// Only the failures count toward the throttle. Counting successes would let a legitimate
+		// visitor lock themselves out by using the share correctly.
+		if n := count(); n != 2 {
+			t.Fatalf("failure count = %d, want 2 — successes must not count toward the throttle", n)
+		}
+	})
+
+	t.Run("FailureCountIsScopedToTheAddress", func(t *testing.T) {
+		s, owner := factory(t)
+		sh := newEmailShare(t, s, owner)
+		ctx := context.Background()
+
+		if err := s.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+			return tx.RecordOTPAttempt(ctx, store.OTPAttempt{
+				ShareID: sh.ID, Email: email, IP: "127.0.0.1", Success: false,
+			})
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		// A different invited address must not inherit the first one's failure count: one
+		// recipient being attacked must not lock out the others.
+		var other int
+		_ = s.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+			n, err := tx.OTPFailureCount(ctx, sh.ID, "someone-else@example.test", time.Hour)
+			other = n
+			return err
+		})
+		if other != 0 {
+			t.Fatalf("an unrelated address reports %d failures, so one recipient's failures "+
+				"would lock out another", other)
+		}
+	})
+
+	t.Run("MarkRecipientVerifiedIsIdempotent", func(t *testing.T) {
+		s, owner := factory(t)
+		sh := newEmailShare(t, s, owner)
+		ctx := context.Background()
+
+		for i := 0; i < 2; i++ {
+			if err := s.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+				return tx.MarkRecipientVerified(ctx, sh.ID, email)
+			}); err != nil {
+				t.Fatalf("verify pass %d: %v", i+1, err)
+			}
+		}
+
+		var r store.ShareRecipient
+		if err := s.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+			got, err := tx.RecipientFor(ctx, sh.ID, email)
+			r = got
+			return err
+		}); err != nil {
+			t.Fatalf("read back: %v", err)
+		}
+		if r.VerifiedAt == nil {
+			t.Fatal("the recipient was not marked verified")
 		}
 	})
 }
