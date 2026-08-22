@@ -690,6 +690,10 @@ func Run(t *testing.T, factory Factory, opts Options) {
 		versionLifecycleSuite(t, factory)
 	})
 
+	t.Run("DeadProps", func(t *testing.T) {
+		deadPropSuite(t, factory)
+	})
+
 	// Blob deduplication across transactions (INV-07 / T-20).
 	//
 	// BlobIDFor maps a content address to one row id. If that mapping is not stable across
@@ -3181,6 +3185,146 @@ func versionLifecycleSuite(t *testing.T, factory func(t *testing.T) (store.Store
 		}
 		if got := versionsOf(t, s, file.ID); len(got) != 2 {
 			t.Fatalf("a zero retention removed versions: %d remain, want 2", len(got))
+		}
+	})
+}
+
+// deadPropSuite covers WebDAV dead-property storage on both backends.
+//
+// Only DeadProps had any test, and it ran against PostgreSQL alone. SetDeadProp upserts and
+// DeleteDeadProp removes; neither had a test on either backend. Dead properties are what a WebDAV
+// client thinks it is persisting — a colour label, a sync token, a custom application field — and
+// a divergence here is silent: the property is written, the client is told it succeeded, and a
+// later PROPFIND on the other backend returns nothing.
+func deadPropSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.UUID)) {
+	t.Helper()
+
+	const (
+		ns   = "http://example.test/ns"
+		name = "label"
+	)
+
+	// fileNode creates a file to hang properties on.
+	fileNode := func(t *testing.T, s store.Store, owner uuid.UUID) store.Node {
+		t.Helper()
+		r := rootOf(t, s, owner)
+		return mkfile(t, s, owner, r.ID, "prop.txt", 10)
+	}
+
+	read := func(t *testing.T, s store.Store, id uuid.UUID) []store.DeadProp {
+		t.Helper()
+		var out []store.DeadProp
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			p, err := tx.DeadProps(ctx, id)
+			out = p
+			return err
+		}); err != nil {
+			t.Fatalf("read props: %v", err)
+		}
+		return out
+	}
+
+	set := func(t *testing.T, s store.Store, id uuid.UUID, value string) {
+		t.Helper()
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.SetDeadProp(ctx, id, ns, name, value)
+		}); err != nil {
+			t.Fatalf("set prop: %v", err)
+		}
+	}
+
+	t.Run("SetThenReadRoundTrips", func(t *testing.T) {
+		s, owner := factory(t)
+		f := fileNode(t, s, owner)
+
+		if got := read(t, s, f.ID); len(got) != 0 {
+			t.Fatalf("a fresh file has %d dead properties", len(got))
+		}
+		set(t, s, f.ID, "one")
+
+		got := read(t, s, f.ID)
+		if len(got) != 1 {
+			t.Fatalf("after setting one property, read back %d", len(got))
+		}
+		if got[0].Value != "one" || got[0].Space != ns || got[0].Name != name {
+			t.Fatalf("property round-trip mismatch: %+v", got[0])
+		}
+	})
+
+	t.Run("SetIsAnUpsert", func(t *testing.T) {
+		s, owner := factory(t)
+		f := fileNode(t, s, owner)
+
+		set(t, s, f.ID, "first")
+		set(t, s, f.ID, "second")
+
+		// Overwriting the same (space, name) must replace, not append. Two rows would make a
+		// PROPFIND return the property twice with different values, which clients handle
+		// inconsistently — and the ON CONFLICT in the SQL makes the intent explicit.
+		got := read(t, s, f.ID)
+		if len(got) != 1 {
+			t.Fatalf("setting the same property twice produced %d rows, want 1", len(got))
+		}
+		if got[0].Value != "second" {
+			t.Fatalf("value = %q, want the latest write %q", got[0].Value, "second")
+		}
+	})
+
+	t.Run("DistinctNamespacesAreDistinctProperties", func(t *testing.T) {
+		s, owner := factory(t)
+		f := fileNode(t, s, owner)
+
+		err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			if err := tx.SetDeadProp(ctx, f.ID, ns, name, "a"); err != nil {
+				return err
+			}
+			// Same local name, different namespace: a different property, not an overwrite.
+			return tx.SetDeadProp(ctx, f.ID, "http://other.test/ns", name, "b")
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := read(t, s, f.ID); len(got) != 2 {
+			t.Fatalf("two namespaces produced %d properties, want 2", len(got))
+		}
+	})
+
+	t.Run("DeleteRemovesOnlyThatProperty", func(t *testing.T) {
+		s, owner := factory(t)
+		f := fileNode(t, s, owner)
+
+		err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			if err := tx.SetDeadProp(ctx, f.ID, ns, "keep", "v"); err != nil {
+				return err
+			}
+			return tx.SetDeadProp(ctx, f.ID, ns, "drop", "v")
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.DeleteDeadProp(ctx, f.ID, ns, "drop")
+		}); err != nil {
+			t.Fatalf("delete: %v", err)
+		}
+
+		got := read(t, s, f.ID)
+		if len(got) != 1 || got[0].Name != "keep" {
+			t.Fatalf("deleting one property left %+v", got)
+		}
+	})
+
+	t.Run("DeleteIsIdempotent", func(t *testing.T) {
+		s, owner := factory(t)
+		f := fileNode(t, s, owner)
+
+		// Deleting a property that was never set is not an error: a PROPPATCH that removes a
+		// property twice is a client retrying, not a mistake.
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.DeleteDeadProp(ctx, f.ID, ns, "never-set")
+		}); err != nil {
+			t.Fatalf("deleting an absent property: %v", err)
 		}
 	})
 }

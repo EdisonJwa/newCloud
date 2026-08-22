@@ -33,13 +33,13 @@ import (
 // down means writing a case in the shared suite and deleting the name here.
 var knownUncovered = []string{
 	"AllRoots", "AppPasswordByHash", "BlobHash", "CollectableBlobs",
-	"DeadProps", "DeleteBlob", "DeleteDeadProp", "DeleteLock",
+	"DeleteBlob", "DeleteLock",
 	"Descendants", "ExpireDownloadSessions", "GroupByID", "GroupByName",
 	"GroupMembers", "GroupsForUser", "IncrementDownload", "IncrementUpload", "LocksForUser",
 	"MarkRecipientAccess", "PruneOTPAttempts",
 	"PurgeTrash", "ReapExpiredLeases", "RecipientsFor", "RefreshLock", "RemoveGroupMember", "RevokeAppPassword", "RevokeSession",
 	"RevokeShare", "RevokeUserAppPasswords", "RevokeUserSessions", "SampleBlobHashes",
-	"SetDeadProp", "ShareByTokenHash", "SharesByOwner", "SharesForNode", "TouchAppPassword",
+	"ShareByTokenHash", "SharesByOwner", "SharesForNode", "TouchAppPassword",
 	"UpdateShare", "UserByEmail", "UserByIdPSubject", "UserByUsername",
 }
 
