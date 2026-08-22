@@ -1623,6 +1623,94 @@ func Run(t *testing.T, factory Factory, opts Options) {
 			}
 		})
 
+		t.Run("ReapExpiredLeasesReleasesTheLease", func(t *testing.T) {
+			s, owner := factory(t)
+			rootOf(t, s, owner)
+
+			enqueue(t, s, store.Job{Kind: "test.reap"})
+
+			// A worker claims with an already-expired lease, as one that died mid-job would.
+			if got := claim(t, s, "w-dead", time.Nanosecond); len(got) != 1 {
+				t.Fatalf("setup claim: %d", len(got))
+			}
+			time.Sleep(5 * time.Millisecond)
+
+			// ReapExpiredLeases is separate from claim-time recovery and was never called by
+			// any test. Both exist on purpose: claim filters on the lease, so a dead worker's
+			// job is reclaimable without help — but the reaper is what clears locked_by and
+			// locked_until, and an operator looking at the queue needs that to be right. A job
+			// stuck showing "running under w-dead" forever is the symptom of a reaper that
+			// never runs.
+			var reaped int
+			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				n, err := tx.ReapExpiredLeases(ctx)
+				reaped = n
+				return err
+			}); err != nil {
+				t.Fatalf("reap: %v", err)
+			}
+			if reaped != 1 {
+				t.Fatalf("reaped %d expired leases, want 1", reaped)
+			}
+
+			// Running it again finds nothing: the reaper is idempotent, and a worker on a timer
+			// calling it every minute must not report perpetual activity.
+			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				n, err := tx.ReapExpiredLeases(ctx)
+				reaped = n
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if reaped != 0 {
+				t.Fatalf("a second reap released %d more leases, want 0", reaped)
+			}
+
+			// The job is still claimable, and the reaper did not consume an attempt.
+			got := claim(t, s, "w-live", time.Minute)
+			if len(got) != 1 {
+				t.Fatalf("after reaping, the job should be claimable, got %d", len(got))
+			}
+			if got[0].Attempts != 2 {
+				t.Fatalf("attempts = %d, want 2 — the reaper releases a lease, it does not "+
+					"consume an attempt; only a claim does", got[0].Attempts)
+			}
+		})
+
+		t.Run("ReapIgnoresLiveAndCompletedLeases", func(t *testing.T) {
+			s, owner := factory(t)
+			rootOf(t, s, owner)
+
+			enqueue(t, s, store.Job{Kind: "test.live"})
+			enqueue(t, s, store.Job{Kind: "test.done"})
+
+			// One claim takes everything due, so both jobs come back together. The first becomes
+			// the live lease, the second is completed — the two states the reaper must leave
+			// alone.
+			jobs := claim(t, s, "w-live", time.Hour)
+			if len(jobs) != 2 {
+				t.Fatalf("setup: claimed %d jobs, want 2", len(jobs))
+			}
+			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				return tx.CompleteJob(ctx, jobs[1].ID)
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			var reaped int
+			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				n, err := tx.ReapExpiredLeases(ctx)
+				reaped = n
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			// Reaping a live lease would let a second worker run a job that is still in progress,
+			// which is exactly the double-execution the queue exists to prevent.
+			if reaped != 0 {
+				t.Fatalf("reaped %d leases, want 0 — a live lease must not be released", reaped)
+			}
+		})
 		t.Run("CompleteRemovesFromPending", func(t *testing.T) {
 			s, owner := factory(t)
 			rootOf(t, s, owner)

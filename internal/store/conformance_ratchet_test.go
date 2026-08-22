@@ -37,7 +37,7 @@ var knownUncovered = []string{
 	"Descendants", "ExpireDownloadSessions", "GroupByID", "GroupByName",
 	"GroupMembers", "GroupsForUser", "IncrementDownload", "IncrementUpload", "LocksForUser",
 	"MarkRecipientAccess", "PruneOTPAttempts",
-	"PurgeTrash", "ReapExpiredLeases", "RecipientsFor", "RefreshLock", "RemoveGroupMember", "RevokeAppPassword", "RevokeSession",
+	"PurgeTrash", "RecipientsFor", "RefreshLock", "RemoveGroupMember", "RevokeAppPassword", "RevokeSession",
 	"RevokeShare", "RevokeUserAppPasswords", "RevokeUserSessions", "SampleBlobHashes",
 	"ShareByTokenHash", "SharesByOwner", "SharesForNode", "TouchAppPassword",
 	"UpdateShare", "UserByEmail", "UserByIdPSubject", "UserByUsername",
