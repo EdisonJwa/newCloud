@@ -694,6 +694,10 @@ func Run(t *testing.T, factory Factory, opts Options) {
 		deadPropSuite(t, factory)
 	})
 
+	t.Run("Locks", func(t *testing.T) {
+		lockSuite(t, factory)
+	})
+
 	// Blob deduplication across transactions (INV-07 / T-20).
 	//
 	// BlobIDFor maps a content address to one row id. If that mapping is not stable across
@@ -3413,6 +3417,275 @@ func deadPropSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.U
 			return tx.DeleteDeadProp(ctx, f.ID, ns, "never-set")
 		}); err != nil {
 			t.Fatalf("deleting an absent property: %v", err)
+		}
+	})
+}
+
+// lockSuite covers WebDAV LOCK ownership on both backends.
+//
+// None of CreateLock, RefreshLock, DeleteLock, ExpireLocks or LocksForUser had any test on
+// either backend — not even a PostgreSQL-only one. LOCK is a P0 requirement and its integrity
+// property is ownership: only the holder may extend or release a lock. Without that, any
+// authenticated user can keep somebody else's lock alive indefinitely or drop it and write
+// underneath them, which defeats the point of locking at all.
+//
+// The rules both backends must share, and which are asserted here:
+//
+//	owned lock    only its holder may refresh or delete it
+//	ownerless     a system lock (user_id NULL) may be released by anyone, because there is no
+//	              holder to ask — this is the expiry/recovery path
+//	expired       invisible to ActiveLock and not refreshable, so a stale row cannot block a file
+func lockSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.UUID)) {
+	t.Helper()
+
+	future := func(d time.Duration) time.Time { return time.Now().Add(d) }
+
+	// drainExpired removes any expired lock the case created.
+	//
+	// ExpireLocks counts GLOBALLY, and the pre-existing LockExpiry case asserts an exact count of
+	// 1. A case here that leaves an expired lock behind therefore breaks that one — which is how
+	// this leak was found: a full-suite run failed while each case passed in isolation.
+	drainExpired := func(t *testing.T, s store.Store) {
+		t.Helper()
+		t.Cleanup(func() {
+			_ = s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				_, err := tx.ExpireLocks(ctx)
+				return err
+			})
+		})
+	}
+
+	// otherUser creates a distinct account, used as the lock holder so the "only the holder"
+	// cases have a real second principal rather than reusing the owner.
+	otherUser := func(t *testing.T, s store.Store, name string) uuid.UUID {
+		t.Helper()
+		u, err := upsertUser(s, store.UpsertUser{
+			Issuer: "https://idp.test", Subject: "lock-" + name,
+			Username: name, Email: name + "@example.test", Role: "user",
+		})
+		if err != nil {
+			t.Fatalf("create %s: %v", name, err)
+		}
+		return u.ID
+	}
+
+	// mkLocked creates a file and puts a lock on it owned by `holder`.
+	mkLocked := func(t *testing.T, s store.Store, owner, holder uuid.UUID,
+		token string, expires time.Time) store.Node {
+		t.Helper()
+		r := rootOf(t, s, owner)
+		f := mkfile(t, s, owner, r.ID, "locked-"+token+".txt", 10)
+		err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.CreateLock(ctx, store.Lock{
+				Token: token, NodeID: f.ID, UserID: &holder,
+				OwnerXML: "<owner>" + token + "</owner>", Depth: "0",
+				TimeoutSec: 3600, CreatedAt: time.Now(), ExpiresAt: expires,
+			})
+		})
+		if err != nil {
+			t.Fatalf("create lock %q: %v", token, err)
+		}
+		return f
+	}
+
+	t.Run("OnlyTheHolderCanDelete", func(t *testing.T) {
+		s, owner := factory(t)
+		holder := otherUser(t, s, "lock-holder")
+		f := mkLocked(t, s, owner, holder, "tok-own", future(time.Hour))
+
+		// A different user must not be able to release it.
+		var removed bool
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			ok, err := tx.DeleteLock(ctx, f.ID, "tok-own", owner)
+			removed = ok
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if removed {
+			t.Fatal("a user who does not hold the lock deleted it. That lets one client unlock a " +
+				"file another is editing and write underneath it, which is the failure LOCK exists " +
+				"to prevent.")
+		}
+
+		// The holder can.
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			ok, err := tx.DeleteLock(ctx, f.ID, "tok-own", holder)
+			removed = ok
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if !removed {
+			t.Fatal("the lock holder could not delete its own lock")
+		}
+	})
+
+	t.Run("DeleteReportsWhetherItRemovedSomething", func(t *testing.T) {
+		s, owner := factory(t)
+		holder := otherUser(t, s, "lock-holder2")
+		f := mkLocked(t, s, owner, holder, "tok-once", future(time.Hour))
+
+		var first, second bool
+		_ = s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			ok, err := tx.DeleteLock(ctx, f.ID, "tok-once", holder)
+			first = ok
+			return err
+		})
+		_ = s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			ok, err := tx.DeleteLock(ctx, f.ID, "tok-once", holder)
+			second = ok
+			return err
+		})
+		if !first || second {
+			t.Fatalf("delete reported %v then %v, want true then false. The bool is how an "+
+				"ownership mismatch is told apart from success, so it has to be accurate.", first, second)
+		}
+	})
+
+	t.Run("OnlyTheHolderCanRefresh", func(t *testing.T) {
+		s, owner := factory(t)
+		holder := otherUser(t, s, "lock-holder3")
+		f := mkLocked(t, s, owner, holder, "tok-ext", future(time.Hour))
+
+		// A stranger's refresh must fail: otherwise anyone can keep a lock alive forever and
+		// block the real owner from ever editing the file again.
+		err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			_, rerr := tx.RefreshLock(ctx, f.ID, "tok-ext", owner, future(2*time.Hour))
+			return rerr
+		})
+		if err == nil {
+			t.Fatal("a non-holder refreshed the lock, which lets one client extend another's lock " +
+				"indefinitely")
+		}
+
+		// The holder can, and the expiry actually moves.
+		var got store.Lock
+		target := future(3 * time.Hour)
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			l, rerr := tx.RefreshLock(ctx, f.ID, "tok-ext", holder, target)
+			got = l
+			return rerr
+		}); err != nil {
+			t.Fatalf("the holder could not refresh: %v", err)
+		}
+		// Compared with a tolerance, not exactly: PostgreSQL stores timestamptz to microsecond
+		// precision and rounds the nanoseconds Go carries, so an exact comparison fails on the
+		// PostgreSQL backend while passing in memory. The suite has to state what the contract
+		// actually is — the expiry moves to the requested time — rather than a storage detail.
+		if d := got.ExpiresAt.Sub(target); d > time.Millisecond || d < -time.Millisecond {
+			t.Fatalf("refresh returned expiry %v, want %v (off by %v)", got.ExpiresAt, target, d)
+		}
+	})
+
+	t.Run("OwnerlessLockIsReleasableByAnyone", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		f := mkfile(t, s, owner, r.ID, "system-locked.txt", 10)
+
+		// A system lock has no holder to ask, so anyone with write access may release it. This
+		// is the recovery path: a lock whose owner row was removed must not strand the file.
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.CreateLock(ctx, store.Lock{
+				Token: "sys", NodeID: f.ID, UserID: nil,
+				Depth: "0", TimeoutSec: 3600, CreatedAt: time.Now(), ExpiresAt: future(time.Hour),
+			})
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		var removed bool
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			ok, err := tx.DeleteLock(ctx, f.ID, "sys", owner)
+			removed = ok
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if !removed {
+			t.Fatal("an ownerless lock could not be released, so a lock without a holder would " +
+				"strand the file permanently")
+		}
+	})
+
+	t.Run("ExpiredLockIsNotActiveAndNotRefreshable", func(t *testing.T) {
+		s, owner := factory(t)
+		holder := otherUser(t, s, "lock-holder4")
+		f := mkLocked(t, s, owner, holder, "tok-old", future(-time.Minute))
+		drainExpired(t, s)
+
+		// ActiveLock must not report it: an expired lock that still blocks a file is worse than
+		// no lock, because the client that held it is gone and cannot release it.
+		err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			_, lerr := tx.ActiveLock(ctx, f.ID)
+			return lerr
+		})
+		if err == nil {
+			t.Fatal("an expired lock is still reported as active")
+		}
+
+		// And it cannot be refreshed back to life.
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			_, rerr := tx.RefreshLock(ctx, f.ID, "tok-old", holder, future(time.Hour))
+			return rerr
+		}); err == nil {
+			t.Fatal("an expired lock was refreshed back into existence")
+		}
+	})
+
+	t.Run("LocksForUserListsOnlyLiveOwnedLocks", func(t *testing.T) {
+		s, owner := factory(t)
+		holder := otherUser(t, s, "lock-holder5")
+		live := mkLocked(t, s, owner, holder, "tok-live", future(time.Hour))
+		mkLocked(t, s, owner, holder, "tok-expired", future(-time.Minute))
+		drainExpired(t, s)
+		other := otherUser(t, s, "lock-other")
+		mkLocked(t, s, owner, other, "tok-theirs", future(time.Hour))
+
+		var locks []store.Lock
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			l, err := tx.LocksForUser(ctx, holder)
+			locks = l
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		// One live lock; the expired one and the other user's must not appear. A cleanup worker
+		// acting on this list would otherwise try to release locks that are not the user's.
+		if len(locks) != 1 {
+			t.Fatalf("LocksForUser returned %d locks, want 1", len(locks))
+		}
+		if locks[0].NodeID != live.ID {
+			t.Fatalf("LocksForUser returned the wrong node")
+		}
+	})
+
+	t.Run("SecondLockOnALockedNodeConflicts", func(t *testing.T) {
+		s, owner := factory(t)
+		holder := otherUser(t, s, "lock-holder6")
+		r := rootOf(t, s, owner)
+		f := mkfile(t, s, owner, r.ID, "contested.txt", 10)
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.CreateLock(ctx, store.Lock{
+				Token: "first", NodeID: f.ID, UserID: &holder,
+				Depth: "0", TimeoutSec: 3600, CreatedAt: time.Now(), ExpiresAt: future(time.Hour),
+			})
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		// A second lock on the same node must fail, and the check has to be in the same statement
+		// as the insert or two racing clients both win.
+		err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.CreateLock(ctx, store.Lock{
+				Token: "second", NodeID: f.ID, UserID: &holder,
+				Depth: "0", TimeoutSec: 3600, CreatedAt: time.Now(), ExpiresAt: future(time.Hour),
+			})
+		})
+		if !errors.Is(err, store.ErrConflict) {
+			t.Fatalf("a second lock on a locked node: want ErrConflict, got %v", err)
 		}
 	})
 }
