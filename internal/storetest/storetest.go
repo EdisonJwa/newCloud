@@ -702,6 +702,10 @@ func Run(t *testing.T, factory Factory, opts Options) {
 		groupSuite(t, factory)
 	})
 
+	t.Run("Credentials", func(t *testing.T) {
+		credentialSuite(t, factory)
+	})
+
 	// Blob deduplication across transactions (INV-07 / T-20).
 	//
 	// BlobIDFor maps a content address to one row id. If that mapping is not stable across
@@ -3890,6 +3894,262 @@ func groupSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.UUID
 			return tx.RemoveGroupMember(ctx, g.ID, erin)
 		}); err != nil {
 			t.Fatalf("removing a non-member failed: %v", err)
+		}
+	})
+}
+
+// credentialSuite covers session and app-password revocation on both backends.
+//
+// None of RevokeSession, RevokeUserSessions, RevokeAppPassword, RevokeUserAppPasswords,
+// AppPasswordByHash or TouchAppPassword had a direct test on either backend. They were exercised
+// only through ApplyIdPRole and DisableUser, which is not the same thing: those test "a downgrade
+// revokes", not "revocation actually stops authentication".
+//
+// The property that matters is end to end: after revocation, the credential must no longer
+// authenticate. A revocation that sets a column but leaves the lookup returning the row is a
+// credential that keeps working — for a WebDAV app password, that means months.
+func credentialSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.UUID)) {
+	t.Helper()
+
+	newUser := func(t *testing.T, s store.Store, name string) uuid.UUID {
+		t.Helper()
+		u, err := upsertUser(s, store.UpsertUser{
+			Issuer: "https://idp.test", Subject: "cred-" + name,
+			Username: name, Email: name + "@example.test", Role: "user",
+		})
+		if err != nil {
+			t.Fatalf("create %s: %v", name, err)
+		}
+		return u.ID
+	}
+
+	// mkSession returns the jti it created.
+	//
+	// The sessions table keys on a uuid, so a readable label like "jti-one" is rejected. The
+	// caller gets the generated id back rather than choosing it — which is also how production
+	// works, since the jti comes from the ticket.
+	mkSession := func(t *testing.T, s store.Store, uid uuid.UUID) string {
+		t.Helper()
+		jti := uuid.New().String()
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.CreateSession(ctx, store.Session{
+				ID: jti, UserID: uid, ExpiresAt: time.Now().Add(time.Hour),
+				IP: "127.0.0.1", UserAgent: "test", AuthMethod: "oidc",
+			})
+		}); err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+		return jti
+	}
+
+	live := func(t *testing.T, s store.Store, jti string) bool {
+		t.Helper()
+		var ok bool
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			v, err := tx.SessionLive(ctx, jti)
+			ok = v
+			return err
+		}); err != nil {
+			t.Fatalf("session live: %v", err)
+		}
+		return ok
+	}
+
+	mkPassword := func(t *testing.T, s store.Store, uid uuid.UUID, label string, hash []byte) uuid.UUID {
+		t.Helper()
+		id := uuid.New()
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.CreateAppPassword(ctx, store.AppPassword{
+				ID: id, UserID: uid, Label: label, Prefix: "wc_" + label,
+				TokenHash: hash, Scope: "rw", CreatedAt: time.Now(),
+			})
+		}); err != nil {
+			t.Fatalf("create app password: %v", err)
+		}
+		return id
+	}
+
+	t.Run("RevokeSessionStopsItAuthenticating", func(t *testing.T) {
+		s, owner := factory(t)
+		jti := mkSession(t, s, owner)
+
+		if !live(t, s, jti) {
+			t.Fatal("a freshly created session is not live")
+		}
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.RevokeSession(ctx, jti)
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		// The whole point: SessionLive must say no. A revocation that only stamps a column is a
+		// logout that does not log anybody out.
+		if live(t, s, jti) {
+			t.Fatal("a revoked session still reports itself live, so logging out would not end " +
+				"the session")
+		}
+	})
+
+	t.Run("RevokeSessionLeavesOtherSessionsAlive", func(t *testing.T) {
+		s, owner := factory(t)
+		a := mkSession(t, s, owner)
+		b := mkSession(t, s, owner)
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.RevokeSession(ctx, a)
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		// Logging out of one device must not sign the user out everywhere; that is what
+		// RevokeUserSessions is for, and conflating them would make a single logout destructive.
+		if !live(t, s, b) {
+			t.Fatal("revoking one session ended another")
+		}
+	})
+
+	t.Run("RevokeUserSessionsStopsEverySessionOfThatUser", func(t *testing.T) {
+		s, owner := factory(t)
+		other := newUser(t, s, "bystander")
+		u1 := mkSession(t, s, owner)
+		u2 := mkSession(t, s, owner)
+		o1 := mkSession(t, s, other)
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.RevokeUserSessions(ctx, owner.String())
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		if live(t, s, u1) || live(t, s, u2) {
+			t.Fatal("a user-wide revocation left one of that user's sessions live")
+		}
+		// And it must be scoped: revoking one account must not sign out the instance.
+		if !live(t, s, o1) {
+			t.Fatal("revoking one user's sessions ended another user's session")
+		}
+	})
+
+	t.Run("RevokeUserSessionsRejectsAMalformedID", func(t *testing.T) {
+		s, _ := factory(t)
+		// A malformed id must be a refusal rather than a silent no-op that leaves every session
+		// alive while the caller believes it revoked them.
+		err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.RevokeUserSessions(ctx, "not-a-uuid")
+		})
+		if err == nil {
+			t.Fatal("revoking a malformed user id succeeded, so a caller with a bad id would " +
+				"believe every session was killed when none were")
+		}
+	})
+
+	t.Run("RevokeAppPasswordStopsItAuthenticating", func(t *testing.T) {
+		s, owner := factory(t)
+		hash := []byte{1, 2, 3, 4}
+		id := mkPassword(t, s, owner, "laptop", hash)
+
+		var found store.AppPassword
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			p, err := tx.AppPasswordByHash(ctx, hash)
+			found = p
+			return err
+		}); err != nil {
+			t.Fatalf("lookup before revoke: %v", err)
+		}
+		if found.RevokedAt != nil {
+			t.Fatal("a fresh app password is already marked revoked")
+		}
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.RevokeAppPassword(ctx, id)
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		// The row still resolves — WebDAV auth reads it to find out WHY it is refused — but it
+		// must carry a revocation timestamp, which is what the auth layer checks.
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			p, err := tx.AppPasswordByHash(ctx, hash)
+			found = p
+			return err
+		}); err != nil {
+			t.Fatalf("after revoking, the row should still resolve so auth can report it as "+
+				"revoked rather than unknown: %v", err)
+		}
+		if found.RevokedAt == nil {
+			t.Fatal("a revoked app password is not marked revoked, so a WebDAV client would keep " +
+				"authenticating with it — potentially for months")
+		}
+	})
+
+	t.Run("RevokeUserAppPasswordsCountsAndScopes", func(t *testing.T) {
+		s, owner := factory(t)
+		other := newUser(t, s, "unrelated")
+		mkPassword(t, s, owner, "one", []byte{1})
+		mkPassword(t, s, owner, "two", []byte{2})
+		otherID := mkPassword(t, s, other, "theirs", []byte{3})
+
+		var revoked int
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			n, err := tx.RevokeUserAppPasswords(ctx, owner)
+			revoked = n
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		// The count is recorded in the audit entry for a disable, so it has to be accurate rather
+		// than "however many rows we felt like touching".
+		if revoked != 2 {
+			t.Fatalf("revoked %d passwords for an account with 2, want 2", revoked)
+		}
+
+		// The other account's credential is untouched: disabling one user must not break another's
+		// WebDAV clients.
+		var theirs store.AppPassword
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			p, err := tx.AppPasswordByHash(ctx, []byte{3})
+			theirs = p
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if theirs.RevokedAt != nil || theirs.ID != otherID {
+			t.Fatal("revoking one user's app passwords affected another user's")
+		}
+	})
+
+	t.Run("TouchAppPasswordRecordsUse", func(t *testing.T) {
+		s, owner := factory(t)
+		hash := []byte{9, 9}
+		id := mkPassword(t, s, owner, "phone", hash)
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.TouchAppPassword(ctx, id, "10.0.0.7")
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		var got store.AppPassword
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			p, err := tx.AppPasswordByHash(ctx, hash)
+			got = p
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		// Last-used is how an owner spots a credential they no longer recognise. An untracked
+		// one is indistinguishable from an unused one.
+		if got.LastUsed == nil {
+			t.Fatal("touching an app password did not record last_used, so an owner cannot tell " +
+				"a live credential from an abandoned one")
+		}
+		// Compared by prefix, not exactly: PostgreSQL stores this as inet, whose text form for a
+		// host address is "10.0.0.7/32". The contract is "the address of the last use is
+		// recorded", not which notation the backend renders it in — asserting the literal would
+		// encode one backend's representation as the interface.
+		if !strings.HasPrefix(got.LastIP, "10.0.0.7") {
+			t.Fatalf("last_used_ip = %q, want the address of the last use", got.LastIP)
 		}
 	})
 }
