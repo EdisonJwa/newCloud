@@ -34,10 +34,9 @@ import (
 var knownUncovered = []string{
 	"AllRoots", "AppPasswordByHash", "BlobHash", "CollectableBlobs",
 	"DeleteBlob",
-	"Descendants", "ExpireDownloadSessions", "GroupByID", "GroupByName",
-	"GroupMembers", "GroupsForUser", "IncrementDownload", "IncrementUpload",
+	"Descendants", "ExpireDownloadSessions", "IncrementDownload", "IncrementUpload",
 	"MarkRecipientAccess", "PruneOTPAttempts",
-	"PurgeTrash", "RecipientsFor", "RemoveGroupMember", "RevokeAppPassword", "RevokeSession",
+	"PurgeTrash", "RecipientsFor", "RevokeAppPassword", "RevokeSession",
 	"RevokeShare", "RevokeUserAppPasswords", "RevokeUserSessions", "SampleBlobHashes",
 	"ShareByTokenHash", "SharesByOwner", "SharesForNode", "TouchAppPassword",
 	"UpdateShare", "UserByEmail", "UserByIdPSubject", "UserByUsername",

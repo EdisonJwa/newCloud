@@ -698,6 +698,10 @@ func Run(t *testing.T, factory Factory, opts Options) {
 		lockSuite(t, factory)
 	})
 
+	t.Run("Groups", func(t *testing.T) {
+		groupSuite(t, factory)
+	})
+
 	// Blob deduplication across transactions (INV-07 / T-20).
 	//
 	// BlobIDFor maps a content address to one row id. If that mapping is not stable across
@@ -3686,6 +3690,206 @@ func lockSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.UUID)
 		})
 		if !errors.Is(err, store.ErrConflict) {
 			t.Fatalf("a second lock on a locked node: want ErrConflict, got %v", err)
+		}
+	})
+}
+
+// groupSuite covers group identity and membership on both backends.
+//
+// The whole group surface had no test on either backend, and it is not decorative: ACL evaluation
+// resolves a grant whose subject is a group by asking whether the caller is a member, so a
+// divergence here grants or withholds access. Nothing renders wrong; the wrong people simply get
+// in.
+func groupSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.UUID)) {
+	t.Helper()
+
+	newUser := func(t *testing.T, s store.Store, name string) uuid.UUID {
+		t.Helper()
+		u, err := upsertUser(s, store.UpsertUser{
+			Issuer: "https://idp.test", Subject: "grp-" + name,
+			Username: name, Email: name + "@example.test", Role: "user",
+		})
+		if err != nil {
+			t.Fatalf("create %s: %v", name, err)
+		}
+		return u.ID
+	}
+
+	createGroup := func(t *testing.T, s store.Store, name string) store.Group {
+		t.Helper()
+		var g store.Group
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			out, err := tx.CreateGroup(ctx, store.Group{Name: name, DisplayName: name + " team"})
+			g = out
+			return err
+		}); err != nil {
+			t.Fatalf("create group %q: %v", name, err)
+		}
+		return g
+	}
+
+	addMember := func(t *testing.T, s store.Store, gid, uid uuid.UUID, role string) {
+		t.Helper()
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.AddGroupMember(ctx, gid, uid, role)
+		}); err != nil {
+			t.Fatalf("add member: %v", err)
+		}
+	}
+
+	t.Run("CreateGroupIsIdempotentByName", func(t *testing.T) {
+		s, _ := factory(t)
+		first := createGroup(t, s, "engineering")
+		second := createGroup(t, s, "engineering")
+
+		// Creating a group that already exists returns it rather than making a second one: the
+		// IdP syncs groups by name, and a duplicate would split membership between two ids.
+		if first.ID != second.ID {
+			t.Fatalf("creating %q twice produced two groups (%s and %s), so membership would "+
+				"split between them", "engineering", first.ID, second.ID)
+		}
+	})
+
+	t.Run("ResolveByNameAndID", func(t *testing.T) {
+		s, _ := factory(t)
+		g := createGroup(t, s, "research")
+
+		var byName, byID store.Group
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			var e1 error
+			byName, e1 = tx.GroupByName(ctx, "research")
+			return e1
+		}); err != nil {
+			t.Fatalf("by name: %v", err)
+		}
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			var e1 error
+			byID, e1 = tx.GroupByID(ctx, g.ID)
+			return e1
+		}); err != nil {
+			t.Fatalf("by id: %v", err)
+		}
+		if byName.ID != g.ID || byID.Name != "research" {
+			t.Fatalf("resolvers disagree: byName=%+v byID=%+v", byName, byID)
+		}
+
+		// A name that does not exist is a refusal, not an empty group: a caller that treats the
+		// zero value as "found" would grant access to nobody's group.
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			_, err := tx.GroupByName(ctx, "does-not-exist")
+			return err
+		}); err == nil {
+			t.Fatal("resolving a group name that does not exist succeeded")
+		}
+	})
+
+	t.Run("MembershipIsVisibleFromBothSides", func(t *testing.T) {
+		s, _ := factory(t)
+		g := createGroup(t, s, "support")
+		alice := newUser(t, s, "alice")
+		addMember(t, s, g.ID, alice, "editor")
+
+		// From the user: which groups is this account in?
+		var groups []store.Group
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			out, err := tx.GroupsForUser(ctx, alice)
+			groups = out
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if len(groups) != 1 || groups[0].ID != g.ID {
+			t.Fatalf("GroupsForUser returned %+v, want just %s", groups, g.ID)
+		}
+
+		// From the group: who is in it? Both directions must agree, because ACL evaluation asks
+		// the first question while an admin screen asks the second.
+		var members []store.GroupMember
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			out, err := tx.GroupMembers(ctx, g.ID)
+			members = out
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if len(members) != 1 || members[0].UserID != alice {
+			t.Fatalf("GroupMembers returned %+v, want just %s", members, alice)
+		}
+	})
+
+	t.Run("AddMemberIsIdempotent", func(t *testing.T) {
+		s, _ := factory(t)
+		g := createGroup(t, s, "ops")
+		bob := newUser(t, s, "bob")
+
+		addMember(t, s, g.ID, bob, "viewer")
+		addMember(t, s, g.ID, bob, "editor") // role change, not a duplicate row
+
+		var members []store.GroupMember
+		_ = s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			out, err := tx.GroupMembers(ctx, g.ID)
+			members = out
+			return err
+		})
+		// Two rows would make a member count wrong and a "remove" incomplete.
+		if len(members) != 1 {
+			t.Fatalf("adding the same member twice produced %d rows, want 1", len(members))
+		}
+		if members[0].Role != "editor" {
+			t.Fatalf("role = %q, want the latest %q — the second add is a role change", members[0].Role, "editor")
+		}
+	})
+
+	t.Run("RemoveMemberRevokesAccessFromBothSides", func(t *testing.T) {
+		s, _ := factory(t)
+		g := createGroup(t, s, "temp")
+		carol := newUser(t, s, "carol")
+		dave := newUser(t, s, "dave")
+		addMember(t, s, g.ID, carol, "viewer")
+		addMember(t, s, g.ID, dave, "viewer")
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.RemoveGroupMember(ctx, g.ID, carol)
+		}); err != nil {
+			t.Fatalf("remove: %v", err)
+		}
+
+		var groups []store.Group
+		_ = s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			out, err := tx.GroupsForUser(ctx, carol)
+			groups = out
+			return err
+		})
+		// A removed member must stop resolving, or the ACL grant the group carries keeps applying
+		// to somebody who was explicitly taken out of it.
+		if len(groups) != 0 {
+			t.Fatalf("a removed member still resolves %d group(s); access granted through the "+
+				"group would still apply", len(groups))
+		}
+
+		// The other member is untouched.
+		var remaining []store.GroupMember
+		_ = s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			out, err := tx.GroupMembers(ctx, g.ID)
+			remaining = out
+			return err
+		})
+		if len(remaining) != 1 || remaining[0].UserID != dave {
+			t.Fatalf("removing one member disturbed another: %+v", remaining)
+		}
+	})
+
+	t.Run("RemovingANonMemberIsHarmless", func(t *testing.T) {
+		s, _ := factory(t)
+		g := createGroup(t, s, "nobody")
+		erin := newUser(t, s, "erin")
+
+		// Removing somebody who was never added is not an error: an IdP sync that reconciles
+		// membership will issue removals for accounts that already left.
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.RemoveGroupMember(ctx, g.ID, erin)
+		}); err != nil {
+			t.Fatalf("removing a non-member failed: %v", err)
 		}
 	})
 }
