@@ -85,10 +85,16 @@ func (t *memTx) RevokeShare(ctx context.Context, id uuid.UUID) error {
 	if !ok {
 		return ErrNotFound
 	}
-	if s.RevokedAt == nil {
-		at := t.m.now()
-		s.RevokedAt = &at
+	if s.RevokedAt != nil {
+		// Already revoked. Reported rather than silently succeeding, matching the SQL: the
+		// UPDATE's `revoked_at IS NULL` predicate matches no row, so PostgreSQL returns
+		// ErrNotFound. A caller that treated the second call as success would log a revocation
+		// that happened at a different time — and the shared suite caught exactly that
+		// disagreement.
+		return ErrNotFound
 	}
+	at := t.m.now()
+	s.RevokedAt = &at
 	return nil
 }
 

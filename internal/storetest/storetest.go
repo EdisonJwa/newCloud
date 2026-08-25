@@ -710,6 +710,10 @@ func Run(t *testing.T, factory Factory, opts Options) {
 		userLookupSuite(t, factory)
 	})
 
+	t.Run("ShareQueries", func(t *testing.T) {
+		shareQuerySuite(t, factory)
+	})
+
 	// Blob deduplication across transactions (INV-07 / T-20).
 	//
 	// BlobIDFor maps a content address to one row id. If that mapping is not stable across
@@ -4298,6 +4302,219 @@ func userLookupSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid
 		if !errors.Is(err, store.ErrNotFound) {
 			t.Fatalf("the same subject from a different issuer resolved: want ErrNotFound, got %v. "+
 				"Subject alone is not an identity — it is only unique within an issuer.", err)
+		}
+	})
+}
+
+// shareQuerySuite covers resolving and editing shares.
+//
+// UpdateShare, ShareByTokenHash, SharesByOwner and SharesForNode had no test on either backend.
+// RevokeShare did, but only through the service layer.
+//
+// The property that matters is that revocation actually stops a link: a revoked share must still
+// RESOLVE (so the handler can report "this link is no longer available" rather than "unknown"), but
+// the resolver that decides whether it is usable must see the revocation. A share that keeps
+// working after revocation is a leaked link nobody can turn off.
+func shareQuerySuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.UUID)) {
+	t.Helper()
+
+	mkShare := func(t *testing.T, s store.Store, owner, nodeID uuid.UUID, label string) (store.Share, []byte) {
+		t.Helper()
+		// Unique token per share so parallel cases cannot collide on the unique index.
+		tokenHash := []byte("token-" + label + "-" + uuid.New().String())
+		var sh store.Share
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			c, err := tx.CreateShare(ctx, store.Share{
+				NodeID: nodeID, OwnerID: owner, Kind: store.ShareLink,
+				Label: label, TokenHash: tokenHash, Permissions: []string{"read"},
+			})
+			sh = c
+			return err
+		}); err != nil {
+			t.Fatalf("create share %q: %v", label, err)
+		}
+		return sh, tokenHash
+	}
+
+	t.Run("ResolvesByTokenHash", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		want, tokenHash := mkShare(t, s, owner, r.ID, "resolve")
+
+		var got store.Share
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			v, err := tx.ShareByTokenHash(ctx, tokenHash)
+			got = v
+			return err
+		}); err != nil {
+			t.Fatalf("resolve by token hash: %v", err)
+		}
+		if got.ID != want.ID {
+			t.Fatalf("resolved the wrong share")
+		}
+
+		// An unknown token is ErrNotFound, not a zero share with a nil error. A caller that
+		// treated the zero value as a hit would serve a link that does not exist.
+		err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			_, err := tx.ShareByTokenHash(ctx, []byte("no-such-token"))
+			return err
+		})
+		if !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("unknown token: want ErrNotFound, got %v", err)
+		}
+	})
+
+	t.Run("RevokedShareStillResolvesButIsMarkedRevoked", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		sh, tokenHash := mkShare(t, s, owner, r.ID, "revoked")
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.RevokeShare(ctx, sh.ID)
+		}); err != nil {
+			t.Fatalf("revoke: %v", err)
+		}
+
+		// It must still resolve: the handler needs the row to say "this link is no longer
+		// available" rather than the identical 404 it gives an unknown token. Both are refusals,
+		// but only one lets an owner be told their own link was revoked.
+		var got store.Share
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			v, err := tx.ShareByTokenHash(ctx, tokenHash)
+			got = v
+			return err
+		}); err != nil {
+			t.Fatalf("a revoked share stopped resolving entirely: %v", err)
+		}
+		if got.RevokedAt == nil {
+			t.Fatal("a revoked share is not marked revoked, so the resolver would treat it as live " +
+				"and the link would keep working")
+		}
+	})
+
+	t.Run("RevokingTwiceIsRefused", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		sh, _ := mkShare(t, s, owner, r.ID, "double")
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.RevokeShare(ctx, sh.ID)
+		}); err != nil {
+			t.Fatal(err)
+		}
+		// The second call reports ErrNotFound rather than succeeding silently: the row is already
+		// revoked, and a caller that treated that as success would log a revocation that did not
+		// happen at that time.
+		err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.RevokeShare(ctx, sh.ID)
+		})
+		if !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("revoking an already-revoked share: want ErrNotFound, got %v", err)
+		}
+	})
+
+	t.Run("UpdateShareAppliesAnEdit", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		sh, _ := mkShare(t, s, owner, r.ID, "editable")
+
+		// An owner changing the label and the expiry. The revision must be visible on read-back,
+		// or an edit would appear to succeed and change nothing.
+		sh.Label = "renamed"
+		limit := int64(7)
+		sh.MaxDownloads = nil
+		sh.MaxBytesPerFile = &limit
+
+		var updated store.Share
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			out, err := tx.UpdateShare(ctx, sh)
+			updated = out
+			return err
+		}); err != nil {
+			t.Fatalf("update: %v", err)
+		}
+		if updated.Label != "renamed" {
+			t.Fatalf("label did not change: %q", updated.Label)
+		}
+		if updated.MaxBytesPerFile == nil || *updated.MaxBytesPerFile != 7 {
+			t.Fatalf("per-file cap did not change: %v", updated.MaxBytesPerFile)
+		}
+
+		// And the change is persisted, not merely returned.
+		var reread store.Share
+		_ = s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			v, err := tx.ShareByID(ctx, sh.ID)
+			reread = v
+			return err
+		})
+		if reread.Label != "renamed" {
+			t.Fatal("the update was returned but not stored")
+		}
+	})
+
+	t.Run("UpdateShareCannotResurrectARevokedShare", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		sh, _ := mkShare(t, s, owner, r.ID, "no-resurrect")
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.RevokeShare(ctx, sh.ID)
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		// Revocation must be final. If UpdateShare matched a revoked row, an owner could edit a
+		// dead link back into service — or, worse, a client replaying a stale edit could.
+		sh.Label = "still-dead"
+		err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			_, err := tx.UpdateShare(ctx, sh)
+			return err
+		})
+		if !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("editing a revoked share: want ErrNotFound, got %v", err)
+		}
+	})
+
+	t.Run("NodeAndOwnerListingsDifferOnRevokedShares", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		live, _ := mkShare(t, s, owner, r.ID, "live")
+		dead, _ := mkShare(t, s, owner, r.ID, "dead")
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.RevokeShare(ctx, dead.ID)
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		// SharesForNode feeds "who can reach this file", so a revoked share must not appear.
+		var forNode []store.Share
+		_ = s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			out, err := tx.SharesForNode(ctx, r.ID)
+			forNode = out
+			return err
+		})
+		if len(forNode) != 1 || forNode[0].ID != live.ID {
+			t.Fatalf("SharesForNode returned %d shares, want just the live one — a revoked share "+
+				"must not appear in the list of ways to reach a file", len(forNode))
+		}
+
+		// SharesByOwner feeds the owner's management screen, which has to SHOW revoked shares so
+		// they can be distinguished from deleted ones. The asymmetry with SharesForNode is
+		// deliberate: one answers "is this reachable", the other "what did I create".
+		var byOwner []store.Share
+		_ = s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			out, err := tx.SharesByOwner(ctx, owner)
+			byOwner = out
+			return err
+		})
+		found := map[uuid.UUID]bool{}
+		for _, sh := range byOwner {
+			found[sh.ID] = true
+		}
+		if !found[live.ID] || !found[dead.ID] {
+			t.Fatalf("SharesByOwner returned %d shares and is missing one; it must include revoked "+
+				"shares so an owner can see them", len(byOwner))
 		}
 	})
 }

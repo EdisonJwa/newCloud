@@ -37,9 +37,7 @@ var knownUncovered = []string{
 	"Descendants", "ExpireDownloadSessions", "IncrementDownload", "IncrementUpload",
 	"MarkRecipientAccess", "PruneOTPAttempts",
 	"PurgeTrash", "RecipientsFor",
-	"RevokeShare", "SampleBlobHashes",
-	"ShareByTokenHash", "SharesByOwner", "SharesForNode",
-	"UpdateShare",
+	"SampleBlobHashes",
 }
 
 // TestSharedSuiteCoversEveryNewTxMethod is the ratchet.
