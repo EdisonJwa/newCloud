@@ -39,7 +39,7 @@ var knownUncovered = []string{
 	"PurgeTrash", "RecipientsFor",
 	"RevokeShare", "SampleBlobHashes",
 	"ShareByTokenHash", "SharesByOwner", "SharesForNode",
-	"UpdateShare", "UserByEmail", "UserByIdPSubject", "UserByUsername",
+	"UpdateShare",
 }
 
 // TestSharedSuiteCoversEveryNewTxMethod is the ratchet.
@@ -142,4 +142,68 @@ func repoRootOf(t *testing.T) string {
 	}
 	t.Fatal("could not find the module root")
 	return ""
+}
+
+// TestCaseFoldingColumnsAreCompatibleWithTheGoComparison guards a pairing that is invisible.
+//
+// The in-memory backend resolves accounts with strings.EqualFold — case-insensitive. PostgreSQL
+// resolves them with `WHERE email = $1`, which is case-insensitive ONLY because the column is
+// citext. Change that column to text and the two backends silently disagree: an ACL grant written
+// as "Erin@Example.Test" would resolve in tests and fail in production, granting access to nobody.
+//
+// The shared suite catches the disagreement, but only if somebody runs it against a real database.
+// This check reads the migration that defines the columns, so a schema change is caught by a test
+// that needs no database at all — and the message names the Go function it has to stay compatible
+// with.
+func TestCaseFoldingColumnsAreCompatibleWithTheGoComparison(t *testing.T) {
+	root := repoRootOf(t)
+
+	// The Go side: which columns are compared case-insensitively in memory.
+	memorySrc, err := os.ReadFile(filepath.Join(root, "internal", "store", "acl_memory.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	goText := string(memorySrc)
+	if !strings.Contains(goText, "strings.EqualFold(u.Email") ||
+		!strings.Contains(goText, "strings.EqualFold(u.Username") {
+		// The comparison changed. If it became exact, the columns should become text; either way
+		// this test's premise is gone and it must not silently pass.
+		t.Fatal("the in-memory backend no longer compares email/username with strings.EqualFold; " +
+			"update this guard to match the new comparison rather than leaving it vacuous")
+	}
+
+	// The SQL side: those columns must be citext for the comparison to agree.
+	dir := filepath.Join(root, "migrations")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var definitions []string
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name(), ".sql") {
+			continue
+		}
+		body, rerr := os.ReadFile(filepath.Join(dir, e.Name()))
+		if rerr != nil {
+			t.Fatal(rerr)
+		}
+		definitions = append(definitions, string(body))
+	}
+	if len(definitions) == 0 {
+		t.Fatal("found no migrations; this check would pass vacuously")
+	}
+	all := strings.Join(definitions, "\n")
+
+	for _, col := range []string{"email", "username"} {
+		// Match the column declaration anywhere in the CREATE TABLE, allowing other columns and
+		// whitespace between.
+		re := regexp.MustCompile(`\b` + col + `\s+citext`)
+		if !re.MatchString(strings.ToLower(all)) {
+			t.Fatalf("users.%s is not declared citext in any migration. The in-memory backend "+
+				"compares it with strings.EqualFold, so PostgreSQL's `WHERE %s = $1` must also be "+
+				"case-insensitive — with a text column the two backends disagree, and an ACL grant "+
+				"written with different capitalisation resolves in tests and fails in production.",
+				col, col)
+		}
+	}
 }

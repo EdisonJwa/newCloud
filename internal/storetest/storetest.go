@@ -706,6 +706,10 @@ func Run(t *testing.T, factory Factory, opts Options) {
 		credentialSuite(t, factory)
 	})
 
+	t.Run("UserLookup", func(t *testing.T) {
+		userLookupSuite(t, factory)
+	})
+
 	// Blob deduplication across transactions (INV-07 / T-20).
 	//
 	// BlobIDFor maps a content address to one row id. If that mapping is not stable across
@@ -4150,6 +4154,150 @@ func credentialSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid
 		// encode one backend's representation as the interface.
 		if !strings.HasPrefix(got.LastIP, "10.0.0.7") {
 			t.Fatalf("last_used_ip = %q, want the address of the last use", got.LastIP)
+		}
+	})
+}
+
+// userLookupSuite covers the three ways an account is resolved from an external string.
+//
+// All three had no test on either backend, and each is on an authorization path: UserByIdPSubject
+// resolves a login to an account, while UserByUsername and UserByEmail resolve the SUBJECT of an
+// ACL grant when an owner grants access to "alice" or "alice@example.test". A divergence here
+// either refuses a legitimate login or grants to the wrong account.
+//
+// The interesting property is case handling. The in-memory backend compares with
+// strings.EqualFold; PostgreSQL compares on a citext column. Those agree only because the column
+// type was chosen to match the Go comparison — a detail nothing enforced until now, and one that
+// would silently invert if the column were ever changed to text.
+func userLookupSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.UUID)) {
+	t.Helper()
+
+	newUser := func(t *testing.T, s store.Store, username, email string) store.User {
+		t.Helper()
+		u, err := upsertUser(s, store.UpsertUser{
+			Issuer: "https://idp.test", Subject: "lookup-" + username,
+			Username: username, Email: email, Role: "user",
+		})
+		if err != nil {
+			t.Fatalf("create %s: %v", username, err)
+		}
+		return u
+	}
+
+	lookup := func(t *testing.T, s store.Store, fn func(ctx context.Context, tx store.Tx) (store.User, error)) (store.User, error) {
+		t.Helper()
+		var out store.User
+		err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			u, err := fn(ctx, tx)
+			out = u
+			return err
+		})
+		return out, err
+	}
+
+	t.Run("ResolvesByExactUsernameAndEmail", func(t *testing.T) {
+		s, _ := factory(t)
+		// Names and addresses here are prefixed to keep them unique across the whole shared suite.
+		// The group suite already creates an "erin", and upsertUser keys on the IdP identity, so
+		// a second "erin@example.test" would silently be the same account under a different
+		// subject — which is how this case failed in the full run while passing alone.
+		want := newUser(t, s, "lu-dana", "lu-dana@example.test")
+
+		byName, err := lookup(t, s, func(ctx context.Context, tx store.Tx) (store.User, error) {
+			return tx.UserByUsername(ctx, "lu-dana")
+		})
+		if err != nil {
+			t.Fatalf("by username: %v", err)
+		}
+		if byName.ID != want.ID {
+			t.Fatalf("UserByUsername returned %s, want %s", byName.ID, want.ID)
+		}
+
+		byEmail, err := lookup(t, s, func(ctx context.Context, tx store.Tx) (store.User, error) {
+			return tx.UserByEmail(ctx, "lu-dana@example.test")
+		})
+		if err != nil {
+			t.Fatalf("by email: %v", err)
+		}
+		if byEmail.ID != want.ID {
+			t.Fatalf("UserByEmail returned %s, want %s", byEmail.ID, want.ID)
+		}
+	})
+
+	t.Run("UsernameAndEmailMatchCaseInsensitively", func(t *testing.T) {
+		s, _ := factory(t)
+		want := newUser(t, s, "lu-erin", "lu-erin@example.test")
+
+		// Both directions matter. A grant written as "Erin" must still resolve to erin, or an
+		// owner typing a name with a capital letter silently grants to nobody.
+		byName, err := lookup(t, s, func(ctx context.Context, tx store.Tx) (store.User, error) {
+			return tx.UserByUsername(ctx, "LU-ERIN")
+		})
+		if err != nil {
+			t.Fatalf("username lookup is case-sensitive: %v. The in-memory backend compares with "+
+				"EqualFold and PostgreSQL relies on citext, so the two agree only while the column "+
+				"type matches the Go comparison.", err)
+		}
+		if byName.ID != want.ID {
+			t.Fatalf("case-insensitive username resolved the wrong account")
+		}
+
+		byEmail, err := lookup(t, s, func(ctx context.Context, tx store.Tx) (store.User, error) {
+			return tx.UserByEmail(ctx, "Lu-Erin@Example.Test")
+		})
+		if err != nil {
+			t.Fatalf("email lookup is case-sensitive: %v", err)
+		}
+		if byEmail.ID != want.ID {
+			t.Fatalf("case-insensitive email resolved the wrong account")
+		}
+	})
+
+	t.Run("UnknownUsernameIsNotFound", func(t *testing.T) {
+		s, _ := factory(t)
+
+		_, err := lookup(t, s, func(ctx context.Context, tx store.Tx) (store.User, error) {
+			return tx.UserByUsername(ctx, "nobody-at-all")
+		})
+		// A lookup that returned the zero User with a nil error would be catastrophic at the ACL
+		// call site: aclmanage.go falls back to UserByEmail when the username fails, and both
+		// returning a zero user would grant to the empty uuid.
+		if !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("unknown username: want ErrNotFound, got %v", err)
+		}
+	})
+
+	t.Run("ResolvesByIdPSubjectAndScopesByIssuer", func(t *testing.T) {
+		s, owner := factory(t)
+		rootOf(t, s, owner)
+
+		u, err := upsertUser(s, store.UpsertUser{
+			Issuer: "https://idp-a.test", Subject: "shared-subject",
+			Username: "frank", Email: "frank@example.test", Role: "user",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		got, err := lookup(t, s, func(ctx context.Context, tx store.Tx) (store.User, error) {
+			return tx.UserByIdPSubject(ctx, "https://idp-a.test", "shared-subject")
+		})
+		if err != nil {
+			t.Fatalf("by subject: %v", err)
+		}
+		if got.ID != u.ID {
+			t.Fatalf("UserByIdPSubject returned the wrong account")
+		}
+
+		// The issuer is part of the key. Two IdPs can issue the same subject string, and matching
+		// on subject alone would let a user from one IdP log in as a user of another — the classic
+		// subject-confusion bug.
+		_, err = lookup(t, s, func(ctx context.Context, tx store.Tx) (store.User, error) {
+			return tx.UserByIdPSubject(ctx, "https://idp-b.test", "shared-subject")
+		})
+		if !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("the same subject from a different issuer resolved: want ErrNotFound, got %v. "+
+				"Subject alone is not an identity — it is only unique within an issuer.", err)
 		}
 	})
 }
