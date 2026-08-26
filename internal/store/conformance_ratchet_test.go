@@ -32,9 +32,9 @@ import (
 // Each entry is a method whose behaviour is currently verified by at most one backend. Paying this
 // down means writing a case in the shared suite and deleting the name here.
 var knownUncovered = []string{
-	"AllRoots", "BlobHash", "CollectableBlobs",
+	"BlobHash", "CollectableBlobs",
 	"DeleteBlob",
-	"Descendants", "ExpireDownloadSessions", "IncrementDownload", "IncrementUpload",
+	"ExpireDownloadSessions", "IncrementDownload", "IncrementUpload",
 	"MarkRecipientAccess", "PruneOTPAttempts",
 	"PurgeTrash", "RecipientsFor",
 	"SampleBlobHashes",

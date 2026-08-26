@@ -714,6 +714,10 @@ func Run(t *testing.T, factory Factory, opts Options) {
 		shareQuerySuite(t, factory)
 	})
 
+	t.Run("TreeWalk", func(t *testing.T) {
+		treeWalkSuite(t, factory)
+	})
+
 	// Blob deduplication across transactions (INV-07 / T-20).
 	//
 	// BlobIDFor maps a content address to one row id. If that mapping is not stable across
@@ -4515,6 +4519,232 @@ func shareQuerySuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid
 		if !found[live.ID] || !found[dead.ID] {
 			t.Fatalf("SharesByOwner returned %d shares and is missing one; it must include revoked "+
 				"shares so an owner can see them", len(byOwner))
+		}
+	})
+}
+
+// treeWalkSuite covers Descendants and AllRoots.
+//
+// Descendants is what a recursive operation uses to check inner protections rather than only the
+// root (§4.2 says a recursive COPY or DELETE must not ignore a nested grant). AllRoots feeds
+// whole-deployment operations like the restore drill. Neither had a test on either backend.
+//
+// The properties that matter are the ones a hand-written walk and a recursive CTE can disagree
+// about: breadth-first ordering, the depth cap, and what the truncation flag means.
+func treeWalkSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.UUID)) {
+	t.Helper()
+
+	walk := func(t *testing.T, s store.Store, rootID uuid.UUID, limit int) ([]store.Node, bool) {
+		t.Helper()
+		var (
+			out   []store.Node
+			trunc bool
+		)
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			n, tr, err := tx.Descendants(ctx, rootID, limit)
+			out, trunc = n, tr
+			return err
+		}); err != nil {
+			t.Fatalf("descendants: %v", err)
+		}
+		return out, trunc
+	}
+
+	// buildTree creates root/ with a.txt, b.txt, and sub/ containing c.txt and deep/ containing
+	// d.txt — three levels, enough to exercise ordering and depth.
+	buildTree := func(t *testing.T, s store.Store, owner uuid.UUID) (store.Node, map[string]store.Node) {
+		t.Helper()
+		r := rootOf(t, s, owner)
+		nodes := map[string]store.Node{}
+		var err error
+		if err = s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			var e error
+			if nodes["a.txt"], e = tx.CreateFile(ctx, store.NewFile{
+				OwnerID: owner, ParentID: r.ID, Name: "a.txt", Size: 1,
+				Mime: "text/plain", ETag: `"a"`, BlobID: newBlobHook(t), BlobHash: [32]byte{1},
+			}); e != nil {
+				return e
+			}
+			if nodes["b.txt"], e = tx.CreateFile(ctx, store.NewFile{
+				OwnerID: owner, ParentID: r.ID, Name: "b.txt", Size: 1,
+				Mime: "text/plain", ETag: `"b"`, BlobID: newBlobHook(t), BlobHash: [32]byte{2},
+			}); e != nil {
+				return e
+			}
+			if nodes["sub"], e = tx.CreateDir(ctx, store.NewNode{
+				OwnerID: owner, ParentID: r.ID, Name: "sub",
+			}); e != nil {
+				return e
+			}
+			if nodes["c.txt"], e = tx.CreateFile(ctx, store.NewFile{
+				OwnerID: owner, ParentID: nodes["sub"].ID, Name: "c.txt", Size: 1,
+				Mime: "text/plain", ETag: `"c"`, BlobID: newBlobHook(t), BlobHash: [32]byte{3},
+			}); e != nil {
+				return e
+			}
+			if nodes["deep"], e = tx.CreateDir(ctx, store.NewNode{
+				OwnerID: owner, ParentID: nodes["sub"].ID, Name: "deep",
+			}); e != nil {
+				return e
+			}
+			nodes["d.txt"], e = tx.CreateFile(ctx, store.NewFile{
+				OwnerID: owner, ParentID: nodes["deep"].ID, Name: "d.txt", Size: 1,
+				Mime: "text/plain", ETag: `"d"`, BlobID: newBlobHook(t), BlobHash: [32]byte{4},
+			})
+			return e
+		}); err != nil {
+			t.Fatalf("build tree: %v", err)
+		}
+		return r, nodes
+	}
+
+	t.Run("WalksTheWholeSubtreeBreadthFirst", func(t *testing.T) {
+		s, owner := factory(t)
+		r, _ := buildTree(t, s, owner)
+
+		got, complete := walk(t, s, r.ID, 0)
+		if !complete {
+			t.Fatalf("a %d-node subtree came back incomplete at the default limit", len(got))
+		}
+		// Named expectations rather than a count: the factory may seed its own children under the
+		// root, and asserting a literal made this fail for a reason that had nothing to do with
+		// the walk.
+		seen := map[string]bool{}
+		for _, n := range got {
+			seen[n.Name] = true
+		}
+		for _, want := range []string{"a.txt", "b.txt", "sub", "c.txt", "deep", "d.txt"} {
+			if !seen[want] {
+				t.Fatalf("the walk missed %q; got %d nodes: %v", want, len(got), namesOf(got))
+			}
+		}
+
+		// Breadth-first, checked structurally rather than by index.
+		//
+		// A depth-first walk would interleave levels, and a caller checking inner protections in
+		// order would see a nested grant after a sibling's. The SQL states the order with
+		// ORDER BY depth, name, so the memory walk must match it. Asserting by index was fragile:
+		// the factory seeds its own children, so any absolute position was an assumption about a
+		// fixture I do not own.
+		depthOf := func(n store.Node) int {
+			d := 0
+			cur := n
+			for cur.ParentID != nil {
+				d++
+				var err error
+				parent := store.Node{}
+				_ = s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+					p, perr := tx.Node(ctx, *cur.ParentID)
+					parent, err = p, perr
+					return perr
+				})
+				if err != nil {
+					cur = parent
+					break
+				}
+				cur = parent
+			}
+			return d
+		}
+		lastDepth := 0
+		for _, n := range got {
+			d := depthOf(n)
+			if d < lastDepth {
+				t.Fatalf("node %q at depth %d came after a node at depth %d — the walk is not "+
+					"breadth-first, so a caller checking inner protections sees them out of order",
+					n.Name, d, lastDepth)
+			}
+			lastDepth = d
+		}
+	})
+
+	t.Run("TruncatesAndSaysSo", func(t *testing.T) {
+		s, owner := factory(t)
+		r, _ := buildTree(t, s, owner)
+
+		// The bool is `complete`, not `truncated`. A limit below the tree size must both cut the
+		// result and report INCOMPLETE — the documented consequence being that a caller checking
+		// inner permissions has to treat an incomplete walk as a refusal, because the node it did
+		// not see may be the protected one.
+		full, _ := walk(t, s, r.ID, 0)
+		got, complete := walk(t, s, r.ID, 2)
+		if len(got) != 2 {
+			t.Fatalf("limit 2 returned %d nodes", len(got))
+		}
+		if complete {
+			t.Fatal("a walk that stopped at the limit reported itself complete, so a caller " +
+				"checking inner protections would treat a partial view as approval")
+		}
+
+		// A limit at or above the size is complete. The size is measured, not assumed, for the
+		// same reason as above.
+		if _, complete := walk(t, s, r.ID, len(full)); !complete {
+			t.Fatalf("a limit equal to the subtree size (%d) reported itself incomplete", len(full))
+		}
+	})
+
+	t.Run("ExcludesTheRootAndTrashedChildren", func(t *testing.T) {
+		s, owner := factory(t)
+		r, nodes := buildTree(t, s, owner)
+
+		// Trash a file: a recursive operation must not act on something already in the trash, and
+		// a walk that included it would double-count against a quota that already released it.
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.Trash(ctx, nodes["a.txt"].ID)
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		got, _ := walk(t, s, r.ID, 0)
+		for _, n := range got {
+			if n.ID == r.ID {
+				t.Fatal("the walk returned the root itself; descendants are the nodes BELOW it")
+			}
+		}
+	})
+
+	t.Run("ALeafHasNoDescendants", func(t *testing.T) {
+		s, owner := factory(t)
+		_, nodes := buildTree(t, s, owner)
+
+		got, complete := walk(t, s, nodes["d.txt"].ID, 0)
+		if len(got) != 0 || !complete {
+			t.Fatalf("walking from a leaf file returned %d nodes, complete=%v", len(got), complete)
+		}
+	})
+
+	t.Run("AllRootsReturnsEveryNamespaceRoot", func(t *testing.T) {
+		s, owner := factory(t)
+		rootOf(t, s, owner)
+
+		second, err := upsertUser(s, store.UpsertUser{
+			Issuer: "https://idp.test", Subject: "roots-second",
+			Username: "roots-second", Email: "roots-second@example.test", Role: "user",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		secondRoot := rootOf(t, s, second.ID)
+
+		var roots []store.Node
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			r, err := tx.AllRoots(ctx)
+			roots = r
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		found := map[uuid.UUID]bool{}
+		for _, r := range roots {
+			found[r.ID] = true
+			if !r.IsDir() || r.ParentID != nil {
+				t.Fatalf("AllRoots returned a node that is not a parentless directory: %+v", r)
+			}
+		}
+		// The drill walks every namespace, so a missing root is a silently incomplete restore.
+		if !found[secondRoot.ID] {
+			t.Fatalf("AllRoots returned %d roots and is missing a user's root", len(roots))
 		}
 	})
 }
