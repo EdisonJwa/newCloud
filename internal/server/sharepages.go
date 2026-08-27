@@ -152,9 +152,31 @@ func (s *Server) handleShareDownload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "this link is not available")
 		return
 	}
-	if !s.gate(r, sh).allowed() {
+	verdict := s.gate(r, sh)
+	if !verdict.allowed() {
 		writeError(w, http.StatusNotFound, "not_found", "this link is not available")
 		return
+	}
+
+	// Record that a verified recipient actually reached the content.
+	//
+	// MarkRecipientAccess existed, was implemented on both backends, and had NO production
+	// caller — so first_access_at and last_access_at were never written, and the columns that
+	// answer "did the recipient ever open this" were permanently NULL. The same defect class as
+	// a retention column that is stored and never enforced: the schema promises an audit trail
+	// nothing produces.
+	//
+	// Failure to record is logged but does not fail the download: the recipient is authorised,
+	// and refusing to serve a file because an audit column could not be updated would trade a
+	// real user's access for a bookkeeping row.
+	if verdict.Email != "" {
+		err := s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
+			return tx.MarkRecipientAccess(ctx, sh.ID, verdict.Email)
+		})
+		if err != nil {
+			s.deps.Log.Warn("could not record recipient access",
+				"share", sh.ID.String(), "error", err)
+		}
 	}
 
 	// Resolve the target relative to the share root. The requested name is

@@ -35,8 +35,8 @@ var knownUncovered = []string{
 	"BlobHash", "CollectableBlobs",
 	"DeleteBlob",
 	"ExpireDownloadSessions", "IncrementDownload", "IncrementUpload",
-	"MarkRecipientAccess", "PruneOTPAttempts",
-	"PurgeTrash", "RecipientsFor",
+	"PruneOTPAttempts",
+	"PurgeTrash",
 	"SampleBlobHashes",
 }
 

@@ -718,6 +718,10 @@ func Run(t *testing.T, factory Factory, opts Options) {
 		treeWalkSuite(t, factory)
 	})
 
+	t.Run("RecipientAccess", func(t *testing.T) {
+		recipientAccessSuite(t, factory)
+	})
+
 	// Blob deduplication across transactions (INV-07 / T-20).
 	//
 	// BlobIDFor maps a content address to one row id. If that mapping is not stable across
@@ -4745,6 +4749,165 @@ func treeWalkSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.U
 		// The drill walks every namespace, so a missing root is a silently incomplete restore.
 		if !found[secondRoot.ID] {
 			t.Fatalf("AllRoots returned %d roots and is missing a user's root", len(roots))
+		}
+	})
+}
+
+// recipientAccessSuite covers the access record for an email share.
+//
+// MarkRecipientAccess and RecipientsFor had no test on either backend. They record WHO opened an
+// email-gated link and WHEN, which is the only durable answer to "did the recipient ever read it"
+// — and the first-access timestamp is what an owner or an auditor asks about, since last-access
+// alone cannot distinguish "read once" from "read on every day since".
+func recipientAccessSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.UUID)) {
+	t.Helper()
+
+	const (
+		first  = "first@example.test"
+		second = "second@example.test"
+	)
+
+	// newEmailShare creates an email share with two invited recipients.
+	newEmailShare := func(t *testing.T, s store.Store, owner uuid.UUID) store.Share {
+		t.Helper()
+		var sh store.Share
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			r, rerr := tx.EnsureRoot(ctx, owner)
+			if rerr != nil {
+				return rerr
+			}
+			c, cerr := tx.CreateShare(ctx, store.Share{
+				NodeID: r.ID, OwnerID: owner, Kind: store.ShareEmail,
+				TokenHash: []byte(uuid.New().String()), Permissions: []string{"read"},
+			})
+			if cerr != nil {
+				return cerr
+			}
+			sh = c
+			for _, email := range []string{first, second} {
+				if err := tx.AddRecipient(ctx, store.ShareRecipient{
+					ShareID: c.ID, Email: email,
+				}); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("create email share: %v", err)
+		}
+		return sh
+	}
+
+	recipients := func(t *testing.T, s store.Store, shareID uuid.UUID) []store.ShareRecipient {
+		t.Helper()
+		var out []store.ShareRecipient
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			r, err := tx.RecipientsFor(ctx, shareID)
+			out = r
+			return err
+		}); err != nil {
+			t.Fatalf("recipients: %v", err)
+		}
+		return out
+	}
+
+	t.Run("ListsEveryRecipient", func(t *testing.T) {
+		s, owner := factory(t)
+		sh := newEmailShare(t, s, owner)
+
+		got := recipients(t, s, sh.ID)
+		if len(got) != 2 {
+			t.Fatalf("RecipientsFor returned %d recipients, want 2", len(got))
+		}
+		seen := map[string]bool{}
+		for _, r := range got {
+			seen[r.Email] = true
+			if r.FirstAccessAt != nil {
+				t.Fatalf("a freshly invited recipient already has a first-access time")
+			}
+		}
+		if !seen[first] || !seen[second] {
+			t.Fatalf("RecipientsFor returned %v, missing an invited address", seen)
+		}
+	})
+
+	t.Run("FirstAccessIsRecordedOnceAndKept", func(t *testing.T) {
+		s, owner := factory(t)
+		sh := newEmailShare(t, s, owner)
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.MarkRecipientAccess(ctx, sh.ID, first)
+		}); err != nil {
+			t.Fatalf("mark access: %v", err)
+		}
+
+		afterFirst := recipients(t, s, sh.ID)
+		var got store.ShareRecipient
+		for _, r := range afterFirst {
+			if r.Email == first {
+				got = r
+			}
+		}
+		if got.FirstAccessAt == nil || got.LastAccessAt == nil {
+			t.Fatal("access was not recorded: both first_access_at and last_access_at should be set")
+		}
+		firstAt := *got.FirstAccessAt
+
+		// A second access must move last_access_at but NOT first_access_at. The SQL does this with
+		// COALESCE(first_access_at, now()); losing the original would make "when did they first
+		// open it" unanswerable, which is the question an owner actually asks.
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.MarkRecipientAccess(ctx, sh.ID, first)
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		var again store.ShareRecipient
+		for _, r := range recipients(t, s, sh.ID) {
+			if r.Email == first {
+				again = r
+			}
+		}
+		if again.FirstAccessAt == nil || !again.FirstAccessAt.Equal(firstAt) {
+			t.Fatalf("the first-access time moved on a second visit (%v then %v). It records the "+
+				"FIRST access and must not be overwritten.", firstAt, again.FirstAccessAt)
+		}
+	})
+
+	t.Run("AccessIsScopedToOneRecipient", func(t *testing.T) {
+		s, owner := factory(t)
+		sh := newEmailShare(t, s, owner)
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.MarkRecipientAccess(ctx, sh.ID, first)
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		// The other invitee must still be untouched: an access on behalf of one recipient must not
+		// mark the others as having read the share.
+		for _, r := range recipients(t, s, sh.ID) {
+			if r.Email == second && r.FirstAccessAt != nil {
+				t.Fatal("accessing as one recipient recorded access for another")
+			}
+		}
+	})
+
+	t.Run("AccessForAnUninvitedAddressDoesNothing", func(t *testing.T) {
+		s, owner := factory(t)
+		sh := newEmailShare(t, s, owner)
+
+		// The UPDATE matches no row, which must be a quiet no-op rather than an error or — worse —
+		// a new row. Creating one would let anybody add themselves to a share's recipient list.
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.MarkRecipientAccess(ctx, sh.ID, "stranger@example.test")
+		}); err != nil {
+			t.Fatalf("marking access for an uninvited address failed: %v", err)
+		}
+
+		if got := recipients(t, s, sh.ID); len(got) != 2 {
+			t.Fatalf("after marking access for an uninvited address there are %d recipients, want "+
+				"2 — it must not create a row", len(got))
 		}
 	})
 }

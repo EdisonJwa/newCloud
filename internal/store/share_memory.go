@@ -208,7 +208,11 @@ func (t *memTx) RecipientFor(ctx context.Context, shareID uuid.UUID, email strin
 func (t *memTx) MarkRecipientVerified(ctx context.Context, shareID uuid.UUID, email string) error {
 	r, ok := t.m.recipients[[2]string{shareID.String(), lower(email)}]
 	if !ok {
-		return ErrNotFound
+		// Matching the SQL: the UPDATE's WHERE clause matches no row and returns nil rather than
+		// an error. An address that was never invited cannot have accessed the share, so there is
+		// nothing to record — and reporting it as a failure would make the download handler log a
+		// warning for a request that did exactly what it should.
+		return nil
 	}
 	if r.VerifiedAt == nil {
 		now := t.m.now()
@@ -220,7 +224,11 @@ func (t *memTx) MarkRecipientVerified(ctx context.Context, shareID uuid.UUID, em
 func (t *memTx) MarkRecipientAccess(ctx context.Context, shareID uuid.UUID, email string) error {
 	r, ok := t.m.recipients[[2]string{shareID.String(), lower(email)}]
 	if !ok {
-		return ErrNotFound
+		// Matching the SQL: the UPDATE's WHERE clause matches no row and returns nil rather than
+		// an error. An address that was never invited cannot have accessed the share, so there is
+		// nothing to record — and reporting it as a failure would make the download handler log a
+		// warning for a request that did exactly what it should.
+		return nil
 	}
 	now := t.m.now()
 	if r.FirstAccessAt == nil {

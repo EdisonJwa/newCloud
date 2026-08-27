@@ -1268,3 +1268,107 @@ func TestUploadRateWindowSlides(t *testing.T) {
 	}
 	_ = ctx
 }
+
+// TestEmailShareDownloadRecordsAccess is the wiring test for MarkRecipientAccess.
+//
+// The method was implemented on both backends and had no production caller: first_access_at and
+// last_access_at were never written, so the columns that answer "did the recipient ever open this"
+// stayed NULL forever. The conformance suite covers the method; only an end-to-end test covers the
+// fact that anything calls it — the same distinction as a background job that is declared, logged
+// and never invoked.
+func TestEmailShareDownloadRecordsAccess(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	content := []byte("recipient-only content")
+	body := &bytes.Buffer{}
+	mw := multipart.NewWriter(body)
+	_ = mw.WriteField("path", "")
+	fw, _ := mw.CreateFormFile("file", "invite.txt")
+	_, _ = io.WriteString(fw, string(content))
+	_ = mw.Close()
+	h.do(http.MethodPost, "/api/files/upload", body,
+		map[string]string{"Content-Type": mw.FormDataContentType()}).Body.Close()
+
+	resp := h.do(http.MethodPost, "/api/shares/",
+		strings.NewReader(`{"path":"invite.txt","kind":"email","recipients":["guest@example.test"]}`),
+		map[string]string{"Content-Type": "application/json"})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create email share: %d %s", resp.StatusCode, readBody(resp))
+	}
+	created := decode(t, resp)
+	token, _ := created["token"].(string)
+	shareID, _ := created["share"].(map[string]any)["id"].(string)
+
+	// Before any access, the recorded column must be empty — otherwise this test could pass
+	// against a handler that marks access on the page load rather than on the download.
+	readAccess := func() (bool, bool) {
+		var first, last bool
+		_ = h.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+			recs, err := tx.RecipientsFor(ctx, uuid.MustParse(shareID))
+			if err != nil {
+				return err
+			}
+			for _, r := range recs {
+				if r.Email == "guest@example.test" {
+					first = r.FirstAccessAt != nil
+					last = r.LastAccessAt != nil
+				}
+			}
+			return nil
+		})
+		return first, last
+	}
+
+	if first, last := readAccess(); first || last {
+		t.Fatal("access is recorded before any download happened")
+	}
+
+	// Verify as the invited address: request a code, then exchange it. That is the two-step flow
+	// the recipient cookie comes from — a single POST to /verify is the PASSWORD endpoint, which
+	// is why the first version of this test got a 404 rather than a cookie.
+	req := h.do(http.MethodPost, "/s/"+token+"/recipient",
+		strings.NewReader(`{"email":"guest@example.test"}`),
+		map[string]string{"Content-Type": "application/json"})
+	req.Body.Close()
+	if req.StatusCode != http.StatusAccepted {
+		t.Fatalf("recipient request: want 202, got %d", req.StatusCode)
+	}
+	code := h.mailer.codeFor("guest@example.test")
+	if code == "" {
+		t.Fatal("no verification code was generated")
+	}
+
+	vr := h.do(http.MethodPost, "/s/"+token+"/recipient/verify",
+		strings.NewReader(`{"email":"guest@example.test","code":"`+code+`"}`),
+		map[string]string{"Content-Type": "application/json"})
+	vr.Body.Close()
+	if vr.StatusCode != http.StatusOK {
+		t.Fatalf("recipient verify: want 200, got %d", vr.StatusCode)
+	}
+
+	// The cookie from the verify response is the grant; carry it to the download explicitly, since
+	// http.Get uses a bare client with no jar.
+	dlReq, err := http.NewRequest(http.MethodGet, h.srv.URL+"/s/"+token+"/download", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ck := range vr.Cookies() {
+		dlReq.AddCookie(ck)
+	}
+	dl, err := http.DefaultClient.Do(dlReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dl.Body.Close()
+	if dl.StatusCode != http.StatusOK {
+		t.Fatalf("download: want 200, got %d", dl.StatusCode)
+	}
+
+	first, last := readAccess()
+	if !first || !last {
+		t.Fatal("a completed download by a verified recipient recorded no access. " +
+			"first_access_at and last_access_at exist to answer \"did the recipient ever open " +
+			"this\", and nothing writes them.")
+	}
+}
