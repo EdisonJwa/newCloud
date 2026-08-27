@@ -27,7 +27,8 @@ func TestConformance(t *testing.T) {
 		})
 		return m, owner.ID
 	}, storetest.Options{
-		Versions: true,
+		Versions:    true,
+		MemoryBlobs: true,
 		AuditCount: func(t *testing.T, s store.Store) int {
 			m, ok := s.(*store.Memory)
 			if !ok {

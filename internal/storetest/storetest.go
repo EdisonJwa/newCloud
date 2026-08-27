@@ -80,6 +80,10 @@ type Options struct {
 	// with a fabricated id; the in-memory store does not care. Making this a hook
 	// keeps the suite identical for both instead of weakening the constraint.
 	NewBlob func(t *testing.T) uuid.UUID
+	// MemoryBlobs marks a backend that does not model blob rows at all, so the blob-identity
+	// cases are skipped there. Stated explicitly rather than inferred: a backend that lost blob
+	// tracking by accident would otherwise look like one that never had it.
+	MemoryBlobs bool
 	// Versions enables the version-history tests.
 	Versions bool
 	// AuditCount reports how many audit rows a store holds; used to verify that
@@ -720,6 +724,13 @@ func Run(t *testing.T, factory Factory, opts Options) {
 
 	t.Run("RecipientAccess", func(t *testing.T) {
 		recipientAccessSuite(t, factory)
+	})
+
+	t.Run("BlobIdentity", func(t *testing.T) {
+		// hasBlobs is false for a backend that does not model blob rows (the in-memory store),
+		// because asserting PostgreSQL semantics there would only document the limitation.
+		// The PostgreSQL conformance run is where these cases run.
+		blobIdentitySuite(t, factory, opts.NewBlob != nil && !opts.MemoryBlobs)
 	})
 
 	// Blob deduplication across transactions (INV-07 / T-20).
@@ -4908,6 +4919,160 @@ func recipientAccessSuite(t *testing.T, factory func(t *testing.T) (store.Store,
 		if got := recipients(t, s, sh.ID); len(got) != 2 {
 			t.Fatalf("after marking access for an uninvited address there are %d recipients, want "+
 				"2 — it must not create a row", len(got))
+		}
+	})
+}
+
+// blobIdentitySuite covers BlobHash and SampleBlobHashes.
+//
+// BlobHash is what the restore drill uses to get the digest the metadata RECORDED, so it can
+// compare restored bytes against what was written rather than against the live copy — comparing
+// against the live copy would pass if the same corruption existed on both sides. SampleBlobHashes
+// is what the integrity scrub uses to pick what to verify.
+//
+// Neither had a test on either backend. The in-memory store deliberately does not model blob
+// lifecycle, so these cases are gated on whether the backend records content addresses at all.
+func blobIdentitySuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.UUID), hasBlobs bool) {
+	t.Helper()
+
+	if !hasBlobs {
+		// The in-memory backend does not track blob rows: its CollectableBlobs reports that
+		// rather than returning an empty list, precisely so the gap cannot be mistaken for
+		// "nothing to do". Asserting the PostgreSQL semantics here would only produce a test that
+		// documents the limitation, so this states it once and stops.
+		t.Skip("this backend does not model blob rows; the PostgreSQL conformance run covers these")
+		return
+	}
+
+	t.Run("BlobHashReturnsTheRecordedAddress", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+
+		var hash [32]byte
+		for i := range hash {
+			hash[i] = byte(i + 1)
+		}
+		var blobID uuid.UUID
+		var node store.Node
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			blobID = s.BlobIDFor(ctx, hash, 10)
+			var e error
+			node, e = tx.CreateFile(ctx, store.NewFile{
+				OwnerID: owner, ParentID: r.ID, Name: "digest.txt", Size: 10,
+				Mime: "text/plain", ETag: `"d"`, BlobID: blobID, BlobHash: hash,
+			})
+			return e
+		}); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		_ = node
+
+		var got []byte
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			raw, err := tx.BlobHash(ctx, blobID)
+			got = raw
+			return err
+		}); err != nil {
+			t.Fatalf("BlobHash: %v", err)
+		}
+
+		// The digest must be the full SHA-256 the file was written with. The drill compares this
+		// against restored bytes, so a truncated or re-encoded value would make every restore look
+		// corrupted — or, worse, make a corrupted one look fine.
+		if len(got) != 32 {
+			t.Fatalf("BlobHash returned %d bytes, want a 32-byte SHA-256", len(got))
+		}
+		for i := range hash {
+			if got[i] != hash[i] {
+				t.Fatalf("BlobHash returned a different digest than the file was written with")
+			}
+		}
+
+		// An unknown blob id is an error, not a zero digest: the drill treats a nil digest as
+		// "cannot verify" and reports a problem, so returning zeros with a nil error would let it
+		// silently skip a file.
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			_, err := tx.BlobHash(ctx, uuid.New())
+			return err
+		}); err == nil {
+			t.Fatal("BlobHash on an unknown blob id succeeded; the drill would then compare " +
+				"restored bytes against a zero digest")
+		}
+	})
+
+	t.Run("SampleBlobHashesReturnsDistinctAddresses", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+
+		// SampleBlobHashes reads the WHOLE blobs table, not this case's fixture — the table is
+		// global and other cases leave rows in it. So the assertions below are about the shape of
+		// the result (distinct, bounded) and about whether this case's content appears, not about
+		// an absolute count. Assuming a clean table is the fixture-shape mistake this suite has
+		// now produced three times.
+		//
+		// BlobIDFor is resolved BEFORE the transaction opens. It takes a lock of its own on
+		// PostgreSQL, so calling it inside WithTx deadlocks — and the in-memory store refuses
+		// nested transactions outright. The suite hung for a minute rather than failing, which is
+		// why this comment is worth its length.
+		contents := [][32]byte{{1}, {2}, {1}}
+		ids := make([]uuid.UUID, len(contents))
+		for i, h := range contents {
+			ids[i] = s.BlobIDFor(context.Background(), h, 1)
+		}
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			for i, h := range contents {
+				name := "s" + string(rune('a'+i)) + ".bin"
+				if _, err := tx.CreateFile(ctx, store.NewFile{
+					OwnerID: owner, ParentID: r.ID, Name: name, Size: 1,
+					Mime: "application/octet-stream", ETag: `"x"`,
+					BlobID: ids[i], BlobHash: h,
+				}); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+
+		var got [][32]byte
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			h, err := tx.SampleBlobHashes(ctx, 100)
+			got = h
+			return err
+		}); err != nil {
+			t.Fatalf("sample: %v", err)
+		}
+		// Distinct: the same address must not be returned twice, or the scrub would read one blob
+		// repeatedly while others went unverified.
+		seen := map[[32]byte]bool{}
+		for _, h := range got {
+			if seen[h] {
+				t.Fatalf("the sample returned the same address twice (%x)", h[:4])
+			}
+			seen[h] = true
+		}
+		// And this case's two distinct contents both appear, so the sample is not filtering them
+		// out for a reason of its own.
+		want := [][32]byte{{1}, {2}}
+		for _, w := range want {
+			if !seen[w] {
+				t.Fatalf("the sample is missing content %x that this case created", w[:4])
+			}
+		}
+
+		// The limit must bound the pass: the scrub's whole cost model is "read at most N blobs per
+		// cycle", so a sampler that ignored the limit would turn it into a full read of the store.
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			h, err := tx.SampleBlobHashes(ctx, 1)
+			got = h
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if len(got) > 1 {
+			t.Fatalf("sample with limit 1 returned %d addresses", len(got))
 		}
 	})
 }

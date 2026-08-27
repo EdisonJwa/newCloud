@@ -32,12 +32,11 @@ import (
 // Each entry is a method whose behaviour is currently verified by at most one backend. Paying this
 // down means writing a case in the shared suite and deleting the name here.
 var knownUncovered = []string{
-	"BlobHash", "CollectableBlobs",
+	"CollectableBlobs",
 	"DeleteBlob",
 	"ExpireDownloadSessions", "IncrementDownload", "IncrementUpload",
 	"PruneOTPAttempts",
 	"PurgeTrash",
-	"SampleBlobHashes",
 }
 
 // TestSharedSuiteCoversEveryNewTxMethod is the ratchet.
