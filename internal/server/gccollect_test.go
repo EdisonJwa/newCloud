@@ -15,6 +15,7 @@ package server_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -50,18 +51,22 @@ func TestUnreferencedBlobFileSurvivesCollection(t *testing.T) {
 
 	// Run the collector's candidate query directly: it is the decision the worker acts on, and
 	// going through the worker's timer would make this test slow and timing-dependent.
+	//
+	// The harness runs on the in-memory store, which does not model blob lifecycle and reports
+	// errNotImplemented for this query. That is the correct answer — it cannot say what is
+	// collectable — and it is why this assertion used to be worthless: the query returned
+	// (nil, nil), so "no candidates" passed on a backend that never looked. The property here is
+	// that the file on disk survives, which is real and checkable regardless.
 	var candidates []store.BlobRef
-	if err := h.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
-		refs, err := tx.CollectableBlobs(ctx, 0)
+	err := h.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		refs, cerr := tx.CollectableBlobs(ctx, 0)
 		candidates = refs
-		return err
-	}); err != nil {
+		return cerr
+	})
+	if err != nil && !errors.Is(err, store.ErrNotImplemented) {
 		t.Fatalf("CollectableBlobs: %v", err)
 	}
-
-	// The orphan file must not be a candidate: it has no row, so the metadata-driven query cannot
-	// see it at all.
-	if len(candidates) != 0 {
+	if err == nil && len(candidates) != 0 {
 		t.Fatalf("a blob file with no metadata row appeared as a collection candidate (%d "+
 			"candidates). This is the restore-window property: while pg_restore has not run, every "+
 			"restored file is in this state, and collecting them would delete the restore.",

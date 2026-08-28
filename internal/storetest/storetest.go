@@ -726,6 +726,105 @@ func Run(t *testing.T, factory Factory, opts Options) {
 		recipientAccessSuite(t, factory)
 	})
 
+	t.Run("BlobCollection", func(t *testing.T) {
+		// CollectableBlobs and DeleteBlob. The PostgreSQL cases live in internal/store
+		// (TestPGCollector*), where the clock can be moved and the real query runs; what belongs
+		// here is the contract BOTH backends must satisfy: a backend that does not model blob
+		// lifecycle reports ErrNotImplemented rather than an empty list.
+		//
+		// That distinction is the whole point. An empty list means "nothing to collect"; an error
+		// means "cannot answer". A sweep that receives the first reports a clean run on a backend
+		// that never looked, which is what this method did for several rounds while its comment
+		// claimed otherwise.
+
+		if opts.MemoryBlobs {
+			t.Run("UnmodelledBackendReportsTheGap", func(t *testing.T) {
+				s, owner := factory(t)
+				rootOf(t, s, owner)
+
+				err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+					_, cerr := tx.CollectableBlobs(ctx, 0)
+					return cerr
+				})
+				if !errors.Is(err, store.ErrNotImplemented) {
+					t.Fatalf("a backend that does not model blob lifecycle returned %v, want "+
+						"ErrNotImplemented. Returning an empty list would let the sweep report a "+
+						"clean run on a backend that never looked.", err)
+				}
+			})
+			return
+		}
+
+		t.Run("CollectsNothingWhileReferenced", func(t *testing.T) {
+			s, owner := factory(t)
+			r := rootOf(t, s, owner)
+
+			var hash [32]byte
+			hash[0] = 0x5a
+			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				_, err := tx.CreateFile(ctx, store.NewFile{
+					OwnerID: owner, ParentID: r.ID, Name: "held.bin", Size: 1,
+					Mime: "application/octet-stream", ETag: `"h"`,
+					BlobID: s.BlobIDFor(ctx, hash, 1), BlobHash: hash,
+				})
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			var refs []store.BlobRef
+			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				got, err := tx.CollectableBlobs(ctx, 0)
+				refs = got
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			for _, ref := range refs {
+				// A blob a live file references must never be a candidate: collecting it would
+				// delete content the database still points at.
+				if ref.Size == 1 {
+					t.Fatalf("a referenced blob appeared as a collection candidate")
+				}
+			}
+		})
+
+		t.Run("DeleteBlobRemovesOnlyItsRow", func(t *testing.T) {
+			s, owner := factory(t)
+			r := rootOf(t, s, owner)
+
+			var keep, drop [32]byte
+			keep[0], drop[0] = 0x11, 0x22
+			keepID := s.BlobIDFor(context.Background(), keep, 1)
+			dropID := s.BlobIDFor(context.Background(), drop, 1)
+			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				if _, err := tx.CreateFile(ctx, store.NewFile{
+					OwnerID: owner, ParentID: r.ID, Name: "keep.bin", Size: 1,
+					Mime: "application/octet-stream", ETag: `"k"`, BlobID: keepID, BlobHash: keep,
+				}); err != nil {
+					return err
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			// Delete the unreferenced one; the referenced one must stay resolvable, or a later
+			// restore of it would fail with a missing row.
+			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				return tx.DeleteBlob(ctx, dropID)
+			}); err != nil {
+				t.Fatalf("DeleteBlob: %v", err)
+			}
+			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				_, err := tx.BlobHash(ctx, keepID)
+				return err
+			}); err != nil {
+				t.Fatalf("deleting one blob disturbed another: %v", err)
+			}
+		})
+	})
+
 	t.Run("BlobIdentity", func(t *testing.T) {
 		// hasBlobs is false for a backend that does not model blob rows (the in-memory store),
 		// because asserting PostgreSQL semantics there would only document the limitation.

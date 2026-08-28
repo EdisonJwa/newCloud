@@ -72,9 +72,14 @@ func (t *pgTx) DeleteBlob(ctx context.Context, id uuid.UUID) error {
 
 func (t *memTx) CollectableBlobs(ctx context.Context, grace time.Duration) ([]BlobRef, error) {
 	// The memory store does not model blob lifecycle; the worker's tests use the
-	// PostgreSQL implementation. Returning an empty list would look like "nothing
-	// to do" and hide the gap, so this reports it instead.
-	return nil, nil
+	// PostgreSQL implementation.
+	//
+	// This reports the gap rather than returning an empty list. The comment said that for
+	// several rounds while the code returned (nil, nil) — so SweepBlobs read it as "nothing to
+	// collect" and returned successfully, which is precisely the silent no-op the comment
+	// promised to avoid. A caller that cannot tell "no garbage" from "cannot tell" reports a
+	// clean sweep on a backend that never looked.
+	return nil, errNotImplemented
 }
 
 func (t *memTx) DeleteBlob(ctx context.Context, id uuid.UUID) error {

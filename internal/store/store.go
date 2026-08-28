@@ -554,4 +554,14 @@ type ResolverNode struct {
 	Size  int64
 }
 
-var errNotImplemented = fmt.Errorf("store: not implemented")
+// ErrNotImplemented reports that a backend does not model this concept at all.
+//
+// Distinct from an empty result on purpose. A caller that cannot tell "there is nothing here"
+// from "this backend cannot answer" will report a clean result for work that never happened —
+// which is exactly what happened to the blob collector: the in-memory store returned an empty
+// list while its own comment claimed to report the gap, and the sweep reported success on a
+// backend that never looked.
+var ErrNotImplemented = fmt.Errorf("store: not implemented")
+
+// errNotImplemented is kept as the internal spelling so existing call sites need no change.
+var errNotImplemented = ErrNotImplemented
