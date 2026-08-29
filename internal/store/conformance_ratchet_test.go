@@ -32,9 +32,15 @@ import (
 // Each entry is a method whose behaviour is currently verified by at most one backend. Paying this
 // down means writing a case in the shared suite and deleting the name here.
 var knownUncovered = []string{
-	"ExpireDownloadSessions", "IncrementDownload", "IncrementUpload",
-	"PruneOTPAttempts",
-	"PurgeTrash",
+	// Empty. Every Tx method is now exercised by the shared conformance suite, which runs each
+	// backend against the same cases — the only thing that catches a PostgreSQL statement and an
+	// in-memory implementation disagreeing.
+	//
+	// The list reached zero by being paid down: 47 methods when the ratchet was written, several
+	// of which turned out to be broken on one backend (a restore stub, a prune boundary that
+	// emptied a table the other backend kept, a double-revoke that succeeded silently, and a
+	// collector whose comment claimed to report a gap it did not). Keeping the list here, empty,
+	// is what makes the guard fire on the NEXT uncovered method rather than only on a growing one.
 }
 
 // TestSharedSuiteCoversEveryNewTxMethod is the ratchet.

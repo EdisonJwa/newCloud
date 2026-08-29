@@ -825,6 +825,14 @@ func Run(t *testing.T, factory Factory, opts Options) {
 		})
 	})
 
+	t.Run("ShareCounters", func(t *testing.T) {
+		counterSuite(t, factory)
+	})
+
+	t.Run("Sweeps", func(t *testing.T) {
+		sweepSuite(t, factory)
+	})
+
 	t.Run("BlobIdentity", func(t *testing.T) {
 		// hasBlobs is false for a backend that does not model blob rows (the in-memory store),
 		// because asserting PostgreSQL semantics there would only document the limitation.
@@ -5172,6 +5180,313 @@ func blobIdentitySuite(t *testing.T, factory func(t *testing.T) (store.Store, uu
 		}
 		if len(got) > 1 {
 			t.Fatalf("sample with limit 1 returned %d addresses", len(got))
+		}
+	})
+}
+
+// counterSuite covers IncrementDownload and IncrementUpload directly.
+//
+// The service layer has a concurrency test for the download cap, but it runs against the in-memory
+// backend. The guard these methods implement is a WHERE clause — `download_count < max_downloads` —
+// and a WHERE clause is exactly what a hand-written memory implementation can get right for the
+// wrong reason, or get wrong in a way no single-threaded test notices.
+//
+// These cases are single-threaded on purpose: what they pin is the CONTRACT (the cap refuses the
+// over-limit call, the counter and the byte total move together, a rejected call changes nothing),
+// which both backends must satisfy. Actual racing lives in the service-layer test and in the
+// PostgreSQL row lock.
+func counterSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.UUID)) {
+	t.Helper()
+
+	mkShare := func(t *testing.T, s store.Store, owner, nodeID uuid.UUID,
+		maxDownloads *int, maxUploads *int, maxTotalBytes *int64) store.Share {
+		t.Helper()
+		var sh store.Share
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			c, err := tx.CreateShare(ctx, store.Share{
+				NodeID: nodeID, OwnerID: owner, Kind: store.ShareLink,
+				TokenHash: []byte(uuid.New().String()), Permissions: []string{"read"},
+				MaxDownloads: maxDownloads, MaxUploads: maxUploads,
+				MaxTotalBytes: maxTotalBytes,
+			})
+			sh = c
+			return err
+		}); err != nil {
+			t.Fatalf("create share: %v", err)
+		}
+		return sh
+	}
+
+	readShare := func(t *testing.T, s store.Store, id uuid.UUID) store.Share {
+		t.Helper()
+		var sh store.Share
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			got, err := tx.ShareByID(ctx, id)
+			sh = got
+			return err
+		}); err != nil {
+			t.Fatalf("read share: %v", err)
+		}
+		return sh
+	}
+
+	t.Run("DownloadCapRefusesTheOverLimitCall", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		two := 2
+		sh := mkShare(t, s, owner, r.ID, &two, nil, nil)
+
+		for i := 0; i < 2; i++ {
+			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				return tx.IncrementDownload(ctx, sh.ID)
+			}); err != nil {
+				t.Fatalf("download %d of 2: %v", i+1, err)
+			}
+		}
+
+		// The third must be refused. This is the statement that makes "usable three times" mean
+		// three and not four — the whole reason the cap is a WHERE clause rather than a check in
+		// Go.
+		err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.IncrementDownload(ctx, sh.ID)
+		})
+		if !errors.Is(err, store.ErrShareExhausted) {
+			t.Fatalf("the third download through a 2-download cap: want ErrShareExhausted, got %v", err)
+		}
+
+		// And the rejected call must not have moved the counter.
+		if got := readShare(t, s, sh.ID).DownloadCount; got != 2 {
+			t.Fatalf("a refused download left the counter at %d, want 2 — a cap that increments "+
+				"before refusing lets a share drift past its limit", got)
+		}
+	})
+
+	t.Run("UploadCounterAndBytesMoveTogether", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		fifty := int64(50)
+		sh := mkShare(t, s, owner, r.ID, nil, nil, &fifty)
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.IncrementUpload(ctx, sh.ID, 30)
+		}); err != nil {
+			t.Fatalf("first upload: %v", err)
+		}
+
+		got := readShare(t, s, sh.ID)
+		if got.UploadCount != 1 || got.ReceivedBytes != 30 {
+			t.Fatalf("after one 30-byte upload: count=%d bytes=%d, want 1 and 30",
+				got.UploadCount, got.ReceivedBytes)
+		}
+
+		// 30 + 30 crosses the 50-byte cap. Both must be untouched afterwards: a counter that
+		// moved while the bytes were refused would let the count and the total disagree.
+		err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.IncrementUpload(ctx, sh.ID, 30)
+		})
+		if !errors.Is(err, store.ErrShareExhausted) {
+			t.Fatalf("an upload that crosses the byte cap: want ErrShareExhausted, got %v", err)
+		}
+		got = readShare(t, s, sh.ID)
+		if got.UploadCount != 1 || got.ReceivedBytes != 30 {
+			t.Fatalf("a refused upload changed the totals: count=%d bytes=%d, want 1 and 30",
+				got.UploadCount, got.ReceivedBytes)
+		}
+	})
+
+	t.Run("RejectedUploadDoesNotInflateTheByteTotal", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		one := 1
+		sh := mkShare(t, s, owner, r.ID, nil, &one, nil)
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.IncrementUpload(ctx, sh.ID, 10)
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		// Refused by the COUNT cap, with bytes that would otherwise fit. The byte total must not
+		// absorb them: the SELECT that enforces the count runs in the same statement, so a store
+		// that updated bytes first and checked the count second would drift.
+		err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.IncrementUpload(ctx, sh.ID, 10)
+		})
+		if !errors.Is(err, store.ErrShareExhausted) {
+			t.Fatalf("want ErrShareExhausted, got %v", err)
+		}
+		if got := readShare(t, s, sh.ID).ReceivedBytes; got != 10 {
+			t.Fatalf("received_bytes = %d after a refused upload, want 10", got)
+		}
+	})
+
+	t.Run("NoCapMeansNoRefusal", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		sh := mkShare(t, s, owner, r.ID, nil, nil, nil)
+
+		// A share with no caps must accept any number. An implementation that treated a nil cap as
+		// zero would refuse everything.
+		for i := 0; i < 20; i++ {
+			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				return tx.IncrementDownload(ctx, sh.ID)
+			}); err != nil {
+				t.Fatalf("download %d with no cap: %v", i+1, err)
+			}
+		}
+		if got := readShare(t, s, sh.ID).DownloadCount; got != 20 {
+			t.Fatalf("count = %d after 20 uncapped downloads", got)
+		}
+	})
+}
+
+// sweepSuite covers the three housekeeping sweeps: ExpireDownloadSessions, PruneOTPAttempts and
+// the opt-in behaviour of PurgeTrash.
+//
+// Each has a production caller on a timer (worker.go), and each is a DELETE bounded by a time
+// predicate — the shape where a hand-written memory loop and a SQL interval most easily disagree,
+// as the share-rate prune already demonstrated once.
+//
+// The property every one of them must share is the same: delete what is older than the window,
+// keep everything else, be idempotent, and treat a zero/negative window as "keep everything"
+// rather than "delete everything" — a data-loss guard these sweeps all rely on.
+func sweepSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.UUID)) {
+	t.Helper()
+
+	t.Run("ExpireDownloadSessionsKeepsLiveOnes", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		f := mkfile(t, s, owner, r.ID, "dl.bin", 10)
+
+		var sh store.Share
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			c, err := tx.CreateShare(ctx, store.Share{
+				NodeID: f.ID, OwnerID: owner, Kind: store.ShareLink,
+				TokenHash: []byte(uuid.New().String()), Permissions: []string{"read"},
+			})
+			sh = c
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		// One session that expires long in the future, one already expired.
+		grant := func(g string, ttl time.Duration) error {
+			return s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				_, _, err := tx.AuthorizeDownload(ctx, store.DownloadSession{
+					ShareID: sh.ID, NodeID: f.ID, GrantHash: []byte(g),
+					ETag: f.ETag, ExpiresAt: time.Now().Add(ttl),
+				}, false)
+				return err
+			})
+		}
+		if err := grant("live-visitor", time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		if err := grant("stale-visitor", -time.Minute); err != nil {
+			t.Fatal(err)
+		}
+
+		var removed int
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			n, err := tx.ExpireDownloadSessions(ctx)
+			removed = n
+			return err
+		}); err != nil {
+			t.Fatalf("expire: %v", err)
+		}
+		if removed != 1 {
+			t.Fatalf("expired %d download sessions, want 1 — removing a live session would let a "+
+				"Range request be charged again", removed)
+		}
+
+		// Idempotent: a worker on a timer must not report perpetual activity.
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			n, err := tx.ExpireDownloadSessions(ctx)
+			removed = n
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if removed != 0 {
+			t.Fatalf("a second sweep expired %d more sessions, want 0", removed)
+		}
+	})
+
+	t.Run("PruneOTPAttemptsKeepsRecentOnes", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		var sh store.Share
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			c, err := tx.CreateShare(ctx, store.Share{
+				NodeID: r.ID, OwnerID: owner, Kind: store.ShareEmail,
+				TokenHash: []byte(uuid.New().String()), Permissions: []string{"read"},
+			})
+			sh = c
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.RecordOTPAttempt(ctx, store.OTPAttempt{
+				ShareID: sh.ID, Email: "prune@example.test", Success: false,
+			})
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		// A keep window far longer than the row's age removes nothing. Pruning a row still inside
+		// the throttle window would reset an attacker's failure count.
+		var removed int
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			n, err := tx.PruneOTPAttempts(ctx, 24*time.Hour)
+			removed = n
+			return err
+		}); err != nil {
+			t.Fatalf("prune: %v", err)
+		}
+		if removed != 0 {
+			t.Fatalf("a 24-hour keep window removed %d fresh OTP attempts", removed)
+		}
+
+		// And the failure count still sees it, which is what the throttle depends on.
+		var failures int
+		_ = s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			n, err := tx.OTPFailureCount(ctx, sh.ID, "prune@example.test", time.Hour)
+			failures = n
+			return err
+		})
+		if failures != 1 {
+			t.Fatalf("after a non-destructive prune the failure count is %d, want 1", failures)
+		}
+	})
+
+	t.Run("PurgeTrashIsOptIn", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		f := mkfile(t, s, owner, r.ID, "keep-me.bin", 10)
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.Trash(ctx, f.ID)
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		// Zero means "never purge", not "purge everything". This is the data-loss guard the
+		// worker relies on when retention is unset, and a sweep that read zero as "delete now"
+		// would empty every trash on a default configuration.
+		var res store.PurgeResult
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			got, err := tx.PurgeTrash(ctx, 0)
+			res = got
+			return err
+		}); err != nil {
+			t.Fatalf("purge with zero retention: %v", err)
+		}
+		if res.Nodes != 0 {
+			t.Fatalf("a zero retention purged %d nodes. Zero means keep forever: a deployment that "+
+				"has not set a policy must not have its trash emptied.", res.Nodes)
 		}
 	})
 }
