@@ -437,6 +437,12 @@ func (s *Server) renderShareError(w http.ResponseWriter, r *http.Request, err er
 	// nothing is leaked, and a 404 with "this link is not available" would tell a legitimate
 	// visitor their link is dead when the correct instruction is "try again shortly". Answering 429
 	// also lets a client back off instead of retrying into the limit.
+	if errors.Is(err, store.ErrSharePasswordThrottled) {
+		w.Header().Set("Retry-After", "900")
+		writeError(w, http.StatusTooManyRequests, "rate_limited",
+			"too many password attempts on this link; try again later")
+		return
+	}
 	if errors.Is(err, store.ErrShareRateLimited) {
 		w.Header().Set("Retry-After", "60")
 		writeError(w, http.StatusTooManyRequests, "rate_limited",

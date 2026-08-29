@@ -345,6 +345,8 @@ type Tx interface {
 	ExpireRetained(ctx context.Context) (int, error)
 	// ShareRateTx is the upload rate limit (SHARE-05 速率).
 	ShareRateTx
+	// SharePasswordTx is the password-guess throttle (SHARE-02 尝试上限).
+	SharePasswordTx
 	ExpireVersions(ctx context.Context, retention time.Duration) (int, error)
 
 	// Enqueue adds an asynchronous job in the same transaction.

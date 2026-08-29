@@ -833,6 +833,10 @@ func Run(t *testing.T, factory Factory, opts Options) {
 		sweepSuite(t, factory)
 	})
 
+	t.Run("PasswordThrottle", func(t *testing.T) {
+		passwordThrottleSuite(t, factory)
+	})
+
 	t.Run("BlobIdentity", func(t *testing.T) {
 		// hasBlobs is false for a backend that does not model blob rows (the in-memory store),
 		// because asserting PostgreSQL semantics there would only document the limitation.
@@ -5487,6 +5491,126 @@ func sweepSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.UUID
 		if res.Nodes != 0 {
 			t.Fatalf("a zero retention purged %d nodes. Zero means keep forever: a deployment that "+
 				"has not set a policy must not have its trash emptied.", res.Nodes)
+		}
+	})
+}
+
+// passwordThrottleSuite covers the SHARE-02 password-guess limit.
+//
+// OTP verification had a rate limit, a validity period, an attempt cap and replay protection.
+// Password verification had none: a wrong password was audited, so an owner could see a burst
+// afterwards, but nothing slowed it down. A share password is usually short and human-chosen,
+// which makes online guessing the realistic attack.
+func passwordThrottleSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.UUID)) {
+	t.Helper()
+
+	mkShare := func(t *testing.T, s store.Store, owner uuid.UUID) store.Share {
+		t.Helper()
+		r := rootOf(t, s, owner)
+		var sh store.Share
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			c, err := tx.CreateShare(ctx, store.Share{
+				NodeID: r.ID, OwnerID: owner, Kind: store.ShareLink,
+				TokenHash: []byte(uuid.New().String()), Permissions: []string{"read"},
+				PasswordHash: []byte("not-a-real-hash"),
+			})
+			sh = c
+			return err
+		}); err != nil {
+			t.Fatalf("create share: %v", err)
+		}
+		return sh
+	}
+
+	count := func(t *testing.T, s store.Store, id uuid.UUID) int {
+		t.Helper()
+		var n int
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			got, err := tx.PasswordFailureCount(ctx, id, store.PasswordWindow)
+			n = got
+			return err
+		}); err != nil {
+			t.Fatalf("count: %v", err)
+		}
+		return n
+	}
+
+	record := func(t *testing.T, s store.Store, id uuid.UUID, ok bool) {
+		t.Helper()
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.RecordPasswordAttempt(ctx, id, "127.0.0.1", ok)
+		}); err != nil {
+			t.Fatalf("record: %v", err)
+		}
+	}
+
+	t.Run("CountsFailuresNotSuccesses", func(t *testing.T) {
+		s, owner := factory(t)
+		sh := mkShare(t, s, owner)
+
+		record(t, s, sh.ID, false)
+		record(t, s, sh.ID, false)
+		record(t, s, sh.ID, true)
+
+		// Successes must not count toward the cap, or a visitor who keeps entering the right
+		// password would eventually lock themselves out of a link they can open.
+		if n := count(t, s, sh.ID); n != 2 {
+			t.Fatalf("failure count = %d, want 2", n)
+		}
+	})
+
+	t.Run("LimitIsReachedAtTheConfiguredAttempts", func(t *testing.T) {
+		s, owner := factory(t)
+		sh := mkShare(t, s, owner)
+
+		for i := 0; i < store.PasswordMaxAttempts; i++ {
+			if n := count(t, s, sh.ID); n != i {
+				t.Fatalf("before guess %d the count is %d", i+1, n)
+			}
+			record(t, s, sh.ID, false)
+		}
+		// At exactly the cap the caller refuses; the constant and the counter have to agree, or the
+		// limit is off by one in whichever direction the code happens to compare.
+		if n := count(t, s, sh.ID); n != store.PasswordMaxAttempts {
+			t.Fatalf("after %d failures the count is %d", store.PasswordMaxAttempts, n)
+		}
+	})
+
+	t.Run("CountIsScopedToOneShare", func(t *testing.T) {
+		s, owner := factory(t)
+		a := mkShare(t, s, owner)
+		b := mkShare(t, s, owner)
+
+		for i := 0; i < store.PasswordMaxAttempts; i++ {
+			record(t, s, a.ID, false)
+		}
+		// A different link must not inherit another's failures: one link being hammered must not
+		// lock every other link the owner created.
+		if n := count(t, s, b.ID); n != 0 {
+			t.Fatalf("an unrelated share reports %d failures", n)
+		}
+	})
+
+	t.Run("PruneRemovesOnlyOldAttempts", func(t *testing.T) {
+		s, owner := factory(t)
+		sh := mkShare(t, s, owner)
+		record(t, s, sh.ID, false)
+
+		var removed int
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			n, err := tx.PrunePasswordAttempts(ctx, 24*time.Hour)
+			removed = n
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		// A keep window longer than the row's age must remove nothing, or pruning would reset an
+		// attacker's failure count.
+		if removed != 0 {
+			t.Fatalf("a 24-hour keep window removed %d fresh attempts", removed)
+		}
+		if n := count(t, s, sh.ID); n != 1 {
+			t.Fatalf("after a non-destructive prune the count is %d, want 1", n)
 		}
 	})
 }

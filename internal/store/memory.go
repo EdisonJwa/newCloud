@@ -53,15 +53,16 @@ type Memory struct {
 	shares       map[uuid.UUID]*Share
 	blobIDs      map[[32]byte]uuid.UUID
 	// auditFault makes audit writes fail, so tests can exercise the T-16 fail-closed policy.
-	auditFault        error
-	recipients        map[[2]string]*ShareRecipient
-	downloads         map[string]*DownloadSession
-	acl               map[uuid.UUID][]ACLEntry
-	groups            []Group
-	groupMembers      []GroupMember
-	otpAttempts       []OTPAttempt
-	shareUploadEvents []memShareUploadEvent
-	nextVersion       int
+	auditFault            error
+	recipients            map[[2]string]*ShareRecipient
+	downloads             map[string]*DownloadSession
+	acl                   map[uuid.UUID][]ACLEntry
+	groups                []Group
+	groupMembers          []GroupMember
+	otpAttempts           []OTPAttempt
+	shareUploadEvents     []memShareUploadEvent
+	sharePasswordAttempts []memPasswordAttempt
+	nextVersion           int
 	// broken simulates an unreachable backend, for tests of failure handling.
 	broken *brokenFlag
 	now    func() time.Time
@@ -89,26 +90,27 @@ type memNode struct {
 // NewMemory returns an empty metadata store.
 func NewMemory() *Memory {
 	m := &Memory{
-		nodes:             map[uuid.UUID]*memNode{},
-		children:          map[uuid.UUID]map[string]uuid.UUID{},
-		roots:             map[uuid.UUID]uuid.UUID{},
-		usage:             map[uuid.UUID]int64{},
-		quota:             map[uuid.UUID]int64{},
-		users:             map[uuid.UUID]*User{},
-		sessions:          map[string]*memSession{},
-		appPasswords:      map[uuid.UUID]*AppPassword{},
-		locks:             map[uuid.UUID]*Lock{},
-		deadProps:         map[uuid.UUID]map[[2]string]string{},
-		shares:            map[uuid.UUID]*Share{},
-		blobIDs:           map[[32]byte]uuid.UUID{},
-		recipients:        map[[2]string]*ShareRecipient{},
-		downloads:         map[string]*DownloadSession{},
-		acl:               map[uuid.UUID][]ACLEntry{},
-		groups:            nil,
-		groupMembers:      nil,
-		otpAttempts:       nil,
-		shareUploadEvents: nil,
-		now:               time.Now,
+		nodes:                 map[uuid.UUID]*memNode{},
+		children:              map[uuid.UUID]map[string]uuid.UUID{},
+		roots:                 map[uuid.UUID]uuid.UUID{},
+		usage:                 map[uuid.UUID]int64{},
+		quota:                 map[uuid.UUID]int64{},
+		users:                 map[uuid.UUID]*User{},
+		sessions:              map[string]*memSession{},
+		appPasswords:          map[uuid.UUID]*AppPassword{},
+		locks:                 map[uuid.UUID]*Lock{},
+		deadProps:             map[uuid.UUID]map[[2]string]string{},
+		shares:                map[uuid.UUID]*Share{},
+		blobIDs:               map[[32]byte]uuid.UUID{},
+		recipients:            map[[2]string]*ShareRecipient{},
+		downloads:             map[string]*DownloadSession{},
+		acl:                   map[uuid.UUID][]ACLEntry{},
+		groups:                nil,
+		groupMembers:          nil,
+		otpAttempts:           nil,
+		shareUploadEvents:     nil,
+		sharePasswordAttempts: nil,
+		now:                   time.Now,
 	}
 	// Route every timestamp through the offset-aware clock, so a test can advance time
 	// and have job scheduling, lease expiry and retention all move together.
@@ -195,6 +197,7 @@ func (m *Memory) WithTx(ctx context.Context, fn func(ctx context.Context, tx Tx)
 	m.groupMembers = work.groupMembers
 	m.otpAttempts = work.otpAttempts
 	m.shareUploadEvents = work.shareUploadEvents
+	m.sharePasswordAttempts = work.sharePasswordAttempts
 	m.audit = work.audit
 	// The timestamps travel with the entries. Copying one without the other is how the
 	// indexes drift out of step, and an index out of range during an audit export is a
@@ -223,19 +226,20 @@ func (m *Memory) snapshot() *Memory {
 		blobIDs:      make(map[[32]byte]uuid.UUID, len(m.blobIDs)),
 		// The audit fault is configuration, not data: it must survive the snapshot or a
 		// transaction would silently succeed while the store reports itself healthy.
-		auditFault:        m.auditFault,
-		recipients:        make(map[[2]string]*ShareRecipient, len(m.recipients)),
-		downloads:         make(map[string]*DownloadSession, len(m.downloads)),
-		acl:               make(map[uuid.UUID][]ACLEntry, len(m.acl)),
-		groups:            append([]Group(nil), m.groups...),
-		groupMembers:      append([]GroupMember(nil), m.groupMembers...),
-		otpAttempts:       append([]OTPAttempt(nil), m.otpAttempts...),
-		shareUploadEvents: append([]memShareUploadEvent(nil), m.shareUploadEvents...),
-		audit:             append([]AuditEntry(nil), m.audit...),
-		auditTimes:        append([]time.Time(nil), m.auditTimes...),
-		jobs:              append([]queuedJob(nil), m.jobs...),
-		nextVersion:       m.nextVersion,
-		now:               m.now,
+		auditFault:            m.auditFault,
+		recipients:            make(map[[2]string]*ShareRecipient, len(m.recipients)),
+		downloads:             make(map[string]*DownloadSession, len(m.downloads)),
+		acl:                   make(map[uuid.UUID][]ACLEntry, len(m.acl)),
+		groups:                append([]Group(nil), m.groups...),
+		groupMembers:          append([]GroupMember(nil), m.groupMembers...),
+		otpAttempts:           append([]OTPAttempt(nil), m.otpAttempts...),
+		shareUploadEvents:     append([]memShareUploadEvent(nil), m.shareUploadEvents...),
+		sharePasswordAttempts: append([]memPasswordAttempt(nil), m.sharePasswordAttempts...),
+		audit:                 append([]AuditEntry(nil), m.audit...),
+		auditTimes:            append([]time.Time(nil), m.auditTimes...),
+		jobs:                  append([]queuedJob(nil), m.jobs...),
+		nextVersion:           m.nextVersion,
+		now:                   m.now,
 	}
 	for k, v := range m.nodes {
 		cp := *v

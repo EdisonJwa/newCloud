@@ -55,7 +55,8 @@ var drillTables = []string{
 	"users", "sessions", "app_passwords", "blobs", "nodes", "versions",
 	"dead_props", "lock_tokens", "shares", "share_recipients", "jobs",
 	"settings", "acl_entries", "groups", "group_members", "group_role_map",
-	"download_sessions", "share_otp_attempts", "share_upload_events", "scim_pending_changes",
+	"download_sessions", "share_otp_attempts", "share_upload_events",
+	"share_password_attempts", "scim_pending_changes",
 	// Added after the list was first written, and found by TestDrillCoversEveryTable rather
 	// than by anyone noticing: a group-to-role mapping and the record of names the name_key
 	// migration had to rename. Both must survive a restore, and neither was being checked.

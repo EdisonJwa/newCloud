@@ -1372,3 +1372,62 @@ func TestEmailShareDownloadRecordsAccess(t *testing.T) {
 			"this\", and nothing writes them.")
 	}
 }
+
+// TestSharePasswordBruteForceIsThrottled is SHARE-02's 尝试上限 for passwords.
+//
+// The requirement asks for a rate limit, a validity period, an attempt cap and replay protection on
+// both password and OTP verification. OTP had all four; password verification had NONE — a wrong
+// password was audited, so an owner could see a burst afterwards, but nothing slowed it down. A
+// share password is usually short and human-chosen, so online guessing was the realistic attack.
+func TestSharePasswordBruteForceIsThrottled(t *testing.T) {
+	h := newHarness(t)
+
+	body := &bytes.Buffer{}
+	mw := multipart.NewWriter(body)
+	_ = mw.WriteField("path", "")
+	fw, _ := mw.CreateFormFile("file", "guarded.txt")
+	_, _ = io.WriteString(fw, "secret")
+	_ = mw.Close()
+	h.do(http.MethodPost, "/api/files/upload", body,
+		map[string]string{"Content-Type": mw.FormDataContentType()}).Body.Close()
+
+	resp := h.do(http.MethodPost, "/api/shares/",
+		strings.NewReader(`{"path":"guarded.txt","kind":"link","password":"correct-horse"}`),
+		map[string]string{"Content-Type": "application/json"})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create share: %d %s", resp.StatusCode, readBody(resp))
+	}
+	token, _ := decode(t, resp)["token"].(string)
+
+	attempt := func(password string) int {
+		r, err := http.Post(h.srv.URL+"/s/"+token+"/verify", "application/json",
+			strings.NewReader(`{"password":"`+password+`"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Body.Close()
+		_, _ = io.Copy(io.Discard, r.Body)
+		return r.StatusCode
+	}
+
+	// Guesses up to the limit are refused as wrong passwords — a normal 403, not a 429.
+	for i := 0; i < 5; i++ {
+		if code := attempt("guess-" + string(rune('a'+i))); code == http.StatusTooManyRequests {
+			t.Fatalf("guess %d was throttled before the limit was reached", i+1)
+		}
+	}
+
+	// The next one must be throttled. Without this, a short human-chosen password could be guessed
+	// at whatever rate the network allows.
+	if code := attempt("another-guess"); code != http.StatusTooManyRequests {
+		t.Fatalf("guess 6 on a 5-attempt link: want 429, got %d. Password verification had no "+
+			"attempt cap, so a share password could be brute forced at network speed.", code)
+	}
+
+	// And the CORRECT password is also refused while the throttle is in force — a limit that let
+	// the right guess through would still leak whether a guess was right.
+	if code := attempt("correct-horse"); code != http.StatusTooManyRequests {
+		t.Fatalf("the correct password during a throttle: want 429, got %d. A cap that admits the "+
+			"right guess still tells an attacker when they found it.", code)
+	}
+}

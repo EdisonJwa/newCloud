@@ -421,18 +421,20 @@ func (w *Worker) PruneRateLimitRows(ctx context.Context) { w.pruneRateLimitRows(
 func (w *Worker) pruneRateLimitRows(ctx context.Context) {
 	const keep = 24 * time.Hour
 
-	var otp, uploads int
+	var otp, uploads, passwords int
 	err := w.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
-		var e1, e2 error
+		var e1, e2, e3 error
 		otp, e1 = tx.PruneOTPAttempts(ctx, keep)
 		uploads, e2 = tx.PruneShareUploadEvents(ctx, keep)
-		return errors.Join(e1, e2)
+		passwords, e3 = tx.PrunePasswordAttempts(ctx, keep)
+		return errors.Join(e1, e2, e3)
 	})
 	if err != nil {
 		w.log.Error("prune rate-limit rows failed", "error", err)
 		return
 	}
-	if otp > 0 || uploads > 0 {
-		w.log.Debug("pruned rate-limit rows", "otp_attempts", otp, "upload_events", uploads)
+	if otp > 0 || uploads > 0 || passwords > 0 {
+		w.log.Debug("pruned rate-limit rows",
+			"otp_attempts", otp, "upload_events", uploads, "password_attempts", passwords)
 	}
 }

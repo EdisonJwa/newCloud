@@ -9,6 +9,7 @@ package server
 // requirement, which would defeat the reason email shares exist.
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -38,8 +39,19 @@ func (s *Server) handleShareVerify(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.deps.Shares.VerifyPassword(r.Context(), sh, body.Password); err != nil {
-		// Deliberately the same status and shape as a bad token: an attacker probing
-		// passwords should not learn that the token is real.
+		// A throttled link is reported distinctly, for the same reason the upload rate limit is:
+		// the caller already proved they hold a working link by exhausting its attempts, so a 429
+		// reveals nothing new — and a 404 would tell a legitimate visitor their link is dead when
+		// the correct instruction is "try again later".
+		//
+		// Every OTHER failure keeps the identical shape of a bad token, because an attacker
+		// probing passwords must not learn that the token is real.
+		if errors.Is(err, store.ErrSharePasswordThrottled) {
+			w.Header().Set("Retry-After", "900")
+			writeError(w, http.StatusTooManyRequests, "rate_limited",
+				"too many password attempts on this link; try again later")
+			return
+		}
 		writeError(w, http.StatusNotFound, "not_found", "this link is not available")
 		return
 	}

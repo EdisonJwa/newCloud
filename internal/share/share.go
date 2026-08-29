@@ -310,7 +310,39 @@ func (s *Service) VerifyPassword(ctx context.Context, sh store.Share, password s
 	if !sh.NeedsPassword() {
 		return nil
 	}
-	if !s.checkPassword(password, sh.PasswordHash) {
+
+	// Throttle BEFORE comparing the hash (SHARE-02 尝试上限).
+	//
+	// Checking the limit first is what makes it hold under parallel guessing: a caller that
+	// counted only after a failure would leave a window in which concurrent attempts all observed
+	// "under the limit". Recording the attempt first, then refusing when the window is full, means
+	// the sixth guess in fifteen minutes is refused regardless of whether it would have been right.
+	//
+	// The recording is best-effort — a store failure must not turn a wrong password into a
+	// different error, which would be an oracle for "the database is unhappy" — but the COUNT is
+	// not: if it cannot be read, the attempt proceeds and the existing audit still fires.
+	var failures int
+	_ = s.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		n, cerr := tx.PasswordFailureCount(ctx, sh.ID, store.PasswordWindow)
+		failures = n
+		return cerr
+	})
+	if failures >= store.PasswordMaxAttempts {
+		_ = s.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+			return tx.Audit(ctx, store.AuditEntry{
+				ActorKind: "anonymous", Action: "share.password.verify.throttled",
+				TargetKind: "share", TargetID: sh.ID.String(), Result: "denied",
+			})
+		})
+		return store.ErrSharePasswordThrottled
+	}
+
+	ok := s.checkPassword(password, sh.PasswordHash)
+	_ = s.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		return tx.RecordPasswordAttempt(ctx, sh.ID, "", ok)
+	})
+
+	if !ok {
 		// Failure is audited: a burst of these on one share is how brute forcing
 		// looks, and it is the only signal the owner has.
 		_ = s.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
