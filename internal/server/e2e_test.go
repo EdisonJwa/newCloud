@@ -1431,3 +1431,102 @@ func TestSharePasswordBruteForceIsThrottled(t *testing.T) {
 			"right guess still tells an attacker when they found it.", code)
 	}
 }
+
+// TestAnonymousDeliveryIsOwnedAndQuotaCharged is SHARE-04/SHARE-06's open policy question:
+// "匿名投递的数据归谁、如何计入配额" — who owns an anonymous delivery, and how is it counted.
+//
+// The answers the implementation gives are: the OWNER, and the owner's quota. Both were
+// unasserted. The consequence of getting either wrong is quiet — a drop box that does not charge
+// quota is unbounded, and a drop box that assigns the file to the uploader would make an anonymous
+// visitor the owner of something in the owner's directory.
+func TestAnonymousDeliveryIsOwnedAndQuotaCharged(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	h.do(http.MethodPost, "/api/files/mkdir",
+		strings.NewReader(`{"path":"inbox"}`), map[string]string{"Content-Type": "application/json"}).
+		Body.Close()
+
+	resp := h.do(http.MethodPost, "/api/shares/",
+		strings.NewReader(`{"path":"inbox","kind":"request","hide_contents":true}`),
+		map[string]string{"Content-Type": "application/json"})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create request share: %d %s", resp.StatusCode, readBody(resp))
+	}
+	created := decode(t, resp)
+	token, _ := created["token"].(string)
+
+	// Read the owner's usage straight from the store: the point is what the store recorded, not
+	// what an endpoint reports.
+	usedBytes := func() int64 {
+		var used int64
+		_ = h.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+			u, uerr := tx.UserByID(ctx, h.user.ID)
+			if uerr == nil {
+				used = u.UsedBytes
+			}
+			return uerr
+		})
+		return used
+	}
+	usedBefore := usedBytes()
+
+	const payload = "anonymous delivery bytes"
+	body := &bytes.Buffer{}
+	mw := multipart.NewWriter(body)
+	fw, _ := mw.CreateFormFile("file", "delivered.txt")
+	_, _ = io.WriteString(fw, payload)
+	_ = mw.Close()
+
+	up, err := http.Post(h.srv.URL+"/s/"+token+"/upload", mw.FormDataContentType(), body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	up.Body.Close()
+	if up.StatusCode != http.StatusCreated {
+		t.Fatalf("anonymous upload: %d", up.StatusCode)
+	}
+
+	// Owned by the OWNER of the share, not by any uploader identity. A drop box that assigned the
+	// file to the visitor would put content in the owner's tree that the owner does not own.
+	var owned bool
+	_ = h.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		// Walk the owner's inbox directory rather than the recent list: the delivery must be
+		// reachable in the OWNER's tree, which is the claim being tested.
+		root, rerr := tx.EnsureRoot(ctx, h.user.ID)
+		if rerr != nil {
+			return rerr
+		}
+		kids, kerr := tx.Children(ctx, root.ID, 100)
+		if kerr != nil {
+			return kerr
+		}
+		for _, kid := range kids {
+			if kid.Name != "inbox" {
+				continue
+			}
+			delivered, derr := tx.Children(ctx, kid.ID, 100)
+			if derr != nil {
+				return derr
+			}
+			for _, d := range delivered {
+				if d.Name == "delivered.txt" {
+					owned = true
+				}
+			}
+		}
+		return nil
+	})
+	if !owned {
+		t.Fatal("the anonymous delivery does not belong to the share owner: it is not reachable in " +
+			"the owner's namespace, so a drop box would accept files nobody can find")
+	}
+
+	// And it is charged to the owner's quota. Without this a drop box is unbounded storage that
+	// every other tenant's limit does not constrain.
+	if got := usedBytes(); got <= usedBefore {
+		t.Fatalf("used_bytes did not move after a %d-byte anonymous delivery (%d -> %d). Anonymous "+
+			"deliveries must count against the owner's quota or the drop box is unbounded.",
+			len(payload), usedBefore, got)
+	}
+}

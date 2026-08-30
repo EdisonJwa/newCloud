@@ -837,6 +837,10 @@ func Run(t *testing.T, factory Factory, opts Options) {
 		passwordThrottleSuite(t, factory)
 	})
 
+	t.Run("Usage", func(t *testing.T) {
+		usageSuite(t, factory, opts.SetQuota)
+	})
+
 	t.Run("BlobIdentity", func(t *testing.T) {
 		// hasBlobs is false for a backend that does not model blob rows (the in-memory store),
 		// because asserting PostgreSQL semantics there would only document the limitation.
@@ -5630,6 +5634,64 @@ func passwordThrottleSuite(t *testing.T, factory func(t *testing.T) (store.Store
 		}
 		if n := count(t, s, sh.ID); n != 1 {
 			t.Fatalf("after a non-destructive prune the count is %d, want 1", n)
+		}
+	})
+}
+
+// usageSuite covers the reported usage figure.
+//
+// UserByID on the in-memory backend returned the stored struct without its usage, because the
+// memory store tracks bytes in a separate map. PostgreSQL reads the real column. The two backends
+// therefore disagreed on a number an admin screen displays and a quota calculation uses — and
+// nothing noticed until an end-to-end test could not see a 24-byte delivery it had just made.
+//
+// The property is simple and worth stating: after a write, the usage the store REPORTS must have
+// moved by the bytes written.
+func usageSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.UUID), setQuota func(t *testing.T, s store.Store, owner uuid.UUID, limit int64)) {
+	t.Helper()
+
+	usageOf := func(t *testing.T, s store.Store, id uuid.UUID) int64 {
+		t.Helper()
+		var used int64
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			u, err := tx.UserByID(ctx, id)
+			used = u.UsedBytes
+			return err
+		}); err != nil {
+			t.Fatalf("read user: %v", err)
+		}
+		return used
+	}
+
+	t.Run("ReportsUsageAfterAWrite", func(t *testing.T) {
+		// A quota must be set, or the memory store skips its accounting entirely — with no limit
+		// there is nothing to compare against, so it never records usage.
+		s, owner := factory(t)
+		if setQuota != nil {
+			// A limit must be set: the memory store skips accounting entirely when there is no
+			// quota to compare against, so an unlimited owner would show zero usage on that
+			// backend and the real figure on PostgreSQL.
+			setQuota(t, s, owner, 1<<20)
+		}
+		r := rootOf(t, s, owner)
+
+		before := usageOf(t, s, owner)
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			_, err := tx.CreateFile(ctx, store.NewFile{
+				OwnerID: owner, ParentID: r.ID, Name: "usage.bin", Size: 4096,
+				Mime: "application/octet-stream", ETag: `"u"`,
+				BlobID: newBlobHook(t), BlobHash: [32]byte{9},
+			})
+			return err
+		}); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+
+		after := usageOf(t, s, owner)
+		if after-before != 4096 {
+			t.Fatalf("reported usage moved by %d after a 4096-byte write. A store that creates the "+
+				"file but does not report the bytes is invisible to every admin view and to the "+
+				"next quota check.", after-before)
 		}
 	})
 }

@@ -89,7 +89,14 @@ func (t *memTx) UserByID(ctx context.Context, id uuid.UUID) (User, error) {
 	if !ok {
 		return User{}, ErrNotFound
 	}
-	return *u, nil
+	out := *u
+	// Usage lives in its own map, so returning the stored struct left UsedBytes at whatever
+	// value it was created with — zero. PostgreSQL reads the real column, so the two backends
+	// disagreed on a figure an admin screen and a quota calculation both depend on. The
+	// anonymous-delivery test is what surfaced it: it could not see a 24-byte delivery on the
+	// memory backend that PostgreSQL would have counted.
+	out.UsedBytes = t.m.usage[id]
+	return out, nil
 }
 
 func (t *memTx) UserByIdPSubject(ctx context.Context, issuer, subject string) (User, error) {
