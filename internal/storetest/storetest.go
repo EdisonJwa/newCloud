@@ -2511,12 +2511,31 @@ func Run(t *testing.T, factory Factory, opts Options) {
 				t.Fatal(err)
 			}
 
-			// Disable, then delete.
+			// liveSessionID is minted between the disable and the delete, below.
+			var liveSessionID string
+
+			// Disable first — which revokes the credentials that exist at this moment.
+			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				_, serr := tx.SetUserStatus(ctx, victim.ID, store.StatusDisabled)
+				return serr
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			// A session minted AFTER the disable but BEFORE the delete. This is the case
+			// DeleteUser's own revocation exists for: the disable cannot have caught it.
+			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				liveSessionID = uuid.New().String()
+				return tx.CreateSession(ctx, store.Session{
+					ID: liveSessionID, UserID: victim.ID,
+					ExpiresAt: time.Now().Add(time.Hour), AuthMethod: "oidc",
+				})
+			}); err != nil {
+				t.Fatalf("mint a session between disable and delete: %v", err)
+			}
+
 			var res store.DeleteUserResult
 			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
-				if _, serr := tx.SetUserStatus(ctx, victim.ID, store.StatusDisabled); serr != nil {
-					return serr
-				}
 				r, derr := tx.DeleteUser(ctx, victim.ID)
 				res = r
 				return derr
@@ -2541,7 +2560,7 @@ func Run(t *testing.T, factory Factory, opts Options) {
 			// Credentials are gone. The counts may be zero here because disabling already
 			// revoked them — what matters is the end state, not which step did it. Asserting on
 			// the count would make this test depend on the two-step flow having been skipped.
-			var liveSessions, livePasswords int
+			var livePasswords int
 			_ = s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
 				list, lerr := tx.ListAppPasswords(ctx, victim.ID)
 				for _, ap := range list {
@@ -2554,22 +2573,22 @@ func Run(t *testing.T, factory Factory, opts Options) {
 			if livePasswords != 0 {
 				t.Fatalf("no live app password may remain, got %d", livePasswords)
 			}
-			// A session minted after the disable, then deleted, also has to be dead: that is the
-			// case this assertion exists for.
-			var lateSessionID string
-			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
-				victim2 := victim
-				victim2.Status = store.StatusActive
-				lateSessionID = uuid.New().String()
-				_ = victim2
+			// The session minted before the delete must be dead now.
+			//
+			// This assertion replaces scaffolding: a comment promising it, a closure that created
+			// a random uuid and discarded it, and five `_ =` suppressions. Nothing was checked, so
+			// the property the comment described was never tested — and a session outliving its
+			// account is exactly the "deleted account still working" failure ID-08 prevents.
+			var alive bool
+			_ = s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				alive, _ = tx.SessionLive(ctx, liveSessionID)
 				return nil
-			}); err != nil {
-				t.Fatal(err)
+			})
+			if alive {
+				t.Fatal("a session minted before the account was deleted still reports itself live. " +
+					"A deleted account whose session works is not deleted, and ID-08 requires the " +
+					"session to end with the account.")
 			}
-			_ = lateSessionID
-			_ = liveSessions
-			_ = res.SessionsRevoked
-			_ = res.AppPasswordsRevoked
 
 			// The audit history survived, and the count says so.
 			if res.AuditRowsKept == 0 {
