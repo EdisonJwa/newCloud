@@ -5694,4 +5694,93 @@ func usageSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.UUID
 				"next quota check.", after-before)
 		}
 	})
+
+	// Every way of LOOKING UP a user has to report the same figures.
+	//
+	// Usage and limit are what an admin screen and /api/me display, and they live outside the
+	// stored identity struct. One backend filled them on one lookup path and not on the others, so
+	// the number depended on WHICH METHOD had answered — /api/me showed zero while the ACL path
+	// showed the truth. A single-field fix would have left the next path wrong.
+	t.Run("EveryLookupReportsTheSameFigures", func(t *testing.T) {
+		s, owner := factory(t)
+		if setQuota != nil {
+			setQuota(t, s, owner, 1<<20)
+		}
+		r := rootOf(t, s, owner)
+
+		// Give the account a known quota and usage, then read it back four ways.
+		var wantUsed, wantQuota int64
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			if _, err := tx.CreateFile(ctx, store.NewFile{
+				OwnerID: owner, ParentID: r.ID, Name: "figure.bin", Size: 1000,
+				Mime: "application/octet-stream", ETag: `"f"`,
+				BlobID: newBlobHook(t), BlobHash: [32]byte{7},
+			}); err != nil {
+				return err
+			}
+			u, err := tx.UserByID(ctx, owner)
+			wantUsed, wantQuota = u.UsedBytes, u.QuotaBytes
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if wantUsed != 1000 {
+			t.Fatalf("UserByID reports used_bytes=%d after a 1000-byte write", wantUsed)
+		}
+		if wantQuota != 1<<20 {
+			t.Fatalf("UserByID reports quota_bytes=%d, want the configured %d", wantQuota, int64(1<<20))
+		}
+
+		// Read the owner's OWN identity so the lookups below address a real account rather than
+		// guessing fixture values. The fixture is not ours, and asserting its shape has already
+		// produced three failures in this suite.
+		var self store.User
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			u, err := tx.UserByID(ctx, owner)
+			self = u
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		lookups := map[string]func(context.Context, store.Tx) (store.User, error){
+			"UserByID": func(ctx context.Context, tx store.Tx) (store.User, error) {
+				return tx.UserByID(ctx, owner)
+			},
+			"UserByUsername": func(ctx context.Context, tx store.Tx) (store.User, error) {
+				return tx.UserByUsername(ctx, self.Username)
+			},
+			"UserByEmail": func(ctx context.Context, tx store.Tx) (store.User, error) {
+				return tx.UserByEmail(ctx, self.Email)
+			},
+			"UserByIdPSubject": func(ctx context.Context, tx store.Tx) (store.User, error) {
+				return tx.UserByIdPSubject(ctx, self.IdPIssuer, self.IdPSubject)
+			},
+		}
+		// An account created outside an IdP — a breakglass or local account — has no subject, so
+		// that lookup cannot resolve it. That is a real state, not a failure, and skipping it here
+		// keeps the case about the figures rather than about provisioning.
+		if self.IdPSubject == "" {
+			delete(lookups, "UserByIdPSubject")
+		}
+		{
+		}
+		for name, fn := range lookups {
+			var got store.User
+			err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				u, err := fn(ctx, tx)
+				got = u
+				return err
+			})
+			if err != nil {
+				t.Fatalf("%s could not resolve the account it was given: %v. Every lookup must "+
+					"reach the same account, or one screen shows a user another cannot find.", name, err)
+			}
+			if got.UsedBytes != wantUsed || got.QuotaBytes != wantQuota {
+				t.Fatalf("%s reports used=%d quota=%d while UserByID reports %d and %d. The figure "+
+					"must not depend on which method answered the question.",
+					name, got.UsedBytes, got.QuotaBytes, wantUsed, wantQuota)
+			}
+		}
+	})
 }

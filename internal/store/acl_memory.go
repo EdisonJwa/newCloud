@@ -125,7 +125,7 @@ var _ = time.Now
 func (t *memTx) UserByUsername(ctx context.Context, username string) (User, error) {
 	for _, u := range t.m.users {
 		if strings.EqualFold(u.Username, username) {
-			return *u, nil
+			return t.hydrateUser(*u), nil
 		}
 	}
 	return User{}, ErrNotFound
@@ -135,7 +135,7 @@ func (t *memTx) UserByUsername(ctx context.Context, username string) (User, erro
 func (t *memTx) UserByEmail(ctx context.Context, email string) (User, error) {
 	for _, u := range t.m.users {
 		if strings.EqualFold(u.Email, email) {
-			return *u, nil
+			return t.hydrateUser(*u), nil
 		}
 	}
 	return User{}, ErrNotFound

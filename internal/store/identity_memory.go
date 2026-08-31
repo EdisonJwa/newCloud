@@ -89,20 +89,30 @@ func (t *memTx) UserByID(ctx context.Context, id uuid.UUID) (User, error) {
 	if !ok {
 		return User{}, ErrNotFound
 	}
-	out := *u
-	// Usage lives in its own map, so returning the stored struct left UsedBytes at whatever
-	// value it was created with — zero. PostgreSQL reads the real column, so the two backends
-	// disagreed on a figure an admin screen and a quota calculation both depend on. The
-	// anonymous-delivery test is what surfaced it: it could not see a 24-byte delivery on the
-	// memory backend that PostgreSQL would have counted.
-	out.UsedBytes = t.m.usage[id]
-	return out, nil
+	return t.hydrateUser(*u), nil
+}
+
+// hydrateUser fills the fields that live outside the stored struct.
+//
+// Usage and limit are separate maps because they are mutable counters rather than identity
+// attributes. Returning the struct as stored left both at whatever value the account was created
+// with — zero. PostgreSQL reads the real columns, so the two backends disagreed on two figures
+// that reach a user (/api/me reports quota_bytes) and an administrator (the user list reports
+// both).
+//
+// A helper rather than two lines in one method, because there are FIVE places that return a User
+// from this backend and only one of them was fixed first. The next one to return a raw struct
+// would have reintroduced the same silent zero.
+func (t *memTx) hydrateUser(u User) User {
+	u.UsedBytes = t.m.usage[u.ID]
+	u.QuotaBytes = t.m.quota[u.ID]
+	return u
 }
 
 func (t *memTx) UserByIdPSubject(ctx context.Context, issuer, subject string) (User, error) {
 	for _, u := range t.m.users {
 		if u.IdPIssuer == issuer && u.IdPSubject == subject {
-			return *u, nil
+			return t.hydrateUser(*u), nil
 		}
 	}
 	return User{}, ErrNotFound
