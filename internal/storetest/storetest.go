@@ -841,6 +841,10 @@ func Run(t *testing.T, factory Factory, opts Options) {
 		usageSuite(t, factory, opts.SetQuota)
 	})
 
+	t.Run("VersionChecksum", func(t *testing.T) {
+		versionChecksumSuite(t, factory)
+	})
+
 	t.Run("BlobIdentity", func(t *testing.T) {
 		// hasBlobs is false for a backend that does not model blob rows (the in-memory store),
 		// because asserting PostgreSQL semantics there would only document the limitation.
@@ -5780,6 +5784,68 @@ func usageSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.UUID
 				t.Fatalf("%s reports used=%d quota=%d while UserByID reports %d and %d. The figure "+
 					"must not depend on which method answered the question.",
 					name, got.UsedBytes, got.QuotaBytes, wantUsed, wantQuota)
+			}
+		}
+	})
+}
+
+// versionChecksumSuite covers §8.1's 内容校验信息 requirement: every version carries a checksum.
+//
+// The column was always reachable — versions.blob_id points at blobs.sha256 — but no query joined
+// it, so the version list reported a number, a size and a date with no way to verify the bytes.
+// A version you cannot check is a version you have to trust.
+func versionChecksumSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.UUID)) {
+	t.Helper()
+
+	t.Run("EachVersionCarriesItsContentAddress", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+
+		// Two distinct contents, so a store that returned the node's CURRENT hash for every
+		// version would be caught: the version must report the hash of ITS OWN bytes.
+		hashes := [][32]byte{{0x11}, {0x22}}
+
+		var node store.Node
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			var e error
+			node, e = tx.CreateFile(ctx, store.NewFile{
+				OwnerID: owner, ParentID: r.ID, Name: "versioned.bin", Size: 4,
+				Mime: "application/octet-stream", ETag: `"v1"`,
+				BlobID: newBlobHook(t), BlobHash: hashes[0],
+			})
+			return e
+		}); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+
+		// One update, keeping a version.
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			_, e := tx.UpdateFile(ctx, store.UpdateFile{
+				NodeID: node.ID, BlobID: newBlobHook(t), Size: 5,
+				ETag: `"v2"`, BlobHash: hashes[1], KeepVersion: true,
+			})
+			return e
+		}); err != nil {
+			t.Fatalf("update: %v", err)
+		}
+
+		var versions []store.Version
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			v, e := tx.Versions(ctx, node.ID, 10)
+			versions = v
+			return e
+		}); err != nil {
+			t.Fatalf("versions: %v", err)
+		}
+		if len(versions) == 0 {
+			t.Fatal("the update kept no version, so there is nothing to check")
+		}
+
+		for _, v := range versions {
+			if len(v.SHA256) != 32 {
+				t.Fatalf("version %d carries %d checksum bytes, want 32. §8.1 requires every "+
+					"version to have 内容校验信息 so a client can verify the bytes it downloads.",
+					v.VersionNo, len(v.SHA256))
 			}
 		}
 	})

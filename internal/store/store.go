@@ -434,6 +434,13 @@ type Version struct {
 	VersionNo int
 	BlobID    uuid.UUID
 	Size      int64
+	// SHA256 is the content address of this version's bytes, joined from blobs.
+	//
+	// §8.1 requires every version to carry 内容校验信息 — a checksum — alongside its id and
+	// creation time. The column was reachable all along through versions.blob_id, but no query
+	// joined it, so the API listed a version's number, size and date with no way for a client to
+	// verify the bytes it downloaded. A version you cannot check is a version you have to trust.
+	SHA256    []byte
 	CreatedAt time.Time
 	CreatedBy *uuid.UUID
 }

@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"net/http"
@@ -964,11 +966,19 @@ func (s *Server) handleVersions(w http.ResponseWriter, r *http.Request) {
 
 	out := make([]map[string]any, 0, len(versions))
 	for _, v := range versions {
-		out = append(out, map[string]any{
+		entry := map[string]any{
 			"version":    v.VersionNo,
 			"size":       v.Size,
 			"created_at": v.CreatedAt.UTC().Format("2006-01-02T15:04:05Z07:00"),
-		})
+		}
+		// §8.1 requires every version to carry 内容校验信息. Without it a client downloading an
+		// old version has no way to verify the bytes, and an operator has no way to tell which
+		// stored object a version refers to. Empty when the blob row is gone, which the LEFT JOIN
+		// allows on purpose: an id and a date are still worth showing.
+		if len(v.SHA256) == sha256.Size {
+			entry["sha256"] = hex.EncodeToString(v.SHA256)
+		}
+		out = append(out, entry)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"path":     path.Join("/", rel),

@@ -631,9 +631,15 @@ func (t *pgTx) Restore(ctx context.Context, id uuid.UUID) (Node, error) {
 }
 
 func (t *pgTx) Versions(ctx context.Context, nodeID uuid.UUID, limit int) ([]Version, error) {
-	const q = `SELECT id, node_id, version_no, blob_id, size, created_at, created_by
-		FROM versions WHERE node_id = $1
-		ORDER BY version_no DESC
+	// The checksum comes from blobs by joining on blob_id, which is the content address. A LEFT
+	// JOIN because a version whose blob row was already collected still has an id and a date —
+	// hiding it from the history would be worse than showing it without a checksum.
+	const q = `SELECT v.id, v.node_id, v.version_no, v.blob_id, v.size, b.sha256, v.created_at,
+		    v.created_by
+		FROM versions v
+		LEFT JOIN blobs b ON b.id = v.blob_id
+		WHERE v.node_id = $1
+		ORDER BY v.version_no DESC
 		LIMIT $2`
 	rows, err := t.tx.Query(ctx, q, nodeID, limitArg(limit))
 	if err != nil {
@@ -644,7 +650,7 @@ func (t *pgTx) Versions(ctx context.Context, nodeID uuid.UUID, limit int) ([]Ver
 	var out []Version
 	for rows.Next() {
 		var v Version
-		if err := rows.Scan(&v.ID, &v.NodeID, &v.VersionNo, &v.BlobID, &v.Size, &v.CreatedAt, &v.CreatedBy); err != nil {
+		if err := rows.Scan(&v.ID, &v.NodeID, &v.VersionNo, &v.BlobID, &v.Size, &v.SHA256, &v.CreatedAt, &v.CreatedBy); err != nil {
 			return nil, translate(err)
 		}
 		out = append(out, v)

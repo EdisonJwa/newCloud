@@ -484,6 +484,9 @@ func (t *memTx) UpdateFile(ctx context.Context, u UpdateFile) (Node, error) {
 			VersionNo: len(rec.versions) + 1,
 			BlobID:    *rec.node.BlobID,
 			Size:      rec.node.Size,
+			// The checksum travels with the version (§8.1 内容校验信息). PostgreSQL joins it
+			// from blobs; here the blob address is already in hand, so it is stored directly.
+			SHA256:    append([]byte(nil), rec.blob[:]...),
 			CreatedAt: rec.node.ModifiedAt,
 		})
 		if u.MaxVersions > 0 && len(rec.versions) > u.MaxVersions {
@@ -762,6 +765,7 @@ func (t *memTx) RestoreVersion(ctx context.Context, nodeID uuid.UUID, versionNo 
 			VersionNo: len(rec.versions) + 1,
 			BlobID:    *rec.node.BlobID,
 			Size:      rec.node.Size,
+			SHA256:    append([]byte(nil), rec.blob[:]...),
 			CreatedAt: rec.node.ModifiedAt,
 		})
 	}
