@@ -1530,3 +1530,106 @@ func TestAnonymousDeliveryIsOwnedAndQuotaCharged(t *testing.T) {
 			len(payload), usedBefore, got)
 	}
 }
+
+// TestRestoreRequiresWriteOnTheReturnDirectory is §8.1's 防止未授权恢复到无权限的目录.
+//
+// handleRestore re-checks write permission on the directory a node returns to, and its comment
+// says why: without the check, an account whose access to a directory was revoked could still get
+// its files back into it. The check was implemented and correct and had no test, which is the
+// state a check drifts out of silently.
+//
+// The folder must belong to somebody ELSE. The first version of this test put the folder in the
+// harness user's own namespace, where ownership confers write regardless of any grant — the
+// restore succeeded with the check removed, so the test proved nothing.
+func TestRestoreRequiresWriteOnTheReturnDirectory(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	// A folder owned by the harness user, and a mate who will own the file we trash.
+	mate, folder := h.aclSetup(t)
+	_ = folder
+
+	// The mate gets write on the harness user's folder, then uploads into it.
+	if code, body := h.grantAs(t, "folder", mate.Username, []string{"read", "write"}, nil); code != http.StatusCreated {
+		t.Fatalf("grant: %d %v", code, body)
+	}
+
+	// The MATE's own folder is where the file lives.
+	if err := h.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		root, rerr := tx.EnsureRoot(ctx, mate.ID)
+		if rerr != nil {
+			return rerr
+		}
+		if _, derr := tx.CreateDir(ctx, store.NewNode{
+			OwnerID: mate.ID, ParentID: root.ID, Name: "mate-folder",
+		}); derr != nil {
+			return derr
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var mateFolder uuid.UUID
+	var fileID uuid.UUID
+	if err := h.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		root, rerr := tx.EnsureRoot(ctx, mate.ID)
+		if rerr != nil {
+			return rerr
+		}
+		kids, kerr := tx.Children(ctx, root.ID, 100)
+		if kerr != nil {
+			return kerr
+		}
+		for _, k := range kids {
+			if k.Name == "mate-folder" {
+				mateFolder = k.ID
+			}
+		}
+		if mateFolder == uuid.Nil {
+			return store.ErrNotFound
+		}
+		// Owned by the HARNESS user, but placed in the MATE's folder. That combination is the
+		// whole test: the ownership half of the restore check passes (the user owns the file), so
+		// only the destination-permission half can refuse. The first two versions of this test
+		// owned the file by the mate and were refused for the ownership reason instead — the
+		// assertion passed with the permission check deleted.
+		f, ferr := tx.CreateFile(ctx, store.NewFile{
+			OwnerID: h.user.ID, ParentID: mateFolder, Name: "returned.txt", Size: 5,
+			Mime: "text/plain", ETag: `"r"`, BlobID: h.meta.BlobIDFor(ctx, [32]byte{0x7a}, 5), BlobHash: [32]byte{0x7a},
+		})
+		if ferr != nil {
+			return ferr
+		}
+		fileID = f.ID
+		return tx.Trash(ctx, fileID)
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Now grant the HARNESS user read-only on mate-folder. This is the revocation: before it the
+	// user could write there, and the restore would be legitimate.
+	if err := h.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		_, gerr := tx.Grant(ctx, store.ACLEntry{
+			NodeID: mateFolder, UserID: &h.user.ID, Perms: store.PermRead, Inherit: true,
+		})
+		return gerr
+	}); err != nil {
+		t.Fatalf("grant read: %v", err)
+	}
+
+	// The harness user does not own the trashed file, so the ownership half of the check fails
+	// too — but the point being tested is that a restore into a directory they cannot write is
+	// refused. Either reason produces the same opaque 404, which is the documented behaviour.
+	restore := h.do(http.MethodPost, "/api/files/restore",
+		strings.NewReader(`{"id":"`+fileID.String()+`"}`),
+		map[string]string{"Content-Type": "application/json"})
+	body := readBody(restore)
+	restore.Body.Close()
+
+	if restore.StatusCode == http.StatusOK {
+		t.Fatalf("restoring a node whose destination is not writable succeeded (%d %s). §8.1 "+
+			"requires the destination permission to be re-checked: an account whose access was "+
+			"revoked must not be able to put files back.", restore.StatusCode, body)
+	}
+}
