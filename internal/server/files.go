@@ -39,6 +39,14 @@ type fileJSON struct {
 	// delivered through (SHARE-05 保留期限). Exposed so a user whose delivery disappears can see
 	// why, rather than concluding the file was lost.
 	RetainUntil string `json:"retain_until,omitempty"`
+	// PurgeAt is when a trashed item will be deleted for good (§8.1 保留期清理). Exposed for the
+	// same reason RetainUntil is: trash_retention_days is enforced by a background sweep, so an
+	// item disappears with no further interaction. A user who cannot see the deadline cannot act
+	// before it, and the loss then looks arbitrary. Absent when retention is zero, because "kept
+	// forever" and "deleted at some date" are different promises.
+	PurgeAt string `json:"purge_at,omitempty"`
+	// TrashedAt is when the item was deleted, which is the reference point PurgeAt counts from.
+	TrashedAt string `json:"trashed_at,omitempty"`
 	// Preview tells the client which renderer to use, or omits the field when the file
 	// downloads instead. It is advisory: the download endpoint re-checks the type and the
 	// bytes, so a stale value cannot make the server inline something it refuses.
@@ -852,15 +860,31 @@ func (s *Server) handleTrashList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	retention := s.deps.Config.Limits.TrashRetention()
+
 	out := make([]fileJSON, 0, len(nodes))
 	for _, n := range nodes {
 		item := toFileJSON(n, path.Join("/", n.Name))
 		item.ID = n.ID.String()
 		item.Trashed = true
+		item.TrashedAt = ""
+		if n.TrashedAt != nil {
+			item.TrashedAt = n.TrashedAt.UTC().Format("2006-01-02T15:04:05Z07:00")
+			if retention > 0 {
+				item.PurgeAt = n.TrashedAt.Add(retention).
+					UTC().Format("2006-01-02T15:04:05Z07:00")
+			}
+		}
 		out = append(out, item)
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{"items": out})
+	body := map[string]any{"items": out}
+	// The window itself, so a client can explain the deadline without hardcoding a number that
+	// the operator may have changed.
+	if retention > 0 {
+		body["retention_days"] = int(retention.Hours() / 24)
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 // handleRestore un-deletes a node and its subtree.

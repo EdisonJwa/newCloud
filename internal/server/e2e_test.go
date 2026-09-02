@@ -1633,3 +1633,84 @@ func TestRestoreRequiresWriteOnTheReturnDirectory(t *testing.T) {
 			"revoked must not be able to put files back.", restore.StatusCode, body)
 	}
 }
+
+// TestTrashListingReportsThePurgeDeadline is §8.1's 保留期清理, made visible.
+//
+// TrashRetentionDays is enforced by a background sweep, so a trashed item is deleted with no
+// further interaction from the user. The listing said only "trashed" — never when it would go —
+// so a user could not act before the deadline and the loss looked arbitrary. The same reasoning
+// that exposed a share delivery's retain_until applies here.
+func TestTrashListingReportsThePurgeDeadline(t *testing.T) {
+	h := newHarnessWith(t, func(c *config.Config) { c.Limits.TrashRetentionDays = 30 })
+
+	// Upload and trash a file.
+	body := &bytes.Buffer{}
+	mw := multipart.NewWriter(body)
+	_ = mw.WriteField("path", "")
+	fw, _ := mw.CreateFormFile("file", "doomed.txt")
+	_, _ = io.WriteString(fw, "bytes")
+	_ = mw.Close()
+	h.do(http.MethodPost, "/api/files/upload", body,
+		map[string]string{"Content-Type": mw.FormDataContentType()}).Body.Close()
+
+	// Actually trash it. The first version of this test only uploaded, so the listing it examined
+	// was empty and every assertion below it would have passed on a truly empty response.
+	del := h.do(http.MethodDelete, "/api/files/?path=doomed.txt", nil, nil)
+	del.Body.Close()
+	if del.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete: want 204, got %d", del.StatusCode)
+	}
+
+	resp := h.do(http.MethodGet, "/api/files/trash", nil, nil)
+	raw := readBody(resp)
+	resp.Body.Close()
+
+	var listed struct {
+		Items []struct {
+			Name    string `json:"name"`
+			PurgeAt string `json:"purge_at"`
+		} `json:"items"`
+		RetentionDays int `json:"retention_days"`
+	}
+	if err := json.Unmarshal([]byte(raw), &listed); err != nil {
+		t.Fatalf("decode trash: %v (%s)", err, raw)
+	}
+	if listed.RetentionDays != 30 {
+		t.Fatalf("the listing reports retention_days=%d, want 30. A client cannot explain a "+
+			"deadline it is not told.", listed.RetentionDays)
+	}
+	if len(listed.Items) != 1 {
+		t.Fatalf("the trash holds %d items, want the one that was just deleted: %s",
+			len(listed.Items), raw)
+	}
+	if listed.Items[0].PurgeAt == "" {
+		t.Fatalf("a trashed item does not report purge_at, so a user cannot act before the sweep "+
+			"deletes it: %s", raw)
+	}
+	// The deadline must be a real RFC 3339 timestamp in the future, not a placeholder.
+	when, perr := time.Parse(time.RFC3339, listed.Items[0].PurgeAt)
+	if perr != nil {
+		t.Fatalf("purge_at is not a timestamp: %q", listed.Items[0].PurgeAt)
+	}
+	if !when.After(time.Now()) {
+		t.Fatalf("purge_at %v is in the past", when)
+	}
+}
+
+// TestTrashPurgeDeadlineIsPerItem checks the per-item deadline on an EMPTY trash, which is the
+// only state this harness can produce without a clock override — the field must simply be absent
+// rather than fabricated.
+func TestTrashPurgeDeadlineIsAbsentWithNoRetention(t *testing.T) {
+	h := newHarnessWith(t, func(c *config.Config) { c.Limits.TrashRetentionDays = 0 })
+
+	resp := h.do(http.MethodGet, "/api/files/trash", nil, nil)
+	raw := readBody(resp)
+	resp.Body.Close()
+
+	// Zero retention means keep forever. Reporting a date would turn "we never delete this" into
+	// "we delete it on the 12th", which is a stronger and false promise.
+	if strings.Contains(raw, "retention_days") {
+		t.Fatalf("a zero retention still reported a retention_days field: %s. Zero means keep "+
+			"forever, and that is not a number of days.", raw)
+	}
+}
