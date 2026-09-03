@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/EdisonJwa/newCloud/internal/audit"
 	"github.com/EdisonJwa/newCloud/internal/auditverify"
 	"github.com/EdisonJwa/newCloud/internal/metrics"
 	"github.com/EdisonJwa/newCloud/internal/store"
@@ -266,7 +267,30 @@ func (w *Worker) PurgeTrash(ctx context.Context) (store.PurgeResult, error) {
 	err := w.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
 		got, perr := tx.PurgeTrash(ctx, w.trashRetention)
 		res = got
-		return perr
+		if perr != nil {
+			return perr
+		}
+		// Audited in the SAME transaction as the deletion (§8.1).
+		//
+		// After the rows are gone there is no remaining evidence of what removed them, so a
+		// separate audit write could claim a purge that was rolled back, or lose the record of one
+		// that committed. Only a row in this transaction is true exactly when the delete is.
+		//
+		// Nothing is written when nothing was deleted: a sweep every few minutes would otherwise
+		// fill the audit log with "deleted 0 items", which is the fastest way to make an audit log
+		// unreadable.
+		if got.Nodes == 0 {
+			return nil
+		}
+		return tx.Audit(ctx, store.AuditEntry{
+			ActorKind: "system", Action: string(audit.ActionTrashPurge),
+			TargetKind: "trash", TargetID: "retention",
+			Result: string(audit.ResultOK),
+			Metadata: map[string]any{
+				"nodes": got.Nodes, "roots": got.Roots, "bytes": got.Bytes,
+				"retention_seconds": int64(w.trashRetention.Seconds()),
+			},
+		})
 	})
 	return res, err
 }
@@ -280,7 +304,24 @@ func (w *Worker) ExpireVersions(ctx context.Context) (int, error) {
 	err := w.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
 		got, eerr := tx.ExpireVersions(ctx, w.versionRetention)
 		n = got
-		return eerr
+		if eerr != nil {
+			return eerr
+		}
+		// Same-transaction audit, same reasoning as the trash purge above. A version that
+		// disappears has no row left to explain itself, and "I could restore this last week" is
+		// answered by this event or by nothing.
+		if got == 0 {
+			return nil
+		}
+		return tx.Audit(ctx, store.AuditEntry{
+			ActorKind: "system", Action: string(audit.ActionVersionExpire),
+			TargetKind: "version", TargetID: "retention",
+			Result: string(audit.ResultOK),
+			Metadata: map[string]any{
+				"versions":          got,
+				"retention_seconds": int64(w.versionRetention.Seconds()),
+			},
+		})
 	})
 	return n, err
 }
@@ -351,6 +392,41 @@ func (w *Worker) SweepBlobs(ctx context.Context) (int, error) {
 			return removed, fmt.Errorf("worker: delete blob %s: %w", ref.ID, err)
 		}
 		removed++
+	}
+
+	// One audit row per RUN, not per blob.
+	//
+	// Per-blob would be correct in the transactional sense and wrong in every other: a first sweep
+	// of a large deployment collects thousands of blobs, and an audit log with thousands of
+	// "collected 1 blob" rows is one nobody reads. What an operator needs is the summary — when the
+	// collector ran, how much it took, and under what grace period.
+	//
+	// The honest limitation: this row is written AFTER the per-blob transactions, so a process that
+	// dies mid-loop leaves blobs deleted with no audit row. The deletes themselves are individually
+	// safe (DeleteBlob refuses anything still referenced), so the loss is a gap in the record, not a
+	// gap in the data. Recording that tradeoff here because the alternative — one row per blob — was
+	// rejected deliberately rather than overlooked.
+	if removed > 0 {
+		var bytes int64
+		for _, ref := range candidates {
+			bytes += ref.Size
+		}
+		if err := w.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+			return tx.Audit(ctx, store.AuditEntry{
+				ActorKind: "system", Action: string(audit.ActionBlobCollect),
+				TargetKind: "blob", TargetID: "gc",
+				Result: string(audit.ResultOK),
+				Metadata: map[string]any{
+					"blobs":           removed,
+					"candidate_bytes": bytes,
+					"grace_seconds":   int64(w.blobGrace.Seconds()),
+				},
+			})
+		}); err != nil {
+			// The bytes are already gone; failing the sweep now would only make the caller retry a
+			// collection it has already performed.
+			w.log.Error("could not audit blob collection", "error", err, "removed", removed)
+		}
 	}
 	return removed, nil
 }

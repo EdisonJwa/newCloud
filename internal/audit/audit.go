@@ -78,6 +78,21 @@ const (
 	ActionAuditExport       Action = "audit.export"
 	ActionPrivilegedRead    Action = "admin.privileged_read"
 
+	// Retention cleanups.
+	//
+	// §8.1 requires 对清理任务提供审计与可重复执行语义 — cleanup tasks must be auditable and
+	// safely repeatable. These are the events a user asks about after data disappears: not "what
+	// did I delete" but "what deleted this, and when". Without them the sweep is invisible in the
+	// audit log, and "the file vanished on Thursday" has no answer in the one place designed to
+	// give one.
+	//
+	// One event per RUN rather than per row: a sweep that deletes ten thousand trashed nodes must
+	// not write ten thousand audit rows, or the audit log becomes the noisiest thing in the
+	// database and operators stop reading it. The counts go in the metadata.
+	ActionTrashPurge    Action = "trash.purge"
+	ActionVersionExpire Action = "version.expire"
+	ActionBlobCollect   Action = "blob.collect"
+
 	// Anomalies.
 	ActionAnomaly Action = "security.anomaly"
 )
