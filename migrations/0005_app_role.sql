@@ -12,8 +12,8 @@
 --
 -- What is deliberately NOT done here:
 --   * No password. A password in a migration would be in version control forever, and every
---     environment would share it. The operator sets one (see deploy/README or the bootstrap
---     snippet in docs), or uses certificate/IAM auth.
+--     environment would share it. The operator sets one (see docs/guides/deployment.md),
+--     or uses certificate/IAM auth.
 --   * No pg_hba changes. Those are cluster configuration, not schema, and silently widening
 --     who may connect is not a migration's business.
 --   * The role is not granted membership in the superuser. It stays unprivileged.

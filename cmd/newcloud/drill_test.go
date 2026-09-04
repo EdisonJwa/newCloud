@@ -3,7 +3,7 @@ package main
 // Drill helper tests.
 //
 // The drill itself needs a live PostgreSQL and the client tools, so its end-to-end path is
-// exercised by running it (see docs/0011 §3). What can be tested without a database is the
+// exercised by running it (see docs/reference/implementation-record.md §3). What can be tested without a database is the
 // part where a mistake would silently weaken the drill: the identifier guard that stands
 // between the table list and string-built SQL.
 

@@ -26,8 +26,10 @@ auth:
     "cloud-admins": admin
     "cloud-users": user
   session_ttl: "12h"
-  # Every 256-bit token (session, app password, share, download grant) is indexed by
-  # an HMAC keyed with this secret, so rotating it invalidates all of them at once.
+  # HMAC key for browser session tickets, share-access cookies, and email
+  # verification codes. Rotating it invalidates those at once. App Passwords and
+  # share links are random values stored only as SHA-256 hashes, so they are not
+  # derived from this secret and survive a rotation.
   # Generate with: openssl rand -base64 48
   # At least 32 bytes; the process refuses to start with a short one.
   session_secret: "REPLACE-WITH-32-BYTES-OF-RANDOM"

@@ -257,7 +257,7 @@ func TestBackupDocsStateTheRightOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read restore-drill.md: %v", err)
 	}
-	if !strings.Contains(string(doc), "先 pg_dump，再备份 Blob") {
+	if !strings.Contains(string(doc), "Take the pg_dump first, then copy the blobs.") {
 		t.Fatalf("restore-drill.md must state that the database dump is taken BEFORE the blob " +
 			"copy. The order is not a style choice: content is stored before its row, so dumping " +
 			"first means a write in the window leaves an orphan blob (harmless), while copying " +
@@ -270,7 +270,7 @@ func TestBackupDocsStateTheRightOrder(t *testing.T) {
 		if strings.HasPrefix(strings.TrimSpace(line), "|") {
 			continue
 		}
-		if strings.Contains(line, "先备份 Blob，再 pg_dump") {
+		if strings.Contains(line, "Copy the blobs first, then pg_dump") {
 			t.Fatalf("restore-drill.md states the backwards order as an instruction:\n%s", line)
 		}
 	}
@@ -367,13 +367,13 @@ func TestRestoreOrderAdviceIsNotOverstated(t *testing.T) {
 	text := string(doc)
 
 	// The accurate framing must be present.
-	want := "恢复顺序：先恢复 Blob，再 pg_restore"
+	want := "Restore order: restore the blobs first, then run pg_restore."
 	if !strings.Contains(text, want) {
 		t.Fatalf("restore-drill.md must state the restore order (%q) and say that the wrong order "+
 			"is a transient outage rather than lost data", want)
 	}
 	// The overstatement must not be.
-	if strings.Contains(text, "反过来的话，同样会出现") {
+	if strings.Contains(text, "same dangling-reference problem") {
 		t.Fatal("restore-drill.md still claims the wrong restore order produces the same " +
 			"dangling-reference problem as the wrong backup order. It does not: backup order " +
 			"decides whether bytes were captured (permanent), restore order decides when they " +

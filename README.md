@@ -1,186 +1,290 @@
 # newCloud
 
-自托管的团队文件服务：**OIDC 单点登录 + WebDAV + 分享 + 审计**，单个 Go 二进制、单个数据库、单个进程。
+**A self-hosted file service for teams that need SSO, WebDAV, sharing, and an audit trail — without the PHP stack.**
 
-用 Go 重写 Nextcloud 的核心能力，去掉 PHP 技术栈。定位是"自己的文件服务器"，不是 Nextcloud 的替代品：不追求应用生态，只把文件存取、分享和外发做到可靠、可审计、可运维。
+One Go binary. One PostgreSQL database. One process.
 
-## 文档
+[![CI](https://github.com/EdisonJwa/newCloud/actions/workflows/ci.yml/badge.svg)](https://github.com/EdisonJwa/newCloud/actions/workflows/ci.yml)
+[![Go 1.26+](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go&logoColor=white)](https://go.dev)
+[![PostgreSQL 17](https://img.shields.io/badge/PostgreSQL-17-4169E1?logo=postgresql&logoColor=white)](https://www.postgresql.org)
 
-- [docs/0001-scope-and-language.md](docs/0001-scope-and-language.md) — 功能范围、语言选型与产品定位
-- [docs/0002-backend-skeleton-adr.md](docs/0002-backend-skeleton-adr.md) — 后端骨架：认证、授权、审计、WebDAV
-- [docs/0003-storage-layout.md](docs/0003-storage-layout.md) — 存储布局：blob / tree 两种摆放方式
-- [docs/0004-metadata-store.md](docs/0004-metadata-store.md) — 元数据层契约与实现约定
-- [docs/0010-functional-requirements-v0.2.md](docs/0010-functional-requirements-v0.2.md) — 功能需求与架构缺口分析（输入）
-- [docs/0011-contract-implementation-record.md](docs/0011-contract-implementation-record.md) — **跨模块契约的实现与验收记录（以及仍然缺什么）**
+newCloud is a small, opinionated replacement for the file-sharing core of Nextcloud: a
+namespace per account, a WebDAV endpoint that desktop clients can rely on, link and email
+sharing, versioning, a trash can, and a hash-chained audit log. It is built for operators who
+would rather run one binary and one database than maintain a PHP application, a job runner, a
+cache, and an app ecosystem.
 
-## 产品能力
+It is not a Nextcloud replacement. There is no app store, no calendar, no chat, and no plugin
+API. The scope is deliberately narrow: **store files, share them safely, and be able to prove
+who did what.**
 
-| 能力 | 实现情况 |
-|---|---|
-| 单点登录 | Pocket ID / 任意 OIDC（PKCE + state + **nonce**）；App Password 供 WebDAV 与脚本使用（作用域在 WebDAV 上生效）；**break-glass 本地管理员**：网段限制、审计、无需重启即可轮换 |
-| 多用户 | 每个账号独立命名空间、独立配额；按 IdP 组映射角色；**资源 ACL**（用户/群组授权、继承、`inherit=false` 中断、`manage_permissions` 可委托）；`POST /api/acl/` 管理授权 |
-| WebDAV | RFC 4918：PROPFIND/PROPPATCH/PUT/DELETE/MKCOL/COPY/MOVE/LOCK/UNLOCK、Range、`If-Match`/`If-None-Match` 与 412；**锁在所有写方法上生效且区分 `Depth: 0`（成员关系）与 `Depth: infinity`（子树内容）**，网页/API 写入同样受锁约束（423，需提交 token）；目录 COPY 递归、PUT 覆盖返回 204 |
-| 并发 | 网页上传、分片上传收尾、WebDAV PUT 共用同一套 `If-Match`/`If-None-Match` 仲裁，冲突返回 412 而非静默覆盖 |
-| 网页端 | 内置前端：列视图 + 网格、跨树搜索、拖拽上传、**大文件分片续传**、重命名、批量删除、回收站、应用密码管理；目录列表用**游标分页** |
-| 预览 | 图片、视频、音频、PDF、文本与源码在浏览器内直接查看；内联渲染走类型白名单 + 内容嗅探 + CSP sandbox，SVG/HTML 永不内联 |
-| 缩略图 | 服务端生成并缓存（仅标准库解码 PNG/JPEG/GIF），有像素上限、并发上限与解码截止时间 |
-| 分享 | 链接分享、密码、有效期、下载次数上限；`email` 分享限定收件人（一次性验证码，**单次使用 + 尝试限速**）；"投递箱"链接让别人向指定目录临时上传 |
-| 下载计数 | 按 `authorized_download_session` 计数：一次播放的多个 Range 请求只算一次下载，换访客/换文件/换版本重新计费 |
-| 回收站 | 恢复、按 `trash_retention_days` **真正永久删除**并释放配额；`version_retention_days` 清理历史版本 |
-| 审计 | 哈希链事件日志；`newcloud audit verify` 可独立校验并检测改写与**截断**；CSV/JSON 导出；INSERT-only 数据库角色（见限制） |
-| 存储 | 本地磁盘或 S3；`blob`（内容寻址去重）或 `tree`（镜像目录结构）两种布局 |
-| 检索 | 按名称/路径浏览；版本历史与恢复 |
+## Why newCloud
 
-## 设计决定
+- **OIDC is the front door.** Pocket ID and any compliant OpenID Connect provider work. Roles come
+  from IdP groups. WebDAV and scripts use scoped App Passwords, never browser cookies.
+- **WebDAV that behaves like a filesystem.** RFC 4918 class 2, real locks enforced on every write
+  path, `If-Match` / `If-None-Match` arbitration shared with the web UI, Range requests, recursive
+  COPY, and correct `Depth` semantics.
+- **Sharing with an exit.** Password-protected links, expiry, download caps, email shares with a
+  single-use code, and drop-box links that accept uploads into a chosen folder.
+- **An audit log that verifies offline.** Events are hash-chained. `newcloud audit verify` detects
+  edits and mid-chain rewrites, and daily anchors make deletion of the newest events visible.
+- **Storage that fits the deployment.** Content-addressed `blob` layout for deduplication, or a
+  `tree` layout that mirrors the user-visible filesystem. Local disk or S3.
+- **Honest failure modes.** Denials are `404`, not `403`. Audited writes fail closed. A write
+  that cannot be audited does not happen.
 
-以下几条不是实现细节，是产品行为，改动前请先读对应的 ADR。
+## Features
 
-**拒绝一律返回 404，不返回 403。** 区分"不存在"和"无权访问"等于免费提供目录枚举接口。
+| Area | Capability |
+| --- | --- |
+| **Authentication** | OIDC authorization code flow with PKCE, `state`, and `nonce`; group-to-role mapping; JIT provisioning (`open`, `pending`, `deny`) with a domain allowlist; break-glass local admin restricted by CIDR, with alerts on use |
+| **Accounts and quotas** | Per-account namespace, per-account quota, admin user management, account disable/delete with an auditable tombstone |
+| **Files** | Web UI with list and grid views, search, drag-and-drop upload, resumable chunked uploads, rename, bulk delete, trash, and version history |
+| **WebDAV** | `PROPFIND`, `PROPPATCH`, `PUT`, `DELETE`, `MKCOL`, `COPY`, `MOVE`, `LOCK`, `UNLOCK`, Range, ETags, conditional writes, and lock enforcement shared with the JSON API |
+| **Sharing** | Link shares with password, expiry, and download limits; email shares with one-time recipient codes; drop-box links; stable links across rename and move |
+| **Previews** | Images, video, audio, PDF, text, and source code in the browser; a type allowlist plus content sniffing; SVG and HTML are never rendered inline; server-side thumbnails with pixel, concurrency, and decode-time limits |
+| **Audit** | Hash-chained event log, external daily anchors, `audit verify`, CSV/JSON export, INSERT-only database role, fail-closed policy |
+| **Storage** | Content-addressed `blob` layout with deduplication or filesystem-mirroring `tree` layout; local disk or S3-compatible object storage; orphan GC, version retention, and periodic integrity scrubbing |
+| **Operations** | Single static binary, `/healthz`, `/readyz`, `/metrics`, 18 Prometheus alert rules, a complete runbook, backup scripts, an automated restore drill, and a `newcloud drill` subcommand |
 
-**两个独立的凭据体系。** 浏览器会话与 App Password 走不同路径，WebDAV 不接受会话 Cookie（桌面客户端无法完成 OIDC 跳转）。所有 256 位随机令牌用 HMAC 派生索引；只有人选的密码（分享密码、break-glass）才用 Argon2id——给随机令牌上 Argon2 只是给每个 WebDAV 请求增加 60ms，不带来安全性。
+## Architecture
 
-**每一次写操作与它的审计记录在同一个事务里。** 审计写入拒绝在未启用链式写入时静默通过，宁可报错也不留下无法追溯的变更。
+```text
+                    ┌─────────────────────────────────────────┐
+   browser ────────▶│  newcloud (single Go process)           │
+   WebDAV client ──▶│                                         │
+   share visitor ──▶│  JSON API  ·  web UI  ·  WebDAV         │
+                    │  public share pages  ·  OIDC callback   │
+                    │                                         │
+                    │  authz  ──▶  store  ──▶  audit          │
+                    │                 │                       │
+                    │                 └──▶ worker (GC, scrub) │
+                    └────────┬────────────────────┬───────────┘
+                             │                    │
+                    ┌────────▼────────┐  ┌────────▼─────────────┐
+                    │ PostgreSQL 17   │  │ blob/tree storage    │
+                    │ metadata, audit │  │ local disk or S3     │
+                    └─────────────────┘  └──────────────────────┘
+```
 
-**条件写入在改行的同一条语句里判断。** 先读后写在并发下必然丢更新；`WriteFile` 把前置条件、行锁和写入放在一起，网页与 WebDAV 因此不可能各用一套规则。
+The metadata tree, versions, quota accounting, shares, locks, sessions, jobs, and the audit chain
+all live in PostgreSQL. File bytes live in the content store. That split is what makes `blob`
+layout deduplicate and what lets `tree` layout be inspected with `ls` and backed up with
+`rsync`.
 
-**锁在写路径上强制，而不只在 LOCK 里记录。** 一个只存在于创建接口的锁，会让客户端误以为受到保护——这比没有锁更糟。
+## Quick start
 
-**存储布局的选择影响运维，不只是性能。** `blob` 去重、省空间、版本几乎免费，但 `ls` 看不到原文件名；`tree` 可以直接用 `rsync`/`ls` 操作，但每个版本是一份完整副本，且继承 Windows 保留字限制。两种都由同一套契约测试验证。
+Prerequisites: Go 1.26+ and Docker.
 
-**代码不假设"我是唯一进程"。** 会话、锁、任务队列都走数据库（`FOR UPDATE SKIP LOCKED` + lease）。单机部署是可以的，但这是部署选择，不是架构前提。
-
-## 快速开始（本地开发）
-
-需要 Go 1.26+ 与 Docker。
+The fastest way to see the product is the self-contained demo. It starts PostgreSQL in Docker, a
+bundled fake identity provider, a TLS proxy, and the real `newcloud` binary — no configuration
+file to edit:
 
 ```sh
-# 数据库
-docker run -d --name wc-pg \
+git clone https://github.com/EdisonJwa/newCloud.git
+cd newCloud
+go run ./tools/demo
+# open https://localhost:8443 (self-signed certificate)
+```
+
+The demo is for evaluation only. It uses a fake IdP that accepts any login and a self-signed
+certificate.
+
+For the standard development loop:
+
+```sh
+docker run -d --name newcloud-pg \
   -e POSTGRES_PASSWORD=test -e POSTGRES_DB=newcloud \
   -p 15432:5432 postgres:17
 
 export DATABASE_URL="postgres://postgres:test@127.0.0.1:15432/newcloud?sslmode=disable"
+cp deploy/config.example.yml config.yml   # set public_url, usercontent_url, auth.issuer,
+                                          # storage.local.root, storage.upload_dir, storage.layout
 
-# 应用 schema
 go run ./cmd/newcloud migrate
-
-# 跑测试（PG 部分无 TEST_DATABASE_URL 时自动跳过）
-export TEST_DATABASE_URL="$DATABASE_URL"
-go test ./...
-
-# 启动
 NEWCLOUD_CONFIG=./config.yml go run ./cmd/newcloud serve
 ```
 
-没有 OIDC 提供方时，用内置的假 IdP 打通整条登录链路：
+Without a real OIDC provider, run the development IdP in another terminal:
 
 ```sh
 go run ./cmd/devidp -addr 127.0.0.1:19000 -client-id newcloud
 ```
 
-**`cmd/devidp` 只能用于开发。** 它对任何请求都放行，绝不可部署。
+`cmd/devidp` accepts every request. It must never be deployed.
 
-## 部署
+See [docs/guides/quickstart.md](docs/guides/quickstart.md) for the full first-run walkthrough.
 
-生产部署见 [deploy/](deploy/)：
+## Production deployment
+
+The reference deployment is Docker Compose with Caddy for TLS:
 
 ```sh
 cd deploy
-PG_PASSWORD='...' docker compose up -d
+cp config.example.yml /etc/newcloud/config.yml   # edit it first
+export PG_PASSWORD="$(openssl rand -base64 32)"
+export PG_APP_PASSWORD="$(openssl rand -base64 32)"
+
+docker compose up -d postgres
+docker compose run --rm \
+  -e DATABASE_URL="postgres://newcloud:${PG_PASSWORD}@postgres:5432/newcloud?sslmode=disable" \
+  web migrate
+docker compose exec postgres psql -U newcloud -d newcloud \
+  -c "ALTER ROLE newcloud_app PASSWORD '${PG_APP_PASSWORD}'"
+docker compose up -d
 ```
 
-组成：`web`（应用，distroless 非 root）、`postgres`（17，开启 WAL 归档）、`caddy`（自动 TLS）。配置在 `/etc/newcloud/config.yml`，参考 [deploy/config.example.yml](deploy/config.example.yml)。
+The migration runs as the owner; the application then connects as `newcloud_app`, whose password is
+deliberately absent from migrations.
 
-两个必须注意的点：
+Three details are load-bearing:
 
-1. **`/var/lib/newcloud` 必须是单个挂载点。** `blobs/` 与 `blobs/tmp/` 跨文件系统会让发布 blob 从 `rename(2)` 退化成整文件复制。启动时会做真实的 rename 探测，不满足就拒绝启动。
-2. **`storage.layout` 必须显式指定**（`blob` 或 `tree`），没有默认值。这个选择改变磁盘上的数据形态，不适合由我替你做。
+1. **`/var/lib/newcloud` must be a single mount point.** `blobs/` and `blobs/tmp/` must share a
+   filesystem, or publishing a blob degrades from `rename(2)` to copying the whole file. Startup
+   probes this with a real rename and refuses to start if the probe fails.
+2. **`server.public_url` and `server.usercontent_url` must be different origins.** Session cookies
+   live on the application origin; user content is served from a separate origin so a stored-XSS
+   payload in an uploaded file cannot reach the session cookie or the app DOM.
+3. **Choose `storage.layout` deliberately.** `blob` is the default, but the choice changes the shape
+   of the data on disk and cannot be mixed per user. `blob` gives deduplication and cheap versions;
+   `tree` gives a filesystem that `ls` and `rsync` can inspect.
 
-备份与恢复演练见 [deploy/backup/restore-drill.md](deploy/backup/restore-drill.md)。备份脚本存在且可用，**但恢复演练尚未执行**：记录表仍是"待首次演练"，因此 INV-08 要求的"经真实恢复验证"目前没有证据，不应对外声称具备。
+The full deployment guide covers the application database role, TLS, backups, retention, and
+capacity planning: [docs/guides/deployment.md](docs/guides/deployment.md).
 
-## 目录结构
+## Documentation
 
-```
-cmd/newcloud      主程序：serve / migrate / healthcheck
-cmd/devidp        开发用假 OIDC 提供方（不可部署）
-internal/
-  auth            OIDC 握手、会话、App Password
-  authz           Actor + Cap；授权结论不可伪造
-  audit           哈希链事件日志
-  blob, storage   内容存储：blob（去重）/ tree（镜像）
-  store           元数据层：节点树、配额、版本、审计、分享、锁
-  dav             WebDAV 处理器
-  server          HTTP 层：JSON API + 分享页 + 静态前端
-  share           分享业务逻辑
-  ticket          HMAC 令牌
-  worker          过期锁清理、孤儿 blob 回收
-  webassets       内嵌前端（无构建步骤、无 npm 依赖）
-tools/            开发期验证脚本
-migrations/       SQL schema
-docs/             决策记录
-```
+| Start here | |
+| --- | --- |
+| [Documentation index](docs/README.md) | Every guide, reference page, and decision record |
+| [Quick start](docs/guides/quickstart.md) | Local development and a first login |
+| [Configuration](docs/guides/configuration.md) | Every configuration key, with defaults |
+| [Deployment](docs/guides/deployment.md) | Production topology and first boot |
+| [Operations](docs/guides/operations.md) | Health, metrics, alerts, backups, audit, key rotation |
+| [Architecture](docs/reference/architecture.md) | How the process, metadata, storage, and audit fit together |
+| [Limitations](docs/guides/limitations.md) | What is deliberately not implemented, and why |
 
-前端刻意不引入框架与构建步骤：三个静态文件内嵌进二进制。这样交付物就是被审查过的代码本身，没有传递依赖需要审计。
+Design decisions are recorded as ADRs in [docs/adr/](docs/adr/):
 
-## 测试
+- [ADR-0001: Product scope and language choice](docs/adr/0001-scope-and-language.md)
+- [ADR-0002: Backend skeleton, credentials, and WebDAV](docs/adr/0002-backend-skeleton.md)
+- [ADR-0003: Optional storage layouts (blob and tree)](docs/adr/0003-storage-layout.md)
+- [ADR-0004: Metadata store contract](docs/adr/0004-metadata-store.md)
+- [ADR-0007: S3 storage backend](docs/adr/0007-s3-storage.md)
+- [ADR-0008: Resumable chunked uploads](docs/adr/0008-resumable-uploads.md)
+- [ADR-0012: Cursor pagination contract](docs/adr/0012-cursor-contract.md)
+
+The evidence behind the claims in this README — the tests, the manual verification, and the
+remaining gaps — is in [docs/reference/implementation-record.md](docs/reference/implementation-record.md).
+
+## Design principles
+
+These are product behavior, not implementation details. Changing one requires an ADR.
+
+**Deny with `404`, never `403`.** Distinguishing "does not exist" from "not allowed" hands an
+attacker a directory-enumeration oracle for free.
+
+**Two credential systems, deliberately.** Browser sessions and App Passwords take different
+paths. WebDAV never accepts a session cookie, because desktop clients cannot complete an OIDC
+redirect. Browser sessions and short-lived share/email tickets are HMAC-signed; App Passwords and
+share links are random values stored only as SHA-256 hashes. Only human-chosen secrets (share
+passwords, the break-glass password) use Argon2id.
+
+**A write and its audit record share one transaction.** Audit writes fail closed: if the event
+cannot be recorded, the operation is refused rather than performed invisibly.
+
+**Conditional writes are decided in the same SQL statement that changes the row.** Read-then-write
+loses updates under concurrency. The web API and WebDAV cannot end up with different rules.
+
+**Locks are enforced on the write path, not merely recorded by `LOCK`.** A lock that exists only
+in the creation endpoint is worse than no lock, because clients believe they are protected.
+
+**Storage layout is an operational choice.** `blob` deduplicates and makes versions nearly free,
+but `ls` shows hashes. `tree` is directly inspectable and `rsync`-friendly, but every version is a
+full copy and Windows reserved names apply. Both are verified by the same contract test suite.
+
+**The code does not assume it is the only process.** Sessions, locks, and the job queue live in
+PostgreSQL, using `FOR UPDATE SKIP LOCKED` and leases. Single-node deployment is a deployment
+choice, not an architectural premise.
+
+## Testing
 
 ```sh
-go test ./...                                  # 单元 + 集成
-go test ./... -race                            # 需要 CGO 与 C 编译器
-TEST_DATABASE_URL=... go test ./internal/store # 追加 PostgreSQL 契约测试
+go test ./...                                   # unit and integration tests
+go test ./... -race                             # requires CGO and a C compiler
+TEST_DATABASE_URL=... go test ./internal/store  # adds the PostgreSQL contract suite
+make check                                      # gofmt, vet, example config, web checks, race
 ```
 
-同一套 `internal/storetest` 契约测试同时跑在内存实现和 PostgreSQL 实现上。这不是形式主义：两者曾经在"预建账号首次登录"上行为不一致，内存实现通过、PostgreSQL 返回 500，只有让两套实现过同一个测试才能发现。
+The same `internal/storetest` contract suite runs against both the in-memory and PostgreSQL
+implementations. That is not ceremony: the two once disagreed on first login for a
+pre-provisioned account, and only a shared suite exposed it.
 
-开发期还有两个端到端脚本，需要真实运行的服务：
+Documentation is tested too. `TestDocumentsCiteOnlyRealTests` fails when a document cites a test
+that does not exist, and `TestGapTableDoesNotClaimClosedGapsAreOpen` fails when a status row claims
+something is missing after it has been implemented.
+
+Two end-to-end tools need a running instance:
 
 ```sh
 go run ./tools/e2e     -app http://127.0.0.1:18500 -idp http://127.0.0.1:19000
 go run ./tools/uicheck -app http://127.0.0.1:18500 -public-host 127.0.0.1:18600
 ```
 
-`uicheck` 用 headless Chrome 加载真实页面，验证渲染、tab 切换、以及文件名等用户数据是以文本而非 HTML 进入 DOM 的。
+## Status and limitations
 
-## 已知限制
+The core file-service contracts are implemented and covered by tests. This is not a claim that
+every feature in the requirements document exists. Notable gaps:
 
-**未实现的能力**（详见 [docs/0011-contract-implementation-record.md](docs/0011-contract-implementation-record.md) §2）：
+- **No shared or group-owned spaces.** Resource ACLs grant users and groups access to a folder;
+  team ownership of a space is not implemented.
+- **`REPORT` and `sync-collection` are not implemented.** Clients receive an explicit `501`, not
+  an empty result. Shared locks are also absent.
+- **S3 is tested against an in-process fake and a moto server, not real object storage.** The
+  backend logic is covered, including multipart behavior and fault injection, but interoperability
+  with AWS S3, MinIO, Ceph, and R2 has not been exercised against those services.
+- **No IdP event source.** A role or group change takes effect at the account's next login. There
+  is no SCIM or push-based deprovisioning.
+- **Previews decode in-process.** Pixel, concurrency, and time limits bound the work; true
+  isolation would require a subprocess.
+- **Resumable upload sessions do not survive a restart.** Content integrity is unaffected; the
+  upload must be restarted.
+- **Restore timing is measured to a 5.5 MiB metadata dump.** The measurements are linear within
+  that range. There is no validated RTO for a 40 TiB deployment; a linear extrapolation produces
+  an unusable number, which is itself the finding.
+- **No bundled Grafana dashboards.** Prometheus rules and runbooks are included; dashboards depend
+  on the operator's Grafana version and are intentionally not shipped.
+- **No import from Nextcloud or other file services.**
+- **No `blob`/`tree` migration tool.** The procedure is designed, not implemented; choose the layout
+  before the first upload.
 
-- 资源 ACL 的 API 完整（`POST /api/acl/` 授予、`DELETE /api/acl/{id}` 撤销、`GET /api/shared` 发现、`GET /api/shared/{id}/content` 取内容），但**没有界面**。`read`/`download`、`create`/`overwrite`、`rename` 都是真正独立的权限：只授 `read` 可以看元数据但取不到字节；只授 `create` 可以新建但不能替换已有文件。群组共享**空间**（团队所有权）仍未实现。
-- break-glass 已有登录入口（`POST /api/auth/breakglass`）与 `newcloud breakglass hash` 生成器，但没有界面；口令从管道读取，不做终端免回显。
-- 账号删除已实现（`DELETE /api/admin/users/{id}`，需 `confirm_username` 确认，且必须先禁用）：文件进回收站、分享与凭据撤销、WebDAV 锁释放、**审计记录保留**、账号墓碑并释放用户名与邮箱。墓碑不可撤销。
-- JIT 开户支持 `open` / `pending` / `deny` 三种模式与域名白名单，**批准 API 已就绪**（`GET /api/admin/users?status=pending`、`POST /api/admin/users/{id}/status`），但没有界面。IdP 离线时服务照常启动：已有会话、应用密码与 WebDAV 不受影响，只有新登录返回 503，IdP 恢复后无需重启即可登录。角色降权会在**下次登录**时生效并撤销该账号的全部会话与 App Password（T-02 已验证）；没有 IdP 事件源，所以"移出组"到"权限消失"之间隔着一次登录。
-- 后台任务队列已有消费者：`jobs` 表带租约、重试退避与永久失败，`FOR UPDATE SKIP LOCKED` 领取，租约到期可被重新领取。目前注册了 3 种 job（blob 回收、缩略图预热、凭据清理），`jobs` 不再是一张只写不读的表。
-- 兄弟名唯一性按 **Unicode NFC + 完整大小写折叠 + 剥离格式字符**判定（`store.nameKey`），内存与 PostgreSQL 两个后端一致，所以 `Readme.md` 与 `README.md` 不可能同时存在。存量冲突由迁移 `0007` 重命名（保留最早的那个，新的改为 `<名字> (conflict N)<扩展名>`）并记入 `name_conflict_renames`，不删除任何文件。存量行的键由 `migrate` 里的 `RepairNameKeys` 收敛：keyset 分页每批 1000 行、每批一个事务，重算并只更新不一致的；会与兄弟冲突的行跳过并逐行报告，不替用户选赢家。（1200 条过期行实测 3.4 秒。）未在 Windows/macOS 实机客户端上验证（T-18）。- COPY/MOVE 失败不破坏源文件：配额不足、目标父目录缺失、目录复制中途失败都保留原件（配额不足时 MOVE 不会先删源）。目录复制逐节点提交，中途失败会留下部分目标——这一点写在限制里，而不是假装是原子的。
-- 目录分页用**游标**（`name > cursor`）而非 offset：offset 在名字排序上遇到并发增删会静默重复和漏行。契约写在 [docs/0012-cursor-contract.md](docs/0012-cursor-contract.md)：**任何行绝不返回两次**；代价是把未见的行重命名到游标之前会漏到下次列表。游标不携带权限，每页重新鉴权。
-- **审计故障时 fail-closed**：审计写不进的操作**不会发生**（`503 audit_unavailable`），读操作继续可用。策略、客户端契约与运维 runbook 见 [deploy/audit-failure-policy.md](deploy/audit-failure-policy.md)。选 fail-closed 的理由是：fail-open 会让"写满磁盘"成为最便宜的攻击，且缺事件不留痕、哈希链依然校验通过。- `/metrics` 以 Prometheus 文本格式暴露请求错误率、DAV 冲突率、上传结果、队列积压、审计链与锚点校验；只有端点，没有随附面板或告警规则。`/readyz` 会探测元数据与内容存储。
-- 审计链有**外部锚点**（每个完成日一个 checkpoint，含链头与事件数），可检测截断与中段重写；但生产环境必须把锚点目录指向与数据库**不同凭据**的位置——代码无法强制这一点。应用角色 `newcloud_app` 现已可登录并被 `docker-compose.yml` 采用，审计表对它只允许 SELECT/INSERT（已验证 UPDATE/DELETE/TRUNCATE 被拒）；口令需运维手动 bootstrap，迁移里故意不写。
-- 预览/缩略图有像素上限 + 并发上限 + 解码截止时间；仍在进程内解码，真正的隔离需要子进程。
-- 共享锁（shared lock）与 `REPORT`/`sync-collection` 未实现，客户端会收到明确的 501 而不是空结果。
-- 管理员看不到用户文件内容，只能看元数据与强制删除。这是刻意的。
-- `email` 分享的验证码需要配置 `mail.*`。未配置时服务照常启动，并在每次生成验证码时告警，而不是假装发送成功。
-- 审计导出对普通用户的范围是"我做过的事"加"关于我数据的匿名事件"（匿名下载、被拒的收件人尝试）；只有管理员能导出全部。
-- `s3` 后端（bucket 必须事先存在，启动时校验连通性）现在跑满**全部** layout 合规用例与 blob 契约用例（共 24 项：覆盖写、Range/Seek、multipart 17 MiB 上传、删除、去重、owner 隔离），默认使用进程内 S3 假实现，因此**不再跳过**。仍**没有对真实 AWS S3 / MinIO / R2 做过互操作测试**——假实现验证的是后端自身逻辑，不是协议兼容性；设置 `TEST_S3_ENDPOINT` 可对真实端点跑同一套用例。
-- `tree` 布局只能在 `local` 后端上使用：它按定义是文件系统镜像。
-- 分享链接在文件被删除后停止服务（404，而非 200 空列表）；"文件已删/链接已吊销/从未存在"三者响应完全相同——区分它们会让端点变成令牌预言机。
-- break-glass 的"使用后告警"已实现：`newcloud_auth_events_total{kind}` 区分"被使用"（首个事件即 critical 告警）与"被猜测"（15 分钟内 >5 次才 warning），两者必须分开，否则前者无法排期。break-glass 刻意不提供网页界面——恢复入口缩小暴露面。
-- 告警规则与运行手册随附在 `deploy/monitoring/`：10 条规则（`promtool check rules` 通过）、抓取配置、9 个 runbook 章节。规则里引用的指标名、标签值、runbook 锚点都有测试校验，防止"指着不存在的指标"这种永远不会触发的规则。
-- `/metrics` 有 Prometheus 暴露端点（请求计数、DAV 冲突、上传结果、队列深度、GC、审计链指标），并有**端到端**测试：路由、中间件、未知路径、以及"未配置 registry 时不暴露指标内容"（该情况返回 200 + 外壳 HTML，抓取器会因 content-type 失败而不是静默记零）。指标本身有 11 个单元测试。
-- 账号审批有界面（账号页）：待审批队列、批准/停用/启用，导航项仅对管理员出现（服务端对非管理员仍返回 404）。停用会立即吊销该账号的会话与应用密码。
-- ACL 管理有界面（Access 页）：按路径载入某文件夹的直接授权、新建、逐条吊销。`delete` 是独立权限，不随 `write` 授予。
-- i18n 有强制校验（`pnpm i18n`，已接入 CI）：英文表里的键必须在其他语言存在（该语言复数规则选不到的形态除外），代码里每个 `t("...")` 引用的键必须真实存在——拼错不会报编译错误，只会把键名渲染到屏幕上。
-- **线上 blob 完整性巡检**：`worker.ScrubBlobs` 周期性读取线上 blob 样本并比对内容地址。此前只有季度演练会读回 blob（那是备份问题，不是线上问题）。损坏与缺失分开报告——处置完全不同。
-- 发现并记录一个**上游数据竞态**：minio-go v7.4.1 的 `hookReader` 在分片重试时被并发读写，生产可达（>16 MiB 对象 + 一次分片重试）。本地"上传前先校验哈希"把危害从"污染存储"降为"上传失败"。详见 `deploy/monitoring/runbook.md`。
-- S3 错误注入（G3）：上传失败不留对象、坏传输在写之前被哈希拒绝、`Stat` 失败不被当成 NotFound。测试用 `FailAlwaysOn`——`FailNextOn` 对会重试的客户端等于没注入。
-- 进程中断不破坏数据（G3）：半截上传落在 `<root>/tmp`，而本地后端从哈希推导路径，**结构上不可达**；提交崩溃因"内容先行、行后写"只留孤儿 blob。上传会话不跨重启持久化——这是能力缺口，不是完整性缺口。
-- 上传分片路由**先认证再解析**：三种请求形态（无 `Content-Range`/畸形/合法）对非属主会话一律 404，否则错误码会泄漏"端点存在且解析了请求"。
-- 越权（T-01）按**路由表**逐条测试而非抽样：12 条带 id 的路由中 10 条有独立用例，其余 2 条各由既有测试覆盖并写明理由。每条断言返回 404（不是 403，403 会确认 id 存在）、拒绝的响应体不泄漏文件名等元数据、变更型操作后对方资源未被改动。
-- 文档引用的每个测试名都必须是真实存在的函数：`TestDocumentsCiteOnlyRealTests` 扫描 `docs/`、`deploy/` 与 README，缺一个就失败。（讨论已废弃名字的句子须显式标记 `docIgnore:`。）
-- OIDC 密钥轮换无需重启：客户端遇到未知 kid 会重取 JWKS；轮换步骤与九种验证失败的策略见 [deploy/oidc-key-rotation.md](deploy/oidc-key-rotation.md)。已有会话不受轮换影响（会话是自己的凭据，从不问 IdP）。
-- `blobs.size` 曾长期被写成 0（`BlobIDFor` 硬编码），GC 的回收字节统计因此失真；`migrate` 里的 `RepairBlobSizes` 从内容寻址对象回填真实长度（单行缺失只报告、不臆造）。
-- 恢复演练的表清单由 `TestDrillCoversEveryTable` 对着实际 schema 自检——手写清单会腐烂，注释里承诺的检查若不写成代码就等于没有。
-- WAL 归档失败是**静默的**：`archive_command` 坏了数据库照常服务，只有 `pg_wal` 在涨（实测 49→65→81 MB、零归档），最终填满数据盘。已补三个指标 + 三条告警 + runbook；`failed` 与 `pending` 分别回答"坏过没有"和"盘是不是正在被填满"。
-- PITR 已实测：base backup → 误删 → 恢复到删除前，被删数据回来且实例已 promote。`docker-compose.yml` 补上了缺失的 `archive_timeout`（没有它，"RPO ≤ 15 分钟"只在忙系统上成立）。
-- 备份由 `deploy/backup/backup-all.sh` 一次跑完（**顺序可执行，不靠记忆**）：先 dump 再 blob，中间写 manifest。全链路实测通过：dump → restic → restore（文件名即 SHA-256）→ pg_restore → 交叉校验缺失 0 个。
-- 恢复顺序是**先恢复 Blob，再 pg_restore**（方向与备份相反）。两个顺序最终都会收敛，推荐这一支是因为它**失败关闭**；之所以两个都安全，是因为 GC 遍历 `blobs` 行、从不扫描目录，"有字节但没有行"的文件对 GC 不可见。
-- 备份顺序是**先 pg_dump，再备份 Blob**：依据"内容先落盘、行后写入"这条不变量，窗口内的写入只会留下可回收的孤儿 blob，不会留下悬空引用。（我第一版把顺序写反了，安全方向恰好相反。）
-- 恢复演练已自动化（`newcloud drill`）：**22 张表**（清单由 `TestDrillCoversEveryTable` 对着实际 schema 自检）、元数据行、审计哈希链、以及**每个 blob 的字节**在 dump→restore 后都完整。已反向验证演练**会失败**——篡改一条审计记录、或翻转一个 blob 字节，都会 FAIL。**restic 快照恢复也已实测**：备份全链路 + 恢复到新目录后 blob 的 SHA-256 逐字节一致；`--one-file-system` 在 Windows 上会 panic，脚本已按平台条件添加。规模测量已补：130 KiB / 1.2 MiB / 5.5 MiB 三点，秒/MiB 稳定在 6.9–9.4（43 倍体积无拐点）。未覆盖：真正的 40 TiB——线性外推给出约 92 000 小时，说明该外推路径本身不可用，真实 RTO 必须在等价硬件上重测；PITR。
+The complete, dated list with evidence is in
+[docs/guides/limitations.md](docs/guides/limitations.md) and
+[docs/reference/implementation-record.md](docs/reference/implementation-record.md).
+
+## Contributing
+
+Issues and pull requests are welcome. Before opening a pull request:
+
+1. Run `gofmt` and `go test ./...`.
+2. Behavior changes require an update to the matching ADR and the tests that pin it.
+3. A new document or claim keeps its evidence link next to it. Documents that cite tests are
+   checked by the test suite.
+
+The project favors small, reviewable changes with a stated failure mode over broad rewrites. A
+correctness fix should come with the test that would have caught the bug.
+
+## Security
+
+Do not open a public issue for a vulnerability. Use GitHub's private vulnerability reporting for
+this repository.
+
+Two properties are worth knowing before deploying:
+
+- The application database role (`newcloud_app`) can `SELECT` and `INSERT` the audit table but
+  cannot `UPDATE`, `DELETE`, or `TRUNCATE` it. The role's password is bootstrapped manually and is
+  deliberately absent from migrations.
+- Audit anchors must be stored where the application cannot rewrite them. The code can detect a
+  truncated chain only if the anchor directory has different credentials from the database; a
+  directory on the metadata volume makes the anchor decorative.

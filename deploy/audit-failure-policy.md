@@ -1,46 +1,46 @@
 # Audit storage failure policy (T-16)
 
-The requirement asks that audited operations follow "事先约定的 fail-open/fail-closed 策略" — a policy
-agreed in advance. This document is that policy. It exists because "we'll decide at 3am during the
-incident" is not a policy.
+The requirement asks that audited operations follow a fail-open or fail-closed policy agreed in
+advance. This document is that policy. It exists because deciding at 3 a.m. during an incident is
+not a policy.
 
 ## The decision: fail-closed
 
 **If an operation cannot be written to the audit log, the operation does not happen.**
 
-The alternative — fail-open, keep serving writes during an audit outage — is tempting because it
-sounds kinder to users. It is the wrong choice for this platform:
+The alternative — fail-open, continuing to serve writes during an audit outage — is tempting because
+it sounds kinder to users. It is the wrong choice for this platform:
 
-- The audit log is a security control (INV-09), not telemetry. It records who downloaded what,
-  which permission changed, which session was revoked. A log that silently stops recording under
-  pressure is worse than no log, because people make decisions based on it.
+- The audit log is a security control (INV-09), not telemetry. It records who downloaded what, which
+  permission changed, which session was revoked. A log that silently stops recording under pressure
+  is worse than no log, because people make decisions based on it.
 - Fail-open makes **filling the disk the cheapest attack on the system**. An attacker who can
-  exhaust the disk then operates entirely unlogged, and the log's absence is indistinguishable
-  from "nothing happened".
+  exhaust the disk then operates entirely unlogged, and the log's absence is indistinguishable from
+  "nothing happened".
 - The chain would still verify. Every recorded event would be correctly chained and every
-  verification would pass — the missing events leave no trace at all. That is the worst property
-  a tamper-evident log can have.
+  verification would pass; the missing events leave no trace at all. That is the worst property a
+  tamper-evident log can have.
 
-## What fails, and what keeps working
+## What fails and what keeps working
 
 | Operation | During an audit outage |
 | --- | --- |
 | Upload, delete, move, rename, mkcol | **Refused** — `503 audit_unavailable`, nothing modified |
 | Permission and ACL changes | **Refused** |
-| Share creation, revocation | **Refused** |
-| Login, session creation | **Refused** |
+| Share creation and revocation | **Refused** |
+| Login and session creation | **Refused** |
 | Session revocation | **Refused** (it is itself audited) |
 | **Reads: list, download, metadata, DAV GET/PROPFIND** | **Keep working** |
-| **Audit verification, export** | **Keep working** |
+| **Audit verification and export** | **Keep working** |
 | **Health and readiness** | **Keep working** |
 
 Reads deliberately stay up. An operator investigating "writes are failing" needs to read the data
 and the audit log; turning an audit outage into a total outage would remove the tools needed to
-diagnose it. This is asserted by `TestReadsSurviveAnAuditOutage`.
+diagnose it. `TestReadsSurviveAnAuditOutage` asserts this.
 
 ## What the client sees
 
-```
+```text
 HTTP/1.1 503 Service Unavailable
 {"error":"audit_unavailable",
  "message":"the audit log is unavailable, so the change was refused and nothing was modified"}
@@ -51,32 +51,32 @@ down, and retrying after it recovers will succeed. The distinction matters opera
 sends an operator to look at the data, and the data is fine.
 
 The underlying cause is preserved in the error chain, so the server log carries the real reason
-(for example `no space left on device` or `relation "audit.events_default" does not exist`)
-rather than only "audit unavailable".
+(`no space left on device`, for example, or `relation "audit.events_default" does not exist`) rather
+than only "audit unavailable".
 
 ## Operator runbook
 
 1. `curl -s http://localhost:8080/readyz` — the payload's `checks` reports the metadata and content
-   stores. Audit health is separate and shows as write failures, not readiness.
+   stores. Audit health is separate and appears as write failures, not in readiness.
 2. `newcloud audit verify` — a *failing* verification is a different incident (tampering or
-   corruption). This policy is about an audit store that cannot accept new rows at all.
+   corruption). This policy covers an audit store that cannot accept new rows at all.
 3. Check the disk: the most common cause is the volume holding PostgreSQL reaching full. The audit
    table is append-only and never VACUUMs away rows, so it grows monotonically.
-4. Check the table exists and is writable: a dropped or revoked `audit.events_default` presents as
+4. Check that the table exists and is writable: a dropped or revoked `audit.events_default` presents
    the same symptom.
 5. Once writes succeed again, the backlog is *not* replayed. **Refused operations were never
-   accepted**, so there is nothing to reconcile — the client saw an error and can retry. This is a
-   consequence of fail-closed that operators should expect: during the outage, some user actions
-   simply did not happen.
+   accepted**, so there is nothing to reconcile; the client saw an error and can retry. Operators
+   should expect this consequence of fail-closed: during the outage, some user actions simply did
+   not happen.
 
 ## What this policy does not cover
 
-- **The audit subsystem becoming slow rather than unavailable.** Every write pays the chain cost
-  in its own transaction; a slow audit store slows every write. There is no timeout-and-fail
-  distinct from slow-and-wait today.
-- **Partial writes inside the audit writer.** The append runs inside the caller's transaction, so
-  it either commits with the mutation or rolls back with it. A failure *after* commit is a
-  different problem this policy does not address.
+- **The audit subsystem becoming slow rather than unavailable.** Every write pays the chain cost in
+  its own transaction, so a slow audit store slows every write. There is no timeout-and-fail
+  behavior today, distinct from slow-and-wait.
+- **Partial writes inside the audit writer.** The append runs inside the caller's transaction, so it
+  either commits with the mutation or rolls back with it. A failure *after* commit is a different
+  problem that this policy does not address.
 - **Backlog replay.** By design there is none (see step 5). If an operator needs the refused
   actions, they came from users who saw errors.
 

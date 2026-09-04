@@ -502,40 +502,40 @@ func upload(c *http.Client, base, dir, name, content string) error {
 func printBanner(publicURL, idpURL, dir string, s seedResult) {
 	line := strings.Repeat("─", 74)
 	fmt.Printf("\n%s\n  newcloud demo is running\n%s\n\n", line, line)
-	fmt.Printf("  打开浏览器  %s\n\n", publicURL)
-	fmt.Printf("  ⚠  证书是自签名的，浏览器会警告。\n")
-	fmt.Printf("     点「高级」→「继续前往 localhost」即可。\n\n")
-	fmt.Printf("  登录方式    OIDC（假 IdP，会自动以 alice 登录）\n")
-	fmt.Printf("  IdP 控制台  %s\n\n", idpURL)
+	fmt.Printf("  Open in a browser  %s\n\n", publicURL)
+	fmt.Printf("  The certificate is self-signed, so the browser will warn.\n")
+	fmt.Printf("  Choose \"Advanced\" and continue to localhost.\n\n")
+	fmt.Printf("  Sign-in            OIDC (fake IdP; signs in as alice automatically)\n")
+	fmt.Printf("  IdP console        %s\n\n", idpURL)
 
 	if s.Files > 0 {
-		fmt.Printf("%s\n  可以直接试的链接\n%s\n\n", line, line)
+		fmt.Printf("%s\n  Links you can try right now\n%s\n\n", line, line)
 		if s.Link != "" {
-			fmt.Printf("  公开链接（无需密码）\n    %s\n\n", s.Link)
+			fmt.Printf("  Public link (no password)\n    %s\n\n", s.Link)
 		}
 		if s.Locked != "" {
-			fmt.Printf("  带密码 + 限 3 次下载\n    %s\n    密码 %s\n\n", s.Locked, s.Password)
+			fmt.Printf("  Password + 3-download limit\n    %s\n    Password %s\n\n", s.Locked, s.Password)
 		}
 		if s.Dropbox != "" {
-			fmt.Printf("  收件箱（只能上传，看不到里面）\n    %s\n\n", s.Dropbox)
+			fmt.Printf("  Drop box (upload only; the contents are not listed)\n    %s\n\n", s.Dropbox)
 		}
 	}
 
-	fmt.Printf("%s\n  建议的演示顺序\n%s\n\n", line, line)
-	fmt.Printf(`  1. 首页登录后，能看到 4 个示例文件、3 个目录
-  2. 文件列表 → 点「Share」创建分享，观察密码/次数/有效期
-  3. 「Shares」标签页能吊销已发出的链接
-  4. 「Trash」标签页：删除一个文件，再从回收站恢复
-  5. 「App passwords」标签页：生成一个 WebDAV 凭证
-  6. 用 WebDAV 客户端连 %s/dav/alice/
-     （用户名 alice，密码用第 5 步生成的）
-  7. 打开上面的"收件箱"链接：只能上传，看不到目录内容
-  8. 打开"限 3 次"链接：第 4 次会被拒
-  9. 审计：GET %s/api/audit?format=csv 能看到每一步
+	fmt.Printf("%s\n  Suggested walkthrough\n%s\n\n", line, line)
+	fmt.Printf(`  1. Sign in on the home page: 4 sample files and 3 folders.
+  2. Files -> Share: create a link and try password, download limit, and expiry.
+  3. The Shares tab revokes a link you have already handed out.
+  4. The Trash tab: delete a file, then restore it.
+  5. App passwords: create a WebDAV credential.
+  6. Connect a WebDAV client to %s/dav/alice/
+     (user alice, password from step 5).
+  7. Open the drop-box link: upload only, no directory listing.
+  8. Open the 3-download link: the fourth attempt is refused.
+  9. Audit: GET %s/api/audit?format=csv shows every step.
 
 `, publicURL, publicURL)
 
-	fmt.Printf("%s\n  状态目录 %s\n  按 Ctrl+C 停止（会删除演示数据库）\n%s\n\n", line, dir, line)
+	fmt.Printf("%s\n  State directory %s\n  Press Ctrl+C to stop (the demo database is removed)\n%s\n\n", line, dir, line)
 }
 
 // tokenOf extracts the share token from a create response.

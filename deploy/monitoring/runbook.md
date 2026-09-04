@@ -1,7 +1,7 @@
 # Runbook
 
 Each section is what an alert links to. The rule is that a page should arrive with enough context
-that the person receiving it does not have to reconstruct the design at 3am — so every section says
+that the person receiving it does not have to reconstruct the design at 3 a.m. — so every section says
 what the signal means, what is *not* the problem, and the first three things to check.
 
 The metrics named here are the ones the server actually publishes. `internal/metrics/metrics.go`
@@ -44,15 +44,15 @@ directory, and no state is only in memory.
 
 More than 5% of responses are 5xx for 10 minutes.
 
-5xx means we broke, not that the caller did. Distinguish the two cases before doing anything else:
+5xx means the server broke, not that the caller did. Distinguish the two cases before doing anything else:
 
 1. **All routes failing** → almost certainly the database. Check `/readyz`. See
    [database-degraded](#database-degraded).
 2. **One route failing** → read the log lines around it; `newcloud_http_requests_total` does not
    carry a route label by design (the route set is large and the cardinality would be unbounded),
    so the log is where the route comes from.
-3. **Only WebDAV failing** → `newcloud_dav_conflicts_total` alongside it tells you whether these
-   are lock conflicts being miscounted as errors. Conflicts are 409/412 and are normal in a
+3. **Only WebDAV failing** → `newcloud_dav_conflicts_total` alongside it shows whether these are
+   lock conflicts being miscounted as errors. Conflicts are 409/412 and are normal in a
    multi-client deployment.
 
 ## database-degraded
@@ -65,7 +65,7 @@ database problem: a healthy process with a dead database stays alive and fails q
    before it shows up anywhere else.
 3. Check the database's own log for `too many connections`, `deadlock detected`, or disk full. A
    full disk manifests as 5xx on every write path, and reads keep working — which looks like a
-   code bug until you check.
+   code bug until the disk is checked.
 
 ## audit-stalled
 
@@ -142,10 +142,11 @@ Over 10% of WebDAV requests are 409/412 for 30 minutes.
 
 Not an outage. This is information.
 
-1. The usual cause is one badly-behaved client polling or writing without honouring locks. The
+1. The usual cause is one badly-behaved client polling or writing without honoring locks. The
    per-caller pattern is in the audit log, not in the metrics.
-2. Two clients editing the same tree is the other common cause, and the fix is organisational.
+2. Two clients editing the same tree is the other common cause, and the fix is organizational.
 3. Nothing here needs action at the server. The alert is at `severity: info` for that reason.
+
 ## breakglass
 
 `newcloud_auth_events_total{kind="breakglass_ok"}` increased, or
@@ -221,7 +222,7 @@ writes — so the service looks perfectly healthy while the recovery point slide
 4. After fixing the cause, do nothing further: the archiver retries on its own and the backlog
    drains. Confirm by watching `archived_count` rise.
 
-**What you have lost while this alert was firing:** every write since the last successfully
+**What is lost while this alert is firing:** every write since the last successfully
 archived segment is not recoverable by point-in-time recovery. It is still in the database — this
 is not data loss yet — but if the disk dies now, the restore point is wherever the archive stops.
 Take a fresh `pg_basebackup` once archiving is healthy again, so the base stops depending on a
@@ -247,7 +248,7 @@ lifecycle rule; on a self-hosted backend they are simply leaked disk, invisible 
 listing.
 
 **Measured (round 46):** with every part upload failing, `Put` returned an error and left **zero**
-stranded uploads — minio-go aborts its own upload before returning. So the common case is handled,
+stranded multipart uploads — minio-go aborts its own upload before returning. So the common case is handled,
 and this section exists for the cases it is not: a process killed mid-upload, or a client that
 disappears between parts.
 
@@ -312,12 +313,9 @@ silently. That is detection after the fact, not prevention.
 
 **What to do about it.** Track upstream; v7.4.1 is the current release and this is not fixable from
 the call site (hiding `io.Seeker` to suppress retries does not help — minio buffers and retries
-anyway, measured). A deployment that sees `ErrHashMismatch`, or a drill failure naming a blob, on
-large uploads against an unstable endpoint should treat it as this and re-upload from the client.
-
-**What to do about it.** Track upstream; this is not fixable from the call site. If a deployment
-sees repeated `ErrHashMismatch` on large uploads against a flaky endpoint, that is this race, and
-the remediation is to retry the upload from the client rather than to investigate the file.
+anyway, measured). A deployment that sees repeated `ErrHashMismatch`, or a drill failure naming a
+blob, on large uploads against an unstable endpoint should treat it as this race and re-upload from
+the client rather than investigate the file.
 
 ### Orphan blobs after a restore
 
@@ -344,8 +342,8 @@ a mismatch needs no interpretation. The scrub logs both hashes.
 **Corrupted (`newcloud_blob_scrub_corrupt`).**
 
 Storage damaged the data — a bad sector, a failed disk, or a transfer that wrote the wrong bytes.
-(a known upstream minio-go race can garble a retried multipart part; see
-[above](#a-known-upstream-race-in-minio-gos-multipart-retry)).
+(A known upstream minio-go race can garble a retried multipart part; see
+[above](#a-known-upstream-race-in-minio-gos-multipart-retry).)
 
 1. **Do not delete the blob.** The metadata references it, so deleting turns corruption into data
    loss and removes the evidence.

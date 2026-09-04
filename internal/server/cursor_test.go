@@ -2,7 +2,7 @@ package server_test
 
 // T-19 at the HTTP layer: a cursor carries no authority, and revoking access stops the walk.
 //
-// The claim in docs/0012-cursor-contract.md is that authorisation is re-checked on every request
+// The claim in docs/adr/0012-cursor-contract.md is that authorisation is re-checked on every request
 // against the directory being listed, so a cursor cannot outlive the permission that produced it.
 // That is worth testing rather than asserting: a cursor is attacker-controlled input, and if it
 // acted as a capability the whole pagination design would be unsafe.

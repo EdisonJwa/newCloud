@@ -46,7 +46,7 @@ services:
       # owner.
       #
       # Migrations still need the owner. Run them with DATABASE_URL pointing at the
-      # superuser - see deploy/README.md.
+      # superuser - see docs/guides/deployment.md.
       DATABASE_URL: postgres://newcloud_app:${PG_APP_PASSWORD}@postgres:5432/newcloud?sslmode=disable
       PGHOST: postgres
       PGUSER: newcloud_app

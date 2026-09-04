@@ -100,7 +100,7 @@ func TestBackupScriptsAgreeOnTheDocumentedOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read restore-drill.md: %v", err)
 	}
-	if !strings.Contains(string(doc), "先 pg_dump，再备份 Blob") {
+	if !strings.Contains(string(doc), "Take the pg_dump first, then copy the blobs.") {
 		t.Fatal("restore-drill.md no longer states the backup order")
 	}
 

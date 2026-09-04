@@ -3,10 +3,11 @@ package server_test
 // The gap table must not claim a gap that has been closed.
 //
 // This exists because the table did exactly that. At one point it contained two rows that
-// contradicted each other: one said the ACL API had "没有 UI … 前端未接入", while another said the
-// ACL screen existed and described it. Both had been written honestly; the first simply outlived
-// the fact. A status document whose "not done" column is stale is actively harmful — it sends the
-// next person to rebuild something that already works, or to distrust the rest of the list.
+// contradicted each other: one said the ACL API had "no UI ... not wired to the frontend", while
+// another said the ACL screen existed and described it. Both had been written honestly; the first
+// simply outlived the fact. A status document whose "not done" column is stale is actively harmful
+// — it sends the next person to rebuild something that already works, or to distrust the rest of
+// the list.
 //
 // The check is a small, explicit assertion list: each entry claims that a named artefact does not
 // exist, and the test fails if it does. That is narrower than "audit the whole document", which is
@@ -38,7 +39,7 @@ type absenceClaim struct {
 func TestGapTableDoesNotClaimClosedGapsAreOpen(t *testing.T) {
 	root := repoRoot(t)
 
-	record, err := os.ReadFile(filepath.Join(root, "docs", "0011-contract-implementation-record.md"))
+	record, err := os.ReadFile(filepath.Join(root, "docs", "reference", "implementation-record.md"))
 	if err != nil {
 		t.Fatalf("read the implementation record: %v", err)
 	}
@@ -46,22 +47,22 @@ func TestGapTableDoesNotClaimClosedGapsAreOpen(t *testing.T) {
 
 	claims := []absenceClaim{
 		{
-			because:  "前端未接入",
+			because:  "no web UI",
 			artefact: "web/src/components/FolderAccess.tsx",
-			row:      "§4.1 ACL",
+			row:      "ACL",
 		},
 		{
-			because:  "没有 UI",
+			because:  "no web UI",
 			artefact: "web/src/views/Admin.tsx",
-			row:      "ACL / 账号审批 UI",
+			row:      "Account approval UI",
 		},
 		{
-			because:  "没有随附的 Grafana 面板或告警规则",
+			because:  "no alert rules",
 			artefact: "deploy/monitoring/alerts.yml",
-			row:      "§11.1 指标",
+			row:      "§11.1 Metrics",
 		},
 		{
-			because:  "restic 在当前环境没有安装",
+			because:  "restic is not installed",
 			artefact: "deploy/backup/blob-backup.sh",
 			row:      "INV-08 restic",
 		},
@@ -70,9 +71,9 @@ func TestGapTableDoesNotClaimClosedGapsAreOpen(t *testing.T) {
 	// Only table rows are checked, not the whole document.
 	//
 	// The narrative legitimately quotes a stale row when explaining that it was fixed ("the table
-	// said 前端未接入"), and matching that prose would make the guard fire on its own changelog —
-	// which is exactly what happened the first time this test ran against the round's notes. The
-	// claim lives in the table; the check reads the table.
+	// said there was no UI"), and matching that prose would make the guard fire on its own
+	// changelog — which is exactly what happened the first time this test ran against the round's
+	// notes. The claim lives in the table; the check reads the table.
 	var tableRows []string
 	for _, line := range strings.Split(doc, "\n") {
 		if strings.HasPrefix(line, "|") {
@@ -140,7 +141,7 @@ func gapRow(doc, name string) (string, bool) {
 // by splicing lines, and a botched splice has silently produced a malformed row before.
 func TestGapTableRowsAreWellFormed(t *testing.T) {
 	root := repoRoot(t)
-	record, err := os.ReadFile(filepath.Join(root, "docs", "0011-contract-implementation-record.md"))
+	record, err := os.ReadFile(filepath.Join(root, "docs", "reference", "implementation-record.md"))
 	if err != nil {
 		t.Fatalf("read the implementation record: %v", err)
 	}
@@ -148,13 +149,13 @@ func TestGapTableRowsAreWellFormed(t *testing.T) {
 
 	header := -1
 	for i, line := range lines {
-		if regexp.MustCompile(`^\|\s*需求\s*\|\s*现状\s*\|\s*影响\s*\|`).MatchString(line) {
+		if regexp.MustCompile(`^\|\s*Requirement\s*\|\s*Status\s*\|\s*Impact\s*\|`).MatchString(line) {
 			header = i
 			break
 		}
 	}
 	if header < 0 {
-		t.Fatal("could not find the gap table header (| 需求 | 现状 | 影响 |)")
+		t.Fatal("could not find the gap table header (| Requirement | Status | Impact |)")
 	}
 	if header+1 >= len(lines) || !strings.Contains(lines[header+1], "---") {
 		t.Fatal("the gap table header is not followed by a separator row")
@@ -210,7 +211,7 @@ func TestGapTableRowsAreWellFormed(t *testing.T) {
 // broader "audit every claim" is not mechanisable, but this specific contradiction is.
 func TestGapTableDoesNotClaimMeasuredThingsAreUnmeasured(t *testing.T) {
 	root := repoRoot(t)
-	raw, err := os.ReadFile(filepath.Join(root, "docs", "0011-contract-implementation-record.md"))
+	raw, err := os.ReadFile(filepath.Join(root, "docs", "reference", "implementation-record.md"))
 	if err != nil {
 		t.Fatalf("read the implementation record: %v", err)
 	}
@@ -240,18 +241,18 @@ func TestGapTableDoesNotClaimMeasuredThingsAreUnmeasured(t *testing.T) {
 
 	checks := []evidence{
 		{
-			claim: "PITR 仍未演练",
+			claim: "PITR has not been rehearsed",
 			proof: "recovery stopping before commit",
 			done:  "round 41 performed a point-in-time recovery and quoted the recovery log",
 		},
 		{
-			claim: "仍未做 restic 快照恢复",
+			claim: "restic snapshot restore has not been performed",
 			proof: "no errors were found",
 			done:  "round 29 ran restic backup, check and restore",
 		},
 		{
-			claim: "大库耗时未知",
-			proof: "规模点 1",
+			claim: "large-database timing is unknown",
+			proof: "Three scale points",
 			done:  "round 37 measured the drill at three data volumes",
 		},
 	}
@@ -261,10 +262,10 @@ func TestGapTableDoesNotClaimMeasuredThingsAreUnmeasured(t *testing.T) {
 			continue // the row has been updated, which is the desired state
 		}
 		// The proof must appear in a ROUND SECTION, not merely anywhere. The narrative legitimately
-		// quotes the state of the world as it was ("PITR 没演练" was true when round 8 was written),
-		// and matching that would make the guard fire on honest history. A round heading is what
-		// marks a later claim: if the proof sits under one, the work happened after the table row
-		// that still denies it.
+		// quotes the state of the world as it was ("PITR had not been rehearsed" was true when round
+		// 8 was written), and matching that would make the guard fire on honest history. A round
+		// heading is what marks a later claim: if the proof sits under one, the work happened after
+		// the table row that still denies it.
 		if strings.Contains(roundSections(doc), c.proof) {
 			t.Fatalf("the gap table still claims %q, but the document records the measurement "+
 				"(%s, evidence: %q). One of the two is wrong, and a reader will believe the "+

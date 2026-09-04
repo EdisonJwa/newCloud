@@ -41,7 +41,7 @@ func TestDrillScaleMeasurementsAreConsistent(t *testing.T) {
 	// hardcoded them would keep passing after someone edited the table.
 	// Matched per line, not per cell: the dump size is in the third cell and the elapsed time in
 	// the sixth, so a cell-scoped pattern finds only one of the two. The whole line is searched.
-	rows := regexp.MustCompile(`(?m)^\| 2026-\d\d-\d\d \| 规模点 \d \|.*$`).
+	rows := regexp.MustCompile(`(?m)^\| 2026-\d\d-\d\d \| Scale point \d \|.*$`).
 		FindAllString(text, -1)
 	if len(rows) < 2 {
 		t.Fatalf("found %d scale rows; need at least two to say anything about scaling", len(rows))
@@ -87,16 +87,16 @@ func TestDrillScaleMeasurementsAreConsistent(t *testing.T) {
 
 	// 2. The document's stated extrapolation for 40 TiB must match the arithmetic.
 	//
-	// The section states the figure in the form "约 92 000 小时". Any number there is checked
-	// against the median rate, with enough tolerance for rounding.
-	// The figure is written in bold and with a thin-space thousands separator, so the pattern
+	// The section states the figure in the form "about 92,000 hours". Any number there is
+	// checked against the median rate, with enough tolerance for rounding.
+	// The figure is written in bold and with a comma thousands separator, so the pattern
 	// allows for both rather than requiring the prose to stay plain.
-	stated := regexp.MustCompile(`约 \*{0,2}([\d ]+) \*{0,2}小时`).FindStringSubmatch(text)
+	stated := regexp.MustCompile(`about \*{0,2}([\d,]+) \*{0,2}hours`).FindStringSubmatch(text)
 	if stated == nil {
 		t.Fatal("the document no longer states a 40 TiB extrapolation in hours; either restore it " +
 			"or update this test")
 	}
-	claimed, err := strconv.ParseFloat(strings.ReplaceAll(stated[1], " ", ""), 64)
+	claimed, err := strconv.ParseFloat(strings.ReplaceAll(stated[1], ",", ""), 64)
 	if err != nil {
 		t.Fatalf("parse the stated hours %q: %v", stated[1], err)
 	}
