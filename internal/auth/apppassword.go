@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/EdisonJwa/newCloud/internal/audit"
 	"github.com/EdisonJwa/newCloud/internal/store"
 )
 
@@ -158,23 +159,42 @@ func (a *AppPasswords) Verify(ctx context.Context, secret, ip string) (store.Use
 		return store.User{}, store.AppPassword{}, ErrInvalidAppPassword
 	}
 
-	a.touch(ctx, cred.ID, ip)
+	a.touch(ctx, cred.ID, ip, user, cred.Scope)
 	return user, cred, nil
 }
 
-// touch updates last_used_at.
+// touch records a successful use: the last-used column, and an audit event.
 //
 // Failures are ignored on purpose: a bookkeeping update must never fail a
 // legitimate request. The cost of a missed touch is a stale "last used" column,
 // which is cosmetic; the cost of failing the request is a broken sync client.
-func (a *AppPasswords) touch(ctx context.Context, id uuid.UUID, ip string) {
+//
+// The audit row is written here rather than before the return, and in this detached
+// goroutine, for two reasons that pull in the same direction. It must not fail the request —
+// an audit write that fails is not a reason to break a sync client. And it must survive the
+// response: a request context is cancelled as soon as the response is written, so an audit
+// row tied to it would be lost precisely for the fast requests that make up most traffic.
+//
+// Volume: this fires on every request that authenticates with an app password, which for a
+// WebDAV client is every request. That is a real cost and it is accepted deliberately —
+// §10.1 asks for 使用, and a credential that works without a session is exactly the one whose
+// every use must be attributable. An operator who finds it too loud can raise the audit
+// retention policy; they cannot reconstruct uses that were never recorded.
+func (a *AppPasswords) touch(ctx context.Context, id uuid.UUID, ip string, user store.User, scope string) {
 	go func() {
-		// Detached context: the request may be cancelled as soon as the response
-		// is written, and losing the update then would defeat the purpose.
 		bg, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = a.meta.WithTx(bg, func(ctx context.Context, tx store.Tx) error {
-			return tx.TouchAppPassword(ctx, id, ip)
+			if err := tx.TouchAppPassword(ctx, id, ip); err != nil {
+				return err
+			}
+			return tx.Audit(ctx, store.AuditEntry{
+				ActorKind: "user", ActorUserID: &user.ID, ActorEmail: user.Email,
+				ActorIP: ip, Action: string(audit.ActionAppPasswordUse),
+				TargetKind: "app_password", TargetID: id.String(),
+				Result:   string(audit.ResultOK),
+				Metadata: map[string]any{"scope": scope},
+			})
 		})
 	}()
 }

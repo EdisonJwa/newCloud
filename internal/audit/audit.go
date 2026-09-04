@@ -39,8 +39,17 @@ const (
 	ActionSessionRevoke     Action = "auth.session.revoke"
 	ActionAppPasswordCreate Action = "auth.apppassword.create"
 	ActionAppPasswordRevoke Action = "auth.apppassword.revoke"
-	ActionBreakglassUsed    Action = "auth.breakglass.used"
-	ActionBreakglassDenied  Action = "auth.breakglass.denied"
+	// ActionAppPasswordUse records a credential being USED, not created or destroyed.
+	//
+	// §10.1 requires 创建/使用/撤销 for app passwords. Creation and revocation were audited;
+	// use was not. That is the gap that matters most: an app password is a long-lived
+	// credential that works without a session, so "was this credential used, from where, and
+	// when" is the question asked after a leak. last_used_at cannot answer it — it is a single
+	// mutable column holding only the most recent use, and it disappears when the credential
+	// is revoked.
+	ActionAppPasswordUse   Action = "auth.apppassword.use"
+	ActionBreakglassUsed   Action = "auth.breakglass.used"
+	ActionBreakglassDenied Action = "auth.breakglass.denied"
 
 	// Shares.
 	ActionShareCreate            Action = "share.create"

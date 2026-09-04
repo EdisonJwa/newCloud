@@ -40,6 +40,14 @@ func (m *Memory) AuditRows(ctx context.Context, afterID int64, limit int) ([]aud
 		limit = 100
 	}
 
+	// Every attribution field the entry carries is mapped through.
+	//
+	// Four were missing: ActorUserID, UserAgent, ShareID and Bytes. The first is the serious one —
+	// the audit trail's central question is "who did this", and the answer was an email string that
+	// an account can change, with the immutable user id dropped. A share-mediated action also lost
+	// which share carried it, so the same event was attributable on PostgreSQL and not on the
+	// in-memory backend, which is the backend the tests run against: the gap could not be caught by
+	// any test that used it.
 	out := make([]audit.Event, 0, limit)
 	for i, e := range m.audit {
 		id := int64(i + 1)
@@ -47,16 +55,20 @@ func (m *Memory) AuditRows(ctx context.Context, afterID int64, limit int) ([]aud
 			continue
 		}
 		out = append(out, audit.Event{
-			ID:         id,
-			Time:       m.auditTimes[i],
-			ActorKind:  audit.ActorKind(e.ActorKind),
-			ActorEmail: e.ActorEmail,
-			ActorIP:    e.ActorIP,
-			Action:     audit.Action(e.Action),
-			TargetKind: audit.TargetKind(e.TargetKind),
-			TargetID:   e.TargetID,
-			Result:     audit.Result(e.Result),
-			Metadata:   e.Metadata,
+			ID:          id,
+			Time:        m.auditTimes[i],
+			ActorKind:   audit.ActorKind(e.ActorKind),
+			ActorUserID: e.ActorUserID,
+			ActorEmail:  e.ActorEmail,
+			ActorIP:     e.ActorIP,
+			UserAgent:   e.UserAgent,
+			Action:      audit.Action(e.Action),
+			TargetKind:  audit.TargetKind(e.TargetKind),
+			TargetID:    e.TargetID,
+			ShareID:     e.ShareID,
+			Result:      audit.Result(e.Result),
+			Bytes:       e.Bytes,
+			Metadata:    e.Metadata,
 			// Hash and PrevHash are intentionally zero: this backend does not seal, and
 			// inventing them here would make verification meaningless.
 		})

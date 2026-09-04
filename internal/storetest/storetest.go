@@ -14,6 +14,7 @@ package storetest
 import (
 	"context"
 	"errors"
+	"net"
 	"strings"
 	"sync"
 	"testing"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/EdisonJwa/newCloud/internal/audit"
 	"github.com/EdisonJwa/newCloud/internal/store"
 )
 
@@ -843,6 +845,10 @@ func Run(t *testing.T, factory Factory, opts Options) {
 
 	t.Run("VersionChecksum", func(t *testing.T) {
 		versionChecksumSuite(t, factory)
+	})
+
+	t.Run("AuditAttribution", func(t *testing.T) {
+		auditAttributionSuite(t, factory)
 	})
 
 	t.Run("BlobIdentity", func(t *testing.T) {
@@ -5847,6 +5853,87 @@ func versionChecksumSuite(t *testing.T, factory func(t *testing.T) (store.Store,
 					"version to have 内容校验信息 so a client can verify the bytes it downloads.",
 					v.VersionNo, len(v.SHA256))
 			}
+		}
+	})
+}
+
+// auditAttributionSuite covers the fields an audit event must carry.
+//
+// The in-memory backend's AuditRows mapped ActorKind, email, IP, action, target and result, and
+// dropped four others: ActorUserID, UserAgent, ShareID and Bytes. The first is the serious one —
+// the audit trail's central question is "who did this", and the answer was an email string that an
+// account can change, with the immutable user id discarded.
+//
+// Worse, the in-memory backend is what most tests run against, so the gap could not be caught by
+// any test that used it: the event looked complete and the missing field was the one nobody had
+// asserted.
+func auditAttributionSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.UUID)) {
+	t.Helper()
+
+	t.Run("EveryAttributionFieldSurvivesTheWrite", func(t *testing.T) {
+		s, owner := factory(t)
+
+		var wantUser, wantShare uuid.UUID
+		userID := owner
+		wantUser = userID
+		wantShare = uuid.New()
+		bytes := int64(4242)
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.Audit(ctx, store.AuditEntry{
+				ActorKind: "user", ActorUserID: &userID, ActorEmail: "who@example.test",
+				ActorIP: "198.51.100.7", UserAgent: "curl/8.0",
+				Action: "file.read", TargetKind: "node", TargetID: uuid.New().String(),
+				ShareID: &wantShare, Result: "ok", Bytes: &bytes,
+				Metadata: map[string]any{"note": "attribution"},
+			})
+		}); err != nil {
+			t.Fatalf("write audit: %v", err)
+		}
+
+		rows, err := s.AuditRows(context.Background(), 0, 1000)
+		if err != nil {
+			t.Fatalf("read audit: %v", err)
+		}
+		var got *audit.Event
+		for i := range rows {
+			if rows[i].Action == "file.read" {
+				got = &rows[i]
+			}
+		}
+		if got == nil {
+			t.Fatal("the audit row was not returned at all")
+		}
+
+		if got.ActorUserID == nil {
+			t.Fatal("the event dropped ActorUserID. Without it the trail records an email string " +
+				"that an account can change, instead of the immutable user id — so \"who did this\" " +
+				"is unanswerable once an address is edited.")
+		}
+		if *got.ActorUserID != wantUser {
+			t.Fatalf("the event names user %s, want %s", *got.ActorUserID, wantUser)
+		}
+		if got.UserAgent != "curl/8.0" {
+			t.Fatalf("the event dropped UserAgent (%q)", got.UserAgent)
+		}
+		if got.ShareID == nil || *got.ShareID != wantShare {
+			t.Fatalf("the event dropped ShareID (%v); a share-mediated action that does not name "+
+				"its share cannot be attributed to the link that carried it", got.ShareID)
+		}
+		if got.Bytes == nil || *got.Bytes != bytes {
+			t.Fatalf("the event dropped Bytes (%v)", got.Bytes)
+		}
+		if got.ActorEmail != "who@example.test" {
+			t.Fatalf("the event lost its actor address (%q)", got.ActorEmail)
+		}
+		// The IP is compared by PARSED ADDRESS, not by string: PostgreSQL stores it as inet and
+		// renders it as "198.51.100.7/32", while the in-memory backend keeps the text it was given.
+		// Both are correct; comparing the text would report a divergence that is only formatting —
+		// and did, the first time this case ran.
+		wantIP := net.ParseIP("198.51.100.7")
+		gotIP := net.ParseIP(strings.SplitN(got.ActorIP, "/", 2)[0])
+		if gotIP == nil || !gotIP.Equal(wantIP) {
+			t.Fatalf("the event records ip %q, want 198.51.100.7", got.ActorIP)
 		}
 	})
 }

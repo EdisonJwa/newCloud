@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/EdisonJwa/newCloud/internal/audit"
 	"github.com/EdisonJwa/newCloud/internal/config"
 	"github.com/EdisonJwa/newCloud/internal/store"
 )
@@ -312,5 +313,69 @@ func TestRevokeAllSessions(t *testing.T) {
 		if _, err := s.Verify(context.Background(), tok); !errors.Is(err, ErrInvalidSession) {
 			t.Fatalf("session %d should be revoked", i)
 		}
+	}
+}
+
+// TestAppPasswordUseIsAudited is §10.1's 使用 for app passwords.
+//
+// Creation and revocation were audited; use was not. That is the gap that matters most: an app
+// password is a long-lived credential that works without a session, so "was this credential used,
+// from where, and when" is the question asked after a leak — and last_used_at cannot answer it,
+// being a single mutable column that disappears with the credential.
+//
+// The write happens in a detached goroutine so it cannot fail the request or be cancelled with the
+// response, which means this test has to WAIT for it rather than assume it ran. A test that only
+// asserted "no error" would pass against a build where nothing was written at all, which is exactly
+// the state this round found.
+func TestAppPasswordUseIsAudited(t *testing.T) {
+	// The in-memory store audits every mutation by default; there is no switch to flip.
+	m := store.NewMemory()
+	u := m.AddUser(store.User{Username: "audited", Email: "audited@example.test", Role: "user"})
+	ap := NewAppPasswords(m)
+
+	secret, cred, err := ap.Issue(context.Background(), u.ID, "sync", ScopeReadWrite, time.Hour)
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+
+	if _, _, err := ap.Verify(context.Background(), secret, "203.0.113.9"); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+
+	// The audit write is asynchronous, so poll rather than sleep a fixed time: a fixed sleep is
+	// either slower than necessary or flaky on a loaded machine.
+	var found *audit.Event
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		rows, aerr := m.AuditRows(context.Background(), 0, 100)
+		if aerr != nil {
+			t.Fatal(aerr)
+		}
+		for i := range rows {
+			if string(rows[i].Action) == string(audit.ActionAppPasswordUse) {
+				found = &rows[i]
+				break
+			}
+		}
+		if found != nil {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if found == nil {
+		t.Fatal("using an app password wrote no auth.apppassword.use event. §10.1 requires " +
+			"创建/使用/撤销; usage is the one that answers \"was this long-lived credential used " +
+			"after it leaked\", and last_used_at is a single mutable column that cannot.")
+	}
+	if found.TargetID != cred.ID.String() {
+		t.Fatalf("the event names %q, want the credential %q. A use event that does not "+
+			"identify which credential was used cannot answer which one leaked.",
+			found.TargetID, cred.ID)
+	}
+	if found.ActorIP != "203.0.113.9" {
+		t.Fatalf("the event records ip %q, want the caller's address", found.ActorIP)
+	}
+	if found.ActorUserID == nil || *found.ActorUserID != u.ID {
+		t.Fatal("the event does not name the acting user")
 	}
 }
