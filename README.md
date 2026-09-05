@@ -288,3 +288,10 @@ Two properties are worth knowing before deploying:
 - Audit anchors must be stored where the application cannot rewrite them. The code can detect a
   truncated chain only if the anchor directory has different credentials from the database; a
   directory on the metadata volume makes the anchor decorative.
+
+## License
+
+newCloud is licensed under the [Apache License, Version 2.0](LICENSE).
+
+The license includes an express patent grant and requires preserving copyright and license
+notices. It does not require publishing modifications.
