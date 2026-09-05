@@ -15,6 +15,7 @@ import (
 
 	"github.com/EdisonJwa/newCloud/internal/audit"
 	"github.com/EdisonJwa/newCloud/internal/auditverify"
+	"github.com/EdisonJwa/newCloud/internal/blob"
 	"github.com/EdisonJwa/newCloud/internal/metrics"
 	"github.com/EdisonJwa/newCloud/internal/store"
 )
@@ -48,6 +49,11 @@ type Worker struct {
 	// has not decided a retention policy deletes nothing.
 	versionRetention time.Duration
 	trashRetention   time.Duration
+	// uploads reclaims partial uploads left by interrupted writes. Nil means the backend cannot do
+	// it, which is a complete answer rather than a failure — a third backend is not required to
+	// implement blob.UploadCleaner.
+	uploads     blob.UploadCleaner
+	uploadGrace time.Duration
 
 	// jobInterval is how often the queue is polled. Short enough that work queued by
 	// a request is picked up in the same second a user is still watching, long enough
@@ -125,6 +131,21 @@ func New(meta store.Store, log *slog.Logger) *Worker {
 // It is a setter rather than a constructor argument so the zero value stays safe:
 // a worker built without it retains everything, which is the only defensible
 // default for a setting that deletes a user's data.
+// WithUploadCleanup enables the partial-upload sweep (§9.3 清理未完成 Multipart Upload).
+//
+// grace must exceed the longest upload the deployment accepts, or the sweep would abort transfers
+// that are still running. It is a required argument rather than a default for that reason: the
+// wrong value destroys live uploads, and there is no value that is obviously safe for every
+// deployment.
+func (w *Worker) WithUploadCleanup(cleaner blob.UploadCleaner, interval, grace time.Duration) *Worker {
+	w.uploads = cleaner
+	w.uploadGrace = grace
+	if interval > 0 {
+		w.purgeInterval = interval
+	}
+	return w
+}
+
 func (w *Worker) WithRetention(versions, trash time.Duration) *Worker {
 	w.versionRetention = versions
 	w.trashRetention = trash
@@ -163,6 +184,10 @@ func (w *Worker) Run(ctx context.Context) {
 	}
 	scrubs := time.NewTicker(scrubEvery)
 	defer scrubs.Stop()
+	// Partial uploads are reclaimed on the purge cadence: they are invisible to every listing and
+	// cost storage until removed, but they are not urgent, so there is no reason for a faster tick.
+	uploadCleanup := time.NewTicker(w.purgeInterval)
+	defer uploadCleanup.Stop()
 
 	w.log.Info("worker started",
 		"lock_interval", w.lockInterval, "sweep_interval", w.sweepInterval,
@@ -242,6 +267,8 @@ func (w *Worker) Run(ctx context.Context) {
 			// expired deliveries to the trash, and the trash window still applies before
 			// anything is destroyed.
 			w.expireRetained(ctx)
+		case <-uploadCleanup.C:
+			w.abortStaleUploads(ctx)
 		case <-purges.C:
 			if res, err := w.PurgeTrash(ctx); err != nil {
 				w.log.Error("trash purge failed", "error", err)
@@ -429,6 +456,27 @@ func (w *Worker) SweepBlobs(ctx context.Context) (int, error) {
 		}
 	}
 	return removed, nil
+}
+
+// abortStaleUploads discards partial uploads that will never complete.
+//
+// Nothing lists these: an interrupted multipart upload is not an object, and a crash-left temp file
+// is not an object either, so the usage they consume is invisible to every count the server keeps.
+// That is why this is a sweep on a timer rather than something triggered by a failed request — the
+// failed request is gone by the time anyone could notice.
+func (w *Worker) abortStaleUploads(ctx context.Context) {
+	if w.uploads == nil || w.uploadGrace <= 0 {
+		return
+	}
+	res, err := w.uploads.AbortStaleUploads(ctx, w.uploadGrace)
+	if err != nil {
+		w.log.Error("partial-upload cleanup failed", "error", err)
+		return
+	}
+	if res.Aborted > 0 {
+		w.log.Info("discarded stale partial uploads",
+			"aborted", res.Aborted, "bytes", res.Bytes)
+	}
 }
 
 // runScrub performs one integrity pass and reports it.

@@ -115,6 +115,19 @@ limits:
   # warning at startup, because "retention configured" and "retention does
   # nothing" look identical from outside until the disk fills.
   trash_retention_days: 30             # how long a deleted item stays restorable
+
+  # How old a PARTIAL upload must be before the worker discards it (§9.3 清理未完成 Multipart
+  # Upload). Zero disables the sweep.
+  #
+  # Two things leak without this, and neither is an object:
+  #   - S3: an interrupted multipart upload leaves parts that no listing shows. AWS warns these
+  #     keep costing money until removed.
+  #   - local: Put writes a temp file and renames it into place, so a crash mid-write leaves that
+  #     temp file behind.
+  #
+  # Set this LONGER than the biggest upload you accept. The sweep aborts anything older, so too
+  # small a value destroys a transfer that is still running — which is why there is no default.
+  upload_cleanup_grace_hours: 24       # discard partial uploads older than this; 0 disables
   version_retention_days: 365          # how long an old version is kept
   version_count_limit: 0               # per-file version count cap; 0 = layout default (10 blob / 3 tree)
   upload_session_ttl_hours: 24         # how long an unfinished resumable upload may sit idle

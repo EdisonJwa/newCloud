@@ -343,6 +343,20 @@ func serve() error {
 	// anything here; the queries are written to tolerate it.
 	wk := worker.New(meta, log).WithRetention(cfg.Limits.VersionRetention(), cfg.Limits.TrashRetention())
 	wk.WithMetrics(reg)
+	// §9.3: 清理未完成 Multipart Upload。Partial uploads are not objects, so no listing, no HEAD and
+	// no usage count can see them; without this pass they persist until the bucket is emptied by
+	// hand. Enabled only when the backend supports it — the optional interface exists so a backend
+	// that cannot clean up does not have to pretend.
+	if cleaner, ok := blobStore.(blob.UploadCleaner); ok {
+		grace := cfg.Limits.UploadCleanupGrace()
+		if grace > 0 {
+			wk.WithUploadCleanup(cleaner, 0, grace)
+			log.Info("partial-upload cleanup enabled", "grace", grace)
+		} else {
+			log.Warn("partial-upload cleanup disabled: upload_cleanup_grace_hours is not set, so " +
+				"abandoned multipart parts and crash-left temp files accumulate and keep costing storage")
+		}
+	}
 	if n := cfg.Limits.BlobScrubPerPass; n > 0 {
 		// The scrub is the only thing that reads stored content back. Without it, a blob
 		// corrupted in place is invisible until a user opens the file — or until a restore

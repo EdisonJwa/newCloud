@@ -191,11 +191,24 @@ type LimitsConfig struct {
 	VersionCountLimit    int `yaml:"version_count_limit"`
 	TrashRetentionDays   int `yaml:"trash_retention_days"`
 	UploadSessionTTLHrs  int `yaml:"upload_session_ttl_hours"`
+
+	// UploadCleanupGraceHours is how old a partial upload must be before it is discarded.
+	//
+	// §9.3: 清理未完成 Multipart Upload. It must exceed the longest upload the deployment
+	// accepts, or the sweep aborts transfers that are still running. Zero disables the sweep
+	// deliberately rather than by omission: there is no grace period that is safe for every
+	// deployment, because "safe" depends on how large a file this one expects to receive.
+	UploadCleanupGraceHours int `yaml:"upload_cleanup_grace_hours"`
 }
 
 // VersionRetention is how long an old version is kept. Zero means forever.
 func (l LimitsConfig) VersionRetention() time.Duration {
 	return time.Duration(l.VersionRetentionDays) * 24 * time.Hour
+}
+
+// UploadCleanupGrace is how old a partial upload must be before it is discarded.
+func (l LimitsConfig) UploadCleanupGrace() time.Duration {
+	return time.Duration(l.UploadCleanupGraceHours) * time.Hour
 }
 
 // TrashRetention is how long a deleted item stays restorable. Zero means forever.

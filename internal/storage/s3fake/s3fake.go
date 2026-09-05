@@ -65,6 +65,10 @@ type multipartUpload struct {
 	bucket string
 	key    string
 	parts  map[int][]byte
+	// initiated is when the upload started. A cleanup policy keys off age, so the fake has to
+	// record it — without it there is no way to test that a STALE upload is aborted and a fresh
+	// one is left alone.
+	initiated time.Time
 }
 
 // New starts a fake S3 server with one bucket.
@@ -161,6 +165,10 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		// GetBucketLocation: minio-go asks before signing some requests.
 		w.Header().Set("Content-Type", "application/xml")
 		_, _ = w.Write([]byte(`<LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></LocationConstraint>`))
+		return
+	case key == "" && r.Method == http.MethodGet && r.URL.Query().Has("uploads"):
+		// ListMultipartUploads: the query a cleanup policy uses to FIND leftover parts.
+		s.listMultipartUploads(w, bucket)
 		return
 	case key == "" && r.Method == http.MethodGet:
 		// A bucket-level GET means different things depending on the query: BucketExists sends
@@ -498,6 +506,47 @@ func (s *Server) listObjectsV2(w http.ResponseWriter, r *http.Request, bucket st
 
 // ---- multipart ----
 
+// listMultipartUploads answers GET /<bucket>?uploads.
+//
+// The response shape matters more than it looks: minio-go parses it into the upload list a cleanup
+// policy iterates, so an empty-but-well-formed body is what tells a caller "there is nothing to
+// abort". Returning NotImplemented instead would make every cleanup run fail, and returning
+// objects would make it abort live transfers.
+func (s *Server) listMultipartUploads(w http.ResponseWriter, bucket string) {
+	type upload struct {
+		Key          string    `xml:"Key"`
+		UploadID     string    `xml:"UploadId"`
+		Initiated    time.Time `xml:"Initiated"`
+		StorageClass string    `xml:"StorageClass"`
+	}
+	type result struct {
+		XMLName xml.Name `xml:"ListMultipartUploadsResult"`
+		Bucket  string   `xml:"Bucket"`
+		Uploads []upload `xml:"Upload"`
+	}
+
+	s.mu.RLock()
+	var out result
+	out.Bucket = bucket
+	for id, up := range s.uploads {
+		if up.bucket != bucket {
+			continue
+		}
+		out.Uploads = append(out.Uploads, upload{
+			Key: up.key, UploadID: id, Initiated: up.initiated.UTC(), StorageClass: "STANDARD",
+		})
+	}
+	s.mu.RUnlock()
+
+	// Deterministic order: map iteration would make a test that aborts "the stale ones" flaky.
+	sort.Slice(out.Uploads, func(i, j int) bool {
+		return out.Uploads[i].UploadID < out.Uploads[j].UploadID
+	})
+
+	w.Header().Set("Content-Type", "application/xml")
+	_ = xml.NewEncoder(w).Encode(out)
+}
+
 type initiateResult struct {
 	XMLName  xml.Name `xml:"InitiateMultipartUploadResult"`
 	Bucket   string   `xml:"Bucket"`
@@ -513,7 +562,7 @@ func (s *Server) createMultipart(w http.ResponseWriter, r *http.Request, bucket,
 		return
 	}
 	id := fmt.Sprintf("upload-%d", time.Now().UnixNano())
-	s.uploads[id] = &multipartUpload{bucket: bucket, key: key, parts: map[int][]byte{}}
+	s.uploads[id] = &multipartUpload{bucket: bucket, key: key, parts: map[int][]byte{}, initiated: time.Now()}
 	s.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/xml")
@@ -628,7 +677,13 @@ func (s *Server) StartMultipartForTest(bucket, key string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	id := "test-upload-" + key
-	s.uploads[id] = &multipartUpload{key: key, parts: map[int][]byte{}}
+	// bucket and initiated are set here too. They used to be omitted, which made the record
+	// invisible to a bucket-scoped listing and permanently "stale" by any age test — so a cleanup
+	// policy could never see it. A helper that produces a record the server cannot list is a
+	// helper that hides the feature under test.
+	s.uploads[id] = &multipartUpload{
+		bucket: bucket, key: key, parts: map[int][]byte{}, initiated: time.Now(),
+	}
 	return id
 }
 

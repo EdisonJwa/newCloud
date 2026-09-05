@@ -13,6 +13,7 @@ import (
 	"errors"
 	"hash"
 	"io"
+	"time"
 )
 
 // Hash is a content address: the SHA-256 of the stored bytes.
@@ -92,4 +93,38 @@ func (w *Hasher) Sum() (Hash, int64) {
 func TeeReader(r io.Reader) (io.Reader, *Hasher) {
 	hw := NewHasher()
 	return io.TeeReader(r, hw), hw
+}
+
+// UploadCleaner is implemented by backends that can leave partial uploads behind, so a maintenance
+// pass can reclaim them.
+//
+// It is NOT part of Store. A third backend must only implement Put/Open/Delete/Stat, and adding a
+// fifth method to the core interface would force every backend to write a method that most of them
+// would stub out with `return nil`. An optional interface lets a caller ask "can you clean up after
+// yourself" and treat "no" as a complete answer.
+//
+// §9.3: 清理未完成 Multipart Upload；AWS 明确建议对残留分块设置生命周期规则，否则可能持续产生费用.
+//
+// Both shipped backends need this, for different reasons: an S3 backend stages large objects as
+// multipart uploads and an interrupted one leaves billable parts; the local backend writes to a
+// temp file before renaming it into place, and a crash mid-write leaves that temp file behind.
+// Neither is visible as an object, which is exactly why neither is noticed — nothing lists them.
+type UploadCleaner interface {
+	// AbortStaleUploads discards partial uploads older than olderThan and reports what it
+	// reclaimed.
+	//
+	// The age bound is not optional. Aborting a fresh upload would destroy a transfer that is
+	// still in progress, so a caller must pass a window comfortably longer than the largest
+	// upload it accepts.
+	AbortStaleUploads(ctx context.Context, olderThan time.Duration) (UploadCleanupResult, error)
+}
+
+// UploadCleanupResult reports what a cleanup pass reclaimed.
+type UploadCleanupResult struct {
+	// Aborted is how many partial uploads were discarded.
+	Aborted int
+	// Bytes is how much staged content was reclaimed, when the backend knows. Zero means "not
+	// measured", which is different from "nothing was reclaimed" and is reported rather than
+	// guessed.
+	Bytes int64
 }
