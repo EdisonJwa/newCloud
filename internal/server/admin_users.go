@@ -136,7 +136,7 @@ func (s *Server) handleAdminSetUserStatus(w http.ResponseWriter, r *http.Request
 		// The audit row names the change and the credentials it cut off. "Who approved this
 		// account" and "who cut off this user's sessions" are the questions an
 		// administrator has to be able to answer afterwards.
-		return tx.Audit(ctx, store.AuditEntry{
+		if aerr := tx.Audit(ctx, store.AuditEntry{
 			ActorKind: "user", ActorUserID: actor.Ptr(), ActorEmail: actor.Email(),
 			ActorIP: clientIP(r), UserAgent: r.UserAgent(),
 			Action: "user.status.change", TargetKind: "user", TargetID: target.String(),
@@ -149,7 +149,17 @@ func (s *Server) handleAdminSetUserStatus(w http.ResponseWriter, r *http.Request
 				"sessions_revoked":      change.SessionsRevoked,
 				"app_passwords_revoked": change.AppPasswordsRevoked,
 			},
-		})
+		}); aerr != nil {
+			return aerr
+		}
+		// The revocation gets its own event as well as the count above.
+		//
+		// auth.session.revoke was declared in the vocabulary and emitted nowhere, so filtering for
+		// it returned nothing whether or not any session had been cut off. An operator asking "was
+		// this session revoked, and by what" needs one event they can filter, not a field buried in
+		// the metadata of several unrelated causes.
+		return auditSessionRevocation(ctx, tx, r, target, u.Username,
+			change.SessionsRevoked, "admin.status", string(change.To))
 	})
 	if err != nil {
 		s.writeStoreError(w, err)

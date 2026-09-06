@@ -232,7 +232,7 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 			if roleChange.Downgraded {
 				result = "denied"
 			}
-			return tx.Audit(ctx, store.AuditEntry{
+			if aerr := tx.Audit(ctx, store.AuditEntry{
 				ActorKind: "system", ActorUserID: &u.ID, ActorEmail: u.Email,
 				ActorIP: clientIP(r), UserAgent: r.UserAgent(),
 				Action: "user.role.change", TargetKind: "user", TargetID: u.ID.String(),
@@ -245,7 +245,15 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 					"app_passwords_revoked": roleChange.AppPasswordsRevoked,
 					"groups":                claims.Groups,
 				},
-			})
+			}); aerr != nil {
+				return aerr
+			}
+			// A downgrade that cut sessions off is also a session revocation (§10.1). Same event
+			// name as the admin path, on purpose: an operator looking for "did anything revoke this
+			// user's sessions" must not have to know which subsystem did it.
+			return auditSessionRevocation(ctx, tx, r, u.ID, u.Username,
+				roleChange.SessionsRevoked, "role.downgrade",
+				roleChange.From+"->"+roleChange.To)
 		}
 		return nil
 	})

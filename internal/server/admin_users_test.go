@@ -425,3 +425,59 @@ func TestAdminDeleteIsInvisibleToNonAdmins(t *testing.T) {
 		t.Fatalf("a non-admin must get 404 from the delete endpoint, got %d", resp.StatusCode)
 	}
 }
+
+// TestSessionRevocationIsItsOwnAuditEvent is §10.1's 会话撤销.
+//
+// auth.session.revoke was declared in the audit vocabulary and emitted by nothing, so filtering for
+// it returned an empty set whether or not any session had ever been cut off. The count existed — in
+// the metadata of user.status.change — but an operator asking "was this session revoked, and by
+// what" had to know which unrelated cause to look under.
+func TestSessionRevocationIsItsOwnAuditEvent(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	client, _ := h.adminClient(t)
+
+	// A victim with a live session, so the disable actually has something to revoke.
+	victim := h.meta.AddUser(store.User{
+		Username: "revokee", Email: "revokee@example.test", Role: "user",
+	})
+	if _, err := h.meta.EnsureRoot(ctx, victim.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.sessions.Mint(ctx, victim.ID, victim.Email, "127.0.0.1", "test"); err != nil {
+		t.Fatal(err)
+	}
+
+	before := countAuditAction(t, h, "auth.session.revoke")
+
+	// Disabling revokes the victim's sessions. That is ID-06, and it is the cause this event has to
+	// name — "12 sessions revoked" without "because the account was disabled" is a fact with no
+	// story.
+	if status, body := h.adminStatus(t, client, victim.ID.String(), store.StatusDisabled); status != http.StatusOK {
+		t.Fatalf("disable: %d %v", status, body)
+	}
+
+	after := countAuditAction(t, h, "auth.session.revoke")
+	if after <= before {
+		t.Fatalf("disabling an account with a live session wrote no auth.session.revoke event. " +
+			"The vocabulary advertises this event, so an empty filter result reads as \"nothing was " +
+			"ever revoked\" — and an auditor cannot tell that from an unwired event.")
+	}
+}
+
+// countAuditAction counts emitted events with one action name.
+func countAuditAction(t *testing.T, h *harness, action string) int {
+	t.Helper()
+	rows, err := h.meta.AuditRows(context.Background(), 0, 10000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, e := range rows {
+		if string(e.Action) == action {
+			n++
+		}
+	}
+	return n
+}
