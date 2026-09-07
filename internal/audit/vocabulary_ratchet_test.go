@@ -99,8 +99,18 @@ func emittedActions(t *testing.T, root string) map[string]bool {
 			return err
 		}
 		if info.IsDir() {
-			// Vendored and generated trees cannot emit anything of ours.
-			if name := info.Name(); name == ".git" || name == "node_modules" {
+			// Skip hidden and vendored trees wholesale.
+			//
+			// The original version listed ".git" and "node_modules" by name and was defeated by a
+			// stray ".rename-tmp" directory holding 404 duplicated files, one of which was a stale
+			// copy of internal/audit/audit.go. The scan then "found" emitters for five actions
+			// because their strings appeared in a duplicate that is not part of the build. A
+			// source-scanning guard must not depend on no stray directory existing: any directory
+			// whose name starts with a dot is not module source, and Go ignores it too.
+			if name := info.Name(); name != "." && strings.HasPrefix(name, ".") {
+				return filepath.SkipDir
+			}
+			if info.Name() == "node_modules" {
 				return filepath.SkipDir
 			}
 			return nil

@@ -15,7 +15,9 @@ import (
 	"context"
 	"time"
 
+	"github.com/EdisonJwa/newCloud/internal/audit"
 	"github.com/EdisonJwa/newCloud/internal/auditverify"
+	"github.com/EdisonJwa/newCloud/internal/store"
 )
 
 // anchorOnce publishes a checkpoint for yesterday if one is missing.
@@ -31,17 +33,35 @@ func (w *Worker) anchorOnce(ctx context.Context) error {
 	// Anchor the most recently completed day.
 	day := time.Now().UTC().AddDate(0, 0, -1).Truncate(24 * time.Hour)
 
-	// Skip if it is already published: rewriting it would erase the very record that
+	// Skip PUBLISHING if it is already published: rewriting it would erase the very record that
 	// makes a later rewrite detectable.
+	//
+	// Only publishing is skipped. This used to `return nil` here, which also skipped the
+	// verification below — so a worker that started after the day's checkpoint existed never
+	// compared it against the log at all, and a running one checked at most once per day. An
+	// anchor that is written but never compared proves nothing, and that was the state for
+	// twenty-three hours out of twenty-four.
 	existing, err := w.anchor.Checkpoints()
 	if err != nil {
 		return err
 	}
+	published := false
 	for _, cp := range existing {
 		if cp.Day.Equal(day) {
-			return nil
+			published = true
+			break
 		}
 	}
+	if !published {
+		return w.publishCheckpoint(ctx, day)
+	}
+	// Nothing to publish; verify what is there.
+	w.verifyAndRecord(ctx)
+	return nil
+}
+
+// publishCheckpoint writes one day's checkpoint and verifies the result.
+func (w *Worker) publishCheckpoint(ctx context.Context, day time.Time) error {
 
 	head, count, err := w.chain.Head()
 	if err != nil {
@@ -62,26 +82,87 @@ func (w *Worker) anchorOnce(ctx context.Context) error {
 		return err
 	}
 
-	// Verify immediately after publishing. An anchor that is written but never compared
-	// against the log proves nothing, so the check runs on the same schedule as the write.
+	w.log.Info("audit chain anchored",
+		"day", day.Format("2006-01-02"),
+		"head", auditverify.Digest(head),
+		"events", count)
+
+	// Verify immediately after publishing: a checkpoint nobody compared is a write-only ritual.
+	w.verifyAndRecord(ctx)
+	return nil
+}
+
+// verifyAndRecord compares every published checkpoint against the chain and records the verdict.
+//
+// Called on EVERY tick, not only when a checkpoint was published. Verification is the part that
+// turns an anchor into evidence, and tying it to the once-a-day publish meant a restarted worker
+// never verified at all and a running one verified once a day — so tampering could go unnoticed for
+// twenty-three hours, which is most of the value of the check gone.
+//
+// WHAT THIS DOES NOT DETECT. This compares published checkpoints against the chain: a deleted or
+// truncated tail, a missing checkpoint in the middle, a broken link, a head that moved. It does NOT
+// recompute each event's hash, so a REWRITE of an event's fields — an action changed from
+// "file.delete" to "file.read", with the stored hash column left alone — passes here.
+//
+// That walk exists as auditverify.Run, and `newcloud audit verify` runs it. It is not on this tick
+// because it reads every event in the table, which is not something a background timer should do on
+// a deployment with millions of them. The split is deliberate: the cheap structural check runs
+// continuously, the expensive full verification is an operator action. It is stated here because a
+// reader would otherwise assume "verified" means every row was checked, and a security check that
+// overstates its coverage is worse than one that is honestly narrow.
+func (w *Worker) verifyAndRecord(ctx context.Context) {
 	result, verr := w.VerifyAnchor()
 	if verr != nil {
 		w.log.Error("anchor verification failed to run", "error", verr)
+		w.recordVerifyFailure(ctx, "runner_error", verr.Error(), nil)
 	} else if !result.OK() {
 		// This is the loudest thing this process can say: the published record and the
 		// log disagree, which means events were added, removed or rewritten.
 		w.log.Error("AUDIT ANCHOR MISMATCH: the chain does not match what was published",
 			"problems", result.Problems)
+		w.recordVerifyFailure(ctx, "mismatch", "", result.Problems)
 	}
 	if w.metrics != nil {
 		w.metrics.ObserveAuditVerify(verr == nil && result.OK())
 	}
+}
 
-	w.log.Info("audit chain anchored",
-		"day", day.Format("2006-01-02"),
-		"head", auditverify.Digest(head),
-		"events", count)
-	return nil
+// recordVerifyFailure writes the failure into the audit log itself (§10.1 审计校验失败).
+//
+// Two failure kinds are distinguished because they call for different investigations. A mismatch
+// means the published record and the log disagree — events were added, removed or rewritten, which
+// is the tampering case. A runner_error means the check could not be performed at all (an
+// unreadable anchor directory, say), which is an operational fault and, on its own, says nothing
+// about the log's integrity. Recording both under one reason code would make "we could not check"
+// look like "we found something".
+//
+// The write is best-effort and never returns an error to the caller: this runs inside the anchor
+// step, and a failure to record a failure must not stop the anchoring that follows. It is logged
+// when it fails, which is the only remaining channel.
+func (w *Worker) recordVerifyFailure(ctx context.Context, reason, detail string, problems []string) {
+	err := w.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		meta := map[string]any{"reason": reason}
+		if detail != "" {
+			meta["error"] = detail
+		}
+		if len(problems) > 0 {
+			// Bounded: a tampered log can produce a long problem list, and an audit row that is
+			// megabytes wide is one nobody can read or index.
+			if len(problems) > 10 {
+				problems = append(problems[:10], "…")
+			}
+			meta["problems"] = problems
+		}
+		return tx.Audit(ctx, store.AuditEntry{
+			ActorKind: "system", Action: string(audit.ActionAuditVerifyFailure),
+			TargetKind: "audit", TargetID: "chain",
+			Result: string(audit.ResultError), Metadata: meta,
+		})
+	})
+	if err != nil {
+		w.log.Error("could not record an audit verification failure in the audit log",
+			"error", err, "reason", reason)
+	}
 }
 
 // EnableAnchoring wires the anchor and the chain it verifies.

@@ -85,7 +85,14 @@ const (
 	ActionGroupMemberChange Action = "group.member.change"
 	ActionSettingChange     Action = "admin.setting.change"
 	ActionAuditExport       Action = "audit.export"
-	ActionPrivilegedRead    Action = "admin.privileged_read"
+	// ActionAuditVerifyFailure records that the audit log failed its own integrity check.
+	//
+	// §10.1 requires 审计校验失败. It was a LOG LINE only, which is the one place a record of
+	// tampering is worthless: whoever can edit the log can edit the line that says the log was
+	// edited. The chain is the tamper-evident record, so the fact that the chain does not match
+	// what was published has to go INTO the chain.
+	ActionAuditVerifyFailure Action = "audit.verify.failure"
+	ActionPrivilegedRead     Action = "admin.privileged_read"
 
 	// Retention cleanups.
 	//
