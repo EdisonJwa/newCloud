@@ -39,11 +39,10 @@ func newCleanupStore(t *testing.T, bucket string) (*s3.Store, *s3fake.Server) {
 func TestS3AbortsStaleMultipartUploads(t *testing.T) {
 	store, fake := newCleanupStore(t, "stale")
 	ctx := context.Background()
-
 	// An upload that was started and abandoned. StartMultipartForTest stages it the way an
 	// interrupted Put would, without completing it.
 	const key = "ab/cd/the-object-left-behind"
-	fake.StartMultipartForTest("stale", key)
+	id := fake.StartMultipartForTest("stale", key)
 	if fake.PendingMultipart() != 1 {
 		t.Fatalf("setup: %d pending uploads, want 1", fake.PendingMultipart())
 	}
@@ -54,21 +53,27 @@ func TestS3AbortsStaleMultipartUploads(t *testing.T) {
 		t.Fatal("a zero age window was accepted; it would abort transfers that are in progress")
 	}
 
-	// The upload was just started, so a one-hour window must leave it alone.
+	// A JUST-STARTED upload must survive a one-hour window. The age is set explicitly rather than
+	// left to elapsed wall time: the first version of this case used a one-nanosecond window and
+	// was a coin flip on Windows, where the clock granularity is about a millisecond — the upload's
+	// timestamp and the cutoff can land on the same tick, so a genuinely fresh upload reads as
+	// fresh and the assertion about a STALE one never gets a fair run.
+	fake.AgeMultipartForTest(id, 0)
 	res, err := store.AbortStaleUploads(ctx, time.Hour)
 	if err != nil {
 		t.Fatalf("cleanup: %v", err)
 	}
 	if res.Aborted != 0 {
-		t.Fatalf("aborted %d fresh uploads; a transfer in progress must not be touched", res.Aborted)
+		t.Fatalf("aborted %d just-started uploads; a transfer in progress must not be touched",
+			res.Aborted)
 	}
 	if fake.PendingMultipart() != 1 {
 		t.Fatal("a fresh upload was removed by a sweep with a one-hour window")
 	}
 
-	// With a window in the past, the same upload is stale. Expressed by asking for an older-than
-	// window, since the fake's clock is real.
-	res, err = store.AbortStaleUploads(ctx, time.Nanosecond)
+	// The same pass, one backdated upload: it must go.
+	fake.AgeMultipartForTest(id, 2*time.Hour)
+	res, err = store.AbortStaleUploads(ctx, time.Hour)
 	if err != nil {
 		t.Fatalf("cleanup: %v", err)
 	}

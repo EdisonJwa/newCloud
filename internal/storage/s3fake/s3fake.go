@@ -687,6 +687,22 @@ func (s *Server) StartMultipartForTest(bucket, key string) string {
 	return id
 }
 
+// AgeMultipartForTest backdates an upload's initiation time.
+//
+// Without this, a test of an age-based cleanup has to pick a window and hope the wall clock moved
+// between setup and the call. On Windows time.Now() has roughly millisecond granularity, so a
+// one-nanosecond window makes "older than the window" a coin flip: the upload's timestamp and the
+// cutoff can land on the same tick, the upload is correctly treated as fresh, and the test fails
+// intermittently. That is not a property of the code under test — it is the fixture failing to say
+// what it meant.
+func (s *Server) AgeMultipartForTest(id string, age time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if up, ok := s.uploads[id]; ok {
+		up.initiated = time.Now().Add(-age)
+	}
+}
+
 // AbortMultipartForTest drops an in-progress upload, as AbortMultipartUpload would.
 func (s *Server) AbortMultipartForTest(id string) {
 	s.mu.Lock()
