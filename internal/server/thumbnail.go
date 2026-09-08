@@ -98,6 +98,14 @@ func (s *Server) handleThumbnail(w http.ResponseWriter, r *http.Request) {
 			// a type badge.
 			writeError(w, http.StatusUnsupportedMediaType, "not_an_image",
 				"this file has no thumbnail")
+		case errors.Is(err, thumbnail.ErrCooldown):
+			// §6.3's cooldown, reported as the same "no thumbnail" outcome and — critically —
+			// WITHOUT a log line. A cooling file is requested on every listing refresh, so logging
+			// here would turn one bad file into a stream of warnings, which is the resource drain
+			// the cooldown exists to prevent, moved from the decoder to the log.
+			s.observeThumbnail("cooldown")
+			writeError(w, http.StatusUnsupportedMediaType, "not_an_image",
+				"this file has no thumbnail")
 		default:
 			s.deps.Log.Warn("thumbnail generation failed",
 				"path", rel, "etag", node.ETag, "error", err)

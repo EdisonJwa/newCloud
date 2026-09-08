@@ -66,6 +66,13 @@ var ErrBusy = errors.New("thumbnail: too many concurrent decode requests")
 // an ordinary corrupt one.
 var ErrTimeout = errors.New("thumbnail: decode exceeded its deadline")
 
+// ErrCooldown means this content failed to decode recently and is not being retried yet.
+//
+// Distinct from the original decode error so the request path can answer "no thumbnail" without
+// logging it as a fresh failure every time. Without the distinction a cooling file would log an
+// error per request, which is its own denial of service against the log.
+var ErrCooldown = errors.New("thumbnail: recent decode failure, retry later")
+
 // Generator produces thumbnails and memoises them.
 //
 // The cache is in memory and keyed by content address. That is the right key: the same
@@ -74,6 +81,19 @@ var ErrTimeout = errors.New("thumbnail: decode exceeded its deadline")
 type Generator struct {
 	mu    sync.RWMutex
 	cache map[[32]byte][]byte
+	// failed records content addresses that could not be decoded, with the time of the failure.
+	//
+	// §6.3: 处理队列可重试，失败结果有冷却和回收策略；避免持续重试恶意文件耗尽资源. Without
+	// this, a file that always fails — a corrupt image, or one crafted to burn the decoder — is
+	// re-decoded on every single request, forever. The concurrency limit and the deadline bound
+	// ONE attempt; they do not stop an unbounded number of attempts being made.
+	//
+	// Keyed by content address like the positive cache, so a replaced file is unaffected: different
+	// bytes mean a different address and a fresh attempt. That is why the cooldown can be long
+	// without ever hiding a fixed file.
+	failed map[[32]byte]time.Time
+	// cooldown overrides FailureCooldown when non-zero, so a test can observe expiry.
+	cooldown time.Duration
 	// maxEntries bounds memory. At ~15 KB per entry this is about 12 MB, which is a
 	// reasonable ceiling for an in-process cache that can always be recomputed.
 	maxEntries int
@@ -104,10 +124,20 @@ const DefaultConcurrency = 4
 // DefaultTimeout bounds one decode.
 const DefaultTimeout = 10 * time.Second
 
+// FailureCooldown is how long a content address is remembered as undecodable.
+//
+// Long enough that a repeatedly-requested broken file costs one decode per window rather than one
+// per request, and set against the content address so replacing the file is never penalised. An
+// hour is a compromise: long enough to matter under a client that polls a listing view, short
+// enough that a transient failure (an out-of-memory condition during one decode) is retried in the
+// same session.
+const FailureCooldown = time.Hour
+
 // New builds a generator.
 func New() *Generator {
 	return &Generator{
 		cache:      make(map[[32]byte][]byte),
+		failed:     make(map[[32]byte]time.Time),
 		maxEntries: 800,
 		sem:        make(chan struct{}, DefaultConcurrency),
 		timeout:    DefaultTimeout,
@@ -144,6 +174,12 @@ func (g *Generator) Generate(hash [32]byte, r io.ReadSeeker) ([]byte, error) {
 	if cached, ok := g.get(hash); ok {
 		return cached, nil
 	}
+	// A recent failure is answered from memory rather than by decoding again (§6.3 cooldown).
+	// Checked before the semaphore on purpose: the point is to consume no slot at all, since a
+	// slot is the resource a repeated attempt would waste.
+	if err, cooling := g.failure(hash); cooling {
+		return nil, err
+	}
 
 	// Take a slot. The context is deliberately not plumbed from the request: a cancelled
 	// HTTP request should not abort a decode another request is queued behind, and the
@@ -173,10 +209,79 @@ func (g *Generator) Generate(hash [32]byte, r io.ReadSeeker) ([]byte, error) {
 
 	select {
 	case res := <-done:
-		return res.data, res.err
+		if res.err != nil {
+			g.recordFailure(hash, res.err)
+			return nil, res.err
+		}
+		g.clearFailure(hash)
+		return res.data, nil
 	case <-time.After(g.timeout):
+		g.recordFailure(hash, ErrTimeout)
 		return nil, ErrTimeout
 	}
+}
+
+// SetFailureCooldownForTest overrides the cooldown window, for tests that cannot wait an hour.
+//
+// Exported rather than reached through an unexported field so the test lives outside the package and
+// exercises the same entry points the server does.
+func (g *Generator) SetFailureCooldownForTest(d time.Duration) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.cooldown = d
+}
+
+// cooldownWindow reports the effective cooldown.
+func (g *Generator) cooldownWindow() time.Duration {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	if g.cooldown > 0 {
+		return g.cooldown
+	}
+	return FailureCooldown
+}
+
+// failure reports whether this address failed recently, and with what.
+func (g *Generator) failure(hash [32]byte) (error, bool) {
+	g.mu.RLock()
+	at, ok := g.failed[hash]
+	g.mu.RUnlock()
+	if !ok {
+		return nil, false
+	}
+	if time.Since(at) >= g.cooldownWindow() {
+		// Expired: drop it so the map does not grow without bound, and let this request try again.
+		g.mu.Lock()
+		delete(g.failed, hash)
+		g.mu.Unlock()
+		return nil, false
+	}
+	return ErrCooldown, true
+}
+
+// recordFailure remembers that this address could not be decoded.
+//
+// Bounded to the same order as the positive cache: a deployment under a stream of distinct corrupt
+// files must not grow this map without limit. Eviction is arbitrary for the same reason the content
+// cache uses it — losing an entry only costs one extra decode.
+func (g *Generator) recordFailure(hash [32]byte, err error) {
+	_ = err // the kind is reported to the immediate caller; the cooldown is keyed only by address
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if len(g.failed) >= g.maxEntries {
+		for k := range g.failed {
+			delete(g.failed, k)
+			break
+		}
+	}
+	g.failed[hash] = time.Now()
+}
+
+// clearFailure forgets a previous failure when a later attempt succeeds.
+func (g *Generator) clearFailure(hash [32]byte) {
+	g.mu.Lock()
+	delete(g.failed, hash)
+	g.mu.Unlock()
 }
 
 // waitBudget bounds how long a request waits for a decode slot.
