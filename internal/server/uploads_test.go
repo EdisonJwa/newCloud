@@ -292,3 +292,51 @@ func TestResumableAndSingleUploadAgree(t *testing.T) {
 		t.Fatalf("etags differ: %q vs %q", single.ETag, chunked.ETag)
 	}
 }
+
+// TestCommitRejectsADeletedTarget is §6.1's 提交阶段重新验证 … 及目标冲突.
+//
+// An upload session can run for hours. The handler's comment says the precondition is re-evaluated
+// at commit "not when the session was created … the target may have been replaced meanwhile", and
+// writableParent runs at commit for the same reason. The case that can actually happen is the
+// target going away: the uploader trashes the destination folder in another tab, and the upload
+// finishes afterwards.
+//
+// Publishing into a trashed folder would produce a file inside a deleted subtree — invisible in
+// every listing, occupying quota, and reachable only by a restore nobody knows they need.
+func TestCommitRejectsADeletedTarget(t *testing.T) {
+	h := newHarness(t)
+
+	h.mkdir(t, "landing")
+	session := startUpload(t, h, "landing", "late.bin", 5)
+
+	chunk, _ := sendChunk(t, h, session.ID, 0, 4, 5, "hello")
+	if chunk.StatusCode != http.StatusOK {
+		t.Fatalf("chunk: %d %s", chunk.StatusCode, readBody(chunk))
+	}
+	chunk.Body.Close()
+
+	// The destination disappears between the chunk and the commit.
+	del := h.do(http.MethodDelete, "/api/files/?path=landing", nil, nil)
+	del.Body.Close()
+	if del.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete landing: %d", del.StatusCode)
+	}
+
+	done := h.do(http.MethodPost, "/api/files/uploads/"+session.ID+"/complete", nil, nil)
+	status := done.StatusCode
+	payload := readBody(done)
+	done.Body.Close()
+
+	if status == http.StatusCreated {
+		t.Fatalf("committing into a trashed folder succeeded (%d %s). The destination is checked "+
+			"at commit precisely because an upload can outlive it; publishing here creates a file "+
+			"inside a deleted subtree that no listing shows.", status, payload)
+	}
+
+	// And nothing was published: the file must not exist anywhere reachable.
+	after := h.do(http.MethodGet, "/api/files/download?path=late.bin", nil, nil)
+	after.Body.Close()
+	if after.StatusCode == http.StatusOK {
+		t.Fatal("the refused upload still published a file at the root")
+	}
+}
