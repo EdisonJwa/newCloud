@@ -374,6 +374,24 @@ func (s *Server) handleShareUpload(w http.ResponseWriter, r *http.Request) {
 	finalName := s.uniqueName(r.Context(), root.ID, name)
 	rel := path.Join(rootPath, finalName)
 
+	// Refuse an over-cap delivery BEFORE writing its bytes (§6.1 保护公共投递箱不耗尽磁盘).
+	//
+	// The authoritative check is RecordUpload below, which increments and refuses under one guarded
+	// statement — but it runs AFTER Content.Put, so an oversized request still wrote its content to
+	// storage first. An anonymous visitor cannot see that cost, and the rejected bytes then sit in
+	// the store until the collector's grace period expires.
+	//
+	// This pre-check is advisory, not authoritative: two concurrent requests can both pass it. It
+	// exists to stop the ordinary case (one visitor sending a file larger than what is left of the
+	// allowance) from touching storage at all. The guarded UPDATE remains the thing that is correct
+	// under concurrency, and it is what the error and the status come from.
+	if sh.MaxTotalBytes != nil {
+		if remaining := *sh.MaxTotalBytes - sh.ReceivedBytes; header.Size > remaining {
+			s.renderShareError(w, r, store.ErrShareExhausted)
+			return
+		}
+	}
+
 	res, err := s.deps.Content.Put(r.Context(), layout.Node{
 		Owner: sh.OwnerID.String(), Path: rel,
 	}, file, header.Size)

@@ -10,6 +10,8 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -1712,5 +1714,85 @@ func TestTrashPurgeDeadlineIsAbsentWithNoRetention(t *testing.T) {
 	if strings.Contains(raw, "retention_days") {
 		t.Fatalf("a zero retention still reported a retention_days field: %s. Zero means keep "+
 			"forever, and that is not a number of days.", raw)
+	}
+}
+
+// countBlobFiles reports how many blob files exist under the local store root.
+//
+// Counting files rather than rows is deliberate: the property under test is whether the BYTES were
+// written, and a blob row without bytes (or bytes without a row) would be a different bug.
+func countBlobFiles(t *testing.T, root string) int {
+	t.Helper()
+	n := 0
+	err := filepath.WalkDir(root, func(_ string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if d.Name() == "tmp" {
+				// The local backend stages writes in <root>/tmp; those are not stored blobs.
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		n++
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// TestDropBoxRefusesAnOverCapUploadBeforeWriting is §6.1's 保护公共投递箱不耗尽磁盘.
+//
+// The authoritative cap check increments and refuses under one guarded statement — but it ran AFTER
+// the content store had already accepted the bytes. An anonymous visitor cannot see that cost, and
+// the rejected content then sits in storage until the collector's grace period expires, so a drop
+// box could be used to fill a disk with deliveries it refused.
+func TestDropBoxRefusesAnOverCapUploadBeforeWriting(t *testing.T) {
+	h := newHarness(t)
+
+	h.mkdir(t, "inbox")
+
+	// A drop box with a small total allowance.
+	resp := h.do(http.MethodPost, "/api/shares/",
+		strings.NewReader(`{"path":"inbox","kind":"request","max_total_bytes":16}`),
+		map[string]string{"Content-Type": "application/json"})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create drop box: %d %s", resp.StatusCode, readBody(resp))
+	}
+	created := decode(t, resp)
+	token, _ := created["token"].(string)
+
+	root := h.blobRootOf(t)
+	before := countBlobFiles(t, root)
+
+	// Larger than the whole allowance, so nothing about it can be accepted.
+	body := &bytes.Buffer{}
+	mw := multipart.NewWriter(body)
+	fw, _ := mw.CreateFormFile("file", "oversized.bin")
+	_, _ = io.WriteString(fw, strings.Repeat("x", 4096))
+	_ = mw.Close()
+
+	up, err := http.Post(h.srv.URL+"/s/"+token+"/upload", mw.FormDataContentType(), body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := up.StatusCode
+	payload := readBody(up)
+	up.Body.Close()
+
+	if status == http.StatusCreated {
+		t.Fatalf("a 4096-byte delivery was accepted through a 16-byte drop box (%d %s)", status, payload)
+	}
+
+	// The bytes must never have reached storage. This is the assertion that distinguishes a
+	// pre-check from the post-check that already existed: with only the post-check the refusal
+	// still costs one stored blob.
+	if after := countBlobFiles(t, root); after != before {
+		t.Fatalf("a refused delivery wrote %d blob file(s) to storage. The cap is enforced after "+
+			"the content is stored, so a drop box can be filled with deliveries it rejects — the "+
+			"exact exhaustion the limit exists to prevent.", after-before)
 	}
 }
