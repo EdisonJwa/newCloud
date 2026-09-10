@@ -391,6 +391,14 @@ func (s *Server) handleShareUpload(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// The rate limit gets the same treatment, and for the same reason: RecordUpload checks it after
+	// the content is stored, so a visitor who has exhausted their allowance could keep writing
+	// bytes — each request refused, each refusal still costing storage. The authoritative check
+	// stays where it is; this one just makes the common case free.
+	if exceeded, rerr := s.deps.Shares.UploadRateExceeded(r.Context(), sh); rerr == nil && exceeded {
+		s.renderShareError(w, r, store.ErrShareRateLimited)
+		return
+	}
 
 	res, err := s.deps.Content.Put(r.Context(), layout.Node{
 		Owner: sh.OwnerID.String(), Path: rel,

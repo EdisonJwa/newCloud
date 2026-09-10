@@ -523,3 +523,33 @@ func (s *Service) checkPassword(secret string, stored []byte) bool {
 // totals rather than per-second budgets. An hour is slow enough to stop a flood and fast enough that
 // a legitimate visitor who hit it can try again in the same session.
 const defaultUploadRateWindow = time.Hour
+
+// UploadRateExceeded reports whether this share has already accepted its allowance for the window.
+//
+// Advisory, and deliberately separate from RecordUpload. RecordUpload's guarded insert is what
+// REFUSES a burst — correct under concurrency, and it stays the authority. This answers the earlier
+// question "is there any point in accepting these bytes", so a caller can refuse before writing
+// content that the authoritative check is about to reject anyway.
+//
+// A false negative here costs one wasted write, which is what happened before this existed. A false
+// positive is impossible: the count is only ever behind the truth, so a share that is over its rate
+// is always reported as such.
+func (s *Service) UploadRateExceeded(ctx context.Context, sh store.Share) (bool, error) {
+	if sh.MaxUploadRate == nil || *sh.MaxUploadRate <= 0 {
+		return false, nil
+	}
+	window := defaultUploadRateWindow
+	if sh.UploadRateWindowSeconds != nil && *sh.UploadRateWindowSeconds > 0 {
+		window = time.Duration(*sh.UploadRateWindowSeconds) * time.Second
+	}
+	var n int64
+	err := s.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		got, cerr := tx.ShareUploadCountInWindow(ctx, sh.ID, window)
+		n = got
+		return cerr
+	})
+	if err != nil {
+		return false, err
+	}
+	return n >= *sh.MaxUploadRate, nil
+}

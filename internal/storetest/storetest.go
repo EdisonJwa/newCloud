@@ -2914,6 +2914,64 @@ func shareRateSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.
 		})
 	}
 
+	// CountInWindowIsTheReadableHalfOfTheGuard.
+	//
+	// ShareUploadCountInWindow exists so a caller can refuse BEFORE writing content the guarded
+	// insert would reject anyway — the drop-box equivalent of checking the bill before serving the
+	// meal. It must therefore agree with AllowShareUpload exactly: a count that under-reported
+	// would let the pre-check pass and the bytes be written, and an over-report would refuse
+	// visitors who still have allowance.
+	t.Run("CountInWindowMatchesWhatTheGuardHasAccepted", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		sh := newRateShare(t, s, owner, r.ID, 5, time.Hour)
+
+		count := func() int64 {
+			t.Helper()
+			var n int64
+			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				got, cerr := tx.ShareUploadCountInWindow(ctx, sh.ID, time.Hour)
+				n = got
+				return cerr
+			}); err != nil {
+				t.Fatalf("count: %v", err)
+			}
+			return n
+		}
+
+		if got := count(); got != 0 {
+			t.Fatalf("a fresh share reports %d uploads in the window", got)
+		}
+		for i := 1; i <= 3; i++ {
+			if err := allow(s, sh, 5, time.Hour); err != nil {
+				t.Fatalf("accept %d: %v", i, err)
+			}
+			if got := count(); got != int64(i) {
+				t.Fatalf("after %d accepted uploads the window count is %d; a pre-check reading "+
+					"this would make the wrong decision", i, got)
+			}
+		}
+
+		// A window that has not elapsed must not exclude the events, or the pre-check would let a
+		// rate-limited visitor through.
+		if got := count(); got != 3 {
+			t.Fatalf("the count dropped to %d inside the window", got)
+		}
+		// And a zero-length window excludes everything that already happened, matching the SQL's
+		// `occurred_at > now() - interval '0'`.
+		var zero int64
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			got, cerr := tx.ShareUploadCountInWindow(ctx, sh.ID, 0)
+			zero = got
+			return cerr
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if zero != 0 {
+			t.Fatalf("a zero window counted %d past events", zero)
+		}
+	})
+
 	t.Run("AllowsUpToTheRateThenRefuses", func(t *testing.T) {
 		s, owner := factory(t)
 		r := rootOf(t, s, owner)

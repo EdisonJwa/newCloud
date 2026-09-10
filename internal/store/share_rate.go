@@ -36,6 +36,15 @@ type ShareRateTx interface {
 	// It must be a single atomic decision. A separate count followed by a separate insert lets two
 	// concurrent uploads both observe "one under the limit", which is how a limit of 10 accepts 20
 	// — the same failure the download cap had before it was made atomic.
+	// ShareUploadCountInWindow reports how many uploads this share has accepted inside the window.
+	//
+	// A READ, separate from AllowShareUpload's guarded insert, because the two answer different
+	// needs. The guarded insert is the authority — it refuses a burst under concurrency. This one
+	// lets a caller refuse EARLY, before writing the bytes, which is the difference between a
+	// rate-limited visitor costing a refused request and costing a refused request plus its
+	// content in storage.
+	ShareUploadCountInWindow(ctx context.Context, id uuid.UUID, window time.Duration) (int64, error)
+
 	AllowShareUpload(ctx context.Context, id uuid.UUID, rate int64, window time.Duration,
 		ip string, bytes int64) error
 

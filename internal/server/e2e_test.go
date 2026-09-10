@@ -1796,3 +1796,67 @@ func TestDropBoxRefusesAnOverCapUploadBeforeWriting(t *testing.T) {
 			"exact exhaustion the limit exists to prevent.", after-before)
 	}
 }
+
+// TestRateLimitedDropBoxWritesNothing is §6.1's 保护公共投递箱不耗尽磁盘, for the rate limit.
+//
+// The byte cap got a pre-check because the authoritative check ran after the content was stored.
+// The rate limit had the same shape and the same cost: RecordUpload refuses a burst correctly, but
+// it does so after Content.Put has accepted the bytes, so a visitor who has exhausted their
+// allowance can keep writing content that is then rejected — each request refused, each refusal
+// still costing storage.
+func TestRateLimitedDropBoxWritesNothing(t *testing.T) {
+	h := newHarness(t)
+
+	h.mkdir(t, "inbox")
+
+	// One upload per hour: the second is refused by the rate.
+	resp := h.do(http.MethodPost, "/api/shares/",
+		strings.NewReader(`{"path":"inbox","kind":"request","max_upload_rate":1,"upload_rate_window_seconds":3600}`),
+		map[string]string{"Content-Type": "application/json"})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create drop box: %d %s", resp.StatusCode, readBody(resp))
+	}
+	token, _ := decode(t, resp)["token"].(string)
+
+	// The first delivery spends the allowance.
+	first := &bytes.Buffer{}
+	mw := multipart.NewWriter(first)
+	fw, _ := mw.CreateFormFile("file", "first.bin")
+	_, _ = io.WriteString(fw, "accepted bytes")
+	_ = mw.Close()
+	up1, err := http.Post(h.srv.URL+"/s/"+token+"/upload", mw.FormDataContentType(), first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if up1.StatusCode != http.StatusCreated {
+		t.Fatalf("first upload: %d %s", up1.StatusCode, readBody(up1))
+	}
+	up1.Body.Close()
+
+	root := h.blobRootOf(t)
+	before := countBlobFiles(t, root)
+
+	// The second is refused. Distinct content, so a stored blob would be a new file rather than a
+	// deduplicated hit on the first one.
+	second := &bytes.Buffer{}
+	mw2 := multipart.NewWriter(second)
+	fw2, _ := mw2.CreateFormFile("file", "second.bin")
+	_, _ = io.WriteString(fw2, "refused bytes that must never reach the disk")
+	_ = mw2.Close()
+	up2, err := http.Post(h.srv.URL+"/s/"+token+"/upload", mw2.FormDataContentType(), second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := up2.StatusCode
+	payload := readBody(up2)
+	up2.Body.Close()
+
+	if status == http.StatusCreated {
+		t.Fatalf("a second delivery passed a one-per-hour limit (%d %s)", status, payload)
+	}
+	if after := countBlobFiles(t, root); after != before {
+		t.Fatalf("a rate-limited delivery wrote %d blob file(s). The limit refuses the REQUEST but "+
+			"the content was already stored, so a visitor who has spent their allowance can keep "+
+			"filling the disk with deliveries that are then rejected.", after-before)
+	}
+}

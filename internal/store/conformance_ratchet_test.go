@@ -57,24 +57,29 @@ func TestSharedSuiteCoversEveryNewTxMethod(t *testing.T) {
 
 	// Only the Tx interface: Store embeds it and a few wrappers, and the question here is what a
 	// backend must implement.
+	//
+	// EMBEDDED INTERFACES ARE RESOLVED, and that is a correction to this check rather than a
+	// refinement. It used to scan only the literal `type Tx interface` block, so every method
+	// contributed by an embedded interface — ShareRateTx, SharePasswordTx, and the rest — was
+	// invisible. The check reported "every Tx method is covered" while 74 methods in sub-interfaces
+	// were never examined, including AllowShareUpload and the rest of the upload rate limiter.
+	//
+	// A guard that measures a subset and reports on the whole is worse than no guard: it is a
+	// statement about coverage that is simply false, and it is reassuring exactly when it should not
+	// be.
 	text := string(iface)
-	start := strings.Index(text, "type Tx interface")
-	if start < 0 {
-		t.Fatal("could not find the Tx interface; this check would pass vacuously")
-	}
-	end := strings.Index(text[start:], "\n}")
-	if end < 0 {
-		t.Fatal("could not find the end of the Tx interface")
-	}
-	decl := text[start : start+end]
-
-	methods := map[string]bool{}
-	for _, m := range regexp.MustCompile(`(?m)^\t([A-Z]\w+)\(`).FindAllStringSubmatch(decl, -1) {
-		methods[m[1]] = true
-	}
+	methods := resolveTxMethods(t, root, text)
 	if len(methods) < 50 {
 		t.Fatalf("found only %d Tx methods, which is far fewer than expected — the parse is "+
 			"probably broken and this check is not testing anything", len(methods))
+	}
+	// The two embedded interfaces must have contributed something, or the resolution is silently
+	// doing nothing and this is back to measuring a subset.
+	for _, name := range []string{"AllowShareUpload", "PasswordFailureCount"} {
+		if !methods[name] {
+			t.Fatalf("%q was not found among the resolved Tx methods; the embedded-interface walk "+
+				"is broken and this check is measuring a subset again", name)
+		}
 	}
 
 	allowed := map[string]bool{}
@@ -207,4 +212,73 @@ func TestCaseFoldingColumnsAreCompatibleWithTheGoComparison(t *testing.T) {
 				col, col)
 		}
 	}
+}
+
+// resolveTxMethods returns every method the Tx interface requires, following embedded interfaces.
+//
+// Interface declarations live in per-concept files (share.go, lock.go, identity.go, …) and Tx
+// composes them by embedding. Resolving them is the difference between checking the composite and
+// checking one of its parts.
+func resolveTxMethods(t *testing.T, root, storeGoText string) map[string]bool {
+	t.Helper()
+
+	// Index every interface declaration in the package.
+	decls := map[string]string{}
+	dir := filepath.Join(root, "internal", "store")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reHeader := regexp.MustCompile(`(?m)^type (\w+) interface \{`)
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") ||
+			strings.HasSuffix(e.Name(), "_test.go") {
+			continue
+		}
+		body, rerr := os.ReadFile(filepath.Join(dir, e.Name()))
+		if rerr != nil {
+			t.Fatal(rerr)
+		}
+		src := string(body)
+		for _, m := range reHeader.FindAllStringSubmatchIndex(src, -1) {
+			name := src[m[2]:m[3]]
+			// The interface body runs to the first closing brace in column zero.
+			open := m[1] - 1
+			rel := strings.Index(src[open:], "\n}")
+			if rel < 0 {
+				continue
+			}
+			decls[name] = src[open : open+rel]
+		}
+	}
+	if len(decls) == 0 {
+		t.Fatal("found no interface declarations in internal/store")
+	}
+
+	reMethod := regexp.MustCompile(`(?m)^\t([A-Z]\w+)\(`)
+	reEmbed := regexp.MustCompile(`(?m)^\t([A-Z]\w+)\s*$`)
+
+	out := map[string]bool{}
+	seen := map[string]bool{}
+	var walk func(name string)
+	walk = func(name string) {
+		if seen[name] {
+			return
+		}
+		seen[name] = true
+		body, ok := decls[name]
+		if !ok {
+			t.Fatalf("interface %q is embedded but not declared in internal/store", name)
+		}
+		for _, m := range reMethod.FindAllStringSubmatch(body, -1) {
+			out[m[1]] = true
+		}
+		for _, m := range reEmbed.FindAllStringSubmatch(body, -1) {
+			walk(m[1])
+		}
+	}
+	walk("Tx")
+
+	_ = storeGoText
+	return out
 }

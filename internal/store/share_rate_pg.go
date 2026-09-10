@@ -64,3 +64,16 @@ func (t *pgTx) PruneShareUploadEvents(ctx context.Context, olderThan time.Durati
 	}
 	return int(tag.RowsAffected()), nil
 }
+
+// ShareUploadCountInWindow counts accepted uploads inside the window.
+func (t *pgTx) ShareUploadCountInWindow(ctx context.Context, id uuid.UUID,
+	window time.Duration) (int64, error) {
+
+	const q = `SELECT count(*) FROM share_upload_events
+		WHERE share_id = $1 AND occurred_at > now() - $2::interval`
+	var n int64
+	if err := t.tx.QueryRow(ctx, q, id, intervalOf(window)).Scan(&n); err != nil {
+		return 0, translate(err)
+	}
+	return n, nil
+}

@@ -74,3 +74,21 @@ type memShareUploadEvent struct {
 	Bytes      int64
 	OccurredAt time.Time
 }
+
+// ShareUploadCountInWindow counts accepted uploads inside the window.
+//
+// Mirrors the SQL exactly, including the boundary: `> cutoff` matches `occurred_at > now() -
+// interval`, and the upload-event prune uses `<= cutoff` to match its own DELETE. Getting those two
+// comparisons out of step is how the memory and PostgreSQL backends disagreed once before.
+func (t *memTx) ShareUploadCountInWindow(ctx context.Context, id uuid.UUID,
+	window time.Duration) (int64, error) {
+
+	cutoff := t.m.now().Add(-window)
+	n := int64(0)
+	for _, e := range t.m.shareUploadEvents {
+		if e.ShareID == id && e.OccurredAt.After(cutoff) {
+			n++
+		}
+	}
+	return n, nil
+}
