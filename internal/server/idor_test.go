@@ -406,26 +406,11 @@ func TestIDORTableCoversEveryIdRoute(t *testing.T) {
 		"DELETE /api/acl/{id}": "covered by TestACLRevokeRejectsForeignGrant",
 	}
 
-	routes := idRoutesTakenFromTheServer()
-	if len(routes) == 0 {
-		t.Fatal("found no id-addressed routes; the enumeration is broken and this check passes vacuously")
-	}
-
-	// Probe the live server: an unregistered route answers 404 for *any* method, while a
-	// registered one answers something else for at least one method. This is what keeps the
-	// hand-written list from going stale in the direction that matters — a route added to the
-	// server but not to this list shows up as "registered but unlisted".
 	h := newHarness(t)
-	for _, r := range routes {
-		method, path, _ := strings.Cut(r, " ")
-		probePath := strings.ReplaceAll(path, "{id}", uuid.New().String())
-		resp := h.doAs(t, h.session, method, probePath, nil, nil)
-		resp.Body.Close()
-		// 404 is ambiguous (registered-and-refused, or not registered). A 405 means the path
-		// exists but not for that method; anything 2xx/400/409 means it was reached.
-		if resp.StatusCode == http.StatusNotFound {
-			continue
-		}
+	routes := idRoutesTakenFromTheServer(t, h)
+	if len(routes) < 8 {
+		t.Fatalf("found only %d id-addressed routes; the parse is probably broken and this check "+
+			"would report full coverage of almost nothing", len(routes))
 	}
 
 	var uncovered []string
@@ -449,21 +434,29 @@ func TestIDORTableCoversEveryIdRoute(t *testing.T) {
 // the source is a second implementation of chi's nesting rules that would drift. The guard against
 // this list going stale is the test below: it fails when the *server* answers an id route that is
 // not listed, which is checked by probing rather than by reading source.
-func idRoutesTakenFromTheServer() []string {
-	return []string{
-		"GET /api/shared/{id}",
-		"GET /api/shared/{id}/content",
-		"DELETE /api/shares/{id}",
-		"PATCH /api/shares/{id}",
-		"DELETE /api/apppasswords/{id}",
-		"PUT /api/files/uploads/{id}",
-		"POST /api/files/uploads/{id}/complete",
-		"DELETE /api/files/uploads/{id}",
-		"GET /api/admin/users",
-		"POST /api/admin/users/{id}/status",
-		"DELETE /api/admin/users/{id}",
-		"DELETE /api/acl/{id}",
+// idRoutesTakenFromTheServer asks the router which routes it actually has.
+//
+// It used to return a hand-written slice, under a name that claimed otherwise. That made the whole
+// IDOR guard circular: a fixed list compared against a fixed coverage map, so a route added to the
+// server was invisible to the check that exists to find it. The test's own comment claimed a live
+// probe kept the list from going stale — and that probe computed a status code and discarded it, so
+// nothing kept anything.
+//
+// chi.Walk reports full patterns including group prefixes, which is why this is not a source parse:
+// the first attempt at one produced "/{id}" for every grouped route and could not tell
+// /api/shares/{id} from /api/apppasswords/{id}.
+func idRoutesTakenFromTheServer(t *testing.T, h *harness) []string {
+	t.Helper()
+	if h.srvServer == nil {
+		t.Fatal("the harness does not expose the server; the route table cannot be enumerated")
 	}
+	var out []string
+	for _, r := range h.srvServer.Routes() {
+		if strings.Contains(r, "{id}") {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // TestUploadChunkAuthorisesBeforeParsing pins the order inside the chunk handler.

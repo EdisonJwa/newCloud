@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -292,6 +293,31 @@ func (s *Server) Handler() http.Handler {
 
 	s.ready.Store(true)
 	return r
+}
+
+// Routes enumerates every registered method and path pattern.
+//
+// Added so a coverage test can enumerate the real route table instead of a hand-maintained copy of
+// it. The IDOR guard did the latter — under a function named idRoutesTakenFromTheServer that
+// returned a literal slice — so it compared one fixed list against another and could not notice a
+// route added to this file. chi.Walk reports the FULL pattern including group prefixes, which a
+// source-level parse cannot reconstruct.
+//
+// Calls Handler(), which flips the ready flag; that is harmless for a test process and the
+// alternative is a second copy of the route table, which is the problem this solves.
+func (s *Server) Routes() []string {
+	router, ok := s.Handler().(chi.Router)
+	if !ok {
+		return nil
+	}
+	var out []string
+	_ = chi.Walk(router, func(method, route string, _ http.Handler,
+		_ ...func(http.Handler) http.Handler) error {
+		out = append(out, method+" "+route)
+		return nil
+	})
+	sort.Strings(out)
+	return out
 }
 
 // securityHeaders applies the baseline to every response.

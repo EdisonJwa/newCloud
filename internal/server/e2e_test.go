@@ -48,7 +48,9 @@ type harness struct {
 	// sessions mints a session for a second account, which cross-account tests need:
 	// acting as somebody else is the only way to test that they are *not* allowed to
 	// do something.
-	sessions *auth.Sessions
+	// srvServer is the server object, kept so a test can enumerate the real route table.
+	srvServer *server.Server
+	sessions  *auth.Sessions
 	// uploads is the resumable-upload manager the server uses. Retained so a test can start
 	// a session as one account and then try to touch it as another: the Manager is
 	// in-memory, so the store cannot fabricate a session for the HTTP-layer check.
@@ -192,7 +194,8 @@ func newHarnessTuned(t *testing.T, mutate func(*config.Config), tune func(*serve
 	t.Cleanup(ts.Close)
 
 	h := &harness{t: t, srv: ts, meta: meta, user: user, session: session,
-		mailer: mailer, sessions: sessions, cfg: &cfg, authz: authorizer, uploads: uploads}
+		mailer: mailer, sessions: sessions, cfg: &cfg, authz: authorizer, uploads: uploads,
+		srvServer: s}
 	h.metrics = deps.Metrics
 	h.blobRoot = blobRoot
 	return h
