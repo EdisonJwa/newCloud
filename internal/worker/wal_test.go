@@ -141,24 +141,65 @@ func TestSampleWALArchiveReportsPendingSegments(t *testing.T) {
 // there is no runtime behaviour to observe when the code never executes.
 func TestEveryTickerHasASelectCase(t *testing.T) {
 	root := repoRootForWorker(t)
-	src, err := os.ReadFile(filepath.Join(root, "internal", "worker", "worker.go"))
+
+	// The WHOLE package, not one file.
+	//
+	// The first version read worker.go alone, which was adequate only by accident: every ticker
+	// happened to live there. A ticker introduced in anchor.go or a new file would have been
+	// entirely outside the check, and the check would have gone on reporting success — the same
+	// shape as the two guards corrected in the preceding rounds, where the instrument measured a
+	// subset and reported on the whole.
+	var text strings.Builder
+	entries, err := os.ReadDir(filepath.Join(root, "internal", "worker"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	text := string(src)
+	scanned := 0
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") ||
+			strings.HasSuffix(e.Name(), "_test.go") {
+			continue
+		}
+		body, rerr := os.ReadFile(filepath.Join(root, "internal", "worker", e.Name()))
+		if rerr != nil {
+			t.Fatal(rerr)
+		}
+		text.Write(body)
+		text.WriteString("\n")
+		scanned++
+	}
+	if scanned == 0 {
+		t.Fatal("scanned no files in internal/worker; this check would pass vacuously")
+	}
+	src := text.String()
 
-	// Tickers declared with `name := time.NewTicker(...)`.
+	// Any assignment form: `x := time.NewTicker(`, `x = time.NewTicker(`, `var x = time.NewTicker(`.
+	//
+	// The first version matched `:=` only. That is the form in use today, which is exactly why
+	// restricting to it is a trap: the guard should fail when somebody writes it differently, not
+	// quietly stop seeing it.
 	declared := map[string]bool{}
-	for _, m := range regexp.MustCompile(`(\w+)\s*:=\s*time\.NewTicker\(`).FindAllStringSubmatch(text, -1) {
+	for _, m := range regexp.MustCompile(`(\w+)\s*:?=\s*time\.NewTicker\(`).FindAllStringSubmatch(src, -1) {
 		declared[m[1]] = true
 	}
-	if len(declared) == 0 {
-		t.Fatal("found no tickers; this check would pass vacuously")
+	if len(declared) < 5 {
+		t.Fatalf("found only %d tickers, which is far fewer than expected — the parse is probably "+
+			"broken and this check is not testing anything", len(declared))
+	}
+
+	// A ticker assigned to the blank identifier can never be received from at all. Named
+	// separately because "_" in the message below reads as a parse bug rather than the defect it
+	// is, and because this is the exact round-48 shape: a ticker created and dropped on the floor,
+	// with every log line still saying the feature is enabled.
+	if declared["_"] {
+		t.Fatal("a ticker is assigned to the blank identifier, so nothing can ever receive from it. " +
+			"That is a background task declared and never invoked — the shape that let the integrity " +
+			"scrub run zero times while the startup log said it was enabled.")
 	}
 
 	for name := range declared {
 		// The ticker must be received from somewhere, which is what makes it fire.
-		if !strings.Contains(text, "<-"+name+".C") {
+		if !strings.Contains(src, "<-"+name+".C") {
 			t.Fatalf("ticker %q is created but nothing receives from %q.C: the task it drives never "+
 				"runs. A background job that is declared, logged and never invoked is worse than a "+
 				"missing one, because the startup log says it is enabled.", name, name)

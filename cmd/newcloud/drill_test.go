@@ -9,7 +9,6 @@ package main
 
 import (
 	"context"
-	"strings"
 	"time"
 
 	"bytes"
@@ -149,23 +148,38 @@ func TestDrillCoversEveryTable(t *testing.T) {
 	}
 	defer pool.Close()
 
+	// Every table, WITH its parent when it is a partition.
+	//
+	// Asking for the parent rather than matching on a name is the whole point. The previous version
+	// skipped anything ending in "_default", which happened to catch audit.events_default and
+	// happened to also catch sessions_default — a partition of a table the drill DOES cover. Because
+	// the suffix check ran before the coverage check, a future partitioned table whose parent was
+	// NOT drilled would have been skipped silently: the exemption pattern would have hidden exactly
+	// the gap this test exists to find.
 	rows, err := pool.Query(ctx, `
-		SELECT schemaname || '.' || tablename
-		FROM pg_tables
-		WHERE schemaname IN ('public', 'audit')
+		SELECT cns.nspname || '.' || child.relname,
+		       COALESCE(pns.nspname || '.' || parent.relname, '')
+		FROM pg_class child
+		JOIN pg_namespace cns ON cns.oid = child.relnamespace
+		LEFT JOIN pg_inherits i ON i.inhrelid = child.oid
+		LEFT JOIN pg_class parent ON parent.oid = i.inhparent
+		LEFT JOIN pg_namespace pns ON pns.oid = parent.relnamespace
+		WHERE cns.nspname IN ('public', 'audit') AND child.relkind = 'r'
 		ORDER BY 1`)
 	if err != nil {
 		t.Fatalf("read schema: %v", err)
 	}
 	defer rows.Close()
 
-	// Tables the drill deliberately does not count, with the reason each is exempt. Exemptions
-	// are written down rather than filtered by a pattern, so adding one is a decision.
+	// Tables the drill deliberately does not count, with the reason each is exempt.
+	//
+	// Used, not just declared. The map existed with this comment above it and the loop below
+	// filtered by PATTERN instead — so the comment described a policy the code did not implement,
+	// and the map was dead. Same class as the two guards corrected in the preceding rounds: the
+	// stated mechanism and the actual one had diverged, and the stated one read better.
 	exempt := map[string]string{
 		"public.schema_migrations": "migration bookkeeping, recreated by the restore itself",
-		"public.events_default":    "a partition of audit.events, counted via its parent",
 	}
-	_ = exempt
 
 	covered := map[string]bool{}
 	for _, t := range drillTables {
@@ -177,12 +191,21 @@ func TestDrillCoversEveryTable(t *testing.T) {
 
 	var missing []string
 	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
+		var name, parent string
+		if err := rows.Scan(&name, &parent); err != nil {
 			t.Fatalf("scan: %v", err)
 		}
-		// Partitions and bookkeeping are covered indirectly or recreated; skip by decision.
-		if strings.HasSuffix(name, "_default") || strings.Contains(name, "schema_migrations") {
+		if _, ok := exempt[name]; ok {
+			continue
+		}
+		if parent != "" {
+			// A partition is covered when its PARENT is: the parent's rows live in the partition, so
+			// a dump of the parent carries them and counting the partition separately double-counts.
+			// The check is therefore on the parent, and a partition of an undrilled table is
+			// reported as its parent rather than hidden by a naming convention.
+			if !covered[parent] {
+				missing = append(missing, parent+" (via partition "+name+")")
+			}
 			continue
 		}
 		if !covered[name] {
