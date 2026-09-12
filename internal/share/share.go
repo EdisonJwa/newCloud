@@ -318,15 +318,25 @@ func (s *Service) VerifyPassword(ctx context.Context, sh store.Share, password s
 	// "under the limit". Recording the attempt first, then refusing when the window is full, means
 	// the sixth guess in fifteen minutes is refused regardless of whether it would have been right.
 	//
-	// The recording is best-effort — a store failure must not turn a wrong password into a
-	// different error, which would be an oracle for "the database is unhappy" — but the COUNT is
-	// not: if it cannot be read, the attempt proceeds and the existing audit still fires.
+	// The count read FAILS CLOSED.
+	//
+	// The previous version discarded this error, leaving `failures` at zero so the comparison was
+	// false and the attempt proceeded. A storage fault therefore disabled the attempt cap
+	// completely — and the worse the fault, the longer the window in which guessing was free.
+	// Fail-open is the wrong direction for a control that exists to bound guessing: if the server
+	// cannot tell whether the cap is reached, it must not assume it is not.
+	//
+	// The error is returned rather than translated into a wrong-password refusal, so a client does
+	// not get told "wrong password" when the truth is "cannot tell", and so the operator sees a
+	// fault instead of a suspicious burst of failures.
 	var failures int
-	_ = s.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
-		n, cerr := tx.PasswordFailureCount(ctx, sh.ID, store.PasswordWindow)
+	if cerr := s.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		n, nerr := tx.PasswordFailureCount(ctx, sh.ID, store.PasswordWindow)
 		failures = n
+		return nerr
+	}); cerr != nil {
 		return cerr
-	})
+	}
 	if failures >= store.PasswordMaxAttempts {
 		_ = s.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
 			return tx.Audit(ctx, store.AuditEntry{

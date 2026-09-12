@@ -431,3 +431,43 @@ func TestTokenLengthIsAdequate(t *testing.T) {
 		t.Fatalf("token too short to resist guessing: %d chars", len(c.Token))
 	}
 }
+
+// TestPasswordThrottleFailsClosed is SHARE-02's attempt cap under a storage fault.
+//
+// Both throttles read a failure count before deciding. When that read failed, the count stayed at
+// its zero value and the comparison "0 >= max" was false — so the attempt PROCEEDED. A transient
+// database error therefore disabled the brute-force cap entirely, and the more a attacker retried
+// the more likely they were to land in the window where it was off.
+//
+// Fail-open is the wrong direction for a security control that exists to bound guessing. If the
+// server cannot tell whether the cap is reached, it must not guess that it is not.
+//
+// The round that added this throttle said the opposite in a comment: "if it cannot be read, the
+// attempt proceeds and the existing audit still fires". The audit is not the control. The cap is.
+func TestPasswordThrottleFailsClosed(t *testing.T) {
+	f := newFixture(t)
+	c := f.create(t, NewShare{Kind: store.ShareLink, Password: "correct-horse"})
+	sh, rerr := f.svc.Resolve(context.Background(), c.Token)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+
+	// Drive the store into its simulated-unreachable state. The password hash comparison needs no
+	// database, so verification would still "work" — which is exactly why the read of the counter
+	// is the only thing standing between an attacker and unlimited guesses.
+	f.meta.BreakForTest()
+	defer f.meta.UnbreakForTest()
+
+	err := f.svc.VerifyPassword(context.Background(), sh, "correct-horse")
+	if err == nil {
+		t.Fatal("with the failure counter unreadable, the correct password was ACCEPTED. That " +
+			"means the attempt cap is not enforced at all while the store is failing: an attacker " +
+			"who can provoke or wait out a storage error gets unlimited guesses, which is the " +
+			"opposite of what an attempt cap is for.")
+	}
+	// It must not be reported as a wrong password either — that would be a lie a client could tell
+	// apart, and it would hide the fault from the operator.
+	if errors.Is(err, store.ErrSharePassword) {
+		t.Fatal("an unreadable counter was reported as a wrong password, hiding a storage fault")
+	}
+}

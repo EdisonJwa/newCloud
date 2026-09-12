@@ -154,12 +154,19 @@ func (s *Service) VerifyRecipientCode(ctx context.Context, sh store.Share, email
 	// The throttle is checked before the code, so a correct guess arriving after the
 	// limit is still refused. Checking afterwards would let an attacker keep
 	// guessing until one landed.
+	// The count read FAILS CLOSED, for the same reason as the password throttle in share.go.
+	//
+	// The error used to be discarded, leaving failures at zero — so a storage fault disabled the
+	// guess limit entirely at the exact moment an operator would least expect it. A throttle that
+	// silently stops being a throttle is worse than one that reports itself broken.
 	var failures int
-	_ = s.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
-		n, ferr := tx.OTPFailureCount(ctx, sh.ID, email, store.OTPWindow)
+	if ferr := s.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		n, cerr := tx.OTPFailureCount(ctx, sh.ID, email, store.OTPWindow)
 		failures = n
+		return cerr
+	}); ferr != nil {
 		return ferr
-	})
+	}
 	if failures >= store.OTPMaxAttempts {
 		s.auditDenied(ctx, sh, email, "throttled")
 		return ErrNotRecipient

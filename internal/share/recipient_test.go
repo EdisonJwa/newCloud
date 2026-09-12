@@ -9,6 +9,7 @@ import (
 	"github.com/EdisonJwa/newCloud/internal/share"
 	"github.com/EdisonJwa/newCloud/internal/store"
 	"github.com/EdisonJwa/newCloud/internal/ticket"
+	"github.com/google/uuid"
 )
 
 // Email shares must not behave like link shares.
@@ -321,5 +322,78 @@ func TestThrottleIsPerAddress(t *testing.T) {
 	}
 	if err := svc.VerifyRecipientCode(ctx, sh, "bob@example.test", code); err != nil {
 		t.Fatalf("another address must still be able to verify: %v", err)
+	}
+}
+
+// failingCountStore fails exactly one Tx method: the OTP failure count.
+//
+// Breaking the whole store does not work for this case, and the first version of this test made
+// that mistake: VerifyRecipientCode calls ResolveRecipient FIRST, which needs the store, so a
+// broken store made the function fail before the count was ever read. The test passed — for a
+// reason that had nothing to do with the throttle, and it would have passed with the fail-open
+// still in place.
+//
+// Embedding the interfaces gives every other method for free and overrides the one under test.
+type failingCountStore struct{ store.Store }
+
+func (f failingCountStore) WithTx(ctx context.Context,
+	fn func(context.Context, store.Tx) error) error {
+
+	return f.Store.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		return fn(ctx, failingCountTx{tx})
+	})
+}
+
+type failingCountTx struct{ store.Tx }
+
+func (f failingCountTx) OTPFailureCount(context.Context, uuid.UUID, string, time.Duration) (int, error) {
+	return 0, errors.New("simulated: the attempt counter is unreadable")
+}
+
+// TestRecipientThrottleFailsClosed is the OTP half of the same rule.
+//
+// VerifyRecipientCode reads the recent-failure count to decide whether the guess limit is in force.
+// The read's error used to be discarded, leaving the count at zero — so a storage fault disabled
+// the limit at the moment it mattered most, and a correct code arriving during the fault was
+// accepted no matter how many wrong ones preceded it.
+func TestRecipientThrottleFailsClosed(t *testing.T) {
+	meta := store.NewMemory()
+	owner := meta.AddUser(store.User{Username: "alice", Email: "alice@example.test", Role: "user"})
+	root, err := meta.EnsureRoot(context.Background(), owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tickets, err := ticket.NewIssuer([]byte("0123456789abcdef0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := share.New(failingCountStore{meta}, share.TestArgon())
+	svc.SetTicketIssuer(tickets)
+
+	created, err := svc.Create(context.Background(), share.NewShare{
+		NodeID: root.ID, OwnerID: owner.ID, Kind: store.ShareEmail,
+		Label: "throttle", Recipients: []string{"alice@example.test"},
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	sh, err := svc.Resolve(context.Background(), created.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, err := svc.IssueRecipientCode(context.Background(), sh, "alice@example.test")
+	if err != nil {
+		t.Fatalf("issue code: %v", err)
+	}
+
+	err = svc.VerifyRecipientCode(context.Background(), sh, "alice@example.test", code)
+	if err == nil {
+		t.Fatal("with the failure counter unreadable, a correct code was ACCEPTED. The guess " +
+			"limit is then not enforced at all while the counter is failing — a throttle that " +
+			"silently stops being a throttle is worse than one that reports itself broken.")
+	}
+	if errors.Is(err, share.ErrNotRecipient) {
+		t.Fatal("an unreadable counter was reported as a bad recipient, hiding a fault behind the " +
+			"same refusal used for wrong codes")
 	}
 }
