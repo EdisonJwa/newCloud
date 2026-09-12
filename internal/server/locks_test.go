@@ -13,7 +13,9 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"mime/multipart"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -283,4 +285,108 @@ func TestDepthInfinityParentLockBlocksContent(t *testing.T) {
 		t.Fatalf("a Depth:infinity lock on the parent must block editing a child, got %d",
 			resp.StatusCode)
 	}
+}
+
+// TestWebDAVLockBlocksAPIWrites is §5.3's Lock 的语义需适用于跨接口操作.
+//
+// What this adds over the cases above: they are thorough, but they take the lock by inserting a
+// lock ROW (h.lockNode calls tx.CreateLock). That proves the API consults the lock table; it does
+// not prove that a lock taken through the WebDAV ENDPOINT is the same lock the API reads. A bug in
+// the DAV handler — a different scope, a different node id, a token stored somewhere else — would
+// leave every one of those tests green.
+//
+// So this takes the lock the way a real client does: LOCK over HTTP with Basic auth against an app
+// password, on the /dav mount. Only then does the end-to-end claim hold, that a WebDAV client's
+// lock actually protects the file from the web UI.
+func TestWebDAVLockBlocksAPIWrites(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	// A file to lock, captured so the test can ask the store what lock exists.
+	body := &bytes.Buffer{}
+	mw := multipart.NewWriter(body)
+	_ = mw.WriteField("path", "")
+	fw, _ := mw.CreateFormFile("file", "locked.txt")
+	_, _ = io.WriteString(fw, "original")
+	_ = mw.Close()
+	upResp := h.do(http.MethodPost, "/api/files/upload", body,
+		map[string]string{"Content-Type": mw.FormDataContentType()})
+	upResp.Body.Close()
+
+	// An app password, because WebDAV authenticates with Basic auth rather than the session cookie.
+	apResp := h.do(http.MethodPost, "/api/apppasswords/",
+		strings.NewReader(`{"label":"lock-client","scope":"rw"}`),
+		map[string]string{"Content-Type": "application/json"})
+	if apResp.StatusCode != http.StatusCreated {
+		t.Fatalf("app password: %d %s", apResp.StatusCode, readBody(apResp))
+	}
+	secret, _ := decode(t, apResp)["secret"].(string)
+	if secret == "" {
+		t.Fatal("no app password secret returned")
+	}
+
+	// LOCK over WebDAV.
+	lockBody := `<?xml version="1.0"?><D:lockinfo xmlns:D="DAV:">
+		<D:lockscope><D:exclusive/></D:lockscope>
+		<D:locktype><D:write/></D:locktype>
+		<D:owner><D:href>api-test</D:href></D:owner></D:lockinfo>`
+	req, err := http.NewRequest("LOCK", h.srv.URL+"/dav/"+h.user.Username+"/locked.txt", strings.NewReader(lockBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.SetBasicAuth(h.user.Username, secret)
+	lockResp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lockResp.StatusCode != http.StatusOK {
+		t.Fatalf("LOCK: %d %s", lockResp.StatusCode, readBody(lockResp))
+	}
+	token := strings.Trim(lockResp.Header.Get("Lock-Token"), "<>")
+	lockResp.Body.Close()
+	if token == "" {
+		t.Fatal("LOCK returned no token")
+	}
+
+	// Every API mutation must refuse while the lock is live. Without the token, exactly as a
+	// second client would arrive.
+	rename := h.do(http.MethodPost, "/api/files/rename",
+		strings.NewReader(`{"path":"locked.txt","name":"renamed.txt"}`),
+		map[string]string{"Content-Type": "application/json"})
+	renameStatus := rename.StatusCode
+	rename.Body.Close()
+	if renameStatus != http.StatusLocked {
+		t.Fatalf("renaming a WebDAV-locked file through the JSON API: want 423, got %d. The API "+
+			"mirrors the DAV lock check, and if that mirror is wrong the lock is advisory to one "+
+			"interface only.", renameStatus)
+	}
+
+	del := h.do(http.MethodDelete, "/api/files/?path=locked.txt", nil, nil)
+	delStatus := del.StatusCode
+	del.Body.Close()
+	if delStatus != http.StatusLocked {
+		t.Fatalf("deleting a WebDAV-locked file through the JSON API: want 423, got %d", delStatus)
+	}
+
+	// And the file is untouched, which is the property the status code stands for.
+	get := h.do(http.MethodGet, "/api/files/download?path=locked.txt", nil, nil)
+	content := readBody(get)
+	get.Body.Close()
+	if content != "original" {
+		t.Fatalf("the locked file's content changed to %q", content)
+	}
+
+	// The holder can still write, through the API, by presenting the token. A lock its own holder
+	// cannot use is a bug in the other direction.
+	rename2 := h.do(http.MethodPost, "/api/files/rename",
+		strings.NewReader(`{"path":"locked.txt","name":"renamed.txt"}`),
+		map[string]string{"Content-Type": "application/json", "X-Lock-Token": token})
+	rename2Status := rename2.StatusCode
+	rename2.Body.Close()
+	if rename2Status != http.StatusOK {
+		t.Fatalf("the lock holder presenting its token through the API: want 200, got %d. The "+
+			"token must be honoured across interfaces, or a WebDAV client's lock would make its "+
+			"own file unwritable from the web UI.", rename2Status)
+	}
+	_ = ctx
 }
