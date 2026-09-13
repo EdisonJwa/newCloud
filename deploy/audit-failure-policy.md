@@ -69,11 +69,26 @@ than only "audit unavailable".
    should expect this consequence of fail-closed: during the outage, some user actions simply did
    not happen.
 
+## A slow audit store is bounded, not waited on
+
+Every write pays the chain cost inside its own transaction, so a *slow* audit store used to slow
+every write with no upper bound: a wedged insert held the caller's transaction open for as long as
+the database cared to, and every write on the platform queued behind the recorder.
+
+That is now bounded. Each append gets a deadline (`DefaultAuditAppendTimeout`, 5s) derived from the
+caller's context. When it expires the append fails, the mutation rolls back, and the client gets the
+same `503 audit_unavailable` it would get from a full disk. Slow becomes a special case of
+unavailable rather than a distinct, unbounded failure mode.
+
+Five seconds is deliberately generous: the append is one indexed insert plus a hash computation, so
+anything approaching it is already pathological. The bound is not there to police normal latency; it
+is there so that "the recorder is wedged" resolves into a refusal instead of a hang.
+
 ## What this policy does not cover
 
-- **The audit subsystem becoming slow rather than unavailable.** Every write pays the chain cost in
-  its own transaction, so a slow audit store slows every write. There is no timeout-and-fail
-  behavior today, distinct from slow-and-wait.
+- **The audit store being intermittently slow.** The bound turns a hang into a refusal, so callers
+  see 503 while the store is slow — but there is no separate circuit breaker, so every write during
+  such an episode pays the timeout before being refused.
 - **Partial writes inside the audit writer.** The append runs inside the caller's transaction, so it
   either commits with the mutation or rolls back with it. A failure *after* commit is a different
   problem that this policy does not address.
@@ -88,3 +103,4 @@ than only "audit unavailable".
 | Reads stay up | — | `TestReadsSurviveAnAuditOutage` |
 | Misconfiguration is loud | `internal/store/pg.go` | `TestMissingAuditWriterIsAlsoFailClosed` |
 | Client-visible status | `internal/server/files.go` (`writeStoreError`) | `TestAuditOutageReturns503` |
+| A slow store is bounded | `internal/store/pg.go` (`pgTx.Audit`) | `TestAuditAppendIsGivenABoundedContext`, `TestSlowAuditStoreIsBoundedNotUnbounded` |

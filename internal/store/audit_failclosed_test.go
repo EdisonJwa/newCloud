@@ -25,6 +25,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -146,5 +147,132 @@ func TestMissingAuditWriterIsAlsoFailClosed(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("an unwired audit writer must fail loudly, not drop the record")
+	}
+}
+
+// hangingAuditWriter blocks until its context is cancelled, which is what a wedged audit store
+// looks like from the caller's side: not an error, just nothing happening.
+type hangingAuditWriter struct{ calls int }
+
+func (h *hangingAuditWriter) Append(ctx context.Context, _ store.Tx, _ store.AuditEntry) error {
+	h.calls++
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// TestSlowAuditStoreIsBoundedNotUnbounded is the gap the policy document used to list as uncovered:
+// "the audit subsystem becoming slow rather than unavailable ... there is no timeout-and-fail
+// behaviour today".
+//
+// The append runs inside the caller's transaction, so a hung insert holds that transaction open
+// for as long as the database cares to. Every write on the platform would queue behind the
+// recorder — the component whose purpose is to observe writes becomes the thing that stops them.
+//
+// With a bound, the outcome is the already-agreed one: the append fails, the mutation rolls back,
+// the client is told 503. This test proves the bound is applied to the writer's context at all,
+// which is the only thing that makes it enforceable against a real database.
+func TestSlowAuditStoreIsBoundedNotUnbounded(t *testing.T) {
+	pool := testPool(t)
+	owner, root := seedOwnerAndRoot(t, pool)
+
+	s := store.NewPG(pool)
+	w := &hangingAuditWriter{}
+	s.SetAuditWriter(w)
+	// Short so the test does not take five seconds; the mechanism is identical.
+	s.SetAuditAppendTimeoutForTest(50 * time.Millisecond)
+
+	ctx := context.Background()
+	done := make(chan error, 1)
+	go func() {
+		done <- s.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+			if _, err := tx.CreateDir(ctx, store.NewNode{
+				OwnerID: owner, ParentID: root, Name: "blocked-by-a-hung-audit",
+			}); err != nil {
+				return err
+			}
+			return tx.Audit(ctx, store.AuditEntry{
+				ActorKind: "user", ActorUserID: &owner,
+				Action: "file.create", TargetKind: "node", Result: "ok",
+			})
+		})
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("an append that never returned was treated as success")
+		}
+		if !errors.Is(err, store.ErrAuditUnavailable) {
+			t.Fatalf("want ErrAuditUnavailable so the client gets 503 and the operator gets a "+
+				"diagnosis, got %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the audit append was not bounded: the write is still waiting on the recorder. " +
+			"One wedged insert would then stall every write on the platform, indefinitely.")
+	}
+	if w.calls != 1 {
+		t.Fatalf("the writer was reached %d times; want exactly 1", w.calls)
+	}
+}
+
+// deadlineProbe records the context the writer was handed, and returns immediately.
+type deadlineProbe struct {
+	called   bool
+	deadline bool
+	budget   time.Duration
+}
+
+func (p *deadlineProbe) Append(ctx context.Context, _ store.Tx, _ store.AuditEntry) error {
+	p.called = true
+	if d, ok := ctx.Deadline(); ok {
+		p.deadline = true
+		p.budget = time.Until(d)
+	}
+	return nil
+}
+
+// TestAuditAppendIsGivenABoundedContext pins the mechanism rather than its consequence.
+//
+// The behavioural test above proves a hung writer resolves into a refusal — but when the bound is
+// missing that test HANGS instead of failing, because the blocked goroutine pins a pool connection
+// until the harness times out. A regression that presents as a sixty-second timeout with no message
+// is nearly useless during a bisect.
+//
+// This one asks the direct question: was the writer handed a context with a deadline? If not, the
+// bound is not applied to anything and no amount of downstream behaviour can enforce it.
+func TestAuditAppendIsGivenABoundedContext(t *testing.T) {
+	pool := testPool(t)
+	owner, root := seedOwnerAndRoot(t, pool)
+
+	s := store.NewPG(pool)
+	p := &deadlineProbe{}
+	s.SetAuditWriter(p)
+
+	err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+		if _, cerr := tx.CreateDir(ctx, store.NewNode{
+			OwnerID: owner, ParentID: root, Name: "deadline-probe",
+		}); cerr != nil {
+			return cerr
+		}
+		return tx.Audit(ctx, store.AuditEntry{
+			ActorKind: "user", ActorUserID: &owner,
+			Action: "file.create", TargetKind: "node", Result: "ok",
+		})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !p.called {
+		t.Fatal("the audit writer was never reached; this test proves nothing")
+	}
+	if !p.deadline {
+		t.Fatal("the audit append was given a context with no deadline, so a wedged insert would " +
+			"hold the caller's transaction open indefinitely — every write on the platform would " +
+			"queue behind the recorder.")
+	}
+	if p.budget <= 0 || p.budget > store.DefaultAuditAppendTimeout {
+		t.Fatalf("the audit append's budget is %v, outside (0, %v]", p.budget,
+			store.DefaultAuditAppendTimeout)
 	}
 }

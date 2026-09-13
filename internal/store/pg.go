@@ -30,8 +30,19 @@ type PG struct {
 	// before the audit package is wired. When nil, Audit() returns an error
 	// instead of silently dropping the record.
 	auditWriter AuditWriter
-	now         func() time.Time
-	resolver    Resolver
+	// auditTimeout bounds a single audit append. Zero disables the bound.
+	//
+	// §10.3 covers "the log database is full" and "events are backing up"; it does not spell out
+	// "the log database is slow". Without a bound, a hung audit insert holds the caller's
+	// transaction open for as long as the database cares to, so every write on the platform stalls
+	// behind the recorder — the one component whose purpose is to observe writes becomes the thing
+	// that stops them. A timeout turns that into the already-agreed outcome: the append fails, the
+	// mutation rolls back, the client gets 503 audit_unavailable.
+	//
+	// The policy document listed this as NOT covered. Bounding it is how that gap closes.
+	auditTimeout time.Duration
+	now          func() time.Time
+	resolver     Resolver
 }
 
 // AuditWriter appends an audit entry within the caller's transaction, computing
@@ -44,7 +55,7 @@ var _ Store = (*PG)(nil)
 
 // NewPG wraps a connection pool.
 func NewPG(pool *pgxpool.Pool) *PG {
-	pg := &PG{pool: pool, now: time.Now}
+	pg := &PG{pool: pool, now: time.Now, auditTimeout: DefaultAuditAppendTimeout}
 	pg.resolver = &pgResolver{s: pg}
 	return pg
 }
@@ -52,6 +63,16 @@ func NewPG(pool *pgxpool.Pool) *PG {
 // SetAuditWriter wires the hash-chaining writer. It is separate from NewPG so a
 // misconfiguration is visible: an unwired writer fails loudly on first use.
 func (s *PG) SetAuditWriter(w AuditWriter) { s.auditWriter = w }
+
+// DefaultAuditAppendTimeout bounds one audit append.
+//
+// Generous on purpose: the append is a single indexed insert plus a hash computation, so anything
+// approaching this is already pathological. The point is not to police normal latency, it is to
+// guarantee that "the audit store is wedged" resolves into a refusal instead of an unbounded hang.
+const DefaultAuditAppendTimeout = 5 * time.Second
+
+// SetAuditAppendTimeoutForTest overrides the bound so a test does not have to wait for it.
+func (s *PG) SetAuditAppendTimeoutForTest(d time.Duration) { s.auditTimeout = d }
 
 // Pool exposes the pool for maintenance tasks (partitions, sweeps).
 func (s *PG) Pool() *pgxpool.Pool { return s.pool }
@@ -719,7 +740,13 @@ func (t *pgTx) Audit(ctx context.Context, e AuditEntry) error {
 		return fmt.Errorf("%w: audit writer not configured; refusing to commit an unaudited operation",
 			ErrAuditUnavailable)
 	}
-	if err := t.s.auditWriter.Append(ctx, t, e); err != nil {
+	appendCtx := ctx
+	if t.s.auditTimeout > 0 {
+		var cancel context.CancelFunc
+		appendCtx, cancel = context.WithTimeout(ctx, t.s.auditTimeout)
+		defer cancel()
+	}
+	if err := t.s.auditWriter.Append(appendCtx, t, e); err != nil {
 		// Wrapped so the HTTP layer can answer with a diagnosable status instead of a generic
 		// 500: an operator seeing "audit storage unavailable" knows to check the audit table and
 		// the disk, which "something went wrong" does not tell them.
