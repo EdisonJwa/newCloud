@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 
 	"github.com/google/uuid"
 
@@ -56,6 +57,29 @@ func Permanent(err error) error {
 // "which process left this job stuck" unanswerable.
 func jobWorkerID() string {
 	return fmt.Sprintf("%s-%s", hostnameOrUnknown(), uuid.New().String()[:8])
+}
+
+// JobKinds reports the job kinds this build can run.
+//
+// Exported so the documentation's claim about the catalogue can be checked against the running
+// registry rather than against the source text. A page that says "three job kinds" and a build that
+// registers two is a small lie, but it is the kind that erodes trust in every other number on the
+// same page.
+func (w *Worker) JobKinds() []string {
+	out := make([]string, 0, len(w.handlers))
+	for k := range w.handlers {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// NewForTest returns a worker with its handlers registered and nothing else wired, so a test can
+// ask what the catalogue contains without standing up a database, a content store and a logger.
+func NewForTest() *Worker {
+	w := &Worker{}
+	w.registerJobs()
+	return w
 }
 
 // registerJobs wires the job kinds this build knows how to run.
