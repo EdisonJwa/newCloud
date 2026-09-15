@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
@@ -139,7 +140,7 @@ func (s *Server) Handler() http.Handler {
 	r := chi.NewRouter()
 
 	r.Use(middleware.RequestID)
-	r.Use(middleware.RealIP)
+	r.Use(s.clientAddress)
 	r.Use(s.requestLogger)
 	r.Use(s.securityHeaders)
 	r.Use(middleware.Recoverer)
@@ -318,6 +319,99 @@ func (s *Server) Routes() []string {
 	})
 	sort.Strings(out)
 	return out
+}
+
+// clientAddress decides what r.RemoteAddr means, and replaces chi's RealIP.
+//
+// RealIP is not usable here. It rewrites r.RemoteAddr from X-Forwarded-For for every caller, and
+// this server derives the outcome of several controls from that value: the break-glass CIDR
+// restriction, the per-IP share password and recipient throttles, the upload rate limit, and the
+// ActorIP written to the audit log. Trusting the header from anyone means each of those is decided
+// by a value the client chose.
+//
+// It was not theoretical. With RealIP in place, break-glass refused a caller outside its allowed
+// range and then accepted the same request with `X-Forwarded-For: 10.1.2.3` — an unauthenticated
+// admin login from the internet, through a control that exists to prevent exactly that.
+//
+// The policy, in order:
+//
+//	trusted_proxies non-empty  honour the header, but only when the direct peer is in the list,
+//	                           and take the rightmost address that is not itself a trusted proxy
+//	trust_proxy: true          honour the header from any peer (deprecated; only safe when the
+//	                           listener is unreachable except through the proxy)
+//	neither                    ignore the header entirely — the default, and the correct one
+func (s *Server) clientAddress(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ip := s.forwardedClientIP(r); ip != "" {
+			r.RemoteAddr = ip
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// forwardedClientIP returns the address to trust, or "" to leave r.RemoteAddr alone.
+func (s *Server) forwardedClientIP(r *http.Request) string {
+	cfg := s.deps.Config.Server
+	if len(cfg.TrustedProxies) == 0 && !cfg.TrustProxy {
+		return ""
+	}
+
+	peer := hostOnly(r.RemoteAddr)
+	peerIP := net.ParseIP(peer)
+	if peerIP == nil {
+		return ""
+	}
+	// With an explicit list, the peer must be in it. TrustProxy keeps the old blanket behaviour
+	// for deployments that relied on it, now that it is a decision instead of an accident.
+	if len(cfg.TrustedProxies) > 0 && !s.isTrustedProxy(peerIP) {
+		return ""
+	}
+
+	xff := r.Header.Get("X-Forwarded-For")
+	if xff == "" {
+		return ""
+	}
+	// Walk right to left: the rightmost entry is the one the nearest proxy appended, so it is the
+	// one least able to be forged. Skip entries that are themselves trusted proxies; the first
+	// untrusted address is the client. Taking the LEFTMOST instead would let a client prepend a
+	// value of its own and have it chosen.
+	parts := strings.Split(xff, ",")
+	for i := len(parts) - 1; i >= 0; i-- {
+		cand := strings.TrimSpace(parts[i])
+		ip := net.ParseIP(cand)
+		if ip == nil {
+			// A malformed hop makes the whole header unusable: continuing past it would mean
+			// trusting an address whose position we cannot reason about.
+			return ""
+		}
+		if len(cfg.TrustedProxies) > 0 && s.isTrustedProxy(ip) && i > 0 {
+			continue
+		}
+		return cand
+	}
+	return ""
+}
+
+// isTrustedProxy reports whether ip is in server.trusted_proxies.
+func (s *Server) isTrustedProxy(ip net.IP) bool {
+	for _, cidr := range s.deps.Config.Server.TrustedProxies {
+		_, network, err := net.ParseCIDR(strings.TrimSpace(cidr))
+		if err != nil {
+			continue
+		}
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// hostOnly strips the port from a host:port, tolerating a bare host.
+func hostOnly(addr string) string {
+	if h, _, err := net.SplitHostPort(addr); err == nil {
+		return h
+	}
+	return addr
 }
 
 // securityHeaders applies the baseline to every response.

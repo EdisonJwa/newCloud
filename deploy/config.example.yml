@@ -4,6 +4,10 @@ server:
   # User content lives on a different origin so a stored-XSS payload in an
   # uploaded file cannot reach the session cookie or the app's DOM.
   usercontent_url: "https://usercontent.example.com"
+  # Peers allowed to set X-Forwarded-For (§9.4). Empty means no peer is trusted and
+  # the header is ignored, which is correct unless a reverse proxy is in front.
+  # List the proxy's address, not the clients': a client can send any header value.
+  # trusted_proxies: ["10.0.0.0/8"]
 
 auth:
   # Pocket ID base URL.

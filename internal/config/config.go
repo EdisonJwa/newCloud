@@ -9,6 +9,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strings"
@@ -61,7 +62,19 @@ type ServerConfig struct {
 	Addr           string `yaml:"addr"`
 	PublicURL      string `yaml:"public_url"`
 	UserContentURL string `yaml:"usercontent_url"`
-	TrustProxy     bool   `yaml:"trust_proxy"`
+	// TrustProxy honours X-Forwarded-For from ANY peer.
+	//
+	// Deprecated in favour of TrustedProxies, and unsafe on a listener that is reachable
+	// directly: the header is client-controlled, so a caller can choose its own address and
+	// with it the outcome of every address-derived decision — the break-glass CIDR
+	// restriction, the per-IP throttles, and the ActorIP in the audit log.
+	TrustProxy bool `yaml:"trust_proxy"`
+	// TrustedProxies lists the CIDRs allowed to set X-Forwarded-For (§9.4 可信源列表).
+	//
+	// Empty means no peer is trusted and the header is ignored entirely, which is the correct
+	// default for a server not behind a reverse proxy. This is the knob the requirement asks
+	// for; TrustProxy is the blunt version kept so an existing deployment does not break.
+	TrustedProxies []string `yaml:"trusted_proxies"`
 }
 
 type AuthConfig struct {
@@ -414,6 +427,16 @@ func (c *Config) Validate() error {
 	}
 	if sameOrigin(pub, uc) {
 		return invalid("server.usercontent_url must differ from public_url in scheme, host or port (got the same origin)")
+	}
+
+	// §9.4 可信源列表. A malformed entry is rejected rather than skipped: an operator who writes
+	// 10.0.0.0/8 expecting a whole network and silently gets no trusted proxies at all would see
+	// every client arrive as the reverse proxy's address, and would have no way to tell why the
+	// per-IP limits had collapsed into one.
+	for _, cidr := range c.Server.TrustedProxies {
+		if _, _, err := net.ParseCIDR(strings.TrimSpace(cidr)); err != nil {
+			return invalid("server.trusted_proxies entry %q is not a CIDR (%v)", cidr, err)
+		}
 	}
 
 	if c.Auth.Issuer == "" {
