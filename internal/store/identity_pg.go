@@ -135,11 +135,28 @@ func (t *pgTx) UpsertIdPUser(ctx context.Context, u UpsertUser) (User, error) {
 	// account pending approval. Empty means active.
 	status := orDefault(u.Status, StatusActive)
 
-	const q = `INSERT INTO users (username, email, display_name, idp_issuer, idp_subject, role, status)
+	// Two variants rather than a COALESCE against a sentinel: with no explicit quota the INSERT
+	// omits the column entirely, so the DEFAULT declared in the migration stays the single source
+	// of truth for it. Writing the default into a query would have duplicated it, and the copy is
+	// what drifts.
+	const insertBase = `INSERT INTO users
+		(username, email, display_name, idp_issuer, idp_subject, role, status)
 		VALUES ($1, $2, $3, $4, $5, $6, $7)
 		RETURNING ` + userColumns
-	user, err := scanUser(t.tx.QueryRow(ctx, q, username, nullableString(u.Email),
-		u.DisplayName, u.Issuer, u.Subject, role, status))
+	const insertWithQuota = `INSERT INTO users
+		(username, email, display_name, idp_issuer, idp_subject, role, status, quota_bytes)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		RETURNING ` + userColumns
+
+	var user User
+	if u.QuotaBytes != nil {
+		user, err = scanUser(t.tx.QueryRow(ctx, insertWithQuota, username,
+			nullableString(u.Email), u.DisplayName, u.Issuer, u.Subject, role, status,
+			*u.QuotaBytes))
+	} else {
+		user, err = scanUser(t.tx.QueryRow(ctx, insertBase, username,
+			nullableString(u.Email), u.DisplayName, u.Issuer, u.Subject, role, status))
+	}
 	if err != nil {
 		// A recycled address is the expected collision, and it must not surface as a
 		// 500. The email column is UNIQUE (deliberately: two accounts sharing an

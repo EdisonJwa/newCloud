@@ -207,9 +207,26 @@ func (t *memTx) UpsertIdPUser(ctx context.Context, in UpsertUser) (User, error) 
 		IdPIssuer: in.Issuer, IdPSubject: in.Subject,
 		CreatedAt: now, UpdatedAt: now,
 	}
+	// Mirrors the PostgreSQL column default (10 GiB) when no explicit quota is supplied, so the
+	// two backends agree about a freshly provisioned account even though only one of them has a
+	// schema to declare it in.
+	if in.QuotaBytes != nil {
+		u.QuotaBytes = *in.QuotaBytes
+		t.m.quota[u.ID] = *in.QuotaBytes
+	} else {
+		t.m.quota[u.ID] = defaultUserQuotaBytes
+		u.QuotaBytes = defaultUserQuotaBytes
+	}
 	t.m.users[u.ID] = u
 	return *u, nil
 }
+
+// defaultUserQuotaBytes mirrors the users.quota_bytes default in migration 0001.
+//
+// Duplicated in the in-memory store because it has no schema to declare a default in, and a
+// backend that leaves a fresh account at zero (unlimited) while PostgreSQL gives it 10 GiB is
+// exactly the divergence the shared conformance suite exists to catch.
+const defaultUserQuotaBytes int64 = 10737418240
 
 // ApplyIdPRole stores the claimed role and revokes credentials on a downgrade.
 //

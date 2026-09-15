@@ -103,7 +103,7 @@ a slowdown. Startup performs a real rename probe and refuses to start if it fail
 | `max_file_bytes` | `1099511627776` (1 TiB) | Hard cap for one file. |
 | `default_file_quota_bytes` | `10737418240` (10 GiB) | Per-user quota for new accounts. |
 | `max_propfind_children` | `100000` | Maximum entries returned for one `PROPFIND`. |
-| `upload_chunk_bytes` | `268435456` (256 MiB) | Chunk size for resumable uploads. Must be positive and no larger than `max_file_bytes`. |
+| `upload_chunk_bytes` | `268435456` (256 MiB) | Advertised chunk size for resumable uploads. Validated at startup and reported to clients, but a chunk larger than this is not refused; the bound that is enforced is `max_file_bytes`. |
 | `blob_scrub_per_pass` | `0` | Blobs read back and verified per scrub cycle. `0` disables the scrub. |
 | `blob_scrub_interval_seconds` | `0` | Scrub period. `0` uses the worker's six-hour sweep cadence. |
 | `trash_retention_days` | `0` | How long a deleted item stays restorable. `0` keeps it forever. |
@@ -124,7 +124,7 @@ place is discovered by a user, or by a restore drill months later.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `retention_days` | `365` | How long audit events are kept. |
+| `retention_days` | `365` | **Not applied today.** Intended as how long audit events are kept; the audit table is append-only and nothing prunes it, so it grows without bound. Setting this changes nothing. See [Limitations](limitations.md). |
 | `anchor_dir` | empty | Directory for daily chain-head checkpoints. Empty disables anchoring and logs a warning. |
 
 `anchor_dir` must be writable by the application but not rewritable with the database credentials.

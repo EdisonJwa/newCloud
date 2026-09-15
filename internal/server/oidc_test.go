@@ -536,3 +536,33 @@ func TestMismatchedNonceIsRejected(t *testing.T) {
 		t.Fatalf("no session may exist after a refused callback, got %d", code)
 	}
 }
+
+// TestProvisionedAccountGetsTheConfiguredQuota is limits.default_file_quota_bytes.
+//
+// The key was documented as "Per-user quota" and had no effect. A new account took the column
+// default from migration 0001 — a hard-coded 10 GiB — so an operator who set the value to 100 GiB
+// got 10 GiB, and an operator who set it to something small got 10 GiB. No error, no warning, no
+// difference. This is the same class as a config field nothing reads, which is how a CIDR
+// restriction was silently bypassable earlier in this work.
+func TestProvisionedAccountGetsTheConfiguredQuota(t *testing.T) {
+	const quota = int64(3 << 30) // 3 GiB, deliberately not the schema default
+	h := newOIDCHarnessWith(t, fakeidp.User{
+		Subject: "quota-subject", Username: "quinn",
+		Email: "quinn@example.test", Groups: []string{"cloud-users"},
+	}, func(c *config.Config) {
+		c.Limits.DefaultFileQuotaBytes = quota
+	})
+
+	h.login(t)
+
+	users := h.meta.Users()
+	if len(users) != 1 {
+		t.Fatalf("want one provisioned account, got %d", len(users))
+	}
+	got := users[0]
+	if got.QuotaBytes != quota {
+		t.Fatalf("the provisioned account has a quota of %d bytes; limits.default_file_quota_bytes "+
+			"is %d. The setting is documented as the per-user default and must control it, not just "+
+			"be validated at startup.", got.QuotaBytes, quota)
+	}
+}

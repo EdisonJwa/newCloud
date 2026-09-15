@@ -118,6 +118,13 @@ type UpsertUser struct {
 	Email       string
 	DisplayName string
 	Role        string
+	// QuotaBytes is the initial quota for a *new* account. Nil leaves the column default.
+	//
+	// It exists because limits.default_file_quota_bytes promised to control exactly this and
+	// controlled nothing: the column default was a hard-coded 10 GiB, so an operator who set the
+	// key saw no change and no warning. Ignored for an existing account, like Status — a login
+	// must not reset a quota an administrator has since adjusted.
+	QuotaBytes *int64
 	// Status is the initial status for a *new* account. Empty means active.
 	//
 	// It matters because the provisioning policy (ID-04) decides whether a first-time

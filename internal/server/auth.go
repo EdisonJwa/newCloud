@@ -179,6 +179,13 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 	var user store.User
 	var roleChange store.RoleChange
 	err = s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
+		// The initial quota comes from limits.default_file_quota_bytes. That key was documented as
+		// the per-user default and had no effect at all: the value was only ever a hard-coded
+		// column default, so changing the config did nothing and said nothing.
+		var initialQuota *int64
+		if q := s.deps.Config.Limits.DefaultFileQuotaBytes; q > 0 {
+			initialQuota = &q
+		}
 		u, uerr := tx.UpsertIdPUser(ctx, store.UpsertUser{
 			Issuer:      s.deps.Config.Auth.Issuer,
 			Subject:     claims.Subject,
@@ -186,6 +193,7 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 			Email:       claims.Email,
 			DisplayName: claims.Name,
 			Role:        string(role),
+			QuotaBytes:  initialQuota,
 			// Carries the policy's decision into the row. Without this the pending mode
 			// computed a status that nothing stored, so it behaved exactly like open.
 			Status: decision.Status,
