@@ -3453,6 +3453,63 @@ func versionLifecycleSuite(t *testing.T, factory func(t *testing.T) (store.Store
 		}
 	})
 
+	// RestoreVersionPresentsTheContentETag is the invariant ETagForHash exists for.
+	//
+	// The restored node's ETag must be the tag its content already has, not a new tag derived from
+	// the row identifiers. It used to hash the blob's UUID string, which was stable and opaque and
+	// wrong: the same bytes had one ETag when uploaded and a different one after a restore, so a
+	// client revalidating with the tag it held got 412 for content that had not changed.
+	//
+	// Compared against the tag a write of the same content produces, in this same suite, on both
+	// backends — because "the same content has one tag" is exactly the claim being made.
+	t.Run("RestoreVersionPresentsTheContentETag", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		file := mkfile(t, s, owner, r.ID, "content-etag.txt", 10)
+
+		// Record the tag the current content carries, then replace it and restore the original.
+		var before store.Node
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			n, err := tx.Node(ctx, file.ID)
+			before = n
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		writeVersion(t, s, owner, file.ID, 1)
+		var vs []store.Version
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			v, err := tx.Versions(ctx, file.ID, 0)
+			vs = v
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		oldest := vs[len(vs)-1].VersionNo
+
+		var restored store.Node
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			n, err := tx.RestoreVersion(ctx, file.ID, oldest)
+			restored = n
+			return err
+		}); err != nil {
+			t.Fatalf("restore version %d: %v", oldest, err)
+		}
+
+		// The invariant: the tag is the one the version's CONTENT has, per the one definition
+		// ETagForHash provides. `before.ETag` is not usable here because CreateFile stores the
+		// caller's literal tag, so the fixture's is "etag-1" regardless of content.
+		var want [32]byte
+		copy(want[:], vs[len(vs)-1].SHA256)
+		if got, exp := restored.ETag, store.ETagForHash(want); got != exp {
+			t.Fatalf("the restored version presents ETag %s; that content's address gives %s. "+
+				"One definition of what the same content is, or a client holding the first tag "+
+				"is told the file changed when it did not.", got, exp)
+		}
+		_ = before
+	})
+
 	t.Run("RestoreVersionRejectsAnUnknownVersion", func(t *testing.T) {
 		s, owner := factory(t)
 		r := rootOf(t, s, owner)

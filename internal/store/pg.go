@@ -680,10 +680,15 @@ func (t *pgTx) Versions(ctx context.Context, nodeID uuid.UUID, limit int) ([]Ver
 }
 
 func (t *pgTx) RestoreVersion(ctx context.Context, nodeID uuid.UUID, versionNo int) (Node, error) {
-	const q = `SELECT blob_id, size FROM versions WHERE node_id = $1 AND version_no = $2`
+	// The content hash comes back with the version, because the ETag must be derived from the
+	// CONTENT and not from the row's identifiers.
+	const q = `SELECT v.blob_id, v.size, b.sha256
+		FROM versions v JOIN blobs b ON b.id = v.blob_id
+		WHERE v.node_id = $1 AND v.version_no = $2`
 	var blobID uuid.UUID
 	var size int64
-	if err := t.tx.QueryRow(ctx, q, nodeID, versionNo).Scan(&blobID, &size); err != nil {
+	var sum []byte
+	if err := t.tx.QueryRow(ctx, q, nodeID, versionNo).Scan(&blobID, &size, &sum); err != nil {
 		return Node{}, translate(err)
 	}
 
@@ -709,11 +714,17 @@ func (t *pgTx) RestoreVersion(ctx context.Context, nodeID uuid.UUID, versionNo i
 		return Node{}, err
 	}
 
-	// The ETag must be derived from the content address, exactly like every
-	// other write path. This used to be an unquoted UUID prefix, which meant a
-	// conditional write after a restore could never match again: every WebDAV
-	// client holding the ETag would get 412 forever.
-	etag := etagForBlob(blobID.String())
+	// The ETag is derived from the content address, exactly like every other write path.
+	//
+	// It used to hash the blob's UUID string. That produced a stable, opaque, correctly
+	// quoted tag - and a WRONG one: the same bytes had one ETag when uploaded and a different
+	// one after being restored, so a client revalidating with the tag it already held got 412
+	// for content that had not changed. It also contradicted ETagForHash's stated purpose:
+	// one definition, so a browser upload and a WebDAV PUT cannot disagree about what the
+	// same content is.
+	var h [32]byte
+	copy(h[:], sum)
+	etag := ETagForHash(h)
 
 	const upd = `UPDATE nodes SET blob_id = $2, size = $3, etag = $4, modified_at = now()
 		WHERE id = $1 AND trashed_at IS NULL

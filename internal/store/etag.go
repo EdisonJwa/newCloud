@@ -11,15 +11,3 @@ import "fmt"
 func ETagForHash(h [32]byte) string {
 	return fmt.Sprintf(`"%x"`, h[:8])
 }
-
-// etagForBlob derives the tag a restored version gets.
-//
-// The version row records the blob id, and a blob row is content-addressed — one
-// row per SHA-256 — so the id identifies the bytes. Hashing it into the same shape
-// as ETagForHash keeps the "an ETag is a quoted opaque string" contract intact for
-// clients that follow it literally.
-func etagForBlob(blobID string) string {
-	var h [32]byte
-	copy(h[:], blobID)
-	return ETagForHash(h)
-}

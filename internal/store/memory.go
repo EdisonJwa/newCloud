@@ -788,7 +788,11 @@ func (t *memTx) RestoreVersion(ctx context.Context, nodeID uuid.UUID, versionNo 
 	blobID := victim.BlobID
 	rec.node.BlobID = &blobID
 	rec.node.Size = victim.Size
-	rec.node.ETag = etagForBlob(blobID.String())
+	// Derived from the recorded content hash, not from the blob id: see the PostgreSQL
+	// implementation. A restored version must present the ETag its content already has.
+	var sum [32]byte
+	copy(sum[:], victim.SHA256)
+	rec.node.ETag = ETagForHash(sum)
 	rec.node.ModifiedAt = t.m.now()
 	if delta > 0 {
 		t.m.usage[rec.node.OwnerID] += delta
