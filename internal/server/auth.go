@@ -179,13 +179,6 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 	var user store.User
 	var roleChange store.RoleChange
 	err = s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
-		// The initial quota comes from limits.default_file_quota_bytes. That key was documented as
-		// the per-user default and had no effect at all: the value was only ever a hard-coded
-		// column default, so changing the config did nothing and said nothing.
-		var initialQuota *int64
-		if q := s.deps.Config.Limits.DefaultFileQuotaBytes; q > 0 {
-			initialQuota = &q
-		}
 		u, uerr := tx.UpsertIdPUser(ctx, store.UpsertUser{
 			Issuer:      s.deps.Config.Auth.Issuer,
 			Subject:     claims.Subject,
@@ -193,7 +186,7 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 			Email:       claims.Email,
 			DisplayName: claims.Name,
 			Role:        string(role),
-			QuotaBytes:  initialQuota,
+			QuotaBytes:  s.initialQuota(),
 			// Carries the policy's decision into the row. Without this the pending mode
 			// computed a status that nothing stored, so it behaved exactly like open.
 			Status: decision.Status,
@@ -506,3 +499,20 @@ type issuerCarrier struct{ s string }
 
 // IssuerURL returns the configured issuer.
 func (i issuerCarrier) IssuerURL() string { return i.s }
+
+// initialQuota is the quota a newly provisioned account starts with.
+//
+// One function, because there is more than one way an account comes into existence: an IdP login
+// and the break-glass login both call UpsertIdPUser. The first version of this logic lived inline
+// in the IdP path, so a break-glass account still took the schema's hard-coded default — the
+// config key was obeyed for one provisioner and ignored for the other, which is harder to notice
+// than ignoring it everywhere.
+//
+// Nil means "leave the schema default alone", which is what an operator gets by setting the key to
+// zero: the migration's value is the documented default and it stays the single source of truth.
+func (s *Server) initialQuota() *int64 {
+	if q := s.deps.Config.Limits.DefaultFileQuotaBytes; q > 0 {
+		return &q
+	}
+	return nil
+}

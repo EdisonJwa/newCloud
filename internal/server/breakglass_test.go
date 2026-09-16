@@ -200,3 +200,62 @@ func TestBreakglassCannotReadUserContent(t *testing.T) {
 		t.Fatalf("an administrator must not be able to download user content, got %v", cap.Perms())
 	}
 }
+
+// TestBreakglassAccountGetsTheConfiguredQuota is the path the first fix missed.
+//
+// limits.default_file_quota_bytes was applied to IdP-provisioned accounts and not to the
+// break-glass one, which is the only local account and the one an operator is most likely to use
+// while checking that a deployment behaves as configured. Found by running a real server with a
+// 4 KiB default: the break-glass account came up with the schema's 10 GiB, and a 9 KiB upload was
+// accepted against it.
+//
+// The policy now lives in one function on the server, so the next provisioner cannot pick it up
+// selectively.
+func TestBreakglassAccountGetsTheConfiguredQuota(t *testing.T) {
+	const quota = int64(4096)
+
+	hash, err := password.Hash("correct horse battery", password.Params{
+		Time: 3, Memory: 64 * 1024, Threads: 4, KeyLen: 32,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "breakglass.hex")
+	if err := os.WriteFile(path, []byte(hex.EncodeToString(hash)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	h := newHarnessTuned(t, func(c *config.Config) {
+		c.Auth.AllowLocalAdmin = true
+		c.Auth.LocalAdmin = config.LocalAdminConfig{
+			Username: "breakglass", PasswordFile: path,
+			AllowedCIDRs: []string{"127.0.0.1/32"},
+		}
+		c.Limits.DefaultFileQuotaBytes = quota
+	}, nil)
+
+	if code, body := h.loginBreakglass(t, "breakglass", "correct horse battery"); code != http.StatusOK {
+		t.Fatalf("break-glass login: %d %v", code, body)
+	}
+
+	// The slice is captured once: Users() rebuilds it on every call, so indexing it repeatedly
+	// re-reads a fresh (and freshly ordered) copy.
+	users := h.meta.Users()
+	var local *store.User
+	for i := range users {
+		if users[i].Username == "breakglass" {
+			local = &users[i]
+		}
+	}
+	if local == nil {
+		t.Fatal("the break-glass login created no account")
+	}
+	if local.QuotaBytes != quota {
+		t.Fatalf("the break-glass account has a quota of %d bytes; limits.default_file_quota_bytes "+
+			"is %d. The setting is the per-user default for every provisioner, not only for IdP "+
+			"logins - a local account that quietly gets ten gibibytes while the config says four "+
+			"kibibytes is how an operator concludes the quota feature does not work.",
+			local.QuotaBytes, quota)
+	}
+}

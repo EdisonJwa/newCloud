@@ -102,6 +102,8 @@ func (s *Server) handleBreakglassLogin(w http.ResponseWriter, r *http.Request) {
 	var user store.User
 	err = s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
 		u, uerr := tx.UpsertIdPUser(ctx, store.UpsertUser{
+			// Same policy as an IdP login: a new local account is not a special case for quota.
+			QuotaBytes: s.initialQuota(),
 			// The issuer string marks this identity as local rather than IdP-backed.
 			// It shares the unique (issuer, subject) key with everything else, so a
 			// real IdP subject can never collide with it.

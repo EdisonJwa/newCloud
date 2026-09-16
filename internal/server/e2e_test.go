@@ -1863,3 +1863,46 @@ func TestRateLimitedDropBoxWritesNothing(t *testing.T) {
 			"filling the disk with deliveries that are then rejected.", after-before)
 	}
 }
+
+// TestDownloadHonoursIfNoneMatch is §6.2's 普通下载支持 Range、条件响应.
+//
+// Range works: a range request returns 206 with Content-Range. The conditional half did not:
+// a download carrying If-None-Match set to the file's own ETag returned 200 with the whole body,
+// so a client revalidating an unchanged file re-downloaded it every time. The handler sets the
+// ETag and calls ServeContent, which is supposed to answer 304 — found on a live server, then
+// pinned here.
+func TestDownloadHonoursIfNoneMatch(t *testing.T) {
+	h := newHarness(t)
+	node := h.uploadFile(t, "cond.txt", "conditional content")
+
+	etag := node.ETag
+	if etag == "" {
+		t.Fatal("the upload returned no ETag")
+	}
+
+	// Control: a matching tag must produce 304 and no body.
+	match := h.do(http.MethodGet, "/api/files/download?path=cond.txt", nil,
+		map[string]string{"If-None-Match": etag})
+	matchStatus := match.StatusCode
+	matchBody := readBody(match)
+	match.Body.Close()
+	if matchStatus != http.StatusNotModified {
+		t.Fatalf("If-None-Match with the file's own ETag (%s) returned %d, not 304. The bytes "+
+			"were sent again even though the client said it already had them.", etag, matchStatus)
+	}
+	if matchBody != "" {
+		t.Fatalf("a 304 carried a %d-byte body", len(matchBody))
+	}
+
+	// And a mismatched tag must still deliver the content: a conditional that always said
+	// "unchanged" would pass the assertion above and never send a changed file.
+	other := h.do(http.MethodGet, "/api/files/download?path=cond.txt", nil,
+		map[string]string{"If-None-Match": `"0000000000000000"`})
+	otherStatus := other.StatusCode
+	otherBody := readBody(other)
+	other.Body.Close()
+	if otherStatus != http.StatusOK || otherBody != "conditional content" {
+		t.Fatalf("a non-matching If-None-Match must return the content, got %d %q",
+			otherStatus, otherBody)
+	}
+}
