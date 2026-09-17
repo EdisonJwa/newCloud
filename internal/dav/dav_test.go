@@ -1047,3 +1047,51 @@ func TestDepthInfinityCollectionLockBlocksChildContent(t *testing.T) {
 		t.Fatalf("a Depth:infinity lock must block editing a child: want 423, got %d", rec.Code)
 	}
 }
+
+// TestPropfindHrefNamesTheRightResource is RFC 4918 §9.1: the response's href is the URI of the
+// resource it describes.
+//
+// Two defects, both found by running a real server rather than this harness:
+//
+//	A PROPFIND on a FILE answered 207 naming the caller's COLLECTION root, with the file's size
+//	and ETag attached to the folder's href. A client following it builds a folder that reports a
+//	file's content-length, and the collection's real etag never appears.
+//
+//	Children were emitted as "<root>//<name>". The doubled path is not cosmetic: the server
+//	answers 404 for it, so the href it published was an address it would not serve.
+func TestPropfindHrefNamesTheRightResource(t *testing.T) {
+	e := newEnv(t)
+	e.do(t, http.MethodPut, e.davPath("doc.txt"), strings.NewReader("x"), nil)
+
+	// A file's href must be the file.
+	rec := e.do(t, "PROPFIND", e.davPath("doc.txt"), nil, map[string]string{"Depth": "0"})
+	if rec.Code != http.StatusMultiStatus {
+		t.Fatalf("PROPFIND on a file: want 207, got %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "/doc.txt</D:href>") {
+		t.Fatalf("the href must name the file that was asked for, not its collection:\n%s", body)
+	}
+
+	// The addressee also needs a name: a file entry whose displayname is empty is a nameless
+	// row with a size and an etag, which is what a client shows as a blank line.
+	if !strings.Contains(body, "<D:displayname>doc.txt</D:displayname>") {
+		t.Fatalf("a file entry must carry the file's displayname:\n%s", body)
+	}
+
+	// A directory's children must not be joined with a doubled slash.
+	rec = e.do(t, "PROPFIND", e.davPath(""), nil, map[string]string{"Depth": "1"})
+	if rec.Code != http.StatusMultiStatus {
+		t.Fatalf("PROPFIND on the collection: want 207, got %d", rec.Code)
+	}
+	body = rec.Body.String()
+	if strings.Contains(body, "//doc.txt") {
+		t.Fatalf("a child href was built by appending to a collection href that already ended in "+
+			"/ — the server answers 404 for the result:\n%s", body)
+	}
+
+	// The parent entry keeps its trailing slash, which is the collection convention clients expect.
+	if !strings.Contains(body, "/breakglass/</D:href>") && !strings.Contains(body, "/alice/</D:href>") {
+		t.Fatalf("the collection's own href should end with a slash:\n%s", body)
+	}
+}

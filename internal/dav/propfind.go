@@ -81,7 +81,7 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request, a authz
 		h.writePropEntry(bw, req, n, href, cap, isRoot)
 	}
 
-	href := resourceHref(h, node, a)
+	href := resourceHref(h, r, node)
 	writeEntry(node, href, true)
 
 	if depth == "1" && node.IsDir() {
@@ -94,7 +94,9 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request, a authz
 			return
 		}
 		for _, c := range children {
-			writeEntry(c, href+"/"+escapeHrefSegment(c.Name), false)
+			// Trim before joining: href ends with "/" for a collection, and joining it directly
+			// produced "/root//name" — an href the server itself answers 404 for.
+			writeEntry(c, strings.TrimSuffix(href, "/")+"/"+escapeHrefSegment(c.Name), false)
 		}
 	}
 
@@ -124,8 +126,14 @@ func (h *Handler) listChildren(ctx context.Context, dir store.Node) ([]store.Nod
 func (h *Handler) writePropEntry(w io.Writer, req propfindRequest, n store.Node,
 	href string, cap authz.Cap, isRoot bool) {
 
+	// A blank displayname is for the NAMESPACE ROOT, which genuinely has no name. Using the
+	// "is this the addressee" flag for it blanked the name of whatever was asked about, so a
+	// PROPFIND on a file reported the file's size and etag with no name at all.
+	//
+	// Quota keeps using isRoot below, because that is the opposite question: Windows reads quota
+	// from whichever resource it is looking at, so the addressee is the right one.
 	name := n.Name
-	if isRoot {
+	if n.ParentID == nil {
 		name = ""
 	}
 
@@ -282,12 +290,26 @@ func parsePropfindBody(r io.Reader) (propfindRequest, error) {
 //
 // The owner segment is the username, which is what the client typed, so hrefs
 // round-trip through the client's own path handling.
-func resourceHref(h *Handler, n store.Node, a authz.Actor) string {
-	base := strings.TrimSuffix(h.cfg.Server.PublicURL, "/") + "/dav/" + a.Username()
-	if n.ParentID == nil {
-		return base + "/"
+// resourceHref is the URL of the resource a PROPFIND addresses.
+//
+// It used to return the caller's collection root for everything: every entry described a node but
+// named the collection it lived in, so a PROPFIND on a file answered 207 with the FILE's size and
+// etag attached to the FOLDER's href. A client following that href builds a folder with a file's
+// content-length, and every child came back as "/root//name" because the same function always
+// ended with a slash. The doubled path is not merely ugly: the server answers 404 for it, so the
+// href it published was an address it would not serve.
+//
+// The addressee's href is the URL the client actually used. Reconstructing it from the node would
+// have to re-derive the path, and the node does not reliably know it — the request already does.
+// EscapedPath keeps whatever encoding the client sent, so a name with a space stays addressable.
+func resourceHref(h *Handler, r *http.Request, n store.Node) string {
+	base := strings.TrimSuffix(h.cfg.Server.PublicURL, "/")
+	href := base + r.URL.EscapedPath()
+	// Collections conventionally end with a slash; the request may omit it.
+	if n.IsDir() && !strings.HasSuffix(href, "/") {
+		href += "/"
 	}
-	return base + "/"
+	return href
 }
 
 func escapeHrefSegment(s string) string {
