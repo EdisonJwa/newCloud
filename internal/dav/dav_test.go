@@ -541,8 +541,12 @@ func TestMoveOverwriteRequiresDeleteRight(t *testing.T) {
 		"Overwrite":   "T",
 	})
 	// Same owner: allowed, and the destination is replaced.
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("same-owner overwrite MOVE: want 201, got %d", rec.Code)
+	//
+	// 204, not 201: RFC 4918 9.9.4 distinguishes "moved, new URL created" (201) from "moved to a
+	// pre-existing URL" (204). Answering 201 for both told a client that an overwrite had created
+	// a resource. This test asserted 201 because the handler did.
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("same-owner overwrite MOVE: want 204, got %d", rec.Code)
 	}
 	if body := e.do(t, http.MethodGet, e.davPath("victim.txt"), nil, nil).Body.String(); body != "source" {
 		t.Fatalf("destination should hold the source bytes: %q", body)
@@ -1093,5 +1097,44 @@ func TestPropfindHrefNamesTheRightResource(t *testing.T) {
 	// The parent entry keeps its trailing slash, which is the collection convention clients expect.
 	if !strings.Contains(body, "/breakglass/</D:href>") && !strings.Contains(body, "/alice/</D:href>") {
 		t.Fatalf("the collection's own href should end with a slash:\n%s", body)
+	}
+}
+
+// TestMovePublishesLocationAndTheRightStatus is RFC 4918 §9.9.4's response contract.
+//
+// A created destination answers 201 and MUST carry a Location header naming the new resource: it
+// is how a client learns the URL without re-listing the parent. A pre-existing destination answers
+// 204 and carries no Location, because nothing new was created. Neither header existed before —
+// MOVE answered 201 with an empty body for both cases.
+func TestMovePublishesLocationAndTheRightStatus(t *testing.T) {
+	e := newEnv(t)
+	e.do(t, http.MethodPut, e.davPath("src.txt"), strings.NewReader("source"), nil)
+
+	rec := e.do(t, "MOVE", e.davPath("src.txt"), nil, map[string]string{
+		"Destination": "https://cloud.example.test/dav/alice/moved.txt",
+	})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("a MOVE to a free name must be 201, got %d", rec.Code)
+	}
+	loc := rec.Header().Get("Location")
+	if loc == "" {
+		t.Fatal("a 201 from MOVE must carry a Location header; a client has no other way to learn " +
+			"the new resource's URL from this response")
+	}
+	if !strings.HasSuffix(loc, "/dav/alice/moved.txt") {
+		t.Fatalf("Location names the wrong resource: %q", loc)
+	}
+
+	// The destination exists now, so a second MOVE onto it is the overwrite case.
+	e.do(t, http.MethodPut, e.davPath("other.txt"), strings.NewReader("other"), nil)
+	rec = e.do(t, "MOVE", e.davPath("other.txt"), nil, map[string]string{
+		"Destination": "https://cloud.example.test/dav/alice/moved.txt",
+		"Overwrite":   "T",
+	})
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("an overwriting MOVE must be 204, got %d", rec.Code)
+	}
+	if loc := rec.Header().Get("Location"); loc != "" {
+		t.Fatalf("a 204 must not claim a new location, got %q", loc)
 	}
 }

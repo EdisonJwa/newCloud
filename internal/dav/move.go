@@ -278,9 +278,44 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request, a authz
 		})
 		// The tree layout mirrors the hierarchy on disk, so the bytes move too.
 		// Blob layout treats this as a metadata update (EfficientRename).
-		if err == nil {
-			_ = h.content.Move(ctx, layout.Node{Owner: a.ID().String(), Path: srcRel, IsDir: src.IsDir()},
-				layout.Node{Owner: a.ID().String(), Path: dstRel, IsDir: src.IsDir()})
+		//
+		// The error is NOT discarded. It used to be, so a MOVE whose metadata commit succeeded
+		// and whose content move failed answered 201 while the bytes stayed where they were: a
+		// node pointing at a path the content store knows nothing about, reported to the client as
+		// a successful move. Silent, and in the direction of data loss.
+		//
+		// Metadata and bytes cannot commit together, so the two are reconciled instead: if the
+		// bytes cannot follow, the metadata is put back and the client is told the move failed.
+		// The compensation can itself fail, and then the honest state is "inconsistent, operator
+		// needed" — which is logged loudly rather than papered over with a 201.
+		// A layout with EfficientRename keeps the bytes where they are and follows the metadata:
+		// its path-to-hash resolver IS the metadata, so by the time this runs the source path no
+		// longer exists there. Calling Move for such a layout always failed, and the discarded
+		// error hid it — the operation only looked correct because nothing read back through the
+		// moved mapping. Skipping it is not an optimisation; it is the correct thing to do.
+		if err == nil && !h.content.Capabilities().EfficientRename {
+			if merr := h.content.Move(ctx,
+				layout.Node{Owner: a.ID().String(), Path: srcRel, IsDir: src.IsDir()},
+				layout.Node{Owner: a.ID().String(), Path: dstRel, IsDir: src.IsDir()}); merr != nil {
+				h.logf("move: content move failed src=%q dst=%q err=%v; restoring metadata", srcRel, dstRel, merr)
+				cerr := h.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+					if _, rerr := tx.Rename(ctx, src.ID, src.Name); rerr != nil {
+						return rerr
+					}
+					if src.ParentID != nil {
+						if _, mverr := tx.Move(ctx, src.ID, *src.ParentID); mverr != nil {
+							return mverr
+						}
+					}
+					return nil
+				})
+				if cerr != nil {
+					h.logf("move: COMPENSATION FAILED for node %s: metadata says the file moved and "+
+						"the content did not; node err=%v", src.ID, cerr)
+				}
+				writeXMLError(w, http.StatusInternalServerError, "")
+				return
+			}
 		}
 	} else {
 		err = h.copyNode(ctx, a, src, dstParent, dstName, dstRel, r)
@@ -291,6 +326,21 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request, a authz
 		return
 	}
 
+	// RFC 4918 §9.8.5 / §9.9.4: 201 Created when the destination is new, 204 No Content when it
+	// already existed and was replaced. PUT already distinguished these; MOVE and COPY answered
+	// 201 for both, so an overwrite looked like the creation of a new resource.
+	//
+	// A 201 also carries Location, which is how a client learns the new resource's URL without
+	// re-listing the parent.
+	destURL := destPath
+	if !strings.HasPrefix(destURL, "http://") && !strings.HasPrefix(destURL, "https://") {
+		destURL = strings.TrimSuffix(h.cfg.Server.PublicURL, "/") + "/" + strings.TrimPrefix(destURL, "/")
+	}
+	if existing != nil {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	w.Header().Set("Location", destURL)
 	w.WriteHeader(http.StatusCreated)
 }
 
