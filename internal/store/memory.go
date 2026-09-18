@@ -556,8 +556,17 @@ func (t *memTx) Rename(ctx context.Context, id uuid.UUID, name string) (Node, er
 		return Node{}, fmt.Errorf("%w: cannot rename a root", ErrInvalidName)
 	}
 	parentID := *rec.node.ParentID
-	if err := t.checkName(parentID, name); err != nil {
-		return Node{}, err
+	// Renaming to the name it already has is a no-op, not a collision.
+	//
+	// checkName sees the node's own entry, so this used to fail with ErrConflict while
+	// PostgreSQL accepted it — the UPDATE there rewrites the same values and the unique index does
+	// not conflict with the row itself. A caller that renames defensively (restoring a failed
+	// move, replaying an idempotent operation) therefore worked on one backend and failed on the
+	// other. The conformance suite never covered it; a compensation path written elsewhere did.
+	if nameKey(rec.node.Name) != nameKey(name) {
+		if err := t.checkName(parentID, name); err != nil {
+			return Node{}, err
+		}
 	}
 	delete(t.m.children[parentID], nameKey(rec.node.Name))
 	rec.node.Name = name

@@ -666,9 +666,24 @@ func (s *Server) handleRename(w http.ResponseWriter, r *http.Request) {
 
 	parentRel, _ := splitParent(body.Path)
 	// The tree layout mirrors names on disk; blob layout treats this as metadata.
-	_ = s.deps.Content.Move(r.Context(),
-		layout.Node{Owner: actor.ID().String(), Path: body.Path, IsDir: node.IsDir()},
-		layout.Node{Owner: actor.ID().String(), Path: path.Join(parentRel, body.Name), IsDir: node.IsDir()})
+	//
+	// The error used to be discarded, which is the same defect the WebDAV MOVE had: metadata
+	// committed, bytes stayed where they were, and the client was told the rename succeeded. The
+	// metadata is put back if the bytes cannot follow, so the two never disagree silently.
+	if merr := s.moveContentByPath(r.Context(), actor.ID().String(), body.Path,
+		path.Join(parentRel, body.Name), node.IsDir()); merr != nil {
+		s.deps.Log.Error("rename: content move failed; restoring metadata",
+			"from", body.Path, "to", body.Name, "error", merr)
+		if cerr := s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
+			_, rerr := tx.Rename(ctx, node.ID, node.Name)
+			return rerr
+		}); cerr != nil {
+			s.deps.Log.Error("rename: COMPENSATION FAILED", "node", node.ID, "error", cerr)
+		}
+		writeError(w, http.StatusInternalServerError, "content_move_failed",
+			"the file could not be moved; nothing was changed")
+		return
+	}
 
 	writeJSON(w, http.StatusOK, toFileJSON(renamed, path.Join(parentRel, body.Name)))
 }
@@ -774,9 +789,32 @@ func (s *Server) handleMove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = s.deps.Content.Move(r.Context(),
-		layout.Node{Owner: actor.ID().String(), Path: body.From, IsDir: node.IsDir()},
-		layout.Node{Owner: actor.ID().String(), Path: body.To, IsDir: node.IsDir()})
+	// Same rule as rename: bytes that cannot follow the metadata put the metadata back.
+	if merr := s.moveContentByPath(r.Context(), actor.ID().String(), body.From, body.To,
+		node.IsDir()); merr != nil {
+		s.deps.Log.Error("move: content move failed; restoring metadata",
+			"from", body.From, "to", body.To, "error", merr)
+		if cerr := s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
+			// Only the parts that actually changed: a no-op rename is harmless now, but relying on
+			// store semantics for a compensation path is how this failed the first time.
+			if node.Name != name {
+				if _, rerr := tx.Rename(ctx, node.ID, node.Name); rerr != nil {
+					return rerr
+				}
+			}
+			if node.ParentID != nil && *node.ParentID != parent.ID {
+				if _, mverr := tx.Move(ctx, node.ID, *node.ParentID); mverr != nil {
+					return mverr
+				}
+			}
+			return nil
+		}); cerr != nil {
+			s.deps.Log.Error("move: COMPENSATION FAILED", "node", node.ID, "error", cerr)
+		}
+		writeError(w, http.StatusInternalServerError, "content_move_failed",
+			"the file could not be moved; nothing was changed")
+		return
+	}
 
 	writeJSON(w, http.StatusOK, toFileJSON(moved, body.To))
 }
@@ -1164,4 +1202,23 @@ func formatRetainUntil(t *time.Time) string {
 		return ""
 	}
 	return t.UTC().Format(time.RFC3339)
+}
+
+// moveContentByPath moves the bytes for a layout that keeps them at a path.
+//
+// Layouts with EfficientRename keep the bytes where they are and follow the metadata: their
+// path-to-hash resolver IS the metadata, so by the time this runs the source path no longer exists
+// there and the call could only fail. That is not a hypothetical — the call always failed for the
+// default layout, and because its error was discarded, the failure was invisible and every rename
+// and move looked successful.
+//
+// Returning nil for those layouts is the correct thing, not an optimisation: there is nothing to
+// move and nothing to verify.
+func (s *Server) moveContentByPath(ctx context.Context, owner, from, to string, isDir bool) error {
+	if s.deps.Content.Capabilities().EfficientRename {
+		return nil
+	}
+	return s.deps.Content.Move(ctx,
+		layout.Node{Owner: owner, Path: from, IsDir: isDir},
+		layout.Node{Owner: owner, Path: to, IsDir: isDir})
 }

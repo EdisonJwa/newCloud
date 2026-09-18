@@ -409,6 +409,32 @@ func Run(t *testing.T, factory Factory, opts Options) {
 	// TestConcurrentSameNameOnlyOneWins is the race the partial unique index
 	// exists for: two simultaneous uploads of the same filename must not both
 	// succeed.
+	// RenameToTheSameNameSucceeds: a no-op rename must be accepted by both backends.
+	//
+	// The in-memory store checked the target name before releasing the old one, so it saw its own
+	// entry and answered ErrConflict. PostgreSQL rewrites the same values and is happy. Any caller
+	// that renames defensively — restoring a failed move, retrying an idempotent request — worked
+	// on one backend and failed on the other, and nothing exercised it.
+	t.Run("RenameToTheSameNameSucceeds", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		file := mkfile(t, s, owner, r.ID, "same.txt", 4)
+
+		var got store.Node
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			n, err := tx.Rename(ctx, file.ID, "same.txt")
+			got = n
+			return err
+		}); err != nil {
+			t.Fatalf("renaming a file to the name it already has: %v. A no-op rename is not a "+
+				"collision with itself, and one backend accepting it while the other refuses makes "+
+				"every defensive re-rename backend-dependent.", err)
+		}
+		if got.Name != "same.txt" {
+			t.Fatalf("the name changed to %q", got.Name)
+		}
+	})
+
 	t.Run("ConcurrentSameNameOnlyOneWins", func(t *testing.T) {
 		s, owner := factory(t)
 		r := rootOf(t, s, owner)
