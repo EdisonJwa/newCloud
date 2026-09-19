@@ -7,11 +7,14 @@ package server_test
 // wrong" — a 500 sends an operator to inspect the data, and the data is fine.
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/EdisonJwa/newCloud/internal/store"
 )
 
 // TestAuditOutageReturns503.
@@ -103,5 +106,47 @@ func TestUploadIsRefusedDuringAuditOutage(t *testing.T) {
 		if e.Name == "blocked.txt" {
 			t.Fatal("the refused upload must not create a file")
 		}
+	}
+}
+
+// TestAppPasswordCreationIsRefusedDuringAuditOutage.
+//
+// The audit event for a credential creation used to be written after the credential had already
+// been committed, best-effort. If that write failed, the platform held a live WebDAV credential
+// with no record of who created it — and the client had been told the creation succeeded. That is
+// the exact pairing the audit failure policy forbids.
+//
+// The event now commits with the credential, so an unauditable creation is refused and no
+// credential exists.
+func TestAppPasswordCreationIsRefusedDuringAuditOutage(t *testing.T) {
+	h := newHarness(t)
+
+	count := func() int {
+		var n int
+		_ = h.meta.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			l, err := tx.ListAppPasswords(ctx, h.user.ID)
+			n = len(l)
+			return err
+		})
+		return n
+	}
+	before := count()
+
+	h.meta.SetAuditFault(errors.New("audit: unavailable"))
+	resp := h.do(http.MethodPost, "/api/apppasswords/",
+		strings.NewReader(`{"label":"dav","scope":"rw"}`),
+		map[string]string{"Content-Type": "application/json"})
+	status := resp.StatusCode
+	payload := readBody(resp)
+	resp.Body.Close()
+	h.meta.SetAuditFault(nil)
+
+	if status == http.StatusCreated {
+		t.Fatalf("a credential was created while its audit event could not be written (%s). The "+
+			"platform then holds a WebDAV credential with no record of its creation, and the "+
+			"client was told it succeeded.", payload)
+	}
+	if got := count(); got != before {
+		t.Fatalf("the refused creation still left %d credential(s) behind", got-before)
 	}
 }

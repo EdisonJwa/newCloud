@@ -61,6 +61,23 @@ func NewAppPasswords(meta store.Store) *AppPasswords {
 // The plaintext is not recoverable afterwards: only its SHA-256 is stored. That
 // is deliberate — a database dump must not yield working credentials.
 func (a *AppPasswords) Issue(ctx context.Context, userID uuid.UUID, label, scope string, ttl time.Duration) (string, AppPassword, error) {
+	return a.issue(ctx, userID, label, scope, ttl, nil)
+}
+
+// IssueAudited creates the credential and records its audit event in ONE transaction.
+//
+// The event used to be written by the caller, best-effort, after Issue had already committed. If
+// that second write failed the credential existed and nothing recorded who created it — a
+// security-relevant event missing for an operation the client was told had succeeded, which is
+// exactly what the audit failure policy forbids. Now a credential that cannot be recorded is not
+// created.
+func (a *AppPasswords) IssueAudited(ctx context.Context, userID uuid.UUID, label, scope string,
+	ttl time.Duration, entry store.AuditEntry) (string, AppPassword, error) {
+	return a.issue(ctx, userID, label, scope, ttl, &entry)
+}
+
+func (a *AppPasswords) issue(ctx context.Context, userID uuid.UUID, label, scope string,
+	ttl time.Duration, entry *store.AuditEntry) (string, AppPassword, error) {
 	if !ValidScope(scope) {
 		return "", AppPassword{}, fmt.Errorf("auth: scope must be %q or %q, got %q",
 			ScopeReadOnly, ScopeReadWrite, scope)
@@ -94,10 +111,18 @@ func (a *AppPasswords) Issue(ctx context.Context, userID uuid.UUID, label, scope
 	}
 
 	if err := a.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
-		return tx.CreateAppPassword(ctx, store.AppPassword{
+		if err := tx.CreateAppPassword(ctx, store.AppPassword{
 			ID: rec.ID, UserID: userID, Label: label, Prefix: rec.Prefix,
 			TokenHash: hash[:], Scope: scope, ExpiresAt: rec.ExpiresAt,
-		})
+		}); err != nil {
+			return err
+		}
+		if entry != nil {
+			e := *entry
+			e.TargetKind, e.TargetID, e.Result = "user", userID.String(), "ok"
+			return tx.Audit(ctx, e)
+		}
+		return nil
 	}); err != nil {
 		return "", AppPassword{}, err
 	}
@@ -201,8 +226,30 @@ func (a *AppPasswords) touch(ctx context.Context, id uuid.UUID, ip string, user 
 
 // Revoke kills a credential. It takes effect on the next request.
 func (a *AppPasswords) Revoke(ctx context.Context, id uuid.UUID) error {
+	return a.revoke(ctx, id, nil)
+}
+
+// RevokeAudited revokes the credential and records the event in ONE transaction.
+//
+// A revoked credential whose revocation went unrecorded is the same defect as an unrecorded
+// creation: the client is told the secret is dead and the audit log has no evidence of who killed
+// it. The same fix applies.
+func (a *AppPasswords) RevokeAudited(ctx context.Context, id uuid.UUID,
+	entry store.AuditEntry) error {
+	return a.revoke(ctx, id, &entry)
+}
+
+func (a *AppPasswords) revoke(ctx context.Context, id uuid.UUID, entry *store.AuditEntry) error {
 	return a.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
-		return tx.RevokeAppPassword(ctx, id)
+		if err := tx.RevokeAppPassword(ctx, id); err != nil {
+			return err
+		}
+		if entry != nil {
+			e := *entry
+			e.TargetKind, e.TargetID, e.Result = "user", id.String(), "ok"
+			return tx.Audit(ctx, e)
+		}
+		return nil
 	})
 }
 

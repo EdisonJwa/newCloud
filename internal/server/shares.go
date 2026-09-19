@@ -381,20 +381,20 @@ func (s *Server) handleAppPasswordCreate(w http.ResponseWriter, r *http.Request)
 		ttl = time.Duration(body.ExpiresIn) * time.Second
 	}
 
-	secret, rec, err := s.deps.AppPass.Issue(r.Context(), actor.ID(), body.Label, body.Scope, ttl)
+	// The audit event is written in the same transaction as the credential. It used to be a
+	// best-effort write afterwards, so a failure left a live credential with no record of who
+	// created it — while the client was told the creation succeeded.
+	secret, rec, err := s.deps.AppPass.IssueAudited(r.Context(), actor.ID(), body.Label,
+		body.Scope, ttl, store.AuditEntry{
+			ActorKind: "user", ActorUserID: actor.Ptr(), ActorEmail: actor.Email(),
+			ActorIP: clientIP(r), UserAgent: r.UserAgent(),
+			Action:   "auth.apppassword.create",
+			Metadata: map[string]any{"scope": body.Scope, "label": body.Label},
+		})
 	if err != nil {
 		s.writeStoreError(w, err)
 		return
 	}
-
-	_ = s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
-		return tx.Audit(ctx, store.AuditEntry{
-			ActorKind: "user", ActorUserID: actor.Ptr(), ActorEmail: actor.Email(),
-			ActorIP: clientIP(r), UserAgent: r.UserAgent(),
-			Action: "auth.apppassword.create", TargetKind: "user", TargetID: actor.ID().String(),
-			Result: "ok", Metadata: map[string]any{"scope": body.Scope, "label": body.Label},
-		})
-	})
 
 	// The plaintext appears exactly once. A UI that offers "show it again" would
 	// require storing it, which defeats the point.
@@ -430,18 +430,15 @@ func (s *Server) handleAppPasswordRevoke(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if err := s.deps.AppPass.Revoke(r.Context(), id); err != nil {
+	// Revocation and its audit event commit together, for the same reason creation does.
+	if err := s.deps.AppPass.RevokeAudited(r.Context(), id, store.AuditEntry{
+		ActorKind: "user", ActorUserID: actor.Ptr(), ActorEmail: actor.Email(),
+		ActorIP: clientIP(r), UserAgent: r.UserAgent(),
+		Action: "auth.apppassword.revoke",
+	}); err != nil {
 		s.writeStoreError(w, err)
 		return
 	}
-	_ = s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
-		return tx.Audit(ctx, store.AuditEntry{
-			ActorKind: "user", ActorUserID: actor.Ptr(), ActorEmail: actor.Email(),
-			ActorIP: clientIP(r), UserAgent: r.UserAgent(),
-			Action: "auth.apppassword.revoke", TargetKind: "user", TargetID: actor.ID().String(),
-			Result: "ok",
-		})
-	})
 	w.WriteHeader(http.StatusNoContent)
 }
 

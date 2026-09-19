@@ -13,6 +13,7 @@ import (
 	"path"
 	"strings"
 	"testing"
+	"time"
 )
 
 type recentItem struct {
@@ -100,7 +101,13 @@ func TestRecentOrdersNewestFirst(t *testing.T) {
 	h := newHarness(t)
 	uploadPath(t, h, "first.txt", "one")
 	uploadPath(t, h, "second.txt", "two")
-	// Re-touch the first one so it becomes the most recent without relying on name order.
+	// The re-touch must land in a LATER clock tick, or the test asserts something the system does
+	// not promise. modified_at comes from the wall clock, two writes inside one tick get the same
+	// value, and the ordering then falls back to its stable tie-break (node id) — which has
+	// nothing to do with which file was touched last. This failed once in a full-package run and
+	// passed in isolation, which is the signature of a test racing the clock rather than a
+	// behaviour changing.
+	time.Sleep(50 * time.Millisecond)
 	uploadPath(t, h, "first.txt", "one again")
 
 	items := getRecent(t, h)
