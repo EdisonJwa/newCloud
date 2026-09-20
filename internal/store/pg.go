@@ -323,7 +323,7 @@ func (t *pgTx) UpdateFile(ctx context.Context, u UpdateFile) (Node, error) {
 	}
 
 	if u.KeepVersion && current.BlobID != nil && *current.BlobID != u.BlobID {
-		if err := t.pushVersion(ctx, current); err != nil {
+		if err := t.pushVersion(ctx, current, u.By); err != nil {
 			return Node{}, err
 		}
 		if u.MaxVersions > 0 {
@@ -395,6 +395,7 @@ func (t *pgTx) WriteFile(ctx context.Context, w WriteFile) (Node, bool, error) {
 			NodeID: existing.ID, Size: w.Size, Mime: w.Mime, ETag: w.ETag,
 			BlobID: w.BlobID, BlobHash: w.BlobHash,
 			KeepVersion: w.KeepVersion, MaxVersions: w.MaxVersions,
+			By: w.By,
 		})
 		if uerr != nil {
 			return Node{}, false, uerr
@@ -414,7 +415,7 @@ func (t *pgTx) WriteFile(ctx context.Context, w WriteFile) (Node, bool, error) {
 	}
 }
 
-func (t *pgTx) pushVersion(ctx context.Context, cur Node) error {
+func (t *pgTx) pushVersion(ctx context.Context, cur Node, by *uuid.UUID) error {
 	// version_no is allocated from the current maximum inside the transaction so
 	// two concurrent saves cannot both claim the same number (the unique
 	// constraint would reject the second one anyway, but failing fast here gives
@@ -423,7 +424,7 @@ func (t *pgTx) pushVersion(ctx context.Context, cur Node) error {
 		SELECT $1,
 		       COALESCE((SELECT max(version_no) FROM versions WHERE node_id = $1), 0) + 1,
 		       $2, $3, $4`
-	if _, err := t.tx.Exec(ctx, q, cur.ID, cur.BlobID, cur.Size, (*uuid.UUID)(nil)); err != nil {
+	if _, err := t.tx.Exec(ctx, q, cur.ID, cur.BlobID, cur.Size, by); err != nil {
 		return translate(err)
 	}
 	// The new version row is a reference to the bytes. Without this increment the
@@ -679,7 +680,7 @@ func (t *pgTx) Versions(ctx context.Context, nodeID uuid.UUID, limit int) ([]Ver
 	return out, translate(rows.Err())
 }
 
-func (t *pgTx) RestoreVersion(ctx context.Context, nodeID uuid.UUID, versionNo int) (Node, error) {
+func (t *pgTx) RestoreVersion(ctx context.Context, nodeID uuid.UUID, versionNo int, by *uuid.UUID) (Node, error) {
 	// The content hash comes back with the version, because the ETag must be derived from the
 	// CONTENT and not from the row's identifiers.
 	const q = `SELECT v.blob_id, v.size, b.sha256
@@ -700,7 +701,7 @@ func (t *pgTx) RestoreVersion(ctx context.Context, nodeID uuid.UUID, versionNo i
 	// Restoring an old version keeps the current one: otherwise "undo" is
 	// destructive and the user cannot change their mind.
 	if current.BlobID != nil {
-		if err := t.pushVersion(ctx, current); err != nil {
+		if err := t.pushVersion(ctx, current, by); err != nil {
 			return Node{}, err
 		}
 	}

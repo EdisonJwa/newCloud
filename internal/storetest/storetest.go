@@ -3446,7 +3446,7 @@ func versionLifecycleSuite(t *testing.T, factory func(t *testing.T) (store.Store
 		oldest := vs[len(vs)-1].VersionNo
 		var restored store.Node
 		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
-			n, err := tx.RestoreVersion(ctx, file.ID, oldest)
+			n, err := tx.RestoreVersion(ctx, file.ID, oldest, nil)
 			restored = n
 			return err
 		}); err != nil {
@@ -3476,6 +3476,52 @@ func versionLifecycleSuite(t *testing.T, factory func(t *testing.T) (store.Store
 			t.Fatalf("after restoring, want 3 versions (2 kept + the replaced current one), got %d. "+
 				"A restore that discards the content it replaced turns version history into a way "+
 				"to destroy data.", len(after))
+		}
+	})
+
+	// VersionRecordsTheOperator is §8.1's 操作者引用.
+	//
+	// versions.created_by existed from the first migration, was selected on every read, and was
+	// written as NULL by every code path: the history could say when a version was made and what
+	// it contained, but never who made it. A column nothing writes is worse than a missing one,
+	// because it looks implemented.
+	t.Run("VersionRecordsTheOperator", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		file := mkfile(t, s, owner, r.ID, "who.txt", 4)
+
+		var hash [32]byte
+		hash[0] = 9
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			_, err := tx.UpdateFile(ctx, store.UpdateFile{
+				NodeID: file.ID, Size: 8, ETag: "e-who", BlobID: newBlobHook(t), BlobHash: hash,
+				KeepVersion: true, MaxVersions: 10, By: &owner,
+			})
+			return err
+		}); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+
+		var vs []store.Version
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			v, err := tx.Versions(ctx, file.ID, 0)
+			vs = v
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if len(vs) == 0 {
+			t.Fatal("the write kept no version, so there is nothing to attribute")
+		}
+		for _, v := range vs {
+			if v.CreatedBy == nil {
+				t.Fatalf("version %d has no operator reference; the column is written as NULL and "+
+					"the history cannot say who made it", v.VersionNo)
+			}
+			if *v.CreatedBy != owner {
+				t.Fatalf("version %d is attributed to %s, not the account that wrote it (%s)",
+					v.VersionNo, *v.CreatedBy, owner)
+			}
 		}
 	})
 
@@ -3516,7 +3562,7 @@ func versionLifecycleSuite(t *testing.T, factory func(t *testing.T) (store.Store
 
 		var restored store.Node
 		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
-			n, err := tx.RestoreVersion(ctx, file.ID, oldest)
+			n, err := tx.RestoreVersion(ctx, file.ID, oldest, nil)
 			restored = n
 			return err
 		}); err != nil {
@@ -3543,7 +3589,7 @@ func versionLifecycleSuite(t *testing.T, factory func(t *testing.T) (store.Store
 		writeVersion(t, s, owner, file.ID, 1)
 
 		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
-			_, err := tx.RestoreVersion(ctx, file.ID, 9999)
+			_, err := tx.RestoreVersion(ctx, file.ID, 9999, nil)
 			return err
 		}); err == nil {
 			t.Fatal("restoring a version number that does not exist succeeded")

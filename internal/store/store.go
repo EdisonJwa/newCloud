@@ -209,7 +209,7 @@ type Tx interface {
 	// Versions lists kept versions of a file, newest first.
 	Versions(ctx context.Context, nodeID uuid.UUID, limit int) ([]Version, error)
 	// RestoreVersion makes an old version current, keeping the current one.
-	RestoreVersion(ctx context.Context, nodeID uuid.UUID, versionNo int) (Node, error)
+	RestoreVersion(ctx context.Context, nodeID uuid.UUID, versionNo int, by *uuid.UUID) (Node, error)
 
 	// Audit appends an event to the audit log in the same transaction.
 	Audit(ctx context.Context, e AuditEntry) error
@@ -407,6 +407,14 @@ type UpdateFile struct {
 	KeepVersion bool
 	// MaxVersions bounds the kept versions; 0 means unlimited.
 	MaxVersions int
+	// By is the account performing the write, recorded on the version row this
+	// write creates.
+	//
+	// §8.1 asks every version to carry "操作者引用" — a reference to the operator. The column
+	// existed and was always written as NULL, so the history could say when a version was made and
+	// what it contained, but never who made it. Nil is legitimate for background work, but a
+	// user-initiated save must name the user.
+	By *uuid.UUID
 }
 
 // WriteFile is an upsert with a precondition: it creates the file when the name
@@ -425,6 +433,9 @@ type WriteFile struct {
 	KeepVersion bool
 	// MaxVersions bounds kept versions; 0 means unlimited.
 	MaxVersions int
+	// By is the account performing the write, recorded on the version row this
+	// write creates. See UpdateFile.By.
+	By *uuid.UUID
 }
 
 // Version is one historical revision of a file.

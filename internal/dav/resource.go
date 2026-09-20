@@ -350,6 +350,8 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request, a authz.Acto
 				// fills the history with noise.
 				KeepVersion: existing.Size != res.Size || existing.ETag != etag,
 				MaxVersions: h.maxVersions(),
+				// §8.1 操作者引用: a WebDAV PUT names the account that made the version.
+				By: a.Ptr(),
 			})
 			if uerr != nil {
 				return uerr

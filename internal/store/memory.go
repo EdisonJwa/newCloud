@@ -488,6 +488,9 @@ func (t *memTx) UpdateFile(ctx context.Context, u UpdateFile) (Node, error) {
 			// from blobs; here the blob address is already in hand, so it is stored directly.
 			SHA256:    append([]byte(nil), rec.blob[:]...),
 			CreatedAt: rec.node.ModifiedAt,
+			// §8.1 操作者引用: who made this version. PostgreSQL recorded NULL here always;
+			// the in-memory store now matches the column it is standing in for.
+			CreatedBy: u.By,
 		})
 		if u.MaxVersions > 0 && len(rec.versions) > u.MaxVersions {
 			rec.versions = rec.versions[len(rec.versions)-u.MaxVersions:]
@@ -517,6 +520,7 @@ func (t *memTx) WriteFile(ctx context.Context, w WriteFile) (Node, bool, error) 
 			NodeID: existing.ID, Size: w.Size, Mime: w.Mime, ETag: w.ETag,
 			BlobID: w.BlobID, BlobHash: w.BlobHash,
 			KeepVersion: w.KeepVersion, MaxVersions: w.MaxVersions,
+			By: w.By,
 		})
 		if uerr != nil {
 			return Node{}, false, uerr
@@ -748,7 +752,7 @@ func (t *memTx) Versions(ctx context.Context, nodeID uuid.UUID, limit int) ([]Ve
 // wrong: the content being replaced is KEPT as a version (otherwise "restore" destroys the newer
 // content), and the restored content becomes current with an ETag derived from it rather than left
 // stale.
-func (t *memTx) RestoreVersion(ctx context.Context, nodeID uuid.UUID, versionNo int) (Node, error) {
+func (t *memTx) RestoreVersion(ctx context.Context, nodeID uuid.UUID, versionNo int, by *uuid.UUID) (Node, error) {
 	rec, ok := t.m.nodes[nodeID]
 	if !ok || rec.node.TrashedAt != nil {
 		return Node{}, ErrNotFound
@@ -776,6 +780,7 @@ func (t *memTx) RestoreVersion(ctx context.Context, nodeID uuid.UUID, versionNo 
 			Size:      rec.node.Size,
 			SHA256:    append([]byte(nil), rec.blob[:]...),
 			CreatedAt: rec.node.ModifiedAt,
+			CreatedBy: by,
 		})
 	}
 

@@ -339,6 +339,8 @@ func (s *Server) publishFile(
 			Expect:      expect,
 			KeepVersion: true,
 			MaxVersions: s.maxVersions(),
+			// §8.1 操作者引用: the version this write supersedes is attributed to whoever saved it.
+			By: actor.Ptr(),
 		})
 		if werr != nil {
 			return werr
@@ -1082,7 +1084,7 @@ func (s *Server) handleRestoreVersion(w http.ResponseWriter, r *http.Request) {
 
 	var restored store.Node
 	err = s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
-		n, rerr := tx.RestoreVersion(ctx, node.ID, body.Version)
+		n, rerr := tx.RestoreVersion(ctx, node.ID, body.Version, actor.Ptr())
 		if rerr != nil {
 			return rerr
 		}
