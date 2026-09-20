@@ -99,12 +99,21 @@ func (s *Server) handleSharedNode(w http.ResponseWriter, r *http.Request) {
 	// cover a child that carries its own non-inheriting restriction.
 	var children []map[string]any
 	if node.IsDir() && cap.Can(authz.PermListChildren) {
+		// A failed read is reported, not rendered as "this folder is empty".
+		//
+		// The error used to be discarded, so a metadata failure produced a perfectly successful
+		// response listing no children — the client is told there is nothing there when the truth
+		// is that the server could not look. For a shared folder that is a data-loss-shaped lie:
+		// the visitor concludes the owner shared an empty directory.
 		var kids []store.Node
-		_ = s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
-			got, cerr := tx.Children(ctx, node.ID, s.deps.Config.Limits.MaxProfindChildren)
+		if cerr := s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
+			got, lerr := tx.Children(ctx, node.ID, s.deps.Config.Limits.MaxProfindChildren)
 			kids = got
-			return cerr
-		})
+			return lerr
+		}); cerr != nil {
+			s.writeStoreError(w, cerr)
+			return
+		}
 		for _, c := range kids {
 			if _, cerr := s.deps.Authz.Authorize(actor, c.ID); cerr != nil {
 				continue

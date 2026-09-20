@@ -59,7 +59,12 @@ func (s *Server) handleShareList(w http.ResponseWriter, r *http.Request) {
 
 	out := make([]shareJSON, 0, len(shares))
 	for _, sh := range shares {
-		out = append(out, s.toShareJSON(r.Context(), sh))
+		item, jerr := s.toShareJSON(r.Context(), sh)
+		if jerr != nil {
+			s.writeStoreError(w, jerr)
+			return
+		}
+		out = append(out, item)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": out})
 }
@@ -155,7 +160,14 @@ func (s *Server) handleShareCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// The plaintext token is returned exactly once, here.
-	out := s.toShareJSON(r.Context(), created.Share)
+	// The share exists; a failure to decorate the response must not tell the client the creation
+	// failed. It is logged instead, and the recipient list is the only field affected.
+	out, jerr := s.toShareJSON(r.Context(), created.Share)
+	if jerr != nil {
+		s.deps.Log.Error("share created but its details could not be read", "share", created.Share.ID, "error", jerr)
+		out = shareJSON{ID: created.Share.ID.String(), NodeID: created.Share.NodeID.String(),
+			Kind: string(created.Share.Kind), Label: created.Share.Label}
+	}
 	out.URL = s.shareURL(created.Token)
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"share": out,
@@ -232,7 +244,12 @@ func (s *Server) handleShareUpdate(w http.ResponseWriter, r *http.Request) {
 		s.writeStoreError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, s.toShareJSON(r.Context(), sh))
+	detail, jerr := s.toShareJSON(r.Context(), sh)
+	if jerr != nil {
+		s.writeStoreError(w, jerr)
+		return
+	}
+	writeJSON(w, http.StatusOK, detail)
 }
 
 // handleShareRevoke withdraws a share.
@@ -264,7 +281,7 @@ func (s *Server) handleShareRevoke(w http.ResponseWriter, r *http.Request) {
 }
 
 // toShareJSON builds the owner-facing view.
-func (s *Server) toShareJSON(ctx context.Context, sh store.Share) shareJSON {
+func (s *Server) toShareJSON(ctx context.Context, sh store.Share) (shareJSON, error) {
 	out := shareJSON{
 		ID: sh.ID.String(), NodeID: sh.NodeID.String(), Kind: string(sh.Kind), Label: sh.Label,
 		HasPassword: sh.NeedsPassword(), ExpiresAt: sh.ExpiresAt,
@@ -282,17 +299,24 @@ func (s *Server) toShareJSON(ctx context.Context, sh store.Share) shareJSON {
 	// file that was renamed since the share was made simply shows its new path.
 	out.NodePath = s.pathOfShare(ctx, sh)
 
-	_ = s.deps.Meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
-		recs, err := tx.RecipientsFor(ctx, sh.ID)
-		if err != nil {
-			return err
+	// A failure here is returned, not rendered as "no recipients".
+	//
+	// An email share whose recipient list reads as empty tells its owner that nobody was invited
+	// while the real state is unknown — the one field on this screen that decides whether the
+	// link is private.
+	if err := s.deps.Meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		recs, rerr := tx.RecipientsFor(ctx, sh.ID)
+		if rerr != nil {
+			return rerr
 		}
 		for _, rec := range recs {
 			out.Recipients = append(out.Recipients, rec.Email)
 		}
 		return nil
-	})
-	return out
+	}); err != nil {
+		return shareJSON{}, err
+	}
+	return out, nil
 }
 
 // pathOfShare reconstructs the shared node's path, or "" when it is gone.

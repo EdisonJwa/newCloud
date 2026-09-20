@@ -1906,3 +1906,148 @@ func TestDownloadHonoursIfNoneMatch(t *testing.T) {
 			otherStatus, otherBody)
 	}
 }
+
+// failingListingStore fails exactly two reads, so a test can make a listing fail without breaking
+// the resolution that must succeed before the listing is reached.
+//
+// Breaking the whole store does not work here, and the first version of this test did exactly that:
+// with every transaction failing, the handler returned an error long before it reached the listing,
+// so the assertion "not an empty list" was satisfied by an unrelated earlier failure. It would have
+// passed with the bug still present — the same trap that has caught several tests in this work.
+type failingListingStore struct{ store.Store }
+
+func (f failingListingStore) WithTx(ctx context.Context,
+	fn func(context.Context, store.Tx) error) error {
+
+	return f.Store.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		return fn(ctx, failingListingTx{tx})
+	})
+}
+
+type failingListingTx struct{ store.Tx }
+
+var errListingUnavailable = errors.New("simulated: the listing read failed")
+
+func (failingListingTx) Children(context.Context, uuid.UUID, int) ([]store.Node, error) {
+	return nil, errListingUnavailable
+}
+
+func (failingListingTx) RecipientsFor(context.Context, uuid.UUID) ([]store.ShareRecipient, error) {
+	return nil, errListingUnavailable
+}
+
+// TestFailedListingIsNotAnEmptyListing is the difference between "nothing is there" and "I could
+// not look".
+//
+// The share listing read each share's recipients with the error discarded, so a failed read
+// rendered "recipients": [] — telling an owner that nobody was invited while the real state was
+// unknown. That is the one field on the screen that decides whether a link is private.
+func TestFailedListingIsNotAnEmptyListing(t *testing.T) {
+	h := newHarnessTuned(t, nil, func(d *server.Deps) {
+		d.Meta = failingListingStore{d.Meta}
+	})
+	h.mkdir(t, "shared")
+
+	req := h.do(http.MethodPost, "/api/shares/",
+		strings.NewReader(`{"path":"shared","kind":"link"}`),
+		map[string]string{"Content-Type": "application/json"})
+	if req.StatusCode != http.StatusCreated {
+		t.Fatalf("create share: %d %s", req.StatusCode, readBody(req))
+	}
+	req.Body.Close()
+
+	// The listing must fail rather than claim an empty recipient list.
+	list := h.do(http.MethodGet, "/api/shares", nil, nil)
+	status := list.StatusCode
+	body := readBody(list)
+	list.Body.Close()
+	if status == http.StatusOK {
+		if strings.Contains(body, `"recipients":[]`) {
+			t.Fatalf("with the recipients read failing, the share listing reported an empty "+
+				"recipient list: %s. An owner reads that as nobody being invited.", body)
+		}
+		t.Fatalf("the listing answered 200 with the recipients read failing: %s", body)
+	}
+}
+
+// childrenFailPlan makes ONE folder's child read fail, and nothing else.
+//
+// Failing every Children call breaks path resolution itself, because Resolve walks the tree with
+// the same method — the handler then answers "not found" long before it lists anything, which is
+// not the failure this test is about.
+type childrenFailPlan struct {
+	folder uuid.UUID
+	err    error
+}
+
+type childrenFailStore struct {
+	store.Store
+	plan *childrenFailPlan
+}
+
+func (f childrenFailStore) WithTx(ctx context.Context,
+	fn func(context.Context, store.Tx) error) error {
+
+	return f.Store.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		return fn(ctx, childrenFailTx{Tx: tx, plan: f.plan})
+	})
+}
+
+type childrenFailTx struct {
+	store.Tx
+	plan *childrenFailPlan
+}
+
+func (t childrenFailTx) Children(ctx context.Context, parentID uuid.UUID, limit int) ([]store.Node, error) {
+	if t.plan.folder != uuid.Nil && parentID == t.plan.folder {
+		return nil, t.plan.err
+	}
+	return t.Tx.Children(ctx, parentID, limit)
+}
+
+// TestSharedFolderListingDoesNotFakeEmptiness is the same rule for /api/shared/{id}.
+//
+// A folder shared with another account listed its children with the read error discarded, so a
+// metadata failure produced a successful response saying the folder was empty. A visitor cannot
+// tell that from a genuinely empty folder, and concludes the owner shared nothing.
+func TestSharedFolderListingDoesNotFakeEmptiness(t *testing.T) {
+	plan := &childrenFailPlan{err: errors.New("simulated: children read failed")}
+	h := newHarnessTuned(t, nil, func(d *server.Deps) {
+		d.Meta = childrenFailStore{Store: d.Meta, plan: plan}
+	})
+
+	h.mkdir(t, "team")
+	// The plan is armed only after setup, so the harness can build the tree normally.
+	root := h.do(http.MethodGet, "/api/files/?path=", nil, nil)
+	var listing struct {
+		Children []struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"children"`
+	}
+	_ = json.NewDecoder(root.Body).Decode(&listing)
+	root.Body.Close()
+	folderID := ""
+	for _, c := range listing.Children {
+		if c.Name == "team" {
+			folderID = c.ID
+		}
+	}
+	if folderID == "" {
+		t.Fatal("could not find the folder in the listing")
+	}
+	plan.folder = uuid.MustParse(folderID)
+
+	resp := h.do(http.MethodGet, "/api/shared/"+folderID, nil, nil)
+	status := resp.StatusCode
+	body := readBody(resp)
+	resp.Body.Close()
+
+	// A nil slice serialises as null, not [], so asserting on the string "[]" missed it: the
+	// client sees {"children":null}, which is just as misleading. The property is the STATUS: a
+	// read that failed must not be reported as a successful listing.
+	if status == http.StatusOK {
+		t.Fatalf("with the children read failing, the shared node still answered 200: %s. A visitor "+
+			"reads that as a folder the owner shared empty.", body)
+	}
+}

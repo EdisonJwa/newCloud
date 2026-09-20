@@ -1138,3 +1138,72 @@ func TestMovePublishesLocationAndTheRightStatus(t *testing.T) {
 		t.Fatalf("a 204 must not claim a new location, got %q", loc)
 	}
 }
+
+// failingDeadPropStore fails exactly one Tx method, so a test can break property storage without
+// breaking the path resolution that has to succeed before it.
+//
+// Breaking the whole store does not work: PROPPATCH resolves the path first, so a broken store
+// answers "not found" and the storage failure is never reached — a test that would pass whether or
+// not the bug was fixed. Embedding the interfaces gives every other method for free.
+type failingDeadPropStore struct{ store.Store }
+
+func (f failingDeadPropStore) WithTx(ctx context.Context,
+	fn func(context.Context, store.Tx) error) error {
+
+	return f.Store.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		return fn(ctx, failingDeadPropTx{tx})
+	})
+}
+
+type failingDeadPropTx struct{ store.Tx }
+
+func (failingDeadPropTx) SetDeadProp(context.Context, uuid.UUID, string, string, string) error {
+	return errors.New("simulated: dead property storage is unavailable")
+}
+
+// TestProppatchReportsStorageFailure is RFC 4918 §9.2.
+//
+// The response used to be a 207 whose propstat said "200 OK" regardless: the store error was
+// discarded, so a client was told its properties were saved when none had been. Windows Explorer
+// sets Win32LastModifiedTime and friends on every upload; a silent failure surfaces much later as
+// properties that do not survive a reconnect.
+func TestProppatchReportsStorageFailure(t *testing.T) {
+	base := newEnv(t)
+
+	// Rebuild the handler over a store whose dead-property writes fail.
+	cfg := config.Default()
+	cfg.Server.PublicURL = "https://cloud.example.test"
+	cfg.Server.UserContentURL = "https://content.example.test"
+	cfg.Limits.MaxProfindChildren = 1000
+
+	broken := failingDeadPropStore{base.meta}
+	appPass := auth.NewAppPasswords(broken)
+	secret, _, err := appPass.Issue(context.Background(), base.user.ID, "t", "rw", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := blobstore.New(base.blobs, &resolverAdapter{r: broken.Resolver()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := New(cfg, broken, content, authz.NewService(&authzAccessor{m: base.meta}), appPass)
+
+	e := &testEnv{h: h, meta: base.meta, blobs: base.blobs, user: base.user, secret: secret,
+		extra: map[string]string{}}
+	e.do(t, http.MethodPut, e.davPath("p.txt"), strings.NewReader("x"), nil)
+
+	body := `<?xml version="1.0"?><D:propertyupdate xmlns:D="DAV:"><D:set><D:prop>
+		<Z:colour xmlns:Z="urn:example">blue</Z:colour></D:prop></D:set></D:propertyupdate>`
+	rec := e.do(t, "PROPPATCH", e.davPath("p.txt"), strings.NewReader(body),
+		map[string]string{"Content-Type": "application/xml"})
+	if rec.Code != http.StatusMultiStatus {
+		t.Fatalf("PROPPATCH: want 207, got %d", rec.Code)
+	}
+	out := rec.Body.String()
+	if strings.Contains(out, "200 OK") {
+		t.Fatalf("the properties could not be stored and the response still claims 200 OK:\n%s", out)
+	}
+	if !strings.Contains(out, "500") {
+		t.Fatalf("the failed property must be reported with a failure status:\n%s", out)
+	}
+}

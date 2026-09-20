@@ -93,8 +93,15 @@ func (h *Handler) handleProppatch(w http.ResponseWriter, r *http.Request, a auth
 		}
 	}
 
+	// The store error is reported, not swallowed.
+	//
+	// It used to be discarded and the response was a 207 whose every property said "200 OK", so a
+	// client was told its properties were saved when none had been. Windows Explorer relies on
+	// PROPPATCH succeeding to keep Win32LastModifiedTime and friends; a silent failure shows up
+	// later as properties that mysteriously do not persist across a reconnect.
+	var storeErr error
 	if len(rejected) == 0 {
-		_ = h.meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
+		storeErr = h.meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
 			for _, p := range props {
 				if err := tx.SetDeadProp(ctx, node.ID, p.Space, p.Name, p.Value); err != nil {
 					return err
@@ -102,6 +109,9 @@ func (h *Handler) handleProppatch(w http.ResponseWriter, r *http.Request, a auth
 			}
 			return nil
 		})
+		if storeErr != nil {
+			h.logf("proppatch: storing dead properties failed for %s: %v", r.URL.Path, storeErr)
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
@@ -112,13 +122,22 @@ func (h *Handler) handleProppatch(w http.ResponseWriter, r *http.Request, a auth
 	b.WriteString(`<D:multistatus xmlns:D="DAV:">` + "\n")
 	b.WriteString("<D:response><D:href>" + xmlEscape(r.URL.Path) + "</D:href>")
 
-	if len(rejected) > 0 {
+	switch {
+	case storeErr != nil:
+		// RFC 4918 9.2: a property that could not be set is reported in its own propstat. The
+		// transaction is all-or-nothing, so every property in it failed together.
+		b.WriteString("<D:propstat><D:prop>")
+		for _, p := range props {
+			b.WriteString("<D:" + p.Name + "/>")
+		}
+		b.WriteString("</D:prop><D:status>HTTP/1.1 500 Internal Server Error</D:status></D:propstat>")
+	case len(rejected) > 0:
 		b.WriteString("<D:propstat><D:prop>")
 		for _, name := range rejected {
 			b.WriteString("<D:" + name + "/>")
 		}
 		b.WriteString("</D:prop><D:status>HTTP/1.1 403 Forbidden</D:status></D:propstat>")
-	} else {
+	default:
 		b.WriteString("<D:propstat><D:status>HTTP/1.1 200 OK</D:status></D:propstat>")
 	}
 	b.WriteString("</D:response>\n</D:multistatus>\n")
