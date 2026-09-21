@@ -160,11 +160,7 @@ func auditVerify(args []string) error {
 		b, _ := json.MarshalIndent(out, "", "  ")
 		fmt.Println(string(b))
 	} else {
-		log.Info("audit chain verified",
-			"events", report.Events,
-			"head", hex.EncodeToString(report.Head),
-			"first_event", formatOptional(report.FirstEvent),
-			"last_event", formatOptional(report.LastEvent))
+		logVerifyReport(log, report)
 	}
 
 	if !report.OK() {
@@ -842,4 +838,27 @@ func readSecretLine(r io.Reader) (string, error) {
 		return "", errors.New("breakglass: empty password")
 	}
 	return secret, nil
+}
+
+// logVerifyReport announces the outcome of a chain verification.
+//
+// The success line used to be unconditional: a BROKEN chain still printed "audit chain verified"
+// on stdout before the command failed on stderr. Anything that reads logs — a human at 3 a.m., or a
+// log-scraping alert — sees the reassuring line and not the exit code. A verification command that
+// announces success for the thing it rejects is worse than one that says nothing at all.
+func logVerifyReport(log *slog.Logger, report auditverify.Report) {
+	if report.OK() {
+		log.Info("audit chain verified",
+			"events", report.Events,
+			"head", hex.EncodeToString(report.Head),
+			"first_event", formatOptional(report.FirstEvent),
+			"last_event", formatOptional(report.LastEvent))
+		return
+	}
+	log.Error("audit chain BROKEN",
+		"events", report.Events,
+		"broken_at", report.BrokenAt,
+		"error", fmt.Sprint(report.Err),
+		"first_event", formatOptional(report.FirstEvent),
+		"last_event", formatOptional(report.LastEvent))
 }
