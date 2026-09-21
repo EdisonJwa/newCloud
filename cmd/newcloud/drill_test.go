@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -220,5 +221,38 @@ func TestDrillCoversEveryTable(t *testing.T) {
 		t.Fatalf("the drill does not verify %d table(s): %v\n"+
 			"Add them to drillTables (or drillAuditTables for partitioned audit tables) so a "+
 			"restore is proven to carry them.", len(missing), missing)
+	}
+}
+
+// TestAnEmptyDrillIsNotAPass is the empty-collection trap, applied to the operator tool.
+//
+// The drill reported PASS with "rows compared 0, audit chain 0 events" against a database that had
+// nothing in it. A green restore drill is evidence an operator signs off on; one that compared
+// nothing is not evidence of anything, and the most likely cause — a mistyped LIVE_DSN — is exactly
+// the mistake that would otherwise go unnoticed.
+func TestAnEmptyDrillIsNotAPass(t *testing.T) {
+	empty := drillResult{Tables: 24}
+	problems := emptyDrillProblems(empty)
+	if len(problems) == 0 {
+		t.Fatal("a drill that compared no rows, no audit events and no blobs must not pass")
+	}
+	if !strings.Contains(problems[0], "empty") {
+		t.Fatalf("the problem should say the database was empty, got %q", problems[0])
+	}
+	empty.Problems = append(empty.Problems, problems...)
+	if empty.OK() {
+		t.Fatal("an empty drill must not be OK()")
+	}
+
+	// Any one of the three kinds of evidence is enough: a deployment may legitimately have no
+	// blobs yet, or no audit events, but not all three and still claim a restore was verified.
+	for _, res := range []drillResult{
+		{RowsCompare: 1},
+		{ChainLength: 1},
+		{BlobFiles: 1},
+	} {
+		if got := emptyDrillProblems(res); len(got) != 0 {
+			t.Fatalf("a drill that compared something must not be called empty: %+v -> %v", res, got)
+		}
 	}
 }

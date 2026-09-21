@@ -309,7 +309,24 @@ func runDrill(ctx context.Context, cfg config.Config, liveDSN, scratchDSN, dir s
 	}
 
 	res.Elapsed = time.Since(start)
+	res.Problems = append(res.Problems, emptyDrillProblems(res)...)
 	return res, nil
+}
+
+// emptyDrillProblems refuses to call an empty exercise a successful one.
+//
+// A drill against a database with no rows, no audit events and no blobs compared nothing and
+// verified nothing, and used to print "VERDICT: PASS — the backup restores and the audit chain
+// survives" all the same. That is the most likely way to get a green drill without evidence: a
+// mistyped LIVE_DSN, a fresh database, a restored-but-wrong instance. The verdict has to be earned
+// by comparing data, so an empty run is a problem, not a pass.
+func emptyDrillProblems(res drillResult) []string {
+	if res.RowsCompare > 0 || res.ChainLength > 0 || res.BlobFiles > 0 {
+		return nil
+	}
+	return []string{"the live database is empty (0 rows, 0 audit events, 0 blobs): this drill " +
+		"compared nothing, so PASS would be a claim it did not test. Check that LIVE_DSN points " +
+		"at the database you meant to drill."}
 }
 
 // openRestoredMetadata connects to the restored database through the normal store.
