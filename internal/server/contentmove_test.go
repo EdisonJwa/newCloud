@@ -11,14 +11,18 @@ package server_test
 // than the previous behaviour, which discarded the error and answered 200.
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
+	"mime/multipart"
 	"net/http"
 	"strings"
 	"testing"
 
 	"github.com/EdisonJwa/newCloud/internal/server"
 	"github.com/EdisonJwa/newCloud/internal/storage/layout"
+	"github.com/EdisonJwa/newCloud/internal/store"
 )
 
 // failingMoveContent is a content store whose bytes cannot be moved.
@@ -106,4 +110,61 @@ func TestMoveFailsWhenTheBytesCannotFollow(t *testing.T) {
 	if body != "payload" {
 		t.Fatalf("the file must still be readable at its original path, got %q", body)
 	}
+}
+
+// TestQuotaRefusalLeavesNoPartialCharge is the accounting half of a refused upload.
+//
+// The content is written before the metadata layer enforces the quota, so a refusal arrives after
+// bytes are on disk; that is acceptable only if the refused request leaves no trace in the
+// account. This asserts the trace that IS observable on the in-memory backend: the file must not
+// exist and the usage counter must be exactly what it was.
+//
+// (The collectability of the bytes themselves cannot be checked here: CollectableBlobs is a
+// PostgreSQL-only capability of the in-memory store, which does not model blob rows. It is covered
+// by the blob-GC tests instead.)
+func TestQuotaRefusalLeavesNoPartialCharge(t *testing.T) {
+	h := newHarness(t)
+	h.uploadFile(t, "small.txt", "1234")
+
+	before := h.userUsageBytes(t)
+	// A quota smaller than what we are about to send, above what is already used.
+	h.meta.SetQuota(h.user.ID, before+256)
+
+	body := &bytes.Buffer{}
+	mw := multipart.NewWriter(body)
+	fw, _ := mw.CreateFormFile("file", "too-big.bin")
+	_, _ = io.WriteString(fw, strings.Repeat("q", 4096))
+	_ = mw.Close()
+	resp := h.do(http.MethodPost, "/api/files/upload", body,
+		map[string]string{"Content-Type": mw.FormDataContentType()})
+	status := resp.StatusCode
+	payload := readBody(resp)
+	resp.Body.Close()
+
+	if status == http.StatusCreated {
+		t.Fatalf("an upload beyond the quota was accepted: %s", payload)
+	}
+	if after := h.userUsageBytes(t); after != before {
+		t.Fatalf("the refused upload changed the usage counter from %d to %d bytes", before, after)
+	}
+	gone := h.do(http.MethodGet, "/api/files/download?path=too-big.bin", nil, nil)
+	gone.Body.Close()
+	if gone.StatusCode == http.StatusOK {
+		t.Fatal("the refused upload created the file anyway")
+	}
+}
+
+// userUsageBytes reads the account's used_bytes through the public API surface (the /api/me
+// payload is not guaranteed to carry it, so the store is asked directly).
+func (h *harness) userUsageBytes(t *testing.T) int64 {
+	t.Helper()
+	var used int64
+	if err := h.meta.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+		u, err := tx.UserByID(ctx, h.user.ID)
+		used = u.UsedBytes
+		return err
+	}); err != nil {
+		t.Fatalf("usage: %v", err)
+	}
+	return used
 }
