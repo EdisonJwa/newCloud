@@ -750,6 +750,12 @@ func Run(t *testing.T, factory Factory, opts Options) {
 		treeWalkSuite(t, factory)
 	})
 
+	// Search and the recent list are Store-level reads, not Tx methods, so the coverage ratchet
+	// never saw them. Only PostgreSQL had tests for owner scoping and the limit.
+	t.Run("StoreQueries", func(t *testing.T) {
+		storeQuerySuite(t, factory)
+	})
+
 	t.Run("RecipientAccess", func(t *testing.T) {
 		recipientAccessSuite(t, factory)
 	})
@@ -6173,6 +6179,134 @@ func auditAttributionSuite(t *testing.T, factory func(t *testing.T) (store.Store
 		gotIP := net.ParseIP(strings.SplitN(got.ActorIP, "/", 2)[0])
 		if gotIP == nil || !gotIP.Equal(wantIP) {
 			t.Fatalf("the event records ip %q, want 198.51.100.7", got.ActorIP)
+		}
+	})
+}
+
+// storeQuerySuite covers the two Store-level reads that bypass the transaction API: name search
+// and the recent-files list.
+//
+// They are not Tx methods, so the coverage ratchet never looked at them, and the PostgreSQL
+// implementation was the only one with tests for the two properties that matter most: that a
+// query never crosses account boundaries, and that the limit is honoured. The in-memory versions
+// were exercised only through the HTTP handlers, which always pass the caller's own id and a fixed
+// limit — so a Search that ignored its ownerID argument would have passed every one of them.
+func storeQuerySuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.UUID)) {
+	t.Helper()
+
+	// seed builds one account with three files, one of them trashed.
+	seed := func(t *testing.T, s store.Store, owner uuid.UUID, prefix string) {
+		t.Helper()
+		r := rootOf(t, s, owner)
+		mkfile(t, s, owner, r.ID, prefix+"-budget.txt", 4)
+		mkfile(t, s, owner, r.ID, prefix+"-report.txt", 4)
+		gone := mkfile(t, s, owner, r.ID, prefix+"-budget-old.txt", 4)
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.Trash(ctx, gone.ID)
+		}); err != nil {
+			t.Fatalf("trash: %v", err)
+		}
+	}
+
+	// Both capabilities are optional interfaces, so the suite asserts them by type: a backend that
+	// stops implementing one should fail here rather than quietly lose the feature.
+	searcher := func(t *testing.T, s store.Store) store.Searcher {
+		t.Helper()
+		se, ok := s.(store.Searcher)
+		if !ok {
+			t.Fatalf("%T does not implement Searcher; the handler would lose search on this backend",
+				s)
+		}
+		return se
+	}
+	recenter := func(t *testing.T, s store.Store) store.RecentReader {
+		t.Helper()
+		r, ok := s.(store.RecentReader)
+		if !ok {
+			t.Fatalf("%T does not implement RecentReader", s)
+		}
+		return r
+	}
+
+	t.Run("SearchIsScopedToTheOwner", func(t *testing.T) {
+		s, mine := factory(t)
+		other := addUser(t, s, "search-other")
+		seed(t, s, mine, "mine")
+		seed(t, s, other.ID, "theirs")
+
+		hits, err := searcher(t, s).Search(context.Background(), mine, "budget", 50)
+		if err != nil {
+			t.Fatalf("search: %v", err)
+		}
+		if len(hits) == 0 {
+			t.Fatal("the search found nothing; the fixture or the query is wrong")
+		}
+		for _, h := range hits {
+			if h.Node.OwnerID != mine {
+				t.Fatalf("the search returned %q, which belongs to another account. A name search "+
+					"that ignores its owner argument leaks the existence of other people's files.",
+					h.Node.Name)
+			}
+		}
+	})
+
+	t.Run("SearchExcludesTrash", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		live := mkfile(t, s, owner, r.ID, "keep-budget.txt", 4)
+		_ = live
+		gone := mkfile(t, s, owner, r.ID, "dump-budget.txt", 4)
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.Trash(ctx, gone.ID)
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		hits, err := searcher(t, s).Search(context.Background(), owner, "budget", 50)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, h := range hits {
+			if h.Node.Name == "dump-budget.txt" {
+				t.Fatal("a trashed file appeared in search results")
+			}
+		}
+		if len(hits) != 1 {
+			t.Fatalf("want exactly the live match, got %d hits", len(hits))
+		}
+	})
+
+	t.Run("RecentFilesIsScopedToTheOwner", func(t *testing.T) {
+		s, mine := factory(t)
+		other := addUser(t, s, "recent-other")
+		r := rootOf(t, s, mine)
+		mkfile(t, s, mine, r.ID, "mine.txt", 4)
+		or := rootOf(t, s, other.ID)
+		mkfile(t, s, other.ID, or.ID, "theirs.txt", 4)
+
+		recent, err := recenter(t, s).RecentFiles(context.Background(), mine, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, x := range recent {
+			if x.Node.OwnerID != mine {
+				t.Fatalf("the recent list included %q from another account", x.Node.Name)
+			}
+		}
+	})
+
+	t.Run("RecentFilesRespectsTheLimit", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		for _, n := range []string{"a.txt", "b.txt", "c.txt"} {
+			mkfile(t, s, owner, r.ID, n, 4)
+		}
+		recent, err := recenter(t, s).RecentFiles(context.Background(), owner, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(recent) != 2 {
+			t.Fatalf("asked for 2 recent files, got %d", len(recent))
 		}
 	})
 }
