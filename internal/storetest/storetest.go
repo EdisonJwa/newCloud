@@ -5713,6 +5713,58 @@ func sweepSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.UUID
 				"has not set a policy must not have its trash emptied.", res.Nodes)
 		}
 	})
+
+	// Purging releases the quota that trashing deliberately keeps.
+	//
+	// §8.1 asks for the policy to be explicit, and it is: trashing does NOT free quota (the data
+	// is recoverable, so the space is still committed), and purging DOES (the data is gone). The
+	// second half was only asserted against PostgreSQL. The in-memory implementation releases the
+	// counter too, but nothing in the shared suite noticed whether it did — which is exactly the
+	// kind of divergence this suite exists to catch, and the reason the first half lives here.
+	t.Run("PurgeTrashReleasesQuota", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		f := mkfile(t, s, owner, r.ID, "big.bin", 4096)
+
+		used := func() int64 {
+			t.Helper()
+			n, err := s.Usage(context.Background(), owner)
+			if err != nil {
+				t.Fatalf("usage: %v", err)
+			}
+			return n
+		}
+
+		if got := used(); got != 4096 {
+			t.Fatalf("the write should have consumed 4096 bytes of quota, got %d", got)
+		}
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.Trash(ctx, f.ID)
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if got := used(); got != 4096 {
+			t.Fatalf("trashing is recoverable and must keep the bytes charged; quota went to %d", got)
+		}
+
+		// The node has to be OLDER than the retention cutoff, and a node trashed in this same
+		// instant is not: a one-nanosecond retention made the test depend on which side of the
+		// clock tick the two statements landed. A real gap, comfortably larger than the clock's
+		// resolution, is what makes eligibility deterministic.
+		time.Sleep(25 * time.Millisecond)
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			_, err := tx.PurgeTrash(ctx, time.Millisecond)
+			return err
+		}); err != nil {
+			t.Fatalf("purge: %v", err)
+		}
+		if got := used(); got != 0 {
+			t.Fatalf("purging permanently deletes the data, so it must release the quota; used=%d. "+
+				"A user at their limit who empties the trash would otherwise still be unable to "+
+				"upload.", got)
+		}
+	})
 }
 
 // passwordThrottleSuite covers the SHARE-02 password-guess limit.
