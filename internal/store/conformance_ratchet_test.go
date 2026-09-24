@@ -282,3 +282,64 @@ func resolveTxMethods(t *testing.T, root, storeGoText string) map[string]bool {
 	_ = storeGoText
 	return out
 }
+
+// TestSharedSuiteCoversEveryStoreMethod is the same ratchet, applied to the Store interface.
+//
+// The Tx ratchet enumerates transaction methods and says nothing about the surface around them.
+// Search and RecentFiles live in optional interfaces implemented by both backends, and only
+// PostgreSQL had tests for owner scoping and limit enforcement — the in-memory versions were
+// exercised only through HTTP handlers that always passed the caller's own id, so a search which
+// ignored its owner argument would have passed every one of them.
+//
+// This closes the same hole one level up: every method on Store must be exercised by the shared
+// suite, or be listed here with a reason.
+func TestSharedSuiteCoversEveryStoreMethod(t *testing.T) {
+	root := repoRootOf(t)
+	src, err := os.ReadFile(filepath.Join(root, "internal", "store", "store.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	suite, err := os.ReadFile(filepath.Join(root, "internal", "storetest", "storetest.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	text := string(src)
+	start := strings.Index(text, "type Store interface")
+	if start < 0 {
+		t.Fatal("could not find the Store interface; this check would pass vacuously")
+	}
+	end := strings.Index(text[start:], "\n}")
+	if end < 0 {
+		t.Fatal("could not find the end of the Store interface")
+	}
+	methods := map[string]bool{}
+	for _, m := range regexp.MustCompile(`(?m)^\t([A-Z]\w+)\(`).FindAllStringSubmatch(text[start:start+end], -1) {
+		methods[m[1]] = true
+	}
+	if len(methods) < 5 {
+		t.Fatalf("found only %d Store methods, which is far fewer than expected — the parse is "+
+			"broken and this check is not testing anything", len(methods))
+	}
+
+	// Methods that cannot be exercised in the shared suite, each with the reason.
+	uncovered := map[string]string{}
+
+	body := string(suite)
+	var missing []string
+	for name := range methods {
+		if _, ok := uncovered[name]; ok {
+			continue
+		}
+		if !strings.Contains(body, name+"(") {
+			missing = append(missing, name)
+		}
+	}
+	sort.Strings(missing)
+	if len(missing) > 0 {
+		t.Fatalf("Store method(s) with no exercise in the shared conformance suite:\n  %s\n\n"+
+			"Add a case to internal/storetest so BOTH backends are held to it. The Tx ratchet does "+
+			"not see these: Search and RecentFiles were PostgreSQL-only for owner scoping and the "+
+			"limit for exactly this reason.", strings.Join(missing, "\n  "))
+	}
+}

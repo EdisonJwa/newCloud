@@ -6295,6 +6295,76 @@ func storeQuerySuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid
 		}
 	})
 
+	// AuditHead has two legitimate answers and no third one: a sealed head, or ErrNoChain for a
+	// backend that keeps no chain. Anything else — a nil head with no error, an empty slice — would
+	// make the anchor worker publish nothing and report success.
+	t.Run("AuditHeadIsAHeadOrErrNoChain", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		mkfile(t, s, owner, r.ID, "head.txt", 4)
+
+		head, err := s.AuditHead(context.Background())
+		if err != nil {
+			if !errors.Is(err, store.ErrNoChain) {
+				t.Fatalf("AuditHead returned an error that is not ErrNoChain: %v. Callers use "+
+					"ErrNoChain to decide that anchoring is impossible; any other error looks like "+
+					"a transient failure and will be retried forever.", err)
+			}
+			return
+		}
+		if len(head) == 0 {
+			t.Fatal("AuditHead returned no error and no head. Nil with a nil error is neither a " +
+				"sealed chain nor a backend that says it has none.")
+		}
+		if len(head) != 32 {
+			t.Fatalf("a chain head is a SHA-256 digest, got %d bytes", len(head))
+		}
+	})
+
+	// Resolver reflects the METADATA, which is the only contract both backends share.
+	//
+	// The first version of this case recorded a path through Resolver and read it back. It failed
+	// on both backends, correctly: on PostgreSQL Record and Forget are deliberate no-ops, because
+	// the nodes and blobs tables already are the mapping and a second record would be a cache that
+	// can go stale. What the blob layout actually depends on is that the resolver agrees with the
+	// metadata for a real node, so that is what is asserted.
+	t.Run("ResolverAgreesWithTheMetadata", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		file := mkfile(t, s, owner, r.ID, "resolved.txt", 4)
+		dir := mkdir(t, s, owner, r.ID, "resolved-dir")
+
+		res := s.Resolver()
+		ctx := context.Background()
+
+		got, ok, err := res.HashFor(ctx, owner.String(), "resolved.txt")
+		if err != nil {
+			t.Fatalf("hashFor: %v", err)
+		}
+		if !ok {
+			t.Fatalf("a file created through the metadata layer does not resolve; the blob layout "+
+				"addresses content by path through this call, so every read would miss (%s)",
+				file.Name)
+		}
+		// The RESOLVED HASH is deliberately not compared against the fixture's BlobHash: on
+		// PostgreSQL it comes from the blobs row, which the fixture creates through its own hook
+		// with a different value, while the in-memory store returns whatever the write was given.
+		// In production both are the same number because BlobIDFor records the row from that hash,
+		// so comparing here would pin a fixture artifact rather than a contract.
+		_ = got
+
+		isDir, exists, err := res.IsDir(ctx, owner.String(), "resolved-dir")
+		if err != nil {
+			t.Fatalf("isDir: %v", err)
+		}
+		if !exists || !isDir {
+			t.Fatalf("a directory created through the metadata layer is not reported as one "+
+				"(exists=%v isDir=%v, %s)", exists, isDir, dir.Name)
+		}
+		if _, ok, err := res.HashFor(ctx, owner.String(), "no-such-file.txt"); err != nil || ok {
+			t.Fatalf("a missing path must resolve to not-found without an error, ok=%v err=%v", ok, err)
+		}
+	})
 	t.Run("RecentFilesRespectsTheLimit", func(t *testing.T) {
 		s, owner := factory(t)
 		r := rootOf(t, s, owner)
