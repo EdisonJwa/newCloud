@@ -204,6 +204,8 @@ func serve() error {
 		return err
 	}
 
+	warnAboutUnusedConfig(log, cfg)
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -861,4 +863,18 @@ func logVerifyReport(log *slog.Logger, report auditverify.Report) {
 		"error", fmt.Sprint(report.Err),
 		"first_event", formatOptional(report.FirstEvent),
 		"last_event", formatOptional(report.LastEvent))
+}
+
+// warnAboutUnusedConfig says out loud which configured key does nothing yet.
+//
+// server.usercontent_url is REQUIRED by verification — it must be an absolute URL that differs from
+// public_url — and the server never reads it. Serving user content from a separate origin is not
+// implemented, so the isolation the key implies does not exist. A required-but-inert key is the
+// quiet kind of wrong: the deployment is forced to set it, the operator concludes the protection is
+// on, and nothing says otherwise. Until origin separation exists, the gap is announced at startup
+// rather than discovered during an audit.
+func warnAboutUnusedConfig(log *slog.Logger, cfg config.Config) {
+	for _, u := range cfg.UnusedKeys() {
+		log.Warn("configuration has no effect", "key", u.Key, "why", u.Why)
+	}
 }

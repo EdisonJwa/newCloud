@@ -153,7 +153,12 @@ func TestEveryConfigKeyIsReadOrPinned(t *testing.T) {
 	// applyEnv() copies the environment over them, Validate() checks them. All three touch every
 	// key, so treating them as readers would make this check pass for keys nothing uses — which is
 	// exactly the failure it exists to catch.
-	setters := map[string]bool{"Validate": true, "Default": true, "applyEnv": true, "ApplyEnv": true}
+	setters := map[string]bool{
+		"Validate": true, "Default": true, "applyEnv": true, "ApplyEnv": true,
+		// UnusedKeys exists to REPORT inert keys; counting it as a consumer would let every dead
+		// key silence this check by being listed there.
+		"UnusedKeys": true,
+	}
 
 	for goName, yamlKey := range fields {
 		if _, pinned := knownUnread[goName]; pinned {
