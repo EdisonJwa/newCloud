@@ -54,14 +54,5 @@ func (c *Config) UnusedKeys() []UnusedKey {
 		})
 	}
 
-	if c.Limits.UploadChunkBytes > 0 {
-		out = append(out, UnusedKey{
-			Key: "limits.upload_chunk_bytes",
-			Why: "the value is validated and then never read: the resumable-upload endpoint accepts " +
-				"whatever chunk size the client sends, and nothing tells the client what to use. " +
-				"It is neither a limit nor advice",
-		})
-	}
-
 	return out
 }

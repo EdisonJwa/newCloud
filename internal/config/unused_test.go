@@ -9,7 +9,7 @@ package config_test
 //   audit.retention_days         audit events are never pruned; a hash-chained log cannot delete
 //                                from its middle without looking tampered
 //   auth.scim_token              no SCIM endpoint is served
-//   limits.upload_chunk_bytes    validated, then never read: not a limit and not advice
+//   limits.upload_chunk_bytes    (implemented — the resumable endpoint now enforces it)
 //
 // Each is reported only when configured, because a warning about a key nobody set is noise, and
 // noise is how a real warning gets ignored.
@@ -49,15 +49,14 @@ func TestUnusedKeysCoversEveryInertKey(t *testing.T) {
 		"server.usercontent_url",
 		"audit.retention_days",
 		"auth.scim_token",
-		"limits.upload_chunk_bytes",
 	} {
 		if _, ok := got[want]; !ok {
 			t.Fatalf("%s is not reported as inert; an operator setting it sees no effect and no "+
 				"explanation. Reported: %v", want, keysOf(got))
 		}
 	}
-	if len(got) != 4 {
-		t.Fatalf("reported %d keys, want 4: %v", len(got), keysOf(got))
+	if len(got) != 3 {
+		t.Fatalf("reported %d keys, want 3: %v", len(got), keysOf(got))
 	}
 }
 
@@ -69,7 +68,6 @@ func TestUnusedKeysIsQuietWhenThereIsNothingToSay(t *testing.T) {
 	cfg.Server.UserContentURL = cfg.Server.PublicURL
 	cfg.Auth.SCIMToken = ""
 	cfg.Audit.RetentionDays = 0
-	cfg.Limits.UploadChunkBytes = 0
 
 	if got := cfg.UnusedKeys(); len(got) != 0 {
 		t.Fatalf("warned about configuration that has an effect: %v", keysOf(unusedByKey(t, cfg)))

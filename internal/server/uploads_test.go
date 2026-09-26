@@ -13,6 +13,8 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/EdisonJwa/newCloud/internal/config"
 )
 
 type uploadSession struct {
@@ -338,5 +340,45 @@ func TestCommitRejectsADeletedTarget(t *testing.T) {
 	after.Body.Close()
 	if after.StatusCode == http.StatusOK {
 		t.Fatal("the refused upload still published a file at the root")
+	}
+}
+
+// TestChunkBeyondTheConfiguredSizeIsRefused enforces limits.upload_chunk_bytes.
+//
+// The key was validated and then never read: the handler compared the chunk only against
+// max_file_bytes, so a client could send the whole file as one chunk and the setting meant nothing.
+// A chunk limit that is not enforced does not bound the memory a single request can make the server
+// stage, which is the only reason to have one.
+func TestChunkBeyondTheConfiguredSizeIsRefused(t *testing.T) {
+	const chunk = 4
+	h := newHarnessWith(t, func(c *config.Config) {
+		c.Limits.UploadChunkBytes = chunk
+	})
+
+	session := startUpload(t, h, "", "bounded.bin", 16)
+
+	// A chunk exactly at the limit is fine: the setting bounds each request, it does not shrink
+	// the permitted size.
+	ok, payload := sendChunk(t, h, session.ID, 0, 3, 16, "abcd")
+	defer ok.Body.Close()
+	if ok.StatusCode != http.StatusOK {
+		t.Fatalf("a chunk at the limit was refused: %d %v", ok.StatusCode, payload)
+	}
+
+	over, overPayload := sendChunk(t, h, session.ID, 4, 9, 16, "abcdef")
+	defer over.Body.Close()
+	if over.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("a chunk over the limit returned %d, want 413: %v", over.StatusCode, overPayload)
+	}
+	if code := overPayload["error"]; code != "chunk_too_large" {
+		// The code is what tells a client to retry with smaller ranges instead of giving up.
+		t.Fatalf("error code = %v, want chunk_too_large", code)
+	}
+
+	// And the session must still work afterwards: a refused chunk is not a broken session.
+	next, nextPayload := sendChunk(t, h, session.ID, 4, 7, 16, "efgh")
+	defer next.Body.Close()
+	if next.StatusCode != http.StatusOK {
+		t.Fatalf("the session was unusable after a refused chunk: %d %v", next.StatusCode, nextPayload)
 	}
 }
