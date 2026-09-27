@@ -51,6 +51,10 @@ func (s *Server) handleSharePage(w http.ResponseWriter, r *http.Request) {
 		s.renderShareError(w, r, err)
 		return
 	}
+	if !s.shareOwnerActive(r.Context(), sh) {
+		writeError(w, http.StatusNotFound, "not_found", "this link is not available")
+		return
+	}
 
 	// Access gate: a password, a verified address, or both.
 	if g := s.gate(r, sh); !g.allowed() {
@@ -149,6 +153,10 @@ func (s *Server) handleShareDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !sh.CanRead() {
+		writeError(w, http.StatusNotFound, "not_found", "this link is not available")
+		return
+	}
+	if !s.shareOwnerActive(r.Context(), sh) {
 		writeError(w, http.StatusNotFound, "not_found", "this link is not available")
 		return
 	}
@@ -314,6 +322,10 @@ func (s *Server) handleShareUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	if !sh.CanCreate() {
 		writeError(w, http.StatusNotFound, "not_found", "this link does not accept uploads")
+		return
+	}
+	if !s.shareOwnerActive(r.Context(), sh) {
+		writeError(w, http.StatusNotFound, "not_found", "this link is not available")
 		return
 	}
 	if !s.gate(r, sh).allowed() {
@@ -593,3 +605,34 @@ var (
 	_ = errors.Is
 	_ = io.Copy
 )
+
+// shareOwnerActive reports whether the account that published a link is still able to use it.
+//
+// ID-08 asks for a determined policy after an account is disabled, and this is the sharing half of
+// it. Without the check, disabling somebody closed their own sessions — the middleware refuses them
+// on every request — while every link they had already published went on serving files to anyone
+// holding the URL. The account was blocked; the access it had granted was not.
+//
+// The policy is suspension, not deletion: the links come back if the account is re-enabled, because
+// revoking them would destroy a sharing decision an administrator may only have meant to pause, and
+// the files themselves stay owned and untouched. A disabled or pending owner is treated exactly like
+// an expired link — 404, the same answer every other unavailable share gets, so the response does not
+// reveal that the account exists.
+func (s *Server) shareOwnerActive(ctx context.Context, sh store.Share) bool {
+	var active bool
+	err := s.deps.Meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		owner, uerr := tx.UserByID(ctx, sh.OwnerID)
+		if uerr != nil {
+			return uerr
+		}
+		active = owner.IsActive()
+		return nil
+	})
+	if err != nil {
+		// Unreadable owner is not "active": the safe answer for an anonymous visitor.
+		s.deps.Log.Warn("could not read the share owner's status",
+			"share", sh.ID.String(), "error", err)
+		return false
+	}
+	return active
+}

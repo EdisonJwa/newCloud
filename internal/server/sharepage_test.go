@@ -176,3 +176,61 @@ func TestUnknownShareTokenStillReturnsTheShell(t *testing.T) {
 		t.Fatalf("want the shell, got %d", resp.StatusCode)
 	}
 }
+
+// TestDisabledOwnerSuspendsTheirShareLinks is ID-08's sharing policy.
+//
+// Disabling an account closed its own sessions — the middleware refuses it on every request — but
+// every link it had already published kept serving files to anyone holding the URL. The account was
+// blocked; the access it had granted was not.
+//
+// The policy is suspension rather than deletion: the links work again if the account is re-enabled,
+// because revoking them destroys a sharing decision an administrator may only have meant to pause.
+// All three public entry points are covered, because a check on one of them is not a policy.
+func TestDisabledOwnerSuspendsTheirShareLinks(t *testing.T) {
+	h := newHarness(t)
+	token := shareToken(t, h)
+
+	// The link works while the owner is active.
+	if code := h.do(http.MethodGet, "/s/"+token+"/download", nil, nil).StatusCode; code != http.StatusOK {
+		t.Fatalf("the link does not work before the account is disabled: %d", code)
+	}
+
+	// Disable the owner, as an administrator would.
+	admin, _ := h.adminClient(t)
+	if code, payload := h.adminStatus(t, admin, h.user.ID.String(), "disabled"); code != http.StatusOK {
+		t.Fatalf("disable: %d %v", code, payload)
+	}
+
+	for _, tc := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/s/" + token},
+		{http.MethodGet, "/s/" + token + "/download"},
+		{http.MethodPost, "/s/" + token + "/upload"},
+	} {
+		// An anonymous request: no session cookie, exactly what a link holder sends.
+		req, err := http.NewRequest(tc.method, h.srv.URL+tc.path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		code := resp.StatusCode
+		resp.Body.Close()
+		if code != http.StatusNotFound {
+			t.Fatalf("%s %s returned %d for a disabled owner's link; want 404 so the link is "+
+				"indistinguishable from an expired one", tc.method, tc.path, code)
+		}
+	}
+
+	// Re-enabling restores the link: suspension, not destruction.
+	if code, payload := h.adminStatus(t, admin, h.user.ID.String(), "active"); code != http.StatusOK {
+		t.Fatalf("re-enable: %d %v", code, payload)
+	}
+	if code := h.do(http.MethodGet, "/s/"+token+"/download", nil, nil).StatusCode; code != http.StatusOK {
+		t.Fatalf("the link did not come back after re-enabling the account: %d", code)
+	}
+}

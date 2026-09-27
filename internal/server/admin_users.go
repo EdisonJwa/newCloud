@@ -102,6 +102,22 @@ func (s *Server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 // One endpoint rather than three verbs: approving, disabling and re-enabling are the same
 // state change with a different target value, and three endpoints would be three places to
 // forget to audit or to forget to revoke credentials.
+//
+// The complete policy for an inactive account (ID-08), each part enforced where the request
+// arrives rather than by a sweep that could lag:
+//
+//	sessions      refused on every request: the middleware re-reads the account and requires
+//	              status "active", so a session minted just before the change dies with it
+//	app passwords refused by the WebDAV entry point, which checks the same status
+//	share links   suspended, not deleted: every public entry point answers 404 while the owner
+//	              is inactive, and the links work again if the account is re-enabled
+//	files         retained, ownership unchanged; an administrator can list them but not read
+//	              their content, so disabling does not quietly hand one user's files to another
+//	audit         retained; the events of an inactive account are exactly what an investigation
+//	              needs, and the hash chain makes deleting them detectable
+//
+// Nothing is destroyed, because disabling is reversible. Deletion is a separate, deliberate act
+// that this system does not offer through the API yet.
 func (s *Server) handleAdminSetUserStatus(w http.ResponseWriter, r *http.Request) {
 	actor, ok := s.requireAdmin(w, r)
 	if !ok {
