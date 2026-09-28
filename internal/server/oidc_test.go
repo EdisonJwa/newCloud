@@ -566,3 +566,78 @@ func TestProvisionedAccountGetsTheConfiguredQuota(t *testing.T) {
 			"be validated at startup.", got.QuotaBytes, quota)
 	}
 }
+
+// TestDemotionAtTheIdPRevokesTheLiveSession is ID-06 at the protocol boundary.
+//
+// The transaction layer already revokes sessions and app passwords when a role goes down, and the
+// conformance suite pins that. What nothing pinned is the WIRING: the login handler has to apply the
+// role the IdP now claims, on every login, or the revocation never happens for a real user. A
+// demoted administrator whose existing session keeps working is the case this requirement exists
+// for — the IdP says "no longer an admin" and the application keeps honouring the old decision.
+//
+// The window is deliberate and worth naming: the role is reconciled at login, not on every request,
+// because ID-07 requires that an IdP outage cannot lock people out of their own files. So the
+// session that outlives a demotion dies at the NEXT login, which is what this asserts.
+func TestDemotionAtTheIdPRevokesTheLiveSession(t *testing.T) {
+	account := fakeidp.User{
+		Subject: "idp-subject-demoted", Username: "demoted", Email: "demoted@example.test",
+		Groups: []string{"cloud-admins"},
+	}
+	h := newOIDCHarnessWith(t, account, func(c *config.Config) {
+		c.Auth.GroupRoleMap = map[string]config.Role{
+			"cloud-admins": config.RoleAdmin,
+			"cloud-users":  config.RoleUser,
+		}
+	})
+
+	h.login(t)
+	if status, body := h.b.me(); status != http.StatusOK {
+		t.Fatalf("me after login: %d %v", status, body)
+	}
+	if role := h.b.meUser(t); role != "admin" {
+		t.Fatalf("the mapped group should have made this account an admin, role=%q", role)
+	}
+
+	// The session the administrator is holding right now.
+	oldCookie := h.b.sessionCookie(testPublicURL)
+	if oldCookie == "" {
+		if u, perr := url.Parse(h.url); perr == nil {
+			for _, ck := range h.b.client.Jar.Cookies(u) {
+				t.Logf("jar cookie: %s (len %d)", ck.Name, len(ck.Value))
+			}
+		}
+		t.Fatalf("no session cookie after login (harness url %s)", h.url)
+	}
+
+	// The IdP removes them from the administrator group.
+	h.idp.SetUser(fakeidp.User{
+		Subject: account.Subject, Username: account.Username, Email: account.Email,
+		Groups: []string{"cloud-users"},
+	})
+
+	// They log in again — a fresh browser, so the new session is not the old one.
+	h.b.resetJar(t)
+	h.login(t)
+	if role := h.b.meUser(t); role != "user" {
+		t.Fatalf("after the IdP downgraded the account the role is still %q; the login path is not "+
+			"applying the claimed role", role)
+	}
+
+	// The session minted while they were an administrator must be dead, or holding two cookies
+	// would be a way to keep the old role forever.
+	req, err := http.NewRequest(http.MethodGet, h.b.URL("/api/auth/me"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.AddCookie(&http.Cookie{Name: "__Host-wc_session", Value: oldCookie})
+	// Jarless: replaying the old credential must not disturb the new session in the jar.
+	resp, err := h.b.jarlessClient().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		t.Fatalf("the pre-demotion session still works (%d). A downgrade that leaves the old "+
+			"credential alive does not demote anybody.", resp.StatusCode)
+	}
+}
