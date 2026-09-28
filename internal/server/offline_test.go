@@ -31,15 +31,18 @@ func TestServerStartsWithNoProvider(t *testing.T) {
 		t.Fatalf("an existing session must work with no IdP, got %d", resp.StatusCode)
 	}
 
-	// A new login must fail with a specific status, not a generic 500. The harness has no
-	// provider, which is exactly the "IdP unreachable" condition.
-	login := h.do(http.MethodGet, "/api/auth/start", nil, nil)
+	// A new login must fail with the DEFINED status. This used to assert only "not a 500" and to
+	// tolerate 404 in case the route had been renamed — which meant it could not fail for the one
+	// thing it was testing, and would have stayed green if the endpoint disappeared entirely. The
+	// exact answer is 503 idp_unavailable; the rest of ID-07 is in idpoffline_test.go.
+	login := h.do(http.MethodGet, "/api/auth/login", nil, nil)
+	body := decode(t, login)
 	login.Body.Close()
-	// The endpoint name differs between builds; what matters is that a login attempt while the
-	// IdP is unavailable is not a 500. 503 is the defined answer, 404 means the route is named
-	// differently and the assertion is not applicable here.
-	if login.StatusCode == http.StatusInternalServerError {
-		t.Fatal("a login attempt with no IdP must not be a 500; it is a defined condition")
+	if login.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("a login attempt with no IdP returned %d, want 503 idp_unavailable", login.StatusCode)
+	}
+	if code, _ := body["error"].(string); code != "idp_unavailable" {
+		t.Fatalf("error code = %v, want idp_unavailable", body["error"])
 	}
 }
 
