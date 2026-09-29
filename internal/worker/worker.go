@@ -253,6 +253,13 @@ func (w *Worker) Run(ctx context.Context) {
 				w.log.Error("audit anchoring failed", "error", err)
 			}
 		case <-jobs.C:
+			// Before claiming, release leases whose worker died mid-job. Claiming would
+			// recover them anyway — an expired lease is claimable — so this is not what makes
+			// recovery work. It is the only place that can REPORT it: ReapExpiredLeases existed,
+			// was implemented on both backends and was called by no production path, so a
+			// deployment whose workers were dying mid-job had no signal at all. A rising count is
+			// the difference between "the queue is busy" and "the queue is being lost".
+			w.reapExpiredJobLeases(ctx)
 			// A failure here is logged and the loop continues: the queue is durable, so
 			// a transient database error means the work waits rather than being lost.
 			if n, err := w.ProcessJobs(ctx); err != nil {
@@ -561,4 +568,34 @@ func (w *Worker) pruneRateLimitRows(ctx context.Context) {
 		w.log.Debug("pruned rate-limit rows",
 			"otp_attempts", otp, "upload_events", uploads, "password_attempts", passwords)
 	}
+}
+
+// reapExpiredJobLeases releases leases held past their expiry and reports them.
+//
+// A worker that dies mid-job leaves its lease behind; the job becomes claimable again when the
+// lease expires, which is the recovery path and needs no help. What was missing is the signal: a
+// deployment whose processes are being killed or crashing mid-handler looked identical to one that
+// is simply idle, because nothing counted the leases being abandoned.
+func (w *Worker) reapExpiredJobLeases(ctx context.Context) int {
+	var n int
+	err := w.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		count, rerr := tx.ReapExpiredLeases(ctx)
+		n = count
+		return rerr
+	})
+	if err != nil {
+		w.log.Error("reaping expired job leases failed", "error", err)
+		return 0
+	}
+	if n > 0 {
+		w.log.Warn("released job leases from workers that did not finish",
+			"count", n,
+			"hint", "a worker is dying mid-job, or the lease is shorter than the slowest handler")
+	}
+	return n
+}
+
+// ReapExpiredJobLeasesForTest exposes the reaper to the package's tests.
+func (w *Worker) ReapExpiredJobLeasesForTest(ctx context.Context) int {
+	return w.reapExpiredJobLeases(ctx)
 }

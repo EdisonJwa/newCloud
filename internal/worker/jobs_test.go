@@ -226,3 +226,76 @@ func fastForward(t *testing.T, m *store.Memory) {
 }
 
 var _ = uuid.Nil
+
+// TestAnAbandonedLeaseIsRecoveredAndReported is INV-06's crash path.
+//
+// Two things have to be true after a worker dies mid-job. The work must come back by itself — an
+// expired lease is claimable, so the next worker picks it up without an operator — and somebody must
+// be able to SEE that it happened. Claiming already recovers the job, so a test that only claimed it
+// would pass with no reporting at all, which is how ReapExpiredLeases ended up implemented on both
+// backends and called by nothing.
+func TestAnAbandonedLeaseIsRecoveredAndReported(t *testing.T) {
+	s := store.NewMemory()
+	ctx := context.Background()
+
+	// Enqueue with room for more than one attempt: a job whose budget is one is finished after the
+	// first claim, which is the policy, not a recovery failure.
+	enqueue(t, s, store.Job{
+		Kind: "blob.collect", Payload: map[string]any{"blob_id": uuid.New().String()},
+		MaxAttempts: 3, DedupeKey: "lease-test",
+	})
+
+	// Worker A claims it and then "dies": nothing completes or fails the job.
+	if err := s.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		claimed, err := tx.ClaimJobs(ctx, "worker-a", 1, 20*time.Millisecond)
+		if err != nil {
+			return err
+		}
+		if len(claimed) != 1 {
+			t.Fatalf("worker A claimed %d jobs, want the one enqueued", len(claimed))
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// While the lease is held, nobody else may take it.
+	if err := s.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		claimed, err := tx.ClaimJobs(ctx, "worker-b", 1, time.Minute)
+		if err != nil {
+			return err
+		}
+		if len(claimed) != 0 {
+			t.Fatalf("worker B claimed a leased job: %d", len(claimed))
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The lease expires. The worker's report is what tells an operator a process died mid-job.
+	time.Sleep(60 * time.Millisecond)
+	// A worker bound to THIS store: binding it to a fresh one would reap an empty queue and the
+	// assertion would pass or fail for a reason unrelated to the lease.
+	w := New(s, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if n := w.ReapExpiredJobLeasesForTest(ctx); n != 1 {
+		t.Fatalf("the abandoned lease was not reported: got %d, want 1", n)
+	}
+
+	// And the work is available again, which is the half that must not depend on the report.
+	if err := s.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		claimed, err := tx.ClaimJobs(ctx, "worker-b", 1, time.Minute)
+		if err != nil {
+			return err
+		}
+		if len(claimed) != 1 {
+			t.Fatalf("the abandoned job was not reclaimed after its lease expired: %d", len(claimed))
+		}
+		if claimed[0].Attempts != 2 {
+			t.Fatalf("a recovery is a second attempt, got %d", claimed[0].Attempts)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
