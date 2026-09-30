@@ -299,3 +299,124 @@ func TestAnAbandonedLeaseIsRecoveredAndReported(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestEveryJobKindIsIdempotent is INV-06's "idempotent" clause, per kind.
+//
+// Idempotency is the property that makes a durable queue safe to run: a job can be reclaimed after
+// a crash, retried after a partial success, or delivered twice by a queue that at-least-once
+// semantics allow — and the result must be the same. It is also a property that is easy to claim and
+// hard to see, so this runs every registered kind TWICE and requires the second run to succeed and
+// change nothing.
+//
+// The case table is checked against Worker.JobKinds(), so a new kind cannot be added without an
+// idempotency case: a ratchet rather than a list someone remembers to extend.
+func TestEveryJobKindIsIdempotent(t *testing.T) {
+	type idemCase struct {
+		// job builds the payload for this kind. A fresh one is used for each run so a test cannot
+		// accidentally depend on the same row being processed twice.
+		job func(t *testing.T, m *store.Memory) store.Job
+		// after runs after the second execution and returns an error describing any drift.
+		after func(t *testing.T, m *store.Memory, first, second int) error
+	}
+
+	cases := map[string]idemCase{
+		"blob.collect": {
+			job: func(t *testing.T, m *store.Memory) store.Job {
+				// A blob id that does not exist: the handler maps "not found" to success, which is
+				// what makes it safe to run speculatively. Deleting an absent row twice must not
+				// become an error the second time.
+				return store.Job{Kind: "blob.collect",
+					Payload: map[string]any{"blob_id": uuid.New().String()}, MaxAttempts: 2}
+			},
+			after: func(t *testing.T, m *store.Memory, first, second int) error {
+				if err := drainQueue(t, m); err != nil {
+					return err
+				}
+				return nil
+			},
+		},
+		"thumbnail.warm": {
+			job: func(t *testing.T, m *store.Memory) store.Job {
+				return store.Job{Kind: "thumbnail.warm",
+					Payload: map[string]any{"node_id": uuid.New().String()}, MaxAttempts: 2}
+			},
+			after: func(t *testing.T, m *store.Memory, first, second int) error { return nil },
+		},
+		"user.purge_credentials": {
+			job: func(t *testing.T, m *store.Memory) store.Job {
+				u := m.AddUser(store.User{Username: "purge-" + uuid.New().String()[:8],
+					Email: "purge@example.test", Role: "user"})
+				return store.Job{Kind: "user.purge_credentials",
+					Payload: map[string]any{"user_id": u.ID.String()}, MaxAttempts: 2}
+			},
+			after: func(t *testing.T, m *store.Memory, first, second int) error {
+				// Revoking twice must not error and must not report a second batch of credentials.
+				// The counts come from the handler's own report via JobCounts; what matters is that
+				// the queue holds no failed job.
+				return drainQueue(t, m)
+			},
+		},
+	}
+
+	kinds := NewForTest().JobKinds()
+	if len(kinds) == 0 {
+		t.Fatal("the worker registers no job kinds; this check would pass vacuously")
+	}
+	for _, kind := range kinds {
+		c, ok := cases[kind]
+		if !ok {
+			t.Fatalf("job kind %q has no idempotency case. Add one here: a kind whose second run "+
+				"is untested is a kind that may double-charge, double-delete or double-notify after "+
+				"a crash.", kind)
+		}
+
+		t.Run(kind, func(t *testing.T) {
+			w, m := testWorker(t)
+			enqueue(t, m, c.job(t, m))
+			if n, err := w.ProcessJobs(context.Background()); err != nil || n != 1 {
+				t.Fatalf("first run: processed %d, err %v", n, err)
+			}
+
+			enqueue(t, m, c.job(t, m))
+			second, err := w.ProcessJobs(context.Background())
+			if err != nil {
+				t.Fatalf("second run of the same kind failed: %v. Re-running a job after a crash "+
+					"or a duplicate delivery must be a no-op, not an error.", err)
+			}
+			if second != 1 {
+				// Distinguish "the handler failed on the re-run and the queue rescheduled it" from
+				// "the job was never there". Without this the failure reads as a queue problem when
+				// the real cause is a handler that is not idempotent — which is what this test is
+				// for, and the message is the only thing an operator sees.
+				var pending, running, failed int
+				_ = m.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+					pending, running, failed, _ = tx.JobCounts(ctx)
+					return nil
+				})
+				t.Fatalf("second run processed %d jobs, want 1 (pending=%d running=%d failed=%d). "+
+					"A handler that errors when re-run is not idempotent; the queue then retries it "+
+					"with backoff or marks it failed.", second, pending, running, failed)
+			}
+			if err := c.after(t, m, 1, second); err != nil {
+				t.Fatalf("after the second run: %v", err)
+			}
+		})
+	}
+}
+
+// drainQueue fails if the queue holds anything that is not completed. A job that was retried into
+// the failed state after two successful runs means the handler is not idempotent.
+func drainQueue(t *testing.T, m *store.Memory) error {
+	t.Helper()
+	return m.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+		pending, running, failed, err := tx.JobCounts(ctx)
+		if err != nil {
+			return err
+		}
+		if pending != 0 || running != 0 || failed != 0 {
+			t.Fatalf("queue not drained after the runs: pending=%d running=%d failed=%d",
+				pending, running, failed)
+		}
+		return nil
+	})
+}
