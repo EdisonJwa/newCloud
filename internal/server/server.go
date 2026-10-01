@@ -280,6 +280,8 @@ func (s *Server) Handler() http.Handler {
 	r.Post("/s/{token}/recipient", s.handleShareRecipientRequest)
 	r.Post("/s/{token}/recipient/verify", s.handleShareRecipientVerify)
 	r.Get("/s/{token}/download", s.handleShareDownload)
+	// Previews are content: same token, same gate, and no permanent URL of their own.
+	r.Get("/s/{token}/thumbnail", s.handleShareThumbnail)
 	r.Post("/s/{token}/upload", s.handleShareUpload)
 
 	// Content origin: user bytes, always as an attachment.

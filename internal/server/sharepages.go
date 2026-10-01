@@ -636,3 +636,93 @@ func (s *Server) shareOwnerActive(ctx context.Context, sh store.Share) bool {
 	}
 	return active
 }
+
+// handleShareThumbnail renders a preview for a visitor of a public share.
+//
+// §6.3 asks for preview derivatives to be protected resources reached through the same authorization
+// as the content, not through a guessable permanent URL. The credential here is the share token plus
+// whatever gate the share declares — a password, a verified recipient — checked in the same order as
+// the download route. The node is resolved as a CHILD of the share root, never by the requested name
+// being concatenated into a path, so "..%2f" cannot escape the shared subtree.
+//
+// Without this route a shared folder showed type badges where it could show pictures, which made the
+// share page the one place previews were unavailable rather than the one place they were unsafe.
+func (s *Server) handleShareThumbnail(w http.ResponseWriter, r *http.Request) {
+	token := chiURLParam(r, "token")
+
+	sh, err := s.deps.Shares.Resolve(r.Context(), token)
+	if err != nil {
+		s.renderShareError(w, r, err)
+		return
+	}
+	if !sh.CanRead() {
+		writeError(w, http.StatusNotFound, "not_found", "this link is not available")
+		return
+	}
+	if !s.shareOwnerActive(r.Context(), sh) {
+		writeError(w, http.StatusNotFound, "not_found", "this link is not available")
+		return
+	}
+	if !s.gate(r, sh).allowed() {
+		writeError(w, http.StatusNotFound, "not_found", "this link is not available")
+		return
+	}
+
+	wantName := r.URL.Query().Get("name")
+	var node store.Node
+	err = s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
+		root, rerr := tx.Node(ctx, sh.NodeID)
+		if rerr != nil {
+			return rerr
+		}
+		if wantName == "" {
+			node = root
+			return nil
+		}
+		child, cerr := tx.ChildByName(ctx, root.ID, wantName)
+		if cerr != nil {
+			return cerr
+		}
+		if child.TrashedAt != nil {
+			return store.ErrNotFound
+		}
+		node = child
+		return nil
+	})
+	if err != nil {
+		writeError(w, http.StatusNotFound, "not_found", "no such file")
+		return
+	}
+	if node.IsDir() {
+		writeError(w, http.StatusBadRequest, "is_directory", "a directory has no thumbnail")
+		return
+	}
+	key := contentKey(node)
+	if key == ([32]byte{}) {
+		writeError(w, http.StatusUnsupportedMediaType, "not_an_image", "this file has no content address")
+		return
+	}
+	// Classified from the stored type before the bytes are opened, exactly as the authenticated
+	// route does: a share full of PDFs must not cost a decode attempt each.
+	if kind := previewKindForNode(node.Name, node.Mime); kind != previewImage {
+		s.observeThumbnail("not_an_image")
+		writeError(w, http.StatusUnsupportedMediaType, "not_an_image", "this file has no thumbnail")
+		return
+	}
+
+	rel, perr := s.pathOfNode(r.Context(), node.OwnerID, node.ID)
+	if perr != nil {
+		writeError(w, http.StatusNotFound, "not_found", "no such file")
+		return
+	}
+	rc, oerr := s.deps.Content.Open(r.Context(), layout.Node{
+		Owner: node.OwnerID.String(), Path: rel,
+	})
+	if oerr != nil {
+		s.writeStoreError(w, oerr)
+		return
+	}
+	defer rc.Close()
+
+	s.serveThumbnailBytes(w, r, node, rel, key, rc)
+}

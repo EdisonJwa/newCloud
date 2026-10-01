@@ -18,6 +18,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -100,6 +101,16 @@ func (s *Server) handleThumbnail(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rc.Close()
 
+	s.serveThumbnailBytes(w, r, node, rel, key, rc)
+}
+
+// serveThumbnailBytes renders and writes the thumbnail for an already-authorized node.
+//
+// Shared by the authenticated endpoint and the public share page: the difference between them is
+// who is allowed to ask, which is settled before this runs. Duplicating the header and conditional
+// logic would let the two drift, and the cache headers here are what make a grid scroll cheap.
+func (s *Server) serveThumbnailBytes(w http.ResponseWriter, r *http.Request,
+	node store.Node, rel string, key [32]byte, rc io.ReadSeeker) {
 	png, err := s.thumbs.Generate(key, rc)
 	if err != nil {
 		switch {

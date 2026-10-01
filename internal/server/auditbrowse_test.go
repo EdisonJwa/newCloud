@@ -291,3 +291,178 @@ func TestSharedFileHasAPreviewOnlyWithAGrant(t *testing.T) {
 			"badges.", code)
 	}
 }
+
+// TestShareThumbnailIsTokenBound is §6.3's rule for preview derivatives.
+//
+// A preview is content. Served from the share page it must be reachable only through the share's own
+// credential — the token plus whatever gate the share declares — and never through a permanent URL
+// that outlives the share. Before this route existed, a shared folder was the one place previews
+// were unavailable; the risk this test guards is the opposite shape, a preview route that forgets the
+// token or the gate.
+func TestShareThumbnailIsTokenBound(t *testing.T) {
+	h := newHarness(t)
+
+	// A folder with one image, shared read-only.
+	if resp := h.do(http.MethodPost, "/api/files/mkdir",
+		strings.NewReader(`{"path":"photos"}`),
+		map[string]string{"Content-Type": "application/json"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("mkdir: %d %s", resp.StatusCode, readBody(resp))
+	}
+	body := multipartBody(t, "photos", "cat.png", samplePNG(t))
+	resp := h.do(http.MethodPost, "/api/files/upload", body,
+		map[string]string{"Content-Type": "multipart/form-data; boundary=" + body.Boundary()})
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("upload: %d", resp.StatusCode)
+	}
+
+	create := h.do(http.MethodPost, "/api/shares/",
+		strings.NewReader(`{"path":"photos","kind":"link"}`),
+		map[string]string{"Content-Type": "application/json"})
+	payload := readBody(create)
+	create.Body.Close()
+	if create.StatusCode != http.StatusCreated {
+		t.Fatalf("share: %d %s", create.StatusCode, payload)
+	}
+	var created struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal([]byte(payload), &created); err != nil || created.Token == "" {
+		t.Fatalf("share response has no token: %s", payload)
+	}
+	token := created.Token
+
+	// The visitor sees the picture.
+	got := h.do(http.MethodGet, "/s/"+token+"/thumbnail?name=cat.png", nil, nil)
+	ct := got.Header.Get("Content-Type")
+	got.Body.Close()
+	if got.StatusCode != http.StatusOK || ct != "image/png" {
+		t.Fatalf("thumbnail through the share: %d %q, want 200 image/png", got.StatusCode, ct)
+	}
+
+	// But not by naming something outside the share root, and not with a bad or missing token.
+	for _, path := range []string{
+		"/s/" + token + "/thumbnail?name=..%2fsecret.png",
+		"/s/" + token + "/thumbnail?name=nope.png",
+		"/s/not-a-real-token/thumbnail?name=cat.png",
+	} {
+		r := h.do(http.MethodGet, path, nil, nil)
+		code := r.StatusCode
+		r.Body.Close()
+		if code == http.StatusOK {
+			t.Fatalf("%s served a preview (%d). The token and the share root are the authorization; "+
+				"neither can be dropped.", path, code)
+		}
+	}
+}
+
+// TestOwnerThumbnailStillNeedsASession is the other half of the same rule, for the endpoint that
+// existed first: the authenticated thumbnail route is content, so an anonymous request must not get
+// it. Written separately because the test above uses the owner's own session and would pass either
+// way, which is the kind of assertion that reads as coverage without being any.
+func TestOwnerThumbnailStillNeedsASession(t *testing.T) {
+	h := newHarness(t)
+	uploadWithType(t, h, "shot.png", "image/png", samplePNG(t))
+
+	req, err := http.NewRequest(http.MethodGet, h.srv.URL+"/api/files/thumbnail?path=shot.png", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := h.srv.Client().Do(req) // no cookie jar: anonymous
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		t.Fatal("an anonymous request got a thumbnail from the authenticated endpoint")
+	}
+}
+
+// TestShareThumbnailHonoursThePasswordGate is the gate half of the rule above.
+//
+// The test for a plain link share does not exercise the gate at all — there is nothing to satisfy —
+// so removing the gate check entirely would leave it green. A password-protected share is where the
+// check is load-bearing: the token alone must not be enough to see the picture, and the password
+// must be enough once supplied.
+func TestShareThumbnailHonoursThePasswordGate(t *testing.T) {
+	h := newHarness(t)
+
+	if resp := h.do(http.MethodPost, "/api/files/mkdir",
+		strings.NewReader(`{"path":"locked"}`),
+		map[string]string{"Content-Type": "application/json"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("mkdir: %d", resp.StatusCode)
+	}
+	body := multipartBody(t, "locked", "secret.png", samplePNG(t))
+	up := h.do(http.MethodPost, "/api/files/upload", body,
+		map[string]string{"Content-Type": "multipart/form-data; boundary=" + body.Boundary()})
+	up.Body.Close()
+
+	create := h.do(http.MethodPost, "/api/shares/",
+		strings.NewReader(`{"path":"locked","kind":"link","password":"correct horse"}`),
+		map[string]string{"Content-Type": "application/json"})
+	payload := readBody(create)
+	create.Body.Close()
+	if create.StatusCode != http.StatusCreated {
+		t.Fatalf("create: %d %s", create.StatusCode, payload)
+	}
+	var created struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal([]byte(payload), &created); err != nil || created.Token == "" {
+		t.Fatalf("no token: %s", payload)
+	}
+
+	anonymous := func(path string) int {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodGet, h.srv.URL+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := h.srv.Client().Do(req) // no cookies: a visitor who has not entered the password
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if code := anonymous("/s/" + created.Token + "/thumbnail?name=secret.png"); code == http.StatusOK {
+		t.Fatal("the token alone was enough to see the picture behind a password")
+	}
+
+	// With the password, the preview works — otherwise the gate would be a wall rather than a check.
+	verify, err := http.NewRequest(http.MethodPost,
+		h.srv.URL+"/s/"+created.Token+"/verify",
+		strings.NewReader(`{"password":"correct horse"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	verify.Header.Set("Content-Type", "application/json")
+	vresp, err := h.srv.Client().Do(verify)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cookies []*http.Cookie
+	for _, ck := range vresp.Cookies() {
+		cookies = append(cookies, ck)
+	}
+	vresp.Body.Close()
+
+	withCookie, err := http.NewRequest(http.MethodGet,
+		h.srv.URL+"/s/"+created.Token+"/thumbnail?name=secret.png", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ck := range cookies {
+		withCookie.AddCookie(ck)
+	}
+	final, err := h.srv.Client().Do(withCookie)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer final.Body.Close()
+	if final.StatusCode != http.StatusOK {
+		t.Fatalf("after entering the password the preview failed (%d); the gate must open, not "+
+			"just close", final.StatusCode)
+	}
+}
