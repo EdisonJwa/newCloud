@@ -7,6 +7,7 @@ package server_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"image"
 	"image/color"
@@ -14,6 +15,8 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/EdisonJwa/newCloud/internal/store"
 )
 
 // samplePNG builds a real 48x48 PNG.
@@ -239,5 +242,52 @@ func TestAuditEventsFilterByAction(t *testing.T) {
 		if ev.Action != "file.read" {
 			t.Fatalf("filter ignored: got %q", ev.Action)
 		}
+	}
+}
+
+// TestSharedFileHasAPreviewOnlyWithAGrant is §6.3's uniform-authorization rule applied to thumbnails.
+//
+// Resolving a thumbnail by path can only ever find the caller's OWN files, so a folder somebody
+// shared through an ACL showed type badges where it could show pictures — the one content entry point
+// that ignored a grant that the download, listing and WebDAV paths all honoured. Addressing the node
+// by id fixes that, and the id is deliberately NOT a capability: the same PermRead check decides,
+// so a shared file has a preview exactly when the caller may read it.
+func TestSharedFileHasAPreviewOnlyWithAGrant(t *testing.T) {
+	h := newHarness(t)
+	uploadWithType(t, h, "private-shot.png", "image/png", samplePNG(t))
+	node := h.resolveNode(t, "private-shot.png")
+
+	// A second account, acting as itself.
+	other := h.meta.AddUser(store.User{
+		Username: "shared-viewer", Email: "shared-viewer@example.test", Role: "user",
+	})
+	if _, err := h.meta.EnsureRoot(context.Background(), other.ID); err != nil {
+		t.Fatal(err)
+	}
+	token, err := h.sessions.Mint(context.Background(), other.ID, other.Email, "127.0.0.1", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := h.cookieClient(token)
+
+	byID := func() int {
+		t.Helper()
+		resp := h.adminGet(t, client, "/api/files/thumbnail?id="+node.ID.String())
+		code := resp.StatusCode
+		resp.Body.Close()
+		return code
+	}
+
+	if code := byID(); code != http.StatusNotFound {
+		t.Fatalf("a stranger got a thumbnail for somebody else's file (%d). The node id must not "+
+			"be a capability.", code)
+	}
+
+	h.grantOn(t, node.ID, other.ID, store.PermRead, false)
+
+	if code := byID(); code != http.StatusOK {
+		t.Fatalf("a file shared with read permission has no preview (%d). Every other entry point "+
+			"honours that grant; the thumbnail one must too, or the shared folder is a wall of type "+
+			"badges.", code)
 	}
 }

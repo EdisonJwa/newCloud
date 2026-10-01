@@ -15,6 +15,7 @@ package server
 //     than 500: the client shows the type badge instead, which is the designed outcome.
 
 import (
+	"context"
 	"crypto/sha256"
 	"errors"
 	"net/http"
@@ -25,6 +26,7 @@ import (
 	"github.com/EdisonJwa/newCloud/internal/storage/layout"
 	"github.com/EdisonJwa/newCloud/internal/store"
 	"github.com/EdisonJwa/newCloud/internal/thumbnail"
+	"github.com/google/uuid"
 )
 
 // maxThumbnailSource bounds how much of a file is read to decide whether it is an image.
@@ -39,12 +41,17 @@ func (s *Server) handleThumbnail(w http.ResponseWriter, r *http.Request) {
 	// failure: a directory full of PDFs would otherwise look like a broken renderer. The
 	// classification happens at each return rather than from a wrapped ResponseWriter, because
 	// the router already installs one and nesting them makes Flush fragile.
-	nodes, err := s.deps.Meta.Resolve(r.Context(), actor.ID(), rel)
+	//
+	// Two ways to name the file. `path` is the caller's own namespace, which is how the file
+	// browser asks. `id` names a node anywhere, which is the only way a file somebody shared with
+	// their ACL can have a preview: resolving by path can only ever find the caller's own files, so
+	// a shared folder showed type badges where it could show pictures. The authorization below is
+	// the same for both — the node id is not a capability.
+	node, rel, err := s.nodeForThumbnail(r, actor, rel)
 	if err != nil {
 		s.writeStoreError(w, err)
 		return
 	}
-	node := nodes[len(nodes)-1]
 	if node.IsDir() {
 		s.observeThumbnail("not_an_image")
 		writeError(w, http.StatusBadRequest, "is_directory", "a directory has no thumbnail")
@@ -81,8 +88,11 @@ func (s *Server) handleThumbnail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The content lives under the OWNER's root, which is the same as the caller's for their own
+	// files and different for a shared one. Using the actor here would look for somebody else's
+	// bytes in the caller's namespace and fail for exactly the files this change is about.
 	rc, err := s.deps.Content.Open(r.Context(), layout.Node{
-		Owner: actor.ID().String(), Path: rel,
+		Owner: node.OwnerID.String(), Path: rel,
 	})
 	if err != nil {
 		s.writeStoreError(w, err)
@@ -183,4 +193,39 @@ func contentKey(n store.Node) [32]byte {
 		return [32]byte{}
 	}
 	return sha256.Sum256([]byte(n.ETag))
+}
+
+// nodeForThumbnail resolves the node a thumbnail was asked for, and the path to read it from.
+//
+// The path is always relative to the OWNER's namespace, not the caller's: content lives under the
+// owner's root regardless of who is allowed to look at it.
+func (s *Server) nodeForThumbnail(r *http.Request, actor authz.Actor, rel string) (store.Node, string, error) {
+	if id := r.URL.Query().Get("id"); id != "" {
+		nodeID, err := uuid.Parse(id)
+		if err != nil {
+			return store.Node{}, "", store.ErrNotFound
+		}
+		var node store.Node
+		if err := s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
+			n, nerr := tx.Node(ctx, nodeID)
+			node = n
+			return nerr
+		}); err != nil {
+			return store.Node{}, "", err
+		}
+		if node.TrashedAt != nil {
+			return store.Node{}, "", store.ErrNotFound
+		}
+		path, perr := s.pathOfNode(r.Context(), node.OwnerID, node.ID)
+		if perr != nil {
+			return store.Node{}, "", perr
+		}
+		return node, path, nil
+	}
+
+	nodes, err := s.deps.Meta.Resolve(r.Context(), actor.ID(), rel)
+	if err != nil {
+		return store.Node{}, "", err
+	}
+	return nodes[len(nodes)-1], rel, nil
 }
