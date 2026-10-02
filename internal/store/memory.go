@@ -30,12 +30,14 @@ import (
 type Memory struct {
 	// mu guards the committed state; txMu orders transactions so two of them
 	// cannot publish conflicting copies.
-	mu       sync.RWMutex
-	txMu     sync.Mutex
-	nodes    map[uuid.UUID]*memNode
-	children map[uuid.UUID]map[string]uuid.UUID // parent -> lower(name) -> child
-	roots    map[uuid.UUID]uuid.UUID
-	trashSeq []uuid.UUID
+	mu   sync.RWMutex
+	txMu sync.Mutex
+	// txLockTimeout overrides txLockTimeout for tests; zero uses the package value.
+	txLockTimeout time.Duration
+	nodes         map[uuid.UUID]*memNode
+	children      map[uuid.UUID]map[string]uuid.UUID // parent -> lower(name) -> child
+	roots         map[uuid.UUID]uuid.UUID
+	trashSeq      []uuid.UUID
 
 	audit []AuditEntry
 	// auditTimes runs parallel to audit. The write-side entry has no timestamp by
@@ -159,9 +161,18 @@ func (m *Memory) WithTx(ctx context.Context, fn func(ctx context.Context, tx Tx)
 	ctx = context.WithValue(ctx, txDepthKey{}, true)
 	ctx = context.WithValue(ctx, txMemKey{}, (*memTx)(nil)) // replaced below once tx exists
 
-	// Serialise transactions, but release the mutex before invoking fn. The
-	// private copy is what isolates them; the mutex only orders the swap.
-	m.txMu.Lock()
+	// Serialise transactions. The mutex IS held across fn — this comment used to claim it was
+	// released first, and it never was. The private snapshot is what isolates concurrent callers;
+	// the mutex only orders the swap, which means a second transaction cannot start until the
+	// first finishes.
+	//
+	// That makes a nested WithTx a deadlock rather than an error whenever the nested call does not
+	// carry the transaction context: the re-entry guard above cannot see it, so it blocks on this
+	// mutex forever. Two hours were spent watching a test suite hang for exactly that, so the wait
+	// is now bounded and the failure is named.
+	if err := m.lockTx(ctx); err != nil {
+		return err
+	}
 	defer m.txMu.Unlock()
 
 	m.mu.RLock()
@@ -1093,5 +1104,40 @@ func (m *Memory) applyClock() {
 			now = now.Add(m.clockOffset.by)
 		}
 		return now
+	}
+}
+
+// txLockTimeout bounds how long a transaction waits for the mutex.
+//
+// A legitimate concurrent transaction holds it for as long as its callback runs, so this cannot be
+// zero; a nested call made with a fresh context holds it until the outer callback returns, which is
+// forever and is the case this exists to name.
+var txLockTimeout = 10 * time.Second
+
+// SetTxLockTimeoutForTest shortens the wait so a test can observe the failure without stalling.
+func (m *Memory) SetTxLockTimeoutForTest(d time.Duration) { m.txLockTimeout = d }
+
+// lockTx takes the transaction mutex, giving up after the configured timeout.
+func (m *Memory) lockTx(ctx context.Context) error {
+	timeout := m.txLockTimeout
+	if timeout <= 0 {
+		timeout = txLockTimeout
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		if m.txMu.TryLock() {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%w: another transaction held the store for %s. The usual cause is "+
+				"WithTx called from inside a WithTx callback with a context that is not the one "+
+				"the callback was given — the re-entry guard cannot see that, so it waits instead "+
+				"of returning immediately", ErrNestedTx, timeout)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Millisecond):
+		}
 	}
 }

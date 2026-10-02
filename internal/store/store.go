@@ -511,8 +511,15 @@ type queuedJob struct {
 
 // Store is the transaction entry point.
 type Store interface {
-	// WithTx runs fn inside a transaction, committing on nil and rolling back
-	// on error. Nested calls reuse the outer transaction.
+	// WithTx runs fn inside a transaction, committing on nil and rolling back on error.
+	//
+	// Nesting is NOT supported, contrary to what this comment used to claim. Neither backend
+	// reuses the outer transaction: PostgreSQL begins a second one — which cannot see the outer
+	// transaction's uncommitted writes and can deadlock the pool — and the in-memory store refuses
+	// it. Call the Tx methods you were given instead of opening another transaction inside the
+	// callback, and pass THAT callback's ctx, not a fresh one: the in-memory re-entry guard keys
+	// off the context, so a nested call carrying a different context waits for the outer
+	// transaction to finish instead of being refused.
 	WithTx(ctx context.Context, fn func(ctx context.Context, tx Tx) error) error
 
 	// Resolve walks a path from a user's root to a node. It returns ErrNotFound
