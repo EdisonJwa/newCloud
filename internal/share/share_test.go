@@ -3,6 +3,7 @@ package share
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -199,12 +200,24 @@ func TestDownloadLimitIsExact(t *testing.T) {
 	c := f.create(t, NewShare{Kind: store.ShareLink, MaxDownloads: &limit})
 	sh, _ := f.svc.Resolve(context.Background(), c.Token)
 
+	// Production charges downloads through the session API, so that is what the limit is asserted
+	// against: one session per logical download, distinguished by the visitor's grant.
+	charge := func(t *testing.T, grant string) error {
+		t.Helper()
+		return f.meta.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			_, _, aerr := tx.AuthorizeDownload(ctx, store.DownloadSession{
+				ShareID: sh.ID, NodeID: sh.NodeID, GrantHash: []byte(grant), ETag: "e",
+			}, false)
+			return aerr
+		})
+	}
+
 	for i := 0; i < limit; i++ {
-		if err := f.svc.RecordDownload(context.Background(), sh, DownloadMeta{ActorKind: "anonymous"}); err != nil {
+		if err := charge(t, fmt.Sprint("visitor-", i)); err != nil {
 			t.Fatalf("download %d should succeed: %v", i+1, err)
 		}
 	}
-	if err := f.svc.RecordDownload(context.Background(), sh, DownloadMeta{ActorKind: "anonymous"}); !errors.Is(err, store.ErrShareExhausted) {
+	if err := charge(t, "one-too-many"); !errors.Is(err, store.ErrShareExhausted) {
 		t.Fatalf("download %d should be refused, got %v", limit+1, err)
 	}
 }
@@ -224,7 +237,13 @@ func TestConcurrentDownloadsRespectLimit(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			errs[i] = f.svc.RecordDownload(context.Background(), sh, DownloadMeta{ActorKind: "anonymous"})
+			errs[i] = f.meta.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				_, _, aerr := tx.AuthorizeDownload(ctx, store.DownloadSession{
+					ShareID: sh.ID, NodeID: sh.NodeID,
+					GrantHash: []byte(fmt.Sprint("racer-", i)), ETag: "e",
+				}, false)
+				return aerr
+			})
 		}(i)
 	}
 	wg.Wait()
@@ -352,43 +371,7 @@ func TestDuplicateRecipientIsIdempotent(t *testing.T) {
 	}
 }
 
-// TestAuditRecordsWhoDownloaded is the whole point of proxying downloads.
-func TestAuditRecordsWhoDownloaded(t *testing.T) {
-	f := newFixture(t)
-	c := f.create(t, NewShare{Kind: store.ShareLink})
-	sh, _ := f.svc.Resolve(context.Background(), c.Token)
-
-	err := f.svc.RecordDownload(context.Background(), sh, DownloadMeta{
-		ActorKind: "anonymous", ActorIP: "203.0.113.5", UserAgent: "curl/8",
-		Name: "report.pdf", Bytes: 4096, Recipient: "dana@example.test",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	var found bool
-	for _, e := range f.meta.AuditLog() {
-		if e.Action != "share.download" {
-			continue
-		}
-		found = true
-		if e.ActorIP != "203.0.113.5" {
-			t.Fatalf("IP not recorded: %q", e.ActorIP)
-		}
-		if e.Bytes == nil || *e.Bytes != 4096 {
-			t.Fatal("byte count not recorded")
-		}
-		if e.Metadata["name"] != "report.pdf" {
-			t.Fatalf("filename not recorded: %v", e.Metadata)
-		}
-		if e.Metadata["recipient"] != "dana@example.test" {
-			t.Fatalf("recipient not recorded: %v", e.Metadata)
-		}
-	}
-	if !found {
-		t.Fatal("no share.download audit entry was written")
-	}
-}
+// TestAuditRecordsWhoDownloaded moved to internal/server: share.download is written by the\n// handler, inside the transaction that charges the download, not by the service.\n
 
 func TestCreateIsAudited(t *testing.T) {
 	f := newFixture(t)

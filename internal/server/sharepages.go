@@ -255,19 +255,52 @@ func (s *Server) handleShareDownload(w http.ResponseWriter, r *http.Request) {
 	//   - a different visitor, or the same visitor downloading another file, pays,
 	//   - a session minted for one version never serves another.
 	grant := s.downloadGrantHash(r, sh)
+	// Resolved BEFORE the transaction below: the visitor's identity is a read, and doing it inside
+	// the charging transaction would re-enter the store from within it.
+	actorKind := s.shareActorKind(r, sh)
+	actorEmail := s.shareRecipientEmail(r, sh)
 	// A Range request continues a download already authorised; a plain GET is a
 	// fresh download and is charged as one. That is the distinction the owner's
 	// "max downloads" setting actually means.
 	continuation := r.Header.Get("Range") != ""
 	err = s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
-		_, _, aerr := tx.AuthorizeDownload(ctx, store.DownloadSession{
+		_, charged, aerr := tx.AuthorizeDownload(ctx, store.DownloadSession{
 			ShareID:   sh.ID,
 			NodeID:    node.ID,
 			GrantHash: grant,
 			ETag:      node.ETag,
 			ExpiresAt: time.Now().Add(store.DownloadSessionTTL),
 		}, continuation)
-		return aerr
+		if aerr != nil {
+			return aerr
+		}
+		if !charged {
+			// A Range request or a retry joining a session already paid for. Recording it would
+			// inflate the log with one row per byte-range of a video and bury the real events.
+			return nil
+		}
+		// §10.1: a public share download is anonymous access to file content, and it was not
+		// audited at all. share.download was declared, had an emitter (RecordDownload), had tests —
+		// and that emitter had no caller, so nothing ever wrote the event while the vocabulary
+		// suggested otherwise. It is written here, inside the transaction that CHARGES the
+		// download: if the row cannot be written, the download is not authorised either, because
+		// "nobody knows this link was used" is not a state this should be able to reach silently.
+		return tx.Audit(ctx, store.AuditEntry{
+			ActorKind:  actorKind,
+			ActorEmail: actorEmail,
+			ActorIP:    clientIP(r),
+			UserAgent:  r.UserAgent(),
+			Action:     "share.download",
+			TargetKind: "share",
+			TargetID:   sh.ID.String(),
+			ShareID:    &sh.ID,
+			Result:     "ok",
+			Metadata: map[string]any{
+				"name":       node.Name,
+				"node_id":    node.ID.String(),
+				"share_kind": string(sh.Kind),
+			},
+		})
 	})
 	if err != nil {
 		// Out of allowance, or the share went away between the gate and here.
@@ -725,4 +758,33 @@ func (s *Server) handleShareThumbnail(w http.ResponseWriter, r *http.Request) {
 	defer rc.Close()
 
 	s.serveThumbnailBytes(w, r, node, rel, key, rc)
+}
+
+// shareActorKind classifies the visitor of a public link for the audit row.
+//
+// A share visitor is usually not authenticated at all, and calling them a "user" would be a lie that
+// makes an anonymous download look like an account action. A visitor who proved a recipient address
+// is recorded as that address, which is the strongest identity a link can carry.
+func (s *Server) shareActorKind(r *http.Request, sh store.Share) string {
+	if s.shareRecipientEmail(r, sh) != "" {
+		return "share_recipient"
+	}
+	return "anonymous"
+}
+
+// shareRecipientEmail returns the address a visitor proved for this share, if any.
+func (s *Server) shareRecipientEmail(r *http.Request, sh store.Share) string {
+	if !share.RequiresRecipient(sh) {
+		return ""
+	}
+	email := s.recipientCookieEmail(r, sh)
+	if email == "" {
+		return ""
+	}
+	// Re-check the invitation: the cookie is signed, but the recipient may have been withdrawn
+	// since it was issued.
+	if _, err := s.deps.Shares.ResolveRecipient(r.Context(), sh, email); err != nil {
+		return ""
+	}
+	return email
 }

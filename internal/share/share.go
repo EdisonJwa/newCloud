@@ -366,33 +366,15 @@ func (s *Service) VerifyPassword(ctx context.Context, sh store.Share, password s
 	return nil
 }
 
-// RecordDownload counts a successful download and audits it.
+// RecordDownload was removed.
 //
-// The count is incremented first: if the cap is already reached the increment
-// fails and the caller must not start streaming. Doing it the other way round
-// would let the bytes leave before we discover there was no allowance left.
-func (s *Service) RecordDownload(ctx context.Context, sh store.Share, meta DownloadMeta) error {
-	return s.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
-		if err := tx.IncrementDownload(ctx, sh.ID); err != nil {
-			return err
-		}
-		bytes := meta.Bytes
-		return tx.Audit(ctx, store.AuditEntry{
-			ActorKind: meta.ActorKind, ActorUserID: meta.ActorUserID,
-			ActorEmail: meta.ActorEmail, ActorIP: meta.ActorIP,
-			UserAgent: meta.UserAgent,
-			Action:    "share.download", TargetKind: "share", TargetID: sh.ID.String(),
-			ShareID: &sh.ID, Result: "ok", Bytes: &bytes,
-			Metadata: map[string]any{
-				"name":       meta.Name,
-				"node_id":    sh.NodeID.String(),
-				"recipient":  meta.Recipient,
-				"share_kind": string(sh.Kind),
-			},
-		})
-	})
-}
-
+// It incremented the share's download counter and wrote the share.download audit row, and it had no
+// production caller: downloads are charged through the session API (AuthorizeDownload), which is what
+// makes Range requests and resumed transfers cost one download instead of many. Because the method
+// still existed and was tested, share.download looked emitted — the vocabulary scan saw the string
+// literal in this file — while in production NOTHING wrote the event, and a public link could serve
+// files with no audit trail at all. Deleting it is part of the fix: the event is now written by the
+// handler, inside the transaction that charges the download.
 // RecordUpload counts an accepted upload and audits it.
 func (s *Service) RecordUpload(ctx context.Context, sh store.Share, meta DownloadMeta) error {
 	return s.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {

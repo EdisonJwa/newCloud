@@ -18,6 +18,7 @@ import (
 	"testing"
 
 	"github.com/EdisonJwa/newCloud/internal/auth"
+	"github.com/EdisonJwa/newCloud/internal/store"
 )
 
 // TestRevokedAppPasswordStopsWorkingImmediately is the WebDAV half.
@@ -115,4 +116,68 @@ func firstShareID(t *testing.T, payload string) string {
 		t.Fatalf("malformed share id in %s", payload)
 	}
 	return rest[:j]
+}
+
+// TestShareDownloadIsAuditedOncePerLogicalDownload is §10.1 for the anonymous case.
+//
+// share.download was declared, had a method that wrote it, had tests for that method — and that
+// method had no caller. So a public link served file content to anonymous visitors with no audit
+// row at all, while the vocabulary said otherwise. The vocabulary scan could not notice: it looks for
+// the action's name in non-test source, and the name was there, in unreachable code.
+//
+// The row is written once per CHARGED download. Range requests and retries join the existing session
+// and must not add rows, or a video becomes hundreds of log entries per view and the real events
+// become unfindable.
+func TestShareDownloadIsAuditedOncePerLogicalDownload(t *testing.T) {
+	h := newHarness(t)
+	token := shareToken(t, h)
+
+	audits := func() []store.AuditEntry {
+		t.Helper()
+		var out []store.AuditEntry
+		for _, e := range h.meta.AuditLog() {
+			if e.Action == "share.download" {
+				out = append(out, e)
+			}
+		}
+		return out
+	}
+	if n := len(audits()); n != 0 {
+		t.Fatalf("the fixture already has %d share.download rows", n)
+	}
+
+	first := h.do(http.MethodGet, "/s/"+token+"/download", nil, nil)
+	body := readBody(first)
+	first.Body.Close()
+	if first.StatusCode != http.StatusOK {
+		t.Fatalf("download: %d %s", first.StatusCode, body)
+	}
+	rows := audits()
+	if len(rows) != 1 {
+		t.Fatalf("an anonymous download through a public link wrote %d audit rows, want 1. "+
+			"Without this row nobody can answer who took the file.", len(rows))
+	}
+	if rows[0].ShareID == nil {
+		t.Fatal("the audit row does not identify the share")
+	}
+	if rows[0].ActorKind == "" || rows[0].ActorIP == "" {
+		t.Fatalf("the row must record who and from where, got kind=%q ip=%q",
+			rows[0].ActorKind, rows[0].ActorIP)
+	}
+
+	// A Range request continues the same paid download and must not be charged — or recorded — again.
+	req, err := http.NewRequest(http.MethodGet, h.srv.URL+"/s/"+token+"/download", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Range", "bytes=0-1")
+	rng, err := h.srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rng.Body.Close()
+	if n := len(audits()); n != 1 {
+		t.Fatalf("a Range continuation added an audit row (%d total). One playback is one "+
+			"download; recording every range buries the events that matter.", n)
+	}
 }

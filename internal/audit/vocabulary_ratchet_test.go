@@ -125,7 +125,12 @@ func emittedActions(t *testing.T, root string) map[string]bool {
 		if rerr != nil {
 			return rerr
 		}
-		text := string(body)
+		// Comments are stripped before matching. A mention of an action in prose is not an
+		// emitter, and counting one makes this ratchet report coverage where there is none —
+		// which is exactly how share.download looked wired while the only emitter was a method
+		// nothing called. The scan still cannot see reachability; it can at least insist that the
+		// reference is code.
+		text := stripComments(string(body))
 		for value, name := range declared {
 			if strings.Contains(text, `"`+value+`"`) || strings.Contains(text, name) {
 				used[value] = true
@@ -182,4 +187,32 @@ func TestEveryDeclaredAuditActionIsEmittedOrCounted(t *testing.T) {
 		t.Fatalf("these actions now have an emitter but are still listed as unemitted:\n  %s\n\n"+
 			"Delete them from knownUnemitted so the count stays true.", strings.Join(stale, "\n  "))
 	}
+}
+
+// stripComments removes line and block comments so a prose mention is not mistaken for an emitter.
+//
+// Deliberately lexical rather than go/ast: this guard reads source it did not compile, and a parse
+// error in an unrelated file must not make the check fail for the wrong reason.
+func stripComments(src string) string {
+	var out strings.Builder
+	out.Grow(len(src))
+	for i := 0; i < len(src); i++ {
+		if i+1 < len(src) && src[i] == '/' && src[i+1] == '/' {
+			for i < len(src) && src[i] != '\n' {
+				i++
+			}
+			out.WriteByte('\n')
+			continue
+		}
+		if i+1 < len(src) && src[i] == '/' && src[i+1] == '*' {
+			i += 2
+			for i+1 < len(src) && !(src[i] == '*' && src[i+1] == '/') {
+				i++
+			}
+			i++
+			continue
+		}
+		out.WriteByte(src[i])
+	}
+	return out.String()
 }
