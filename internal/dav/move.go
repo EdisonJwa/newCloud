@@ -208,8 +208,16 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request, a authz
 		writeXMLError(w, http.StatusBadRequest, "")
 		return
 	}
-	// Destination is an absolute URL; only the path is meaningful here, and a
-	// different host would be an SSRF vector.
+	// Destination may be an absolute URL. Only the path is used, but the HOST is checked:
+	// destinationHostMatches was written for this, documented as "checked by the caller", and no
+	// caller ever checked it — so a MOVE or COPY naming another server was silently applied
+	// locally instead of being refused. RFC 4918 §9.8.5 is explicit that a destination on another
+	// server is 502 Bad Gateway, and the check also keeps a client from believing the bytes went
+	// somewhere they did not.
+	if !destinationHostMatches(destPath, h.cfg.Server.PublicURL) {
+		writeXMLError(w, http.StatusBadGateway, "")
+		return
+	}
 	if u, perr := parseDestination(destPath); perr != nil {
 		writeXMLError(w, http.StatusBadRequest, "")
 		return

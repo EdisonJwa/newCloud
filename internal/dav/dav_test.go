@@ -1207,3 +1207,39 @@ func TestProppatchReportsStorageFailure(t *testing.T) {
 		t.Fatalf("the failed property must be reported with a failure status:\n%s", out)
 	}
 }
+
+// TestMoveAndCopyRefuseAForeignDestinationHost is RFC 4918 §9.8.5 and the check that never ran.
+//
+// destinationHostMatches was written for exactly this, documented as "checked by the caller", and
+// no caller checked it. A MOVE or COPY naming another server was therefore applied locally: the
+// path was used and the host ignored. Nothing left the server, so this was never an SSRF, but the
+// client was told its file moved somewhere it had not, and the code claimed a defence it did not
+// have — which is the part worth fixing.
+func TestMoveAndCopyRefuseAForeignDestinationHost(t *testing.T) {
+	e := newEnv(t)
+	e.do(t, http.MethodPut, e.davPath("src.txt"), strings.NewReader("bytes"), nil)
+
+	for _, method := range []string{"MOVE", "COPY"} {
+		rec := e.do(t, method, e.davPath("src.txt"), nil, map[string]string{
+			"Destination": "https://elsewhere.example/dav/alice/dst.txt",
+		})
+		if rec.Code != http.StatusBadGateway {
+			t.Fatalf("%s with a foreign destination host returned %d, want 502: %s",
+				method, rec.Code, rec.Body.String())
+		}
+		// And nothing was done locally under the destination name.
+		probe := e.do(t, http.MethodGet, e.davPath("dst.txt"), nil, nil)
+		if probe.Code == http.StatusOK {
+			t.Fatalf("%s applied the move locally despite refusing the host", method)
+		}
+	}
+
+	// The same request with this server's own host still works, so the check is a check and not a
+	// wall.
+	ok := e.do(t, "COPY", e.davPath("src.txt"), nil, map[string]string{
+		"Destination": "https://cloud.example.test/dav/alice/dst.txt",
+	})
+	if ok.Code != http.StatusCreated {
+		t.Fatalf("COPY to this server's own host returned %d, want 201", ok.Code)
+	}
+}
