@@ -25,6 +25,7 @@ import (
 
 	"github.com/EdisonJwa/newCloud/internal/auth"
 	"github.com/EdisonJwa/newCloud/internal/authz"
+	"github.com/EdisonJwa/newCloud/internal/blob"
 	"github.com/EdisonJwa/newCloud/internal/config"
 	"github.com/EdisonJwa/newCloud/internal/dav"
 	"github.com/EdisonJwa/newCloud/internal/mail"
@@ -42,9 +43,15 @@ import (
 // than reaching for globals keeps the wiring visible in one place (cmd/newcloud)
 // and makes the handler testable with fakes.
 type Deps struct {
-	Config   config.Config
-	Meta     store.Store
-	Content  layout.ContentStore
+	Config  config.Config
+	Meta    store.Store
+	Content layout.ContentStore
+	// Blobs is the content-addressed store, set only for the blob layout. Reading a HISTORICAL
+	// version needs an address, not a path: the node's path resolves to the current bytes, so the
+	// path-addressing ContentStore cannot serve an old one. Nil means this deployment's layout
+	// keeps no addressable history, and the version-content endpoint says so rather than serving
+	// the wrong bytes.
+	Blobs    blob.Store
 	Authz    *authz.Service
 	Tickets  *ticket.Issuer
 	Sessions *auth.Sessions
@@ -208,6 +215,9 @@ func (s *Server) Handler() http.Handler {
 					r.Delete("/{id}", s.handleUploadAbort)
 				})
 				r.Get("/versions", s.handleVersions)
+				// Historical content: §8.1 lists 版本下载 among the entry points that must follow the same
+				// authorization as everything else.
+				r.Get("/version", s.handleVersionContent)
 				r.Post("/restore-version", s.handleRestoreVersion)
 			})
 

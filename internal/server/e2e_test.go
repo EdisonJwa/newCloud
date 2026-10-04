@@ -169,7 +169,7 @@ func newHarnessTuned(t *testing.T, mutate func(*config.Config), tune func(*serve
 
 	authorizer := authz.NewService(&accessor{m: meta})
 	deps := server.Deps{
-		Config: cfg, Meta: meta, Content: content,
+		Config: cfg, Meta: meta, Content: content, Blobs: blobs,
 		Authz:   authorizer,
 		Tickets: tickets, Sessions: sessions,
 		AppPass: auth.NewAppPasswords(meta),

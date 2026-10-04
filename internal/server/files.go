@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/EdisonJwa/newCloud/internal/authz"
+	"github.com/EdisonJwa/newCloud/internal/blob"
 	"github.com/EdisonJwa/newCloud/internal/storage/layout"
 	"github.com/EdisonJwa/newCloud/internal/store"
 )
@@ -1223,4 +1224,155 @@ func (s *Server) moveContentByPath(ctx context.Context, owner, from, to string, 
 	return s.deps.Content.Move(ctx,
 		layout.Node{Owner: owner, Path: from, IsDir: isDir},
 		layout.Node{Owner: owner, Path: to, IsDir: isDir})
+}
+
+// handleVersionContent serves the bytes of one historical version.
+//
+// §8.1 lists 版本下载 among the entry points that must share the permission model, and it did not
+// exist: the API could list a version and restore it, but not hand back the bytes. That made "the
+// version history" a list of promises — an auditor could see that v3 existed and could not check
+// what it contained.
+//
+// The read is by CONTENT ADDRESS, not by path: a path resolves to the node's CURRENT bytes, so
+// serving a path would quietly return the wrong content under the right label. That is why this needs
+// the blob store and refuses when the layout does not keep addressable history.
+func (s *Server) handleVersionContent(w http.ResponseWriter, r *http.Request) {
+	actor, _ := actorFrom(r.Context())
+	rel := r.URL.Query().Get("path")
+	no, err := strconv.Atoi(r.URL.Query().Get("version"))
+	if err != nil || no <= 0 {
+		writeError(w, http.StatusBadRequest, "bad_version", "a positive version number is required")
+		return
+	}
+
+	// Two ways to name the file, exactly as the thumbnail endpoint has: `path` for the caller's own
+	// namespace, `id` for a node somebody shared through an ACL. Without `id` the permission check
+	// below is decorative — resolving by path can only ever find the caller's own files, where they
+	// hold every right — and version history for a shared file would be unreachable while the
+	// listing, download and WebDAV paths all honoured the grant.
+	node, rel, err := s.nodeForVersionContent(r, actor, rel)
+	if err != nil {
+		s.writeStoreError(w, err)
+		return
+	}
+	if node.IsDir() {
+		writeError(w, http.StatusBadRequest, "is_directory", "a directory has no versions")
+		return
+	}
+
+	// The same capability the version LIST requires: reading a version's bytes is a strictly
+	// stronger act than seeing that it exists.
+	cap, err := s.deps.Authz.Authorize(actor, node.ID)
+	if err != nil {
+		s.writeStoreError(w, err)
+		return
+	}
+	if !cap.Can(authz.PermReadVersions) {
+		writeError(w, http.StatusNotFound, "not_found", "no such file")
+		return
+	}
+
+	var version store.Version
+	found := false
+	err = s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
+		// A generous window rather than a new store method: history is bounded by the version
+		// limit the deployment sets, and the alternative is a new Tx method on both backends.
+		versions, verr := tx.Versions(ctx, node.ID, 1000)
+		if verr != nil {
+			return verr
+		}
+		for _, v := range versions {
+			if v.VersionNo == no {
+				version = v
+				found = true
+				break
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		s.writeStoreError(w, err)
+		return
+	}
+	if !found {
+		writeError(w, http.StatusNotFound, "not_found", "no such version")
+		return
+	}
+
+	if s.deps.Blobs == nil {
+		// The tree layout stores one copy per version at a path, not an address, so there is
+		// nothing to open here. Saying so is better than streaming the current bytes.
+		writeError(w, http.StatusConflict, "no_version_content",
+			"this storage layout does not keep addressable version history")
+		return
+	}
+	if len(version.SHA256) != sha256.Size {
+		writeError(w, http.StatusConflict, "no_version_content",
+			"this version has no content address, so its bytes cannot be located")
+		return
+	}
+
+	var hash blob.Hash
+	copy(hash[:], version.SHA256)
+	rc, err := s.deps.Blobs.Open(r.Context(), hash)
+	if err != nil {
+		s.writeStoreError(w, err)
+		return
+	}
+	defer rc.Close()
+
+	// §10.1: reading a historical version is access to file content, and it is audited like any
+	// other read. After the reader is open, so a missing object is not recorded as a read.
+	_ = s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
+		return tx.Audit(ctx, store.AuditEntry{
+			ActorKind: "user", ActorUserID: actor.Ptr(), ActorEmail: actor.Email(),
+			ActorIP: clientIP(r), UserAgent: r.UserAgent(),
+			Action: "file.version.read", TargetKind: "node", TargetID: node.ID.String(),
+			Result: "ok",
+			Metadata: map[string]any{
+				"name":    node.Name,
+				"version": no,
+				"sha256":  hex.EncodeToString(version.SHA256),
+			},
+		})
+	})
+
+	w.Header().Set("Content-Type", contentTypeFor(node))
+	w.Header().Set("Content-Disposition", contentDisposition(node.Name))
+	w.Header().Set("X-Robots-Tag", "noindex, nofollow, noarchive")
+	// An old version never changes, so it can be cached for as long as anything can.
+	w.Header().Set("Cache-Control", "private, max-age=31536000, immutable")
+	http.ServeContent(w, r, node.Name, version.CreatedAt, rc)
+}
+
+// nodeForVersionContent resolves the file a version read is about, and its path under the OWNER.
+func (s *Server) nodeForVersionContent(r *http.Request, actor authz.Actor,
+	rel string) (store.Node, string, error) {
+	if id := r.URL.Query().Get("id"); id != "" {
+		nodeID, err := uuid.Parse(id)
+		if err != nil {
+			return store.Node{}, "", store.ErrNotFound
+		}
+		var node store.Node
+		if err := s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
+			n, nerr := tx.Node(ctx, nodeID)
+			node = n
+			return nerr
+		}); err != nil {
+			return store.Node{}, "", err
+		}
+		if node.TrashedAt != nil {
+			return store.Node{}, "", store.ErrNotFound
+		}
+		path, perr := s.pathOfNode(r.Context(), node.OwnerID, node.ID)
+		if perr != nil {
+			return store.Node{}, "", perr
+		}
+		return node, path, nil
+	}
+	nodes, err := s.deps.Meta.Resolve(r.Context(), actor.ID(), rel)
+	if err != nil {
+		return store.Node{}, "", err
+	}
+	return nodes[len(nodes)-1], rel, nil
 }

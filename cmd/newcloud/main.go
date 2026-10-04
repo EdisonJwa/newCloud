@@ -314,9 +314,12 @@ func serve() error {
 	reg := metrics.New()
 
 	deps := server.Deps{
-		Config:    cfg,
-		Meta:      meta,
-		Content:   content,
+		Config:  cfg,
+		Meta:    meta,
+		Content: content,
+		// Set for the addressable layout only: reading a historical version needs an address,
+		// and openStorage returns nil here for the tree layout.
+		Blobs:     blobStore,
 		Authz:     authz.NewService(&authzAccessor{m: meta}),
 		Tickets:   tickets,
 		Sessions:  auth.NewSessions(tickets, meta, cfg.Auth.SessionTTL),
