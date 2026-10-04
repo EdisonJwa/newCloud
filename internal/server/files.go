@@ -1001,12 +1001,15 @@ func (s *Server) handleVersions(w http.ResponseWriter, r *http.Request) {
 	actor, _ := actorFrom(r.Context())
 	rel := r.URL.Query().Get("path")
 
-	nodes, err := s.deps.Meta.Resolve(r.Context(), actor.ID(), rel)
+	// ?id= as well as ?path=, for the same reason the version-content route takes it: a path can
+	// only ever name the caller's own files, so a shared file's history was unlistable even though
+	// its bytes became readable. A caller who is granted version history needs to know WHICH
+	// versions exist before asking for one.
+	node, _, err := s.nodeForVersionContent(r, actor, rel)
 	if err != nil {
 		s.writeStoreError(w, err)
 		return
 	}
-	node := nodes[len(nodes)-1]
 
 	cap, err := s.deps.Authz.Authorize(actor, node.ID)
 	if err != nil {

@@ -9,6 +9,7 @@ package server_test
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/EdisonJwa/newCloud/internal/store"
@@ -144,5 +145,18 @@ func TestSharedFileVersionsNeedTheVersionRight(t *testing.T) {
 	h.grantOn(t, node.ID, viewer.ID, store.PermRead|store.PermReadVersions, false)
 	if code := get(); code != http.StatusOK {
 		t.Fatalf("a grant that includes version history was refused (%d)", code)
+	}
+
+	// And the LIST is reachable too. Reading version 1 is useless if the client cannot learn that
+	// version 1 exists: the list is how a caller discovers the numbers this endpoint takes.
+	listResp := h.adminGet(t, client, "/api/files/versions?id="+node.ID.String())
+	listBody := readBody(listResp)
+	code := listResp.StatusCode
+	listResp.Body.Close()
+	if code != http.StatusOK {
+		t.Fatalf("the granted viewer cannot list versions (%d): %s", code, listBody)
+	}
+	if !strings.Contains(listBody, `"version":1`) {
+		t.Fatalf("the version list does not name version 1: %s", listBody)
 	}
 }
