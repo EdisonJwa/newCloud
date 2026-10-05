@@ -111,18 +111,28 @@ func (w *Worker) ScrubBlobs(ctx context.Context, store BlobReader, limit int) (S
 			res.Corrupt = append(res.Corrupt, CorruptBlob{Hash: bh, Actual: actual, Size: n})
 		}
 	}
+	// Advance past this batch, and wrap when it came back short: a short page means the keyspace
+	// ended, so the next pass starts over rather than stopping there forever.
+	if len(hashes) > 0 {
+		w.scrubCursor = hashes[len(hashes)-1]
+		if len(hashes) < limit {
+			w.scrubCursor = [32]byte{}
+		}
+	}
 	return res, nil
 }
 
-// sampleBlobHashes returns up to limit distinct content hashes from the metadata.
+// sampleBlobHashes returns up to limit content hashes, continuing from the last pass.
 //
-// Ordered by id so successive passes with a growing offset would walk the keyspace; for now the
-// order is stable and the set is the first `limit` rows, which is enough to be repeatable and to
-// cover a store smaller than the limit entirely.
+// The cursor is what makes the scrub cover the store. Ordering by insertion and taking the first
+// `limit` rows meant a deployment with more blobs than that verified the SAME oldest subset on every
+// pass and never looked at anything newer — including content written minutes ago, which is the most
+// likely to be damaged. The cursor advances past each batch and wraps when a pass comes back short,
+// so every blob is verified eventually and no blob is verified twice while others wait.
 func (w *Worker) sampleBlobHashes(ctx context.Context, limit int) ([][32]byte, error) {
 	var out [][32]byte
 	err := w.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
-		rows, err := tx.SampleBlobHashes(ctx, limit)
+		rows, err := tx.SampleBlobHashes(ctx, w.scrubCursor, limit)
 		if err != nil {
 			return err
 		}

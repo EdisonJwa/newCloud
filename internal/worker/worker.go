@@ -31,6 +31,9 @@ type Worker struct {
 	// reading of "unset" — defaulting to "everything" would make enabling it a surprise full read
 	// of the store.
 	scrubLimit int
+	// scrubCursor is where the previous pass stopped. It is what makes the scrub cover the whole
+	// store over time instead of re-verifying the same first rows forever.
+	scrubCursor [32]byte
 	// scrubInterval is how often a pass runs. Separate from the sweep because the two have
 	// different costs and different urgency: the sweep reclaims unreferenced bytes and can wait
 	// six hours, while a corrupted blob is a file a user cannot open, and finding it within the

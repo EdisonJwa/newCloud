@@ -291,3 +291,43 @@ func TestPruneRateLimitRowsActuallyRuns(t *testing.T) {
 }
 
 func int64ptr(v int64) *int64 { return &v }
+
+// recordingReader remembers which blobs a scrub pass actually opened.
+type recordingReader struct {
+	blob.Store
+	seen map[blob.Hash]bool
+}
+
+func (r *recordingReader) Open(ctx context.Context, h blob.Hash) (io.ReadSeekCloser, error) {
+	r.seen[h] = true
+	return r.Store.Open(ctx, h)
+}
+
+// TestScrubRotatesThroughTheStore is the property the cursor exists for.
+//
+// Before it, each pass verified the first `limit` blobs by insertion order and nothing else, so a
+// deployment with more blobs than the limit checked the same oldest subset forever and never looked
+// at content written since — the content most likely to be damaged.
+//
+// The assertion counts DISTINCT blobs opened, not checks: an earlier version summed the per-pass
+// counters and passed with the cursor pinned to zero, because two passes over the same two blobs
+// still add up to four checks. Counting what was read is what makes the test about coverage.
+func TestScrubRotatesThroughTheStore(t *testing.T) {
+	f := newScrubFixture(t)
+	for i := 0; i < 6; i++ {
+		f.put(t, []byte{byte('a' + i)})
+	}
+
+	rec := &recordingReader{Store: f.store, seen: map[blob.Hash]bool{}}
+	for pass := 0; pass < 2; pass++ {
+		if _, err := f.worker.ScrubBlobs(context.Background(), rec, 2); err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+	}
+
+	if len(rec.seen) < 3 {
+		t.Fatalf("two passes of two opened only %d distinct blobs. The same rows are being "+
+			"re-read and the rest of the store is never verified, which is what the cursor was "+
+			"added to stop.", len(rec.seen))
+	}
+}

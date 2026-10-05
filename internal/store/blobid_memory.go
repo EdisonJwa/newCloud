@@ -1,7 +1,9 @@
 package store
 
 import (
+	"bytes"
 	"context"
+	"sort"
 
 	"github.com/google/uuid"
 )
@@ -79,18 +81,21 @@ func (t *memTx) BlobHash(ctx context.Context, id uuid.UUID) ([]byte, error) {
 }
 
 // SampleBlobHashes returns up to limit content addresses from the in-memory blobs.
-func (t *memTx) SampleBlobHashes(ctx context.Context, limit int) ([][32]byte, error) {
+func (t *memTx) SampleBlobHashes(ctx context.Context, after [32]byte, limit int) ([][32]byte, error) {
 	if limit <= 0 {
 		return nil, nil
 	}
 	// The memory store indexes content addresses in blobIDs, which is the map the scrub needs:
-	// the keys ARE the hashes.
-	var out [][32]byte
+	// the keys ARE the hashes. Sorted, so the cursor means the same thing it does in SQL.
+	keys := make([][32]byte, 0, len(t.m.blobIDs))
 	for h := range t.m.blobIDs {
-		if len(out) >= limit {
-			break
+		if bytes.Compare(h[:], after[:]) > 0 || after == ([32]byte{}) {
+			keys = append(keys, h)
 		}
-		out = append(out, h)
 	}
-	return out, nil
+	sort.Slice(keys, func(i, j int) bool { return bytes.Compare(keys[i][:], keys[j][:]) < 0 })
+	if len(keys) > limit {
+		keys = keys[:limit]
+	}
+	return keys, nil
 }

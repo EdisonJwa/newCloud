@@ -233,6 +233,14 @@ func (s *Server) Handler() http.Handler {
 			// Account administration. Approving a JIT-provisioned account is the
 			// remedy the provisioning policy names, and until this existed the policy
 			// had no way out of the state it created.
+			// Groups: the surface that made group sharing (SHARE-08) reachable at all. The store,
+			// the authorizer and the ACL API all supported groups already; nothing could create
+			// one or put anybody in it.
+			r.Route("/admin/groups", func(r chi.Router) {
+				r.Post("/", s.handleAdminCreateGroup)
+				r.Post("/{id}/members", s.handleAdminAddGroupMember)
+				r.Delete("/{id}/members/{userID}", s.handleAdminRemoveGroupMember)
+			})
 			r.Route("/admin/users", func(r chi.Router) {
 				r.Get("/", s.handleAdminUsers)
 				r.Post("/{id}/status", s.handleAdminSetUserStatus)

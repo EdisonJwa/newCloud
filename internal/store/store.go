@@ -288,12 +288,20 @@ type Tx interface {
 	// BlobHash returns the content address recorded for a blob, for verification that does
 	// not trust either copy on disk.
 	BlobHash(ctx context.Context, id uuid.UUID) ([]byte, error)
-	// SampleBlobHashes returns up to limit content addresses, for an integrity scrub.
+	// SampleBlobHashes returns up to limit content addresses ordered after `after`, for an integrity
+	// scrub.
 	//
 	// It reads the metadata rather than the storage directory because the metadata is what knows
 	// which blobs are SUPPOSED to exist — a directory scan verifies exactly the blobs that are
 	// easy to find and misses a row whose bytes are gone.
-	SampleBlobHashes(ctx context.Context, limit int) ([][32]byte, error)
+	//
+	// The cursor is what makes the scrub COVER the store. The previous signature returned the first
+	// `limit` rows by insertion order, so a deployment with more blobs than the limit verified the
+	// same oldest subset on every pass and never looked at anything newer — including freshly
+	// written content, which is the most likely to be damaged. A zero `after` starts from the
+	// beginning; the caller passes the last hash it received to continue, and starts over when a
+	// pass returns fewer than `limit`.
+	SampleBlobHashes(ctx context.Context, after [32]byte, limit int) ([][32]byte, error)
 
 	// AuthorizeDownload opens or joins the download session for a shared file,
 	// charging the share at most once per logical download.

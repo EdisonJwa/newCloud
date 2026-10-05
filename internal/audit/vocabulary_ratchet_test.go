@@ -38,7 +38,6 @@ var knownUnemitted = []string{
 	"admin.privileged_read",
 	"admin.setting.change",
 	"file.download_zip",
-	"group.member.change",
 	"security.anomaly",
 	"share.view",
 	"user.quota.change",

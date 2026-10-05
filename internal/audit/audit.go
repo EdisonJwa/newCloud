@@ -83,8 +83,10 @@ const (
 	ActionUserDisable       Action = "user.disable"
 	ActionUserQuotaChange   Action = "user.quota.change"
 	ActionGroupMemberChange Action = "group.member.change"
-	ActionSettingChange     Action = "admin.setting.change"
-	ActionAuditExport       Action = "audit.export"
+	// ActionGroupCreate is the group appearing, as opposed to somebody joining it.
+	ActionGroupCreate   Action = "group.create"
+	ActionSettingChange Action = "admin.setting.change"
+	ActionAuditExport   Action = "audit.export"
 	// ActionAuditVerifyFailure records that the audit log failed its own integrity check.
 	//
 	// §10.1 requires 审计校验失败. It was a LOG LINE only, which is the one place a record of

@@ -320,6 +320,20 @@ func TestIDORIsRefusedOnEveryRouteThatTakesAnID(t *testing.T) {
 			},
 		},
 		{
+			name:   "non-admin adding a group member",
+			method: http.MethodPost,
+			// A group id that need not exist: requireAdmin runs before the lookup, so the refusal
+			// proves the gate rather than the 404 an unknown id would give anyway.
+			path: func(v *idorVictim) string {
+				return "/api/admin/groups/" + uuid.New().String() + "/members"
+			},
+			body: func() io.Reader {
+				b, _ := json.Marshal(map[string]string{"username": "intruder"})
+				return bytes.NewReader(b)
+			},
+			secrets: func(v *idorVictim) []string { return priv },
+		},
+		{
 			name:   "non-admin disabling an account",
 			method: http.MethodPost,
 			path:   func(v *idorVictim) string { return "/api/admin/users/" + v.user.ID.String() + "/status" },
@@ -395,6 +409,7 @@ func TestIDORTableCoversEveryIdRoute(t *testing.T) {
 		"DELETE /api/files/uploads/{id}":        true,
 		"GET /api/admin/users":                  true,
 		"POST /api/admin/users/{id}/status":     true,
+		"POST /api/admin/groups/{id}/members":   true,
 	}
 
 	// Id-addressed routes deliberately not in the table, each with the reason. An exemption has
@@ -404,6 +419,8 @@ func TestIDORTableCoversEveryIdRoute(t *testing.T) {
 		"DELETE /api/admin/users/{id}": "admin-only; the non-admin listing and status cases " +
 			"prove the gate rejects a non-admin, and a second case would test the same gate",
 		"DELETE /api/acl/{id}": "covered by TestACLRevokeRejectsForeignGrant",
+		"DELETE /api/admin/groups/{id}/members/{userID}": "admin-only; the member-add case above " +
+			"proves the gate rejects a non-admin, and the removal runs behind the same check",
 	}
 
 	h := newHarness(t)

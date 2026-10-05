@@ -78,12 +78,19 @@ func (t *pgTx) BlobHash(ctx context.Context, id uuid.UUID) ([]byte, error) {
 }
 
 // SampleBlobHashes returns up to limit content addresses from the blobs table.
-func (t *pgTx) SampleBlobHashes(ctx context.Context, limit int) ([][32]byte, error) {
+func (t *pgTx) SampleBlobHashes(ctx context.Context, after [32]byte, limit int) ([][32]byte, error) {
 	if limit <= 0 {
 		return nil, nil
 	}
-	const q = `SELECT sha256 FROM blobs ORDER BY id LIMIT $1`
-	rows, err := t.tx.Query(ctx, q, limit)
+	// Keyset pagination, not OFFSET: the unique index on sha256 makes `sha256 > $1` a range scan,
+	// so each pass costs what it returns rather than scanning everything before the cursor.
+	const q = `SELECT sha256 FROM blobs WHERE $1::bytea IS NULL OR sha256 > $1::bytea
+	           ORDER BY sha256 LIMIT $2`
+	var cursor any
+	if after != ([32]byte{}) {
+		cursor = after[:]
+	}
+	rows, err := t.tx.Query(ctx, q, cursor, limit)
 	if err != nil {
 		return nil, translate(err)
 	}

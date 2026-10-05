@@ -12,6 +12,7 @@
 package storetest
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net"
@@ -5337,26 +5338,21 @@ func blobIdentitySuite(t *testing.T, factory func(t *testing.T) (store.Store, uu
 		}
 	})
 
-	t.Run("SampleBlobHashesReturnsDistinctAddresses", func(t *testing.T) {
+	t.Run("SampleBlobHashesWalksTheWholeStore", func(t *testing.T) {
 		s, owner := factory(t)
 		r := rootOf(t, s, owner)
 
-		// SampleBlobHashes reads the WHOLE blobs table, not this case's fixture — the table is
-		// global and other cases leave rows in it. So the assertions below are about the shape of
-		// the result (distinct, bounded) and about whether this case's content appears, not about
-		// an absolute count. Assuming a clean table is the fixture-shape mistake this suite has
-		// now produced three times.
-		//
-		// BlobIDFor is resolved BEFORE the transaction opens. It takes a lock of its own on
-		// PostgreSQL, so calling it inside WithTx deadlocks — and the in-memory store refuses
-		// nested transactions outright. The suite hung for a minute rather than failing, which is
-		// why this comment is worth its length.
-		contents := [][32]byte{{1}, {2}, {1}}
+		// The blobs table is global and other cases leave rows in it, so nothing here may assume a
+		// clean table. What IS asserted is the property the scrub depends on: successive calls with
+		// the cursor returned walk forward through the keyspace without repeating an address, and a
+		// short page means the walk is over.
+		contents := [][32]byte{{1}, {2}, {3}}
 		ids := make([]uuid.UUID, len(contents))
 		for i, h := range contents {
+			// Resolved BEFORE the transaction: BlobIDFor takes its own lock on PostgreSQL, and
+			// the in-memory store refuses nested transactions outright.
 			ids[i] = s.BlobIDFor(context.Background(), h, 1)
 		}
-
 		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
 			for i, h := range contents {
 				name := "s" + string(rune('a'+i)) + ".bin"
@@ -5373,43 +5369,58 @@ func blobIdentitySuite(t *testing.T, factory func(t *testing.T) (store.Store, uu
 			t.Fatalf("seed: %v", err)
 		}
 
-		var got [][32]byte
-		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
-			h, err := tx.SampleBlobHashes(ctx, 100)
-			got = h
-			return err
-		}); err != nil {
-			t.Fatalf("sample: %v", err)
-		}
-		// Distinct: the same address must not be returned twice, or the scrub would read one blob
-		// repeatedly while others went unverified.
-		seen := map[[32]byte]bool{}
-		for _, h := range got {
-			if seen[h] {
-				t.Fatalf("the sample returned the same address twice (%x)", h[:4])
+		sample := func(after [32]byte, limit int) [][32]byte {
+			t.Helper()
+			var got [][32]byte
+			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				h, err := tx.SampleBlobHashes(ctx, after, limit)
+				got = h
+				return err
+			}); err != nil {
+				t.Fatalf("sample: %v", err)
 			}
-			seen[h] = true
+			if len(got) > limit {
+				t.Fatalf("sample with limit %d returned %d addresses; the scrub's cost model is "+
+					"built on this bound", limit, len(got))
+			}
+			return got
 		}
-		// And this case's two distinct contents both appear, so the sample is not filtering them
-		// out for a reason of its own.
-		want := [][32]byte{{1}, {2}}
-		for _, w := range want {
-			if !seen[w] {
-				t.Fatalf("the sample is missing content %x that this case created", w[:4])
+
+		// Walk from the beginning in pages of two, collecting everything, and require strict
+		// forward progress with no repeats. The old contract returned the first `limit` rows by
+		// insertion order on EVERY call, so a store larger than the limit was only ever verified at
+		// its oldest end and freshly written content was never checked.
+		var cursor [32]byte
+		seen := map[[32]byte]bool{}
+		pages := 0
+		for {
+			page := sample(cursor, 2)
+			pages++
+			if pages > 1000 {
+				t.Fatal("the walk did not terminate; the cursor is not advancing")
+			}
+			for _, h := range page {
+				if seen[h] {
+					t.Fatalf("the walk returned %x twice; the scrub would re-read one blob while "+
+						"another went unverified", h[:4])
+				}
+				seen[h] = true
+				if bytes.Compare(h[:], cursor[:]) <= 0 && cursor != ([32]byte{}) {
+					t.Fatalf("the walk went backwards: %x after %x", h[:4], cursor[:4])
+				}
+				cursor = h
+			}
+			if len(page) < 2 {
+				break // short page: the keyspace ended
 			}
 		}
 
-		// The limit must bound the pass: the scrub's whole cost model is "read at most N blobs per
-		// cycle", so a sampler that ignored the limit would turn it into a full read of the store.
-		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
-			h, err := tx.SampleBlobHashes(ctx, 1)
-			got = h
-			return err
-		}); err != nil {
-			t.Fatal(err)
-		}
-		if len(got) > 1 {
-			t.Fatalf("sample with limit 1 returned %d addresses", len(got))
+		// This case's two contents are somewhere in that walk, which proves the walk covers rows
+		// that were not the first inserted.
+		for _, want := range [][32]byte{{1}, {2}, {3}} {
+			if !seen[want] {
+				t.Fatalf("the walk never reached %x, which this case created", want[:4])
+			}
 		}
 	})
 }
