@@ -225,6 +225,31 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 			return rerr
 		}
 
+		// §10.1: the creation of an account is its own event, not a property of the first login
+		// that happens to produce it.
+		//
+		// user.create was declared in the vocabulary with no emitter, and the question it answers —
+		// "when did this account appear, and by what path" — is the first one anybody asks when an
+		// unexpected account turns up. A login row mentions the account but not that it did not
+		// exist before, so it cannot answer that: the difference between "signed in" and "came into
+		// existence" is exactly what an auditor needs.
+		if !existing {
+			if aerr := tx.Audit(ctx, store.AuditEntry{
+				ActorKind: "system", ActorUserID: &u.ID, ActorEmail: u.Email,
+				ActorIP: clientIP(r), UserAgent: r.UserAgent(),
+				Action: "user.create", TargetKind: "user", TargetID: u.ID.String(),
+				Result: "ok",
+				Metadata: map[string]any{
+					"via":    "oidc",
+					"issuer": s.deps.Config.Auth.Issuer,
+					"status": string(decision.Status),
+					"role":   string(role),
+				},
+			}); aerr != nil {
+				return aerr
+			}
+		}
+
 		// The role change is its own event. A login that silently rewrote somebody's
 		// privileges would be the one change an operator could not find afterwards,
 		// and §10.1 requires role changes to be audited.

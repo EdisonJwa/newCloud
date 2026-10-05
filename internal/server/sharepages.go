@@ -520,6 +520,21 @@ func (s *Server) renderShareError(w http.ResponseWriter, r *http.Request, err er
 			"too many uploads through this link; try again shortly")
 		return
 	}
+	// The cause is hidden from the VISITOR and recorded for the OWNER.
+	//
+	// Indistinguishable responses are what keep this endpoint from being a token oracle, but the
+	// distinction is exactly what the person who published the link needs: "my link stopped
+	// working" has two very different answers — it expired, or somebody revoked it. share.expired
+	// was declared with no emitter, so the owner had no way to tell. The audit log is not a public
+	// answer surface, so recording the reason there leaks nothing.
+	if errors.Is(err, store.ErrShareExpired) {
+		s.auditShareRefusal(r, "share.expired", "anonymous")
+	}
+	// The other half of "my link stopped working": the allowance ran out. Same reasoning — hidden
+	// from the visitor, recorded for the owner, who is the only one who can raise the limit.
+	if errors.Is(err, store.ErrShareExhausted) {
+		s.auditShareRefusal(r, "share.limit_reached", "anonymous")
+	}
 	writeError(w, http.StatusNotFound, "not_found", "this link is not available")
 }
 
@@ -787,4 +802,23 @@ func (s *Server) shareRecipientEmail(r *http.Request, sh store.Share) string {
 		return ""
 	}
 	return email
+}
+
+// auditShareRefusal records why a public link refused a visitor.
+//
+// Anonymous, and best-effort in a separate transaction: the refusal has already been decided, and a
+// bookkeeping failure must not turn a 404 into a 500 the visitor can see. It is still recorded,
+// because "nobody knows this link was used" and "this link was used and refused" are different
+// states for the person who owns it.
+func (s *Server) auditShareRefusal(r *http.Request, action, actorKind string) {
+	err := s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
+		return tx.Audit(ctx, store.AuditEntry{
+			ActorKind: actorKind, ActorIP: clientIP(r), UserAgent: r.UserAgent(),
+			Action: action, TargetKind: "share", Result: "denied",
+			Metadata: map[string]any{"path": r.URL.Path},
+		})
+	})
+	if err != nil {
+		s.deps.Log.Warn("could not audit a share refusal", "action", action, "error", err)
+	}
 }

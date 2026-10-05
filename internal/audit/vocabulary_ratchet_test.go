@@ -40,10 +40,7 @@ var knownUnemitted = []string{
 	"file.download_zip",
 	"group.member.change",
 	"security.anomaly",
-	"share.expired",
-	"share.limit_reached",
 	"share.view",
-	"user.create",
 	"user.quota.change",
 }
 
