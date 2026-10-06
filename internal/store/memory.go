@@ -1141,3 +1141,16 @@ func (m *Memory) lockTx(ctx context.Context) error {
 		}
 	}
 }
+
+// SetUserQuota changes the account's byte limit in the in-memory model.
+//
+// The in-memory store keys quota by owner id, which is the same map the test helper SetQuota writes;
+// this is the transactional form, so the change commits or rolls back with the audit row that
+// records it.
+func (t *memTx) SetUserQuota(ctx context.Context, userID uuid.UUID, bytes int64) error {
+	if _, ok := t.m.users[userID]; !ok {
+		return ErrNotFound
+	}
+	t.m.quota[userID] = bytes
+	return nil
+}

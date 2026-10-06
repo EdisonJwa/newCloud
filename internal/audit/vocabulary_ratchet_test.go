@@ -39,8 +39,6 @@ var knownUnemitted = []string{
 	"admin.setting.change",
 	"file.download_zip",
 	"security.anomaly",
-	"share.view",
-	"user.quota.change",
 }
 
 // declaredActions parses the Action constants out of internal/audit/audit.go.

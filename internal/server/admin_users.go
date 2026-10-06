@@ -285,3 +285,74 @@ func (s *Server) handleAdminDeleteUser(w http.ResponseWriter, r *http.Request) {
 
 // errConfirmationMismatch is a sentinel so the handler can answer 400 rather than 500.
 var errConfirmationMismatch = errors.New("server: confirmation does not match")
+
+// handleAdminSetQuota changes one account's byte limit.
+//
+// limits.default_file_quota_bytes is applied once, at provisioning. Until this endpoint there was no
+// way to change it afterwards: an operator whose user hit the limit could edit the database or tell
+// the user to delete files, and the second is not a policy. §4 makes quotas an administrative
+// control, so changing one is an administrative act, and it is audited as its own event rather than
+// inferred from a login.
+func (s *Server) handleAdminSetQuota(w http.ResponseWriter, r *http.Request) {
+	actor, ok := s.requireAdmin(w, r)
+	if !ok {
+		return
+	}
+	target := parseUUID(chiURLParam(r, "id"))
+	var body struct {
+		Bytes int64 `json:"bytes"`
+	}
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	if body.Bytes < 0 {
+		writeError(w, http.StatusBadRequest, "invalid_quota", "a quota cannot be negative")
+		return
+	}
+
+	var (
+		before store.User
+		after  store.User
+	)
+	err := s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
+		cur, uerr := tx.UserByID(ctx, target)
+		if uerr != nil {
+			return uerr
+		}
+		before = cur
+		if serr := tx.SetUserQuota(ctx, target, body.Bytes); serr != nil {
+			return serr
+		}
+		updated, uerr := tx.UserByID(ctx, target)
+		if uerr != nil {
+			return uerr
+		}
+		after = updated
+		return tx.Audit(ctx, store.AuditEntry{
+			ActorKind: "user", ActorUserID: actor.Ptr(), ActorEmail: actor.Email(),
+			ActorIP: clientIP(r), UserAgent: r.UserAgent(),
+			Action: "user.quota.change", TargetKind: "user", TargetID: target.String(),
+			Result: "ok",
+			Metadata: map[string]any{
+				"username":   after.Username,
+				"from_bytes": before.QuotaBytes,
+				"to_bytes":   after.QuotaBytes,
+				"used_bytes": after.UsedBytes,
+				"over_quota": after.QuotaBytes > 0 && after.UsedBytes > after.QuotaBytes,
+			},
+		})
+	})
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", "no such account")
+			return
+		}
+		s.writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":         after.ID.String(),
+		"quota":      after.QuotaBytes,
+		"used_bytes": after.UsedBytes,
+	})
+}

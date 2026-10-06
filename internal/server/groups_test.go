@@ -144,3 +144,62 @@ func (h *harness) adminDo(t *testing.T, c *http.Client, method, path, body strin
 	}
 	return resp
 }
+
+// TestAdminCanChangeAUsersQuota: the limit was set once at provisioning and never changeable.
+func TestAdminCanChangeAUsersQuota(t *testing.T) {
+	h := newHarness(t)
+	admin, _ := h.adminClient(t)
+
+	// A small quota, set the way an operator would now set it.
+	change := h.adminDo(t, admin, http.MethodPost,
+		"/api/admin/users/"+h.user.ID.String()+"/quota", `{"bytes":8}`)
+	changeBody := readBody(change)
+	change.Body.Close()
+	if change.StatusCode != http.StatusOK {
+		t.Fatalf("set quota: %d %s", change.StatusCode, changeBody)
+	}
+
+	// The limit is enforced on the next write: the 9-byte upload does not fit into 8.
+	upload := func(name, content string) int {
+		t.Helper()
+		body := multipartBody(t, "", name, content)
+		resp := h.do(http.MethodPost, "/api/files/upload", body,
+			map[string]string{"Content-Type": "multipart/form-data; boundary=" + body.Boundary()})
+		code := resp.StatusCode
+		resp.Body.Close()
+		return code
+	}
+	if code := upload("fits.txt", "12345678"); code != http.StatusCreated {
+		t.Fatalf("an upload exactly at the quota was refused: %d", code)
+	}
+	if code := upload("too-big.txt", strings.Repeat("x", 9)); code == http.StatusCreated {
+		t.Fatal("the write exceeded the quota an administrator had just set")
+	}
+
+	// Raising it is the operator's remedy, and it works without a restart.
+	raise := h.adminDo(t, admin, http.MethodPost,
+		"/api/admin/users/"+h.user.ID.String()+"/quota", `{"bytes":1048576}`)
+	raiseBody := readBody(raise)
+	raise.Body.Close()
+	if raise.StatusCode != http.StatusOK {
+		t.Fatalf("raise quota: %d %s", raise.StatusCode, raiseBody)
+	}
+	if code := upload("too-big.txt", strings.Repeat("x", 9)); code != http.StatusCreated {
+		t.Fatalf("the write was still refused after the quota was raised: %d", code)
+	}
+
+	// Both changes are audited, with the sizes, because "who shrank this account" is the question
+	// an operator asks when a user complains.
+	var changes int
+	for _, e := range h.meta.AuditLog() {
+		if e.Action == "user.quota.change" {
+			changes++
+			if e.Metadata["to_bytes"] == nil {
+				t.Fatalf("the quota change does not record the new limit: %v", e.Metadata)
+			}
+		}
+	}
+	if changes != 2 {
+		t.Fatalf("want two user.quota.change rows, got %d", changes)
+	}
+}

@@ -1019,3 +1019,20 @@ func (r *pgResolver) Children(ctx context.Context, owner, dirPath string, limit 
 	}
 	return out, translate(rows.Err())
 }
+
+// SetUserQuota writes the account's byte limit.
+//
+// usage is NOT recomputed: used_bytes is the recorded consumption, and lowering the limit below it
+// leaves the account over quota, which is a state reserveQuota already refuses. Rewriting usage to
+// match the new limit would forget bytes that are still on disk.
+func (t *pgTx) SetUserQuota(ctx context.Context, userID uuid.UUID, bytes int64) error {
+	tag, err := t.tx.Exec(ctx,
+		`UPDATE users SET quota_bytes = $2, updated_at = now() WHERE id = $1`, userID, bytes)
+	if err != nil {
+		return translate(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}

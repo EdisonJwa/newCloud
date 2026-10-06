@@ -334,6 +334,27 @@ func TestIDORIsRefusedOnEveryRouteThatTakesAnID(t *testing.T) {
 			secrets: func(v *idorVictim) []string { return priv },
 		},
 		{
+			name:   "non-admin changing a quota",
+			method: http.MethodPost,
+			path:   func(v *idorVictim) string { return "/api/admin/users/" + v.user.ID.String() + "/quota" },
+			body: func() io.Reader {
+				b, _ := json.Marshal(map[string]int64{"bytes": 1})
+				return bytes.NewReader(b)
+			},
+			secrets: func(v *idorVictim) []string { return priv },
+			stillIntact: func(t *testing.T, h *harness, v *idorVictim) {
+				var quota int64
+				_ = h.meta.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+					u, uerr := tx.UserByID(ctx, v.user.ID)
+					quota = u.QuotaBytes
+					return uerr
+				})
+				if quota == 1 {
+					t.Fatal("the intruder changed another account's quota to 1 byte")
+				}
+			},
+		},
+		{
 			name:   "non-admin disabling an account",
 			method: http.MethodPost,
 			path:   func(v *idorVictim) string { return "/api/admin/users/" + v.user.ID.String() + "/status" },
@@ -410,6 +431,7 @@ func TestIDORTableCoversEveryIdRoute(t *testing.T) {
 		"GET /api/admin/users":                  true,
 		"POST /api/admin/users/{id}/status":     true,
 		"POST /api/admin/groups/{id}/members":   true,
+		"POST /api/admin/users/{id}/quota":      true,
 	}
 
 	// Id-addressed routes deliberately not in the table, each with the reason. An exemption has

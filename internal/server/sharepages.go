@@ -68,6 +68,11 @@ func (s *Server) handleSharePage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// §10.1 分享访问: a visitor who passed the gate has opened the link, and that is the event the
+	// owner wants to see — not only the downloads. Recorded once per page view: the listing is
+	// fetched once per visit, unlike a media player's range requests.
+	s.auditShareView(r, sh)
+
 	// A request share never lists its contents: the server decides, not the UI.
 	if sh.Kind == store.ShareRequest {
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -820,5 +825,26 @@ func (s *Server) auditShareRefusal(r *http.Request, action, actorKind string) {
 	})
 	if err != nil {
 		s.deps.Log.Warn("could not audit a share refusal", "action", action, "error", err)
+	}
+}
+
+// auditShareView records that somebody opened a share link.
+//
+// Best effort in its own transaction: the visitor has already been authorised, and a bookkeeping
+// failure must not turn a working link into an error they cannot act on. The row names the share and
+// the visitor class, which is all a link can honestly say about an anonymous person.
+func (s *Server) auditShareView(r *http.Request, sh store.Share) {
+	err := s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
+		return tx.Audit(ctx, store.AuditEntry{
+			ActorKind:  s.shareActorKind(r, sh),
+			ActorEmail: s.shareRecipientEmail(r, sh),
+			ActorIP:    clientIP(r), UserAgent: r.UserAgent(),
+			Action: "share.view", TargetKind: "share", TargetID: sh.ID.String(),
+			ShareID: &sh.ID, Result: "ok",
+			Metadata: map[string]any{"share_kind": string(sh.Kind), "label": sh.Label},
+		})
+	})
+	if err != nil {
+		s.deps.Log.Warn("could not audit a share view", "share", sh.ID.String(), "error", err)
 	}
 }

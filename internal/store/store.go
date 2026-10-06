@@ -288,6 +288,17 @@ type Tx interface {
 	// BlobHash returns the content address recorded for a blob, for verification that does
 	// not trust either copy on disk.
 	BlobHash(ctx context.Context, id uuid.UUID) ([]byte, error)
+	// SetUserQuota changes an account's byte limit. Zero or negative means unlimited.
+	//
+	// There was NO way to change an existing account's quota: limits.default_file_quota_bytes is
+	// applied once, when the account is provisioned, and nothing afterwards could raise or lower it.
+	// An operator whose user hit the limit had two options — edit the database, or tell the user to
+	// delete files — and the second is not a policy.
+	//
+	// Lowering the limit below current usage is allowed and must not be "fixed" by deleting
+	// anything: the account is over its limit and the next write is refused, which is the point.
+	SetUserQuota(ctx context.Context, userID uuid.UUID, bytes int64) error
+
 	// SampleBlobHashes returns up to limit content addresses ordered after `after`, for an integrity
 	// scrub.
 	//

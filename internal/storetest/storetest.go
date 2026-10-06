@@ -757,6 +757,12 @@ func Run(t *testing.T, factory Factory, opts Options) {
 		storeQuerySuite(t, factory)
 	})
 
+	// Changing an existing account's quota was not possible at all through any store method: the
+	// only writer was a test helper on the in-memory backend.
+	t.Run("QuotaChange", func(t *testing.T) {
+		quotaChangeSuite(t, factory)
+	})
+
 	t.Run("RecipientAccess", func(t *testing.T) {
 		recipientAccessSuite(t, factory)
 	})
@@ -6388,6 +6394,88 @@ func storeQuerySuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid
 		}
 		if len(recent) != 2 {
 			t.Fatalf("asked for 2 recent files, got %d", len(recent))
+		}
+	})
+}
+
+// quotaChangeSuite covers SetUserQuota, which is how an operator raises or lowers a limit.
+//
+// The behaviour that matters is not the UPDATE: it is that the change is seen by the code that
+// enforces the limit, in both directions, and that lowering a limit below current usage is allowed
+// and takes effect on the NEXT write rather than destroying what is already there.
+func quotaChangeSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.UUID)) {
+	t.Helper()
+
+	t.Run("RaisingTheQuotaAllowsTheWrite", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.SetUserQuota(ctx, owner, 1024)
+		}); err != nil {
+			t.Fatalf("set quota: %v", err)
+		}
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			_, err := tx.CreateFile(ctx, store.NewFile{
+				OwnerID: owner, ParentID: r.ID, Name: "big.bin", Size: 4096,
+				Mime: "application/octet-stream", ETag: `"q"`,
+				BlobID: newBlobHook(t), BlobHash: [32]byte{9},
+			})
+			return err
+		}); !errors.Is(err, store.ErrQuota) {
+			t.Fatalf("a 4 KiB write under a 1 KiB quota was allowed: %v", err)
+		}
+
+		// Raise it and the same write succeeds. This is the operator's remedy.
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.SetUserQuota(ctx, owner, 1<<20)
+		}); err != nil {
+			t.Fatalf("raise quota: %v", err)
+		}
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			_, err := tx.CreateFile(ctx, store.NewFile{
+				OwnerID: owner, ParentID: r.ID, Name: "big.bin", Size: 4096,
+				Mime: "application/octet-stream", ETag: `"q"`,
+				BlobID: newBlobHook(t), BlobHash: [32]byte{9},
+			})
+			return err
+		}); err != nil {
+			t.Fatalf("the write was still refused after raising the quota: %v", err)
+		}
+	})
+
+	t.Run("LoweringBelowUsageKeepsTheDataAndBlocksTheNextWrite", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		mkfile(t, s, owner, r.ID, "kept.bin", 4096)
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.SetUserQuota(ctx, owner, 1024)
+		}); err != nil {
+			t.Fatalf("lower quota: %v", err)
+		}
+		// The file is still there: lowering a limit is not a deletion.
+		var stillThere bool
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			n, gerr := tx.ChildByName(ctx, r.ID, "kept.bin")
+			stillThere = gerr == nil && n.Size == 4096
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if !stillThere {
+			t.Fatal("lowering the quota destroyed existing content")
+		}
+		// And the next write is refused.
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			_, err := tx.CreateFile(ctx, store.NewFile{
+				OwnerID: owner, ParentID: r.ID, Name: "next.bin", Size: 1,
+				Mime: "application/octet-stream", ETag: `"n"`,
+				BlobID: newBlobHook(t), BlobHash: [32]byte{8},
+			})
+			return err
+		}); !errors.Is(err, store.ErrQuota) {
+			t.Fatalf("a write after the quota was lowered below usage was allowed: %v", err)
 		}
 	})
 }

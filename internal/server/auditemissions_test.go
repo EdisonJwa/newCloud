@@ -145,3 +145,87 @@ func TestExhaustedShareLimitIsRecorded(t *testing.T) {
 		t.Fatalf("an exhausted allowance was recorded as an expiry: %v", rows)
 	}
 }
+
+// TestShareViewIsRecordedOnlyWhenTheGateOpens: §10.1 分享访问.
+//
+// The download was audited and the view was not, so an owner could see what was taken and not that
+// the link had been opened at all — and a visitor who studied the listing and took nothing left no
+// trace. The row is written after the gate passes, not before: a refusal is a different event, and
+// recording every password prompt as a view would drown the real ones.
+func TestShareViewIsRecordedOnlyWhenTheGateOpens(t *testing.T) {
+	h := newHarness(t)
+
+	if resp := h.do(http.MethodPost, "/api/files/mkdir",
+		strings.NewReader(`{"path":"viewed"}`),
+		map[string]string{"Content-Type": "application/json"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("mkdir: %d", resp.StatusCode)
+	}
+	create := h.do(http.MethodPost, "/api/shares/",
+		strings.NewReader(`{"path":"viewed","kind":"link","password":"open sesame"}`),
+		map[string]string{"Content-Type": "application/json"})
+	payload := readBody(create)
+	create.Body.Close()
+	if create.StatusCode != http.StatusCreated {
+		t.Fatalf("create: %d %s", create.StatusCode, payload)
+	}
+	token := createdToken(t, payload)
+
+	// A visitor who has not entered the password gets the challenge, not a view.
+	if resp := h.do(http.MethodGet, "/s/"+token, nil, nil); resp.StatusCode != http.StatusOK {
+		t.Fatalf("challenge: %d", resp.StatusCode)
+	}
+	if rows := actionsIn(t, h.meta, "share.view"); len(rows) != 0 {
+		t.Fatalf("a password challenge was recorded as a view (%d rows)", len(rows))
+	}
+
+	// After entering it, the listing is a view.
+	verify, err := http.NewRequest(http.MethodPost, h.srv.URL+"/s/"+token+"/verify",
+		strings.NewReader(`{"password":"open sesame"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	verify.Header.Set("Content-Type", "application/json")
+	vresp, err := h.srv.Client().Do(verify)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cookies []*http.Cookie
+	cookies = append(cookies, vresp.Cookies()...)
+	vresp.Body.Close()
+
+	view, err := http.NewRequest(http.MethodGet, h.srv.URL+"/s/"+token, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ck := range cookies {
+		view.AddCookie(ck)
+	}
+	vres, err := h.srv.Client().Do(view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vres.Body.Close()
+	if vres.StatusCode != http.StatusOK {
+		t.Fatalf("view: %d", vres.StatusCode)
+	}
+
+	rows := actionsIn(t, h.meta, "share.view")
+	if len(rows) != 1 {
+		t.Fatalf("want exactly one share.view row after the gate opened, got %d", len(rows))
+	}
+	if rows[0].ShareID == nil {
+		t.Fatal("the view row does not identify the share")
+	}
+}
+
+// createdToken pulls the token out of a share-create response.
+func createdToken(t *testing.T, payload string) string {
+	t.Helper()
+	var created struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal([]byte(payload), &created); err != nil || created.Token == "" {
+		t.Fatalf("no token in %s", payload)
+	}
+	return created.Token
+}
