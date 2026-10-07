@@ -59,13 +59,26 @@ func (r Report) OK() bool { return r.Err == nil }
 // memory would make the verifier itself an outage risk, and the batch boundary does
 // not weaken the check because each event commits to its predecessor's hash.
 func Run(ctx context.Context, r Reader, batch int) (Report, error) {
+	return RunFrom(ctx, r, batch, 0, audit.GenesisHash)
+}
+
+// RunFrom verifies the chain from a recorded archive boundary instead of from genesis.
+//
+// A log that has been pruned no longer starts at genesis: the first surviving event commits to an
+// event that was archived deliberately. Verifying from genesis would report every pruned log as
+// broken, which is the same answer it gives for tampering — so the boundary is passed in, and the
+// caller supplies the hash the archive ended at. That hash comes from the prune mark, which is
+// append-only and written in the same transaction as the deletion.
+//
+// afterID is the last archived event id; startPrev is its hash.
+func RunFrom(ctx context.Context, r Reader, batch int, afterID int64, startPrev []byte) (Report, error) {
 	if batch <= 0 {
 		batch = 1000
 	}
 
 	var (
-		after   int64
-		prev    = audit.GenesisHash
+		after   = afterID
+		prev    = startPrev
 		report  = Report{}
 		checked int
 	)

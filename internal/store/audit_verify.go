@@ -69,6 +69,15 @@ func (s *PG) AuditHead(ctx context.Context) ([]byte, error) {
 		`SELECT hash FROM audit.events ORDER BY id DESC LIMIT 1`).Scan(&head)
 	if err != nil {
 		if isNoRows(err) {
+			// An empty table after a prune still has a head: the newest archive boundary. Returning
+			// genesis would tell the verifier the log was truncated to nothing, which is exactly
+			// what a pruned log is not.
+			var markHead []byte
+			if merr := s.pool.QueryRow(ctx,
+				`SELECT head_hash FROM audit.prune_marks ORDER BY through_id DESC LIMIT 1`).
+				Scan(&markHead); merr == nil {
+				return markHead, nil
+			}
 			return audit.GenesisHash, nil
 		}
 		return nil, translate(err)

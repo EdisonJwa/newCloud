@@ -295,6 +295,12 @@ type AuditConfig struct {
 	// directory on the same volume as the metadata store makes the anchor decorative,
 	// and the deployment documentation says so.
 	AnchorDir string `yaml:"anchor_dir"`
+	// ArchiveDir is where `newcloud audit prune` writes the events it is about to remove.
+	//
+	// Empty means ./audit-archive. It should point at the same kind of place as the anchor —
+	// somewhere the database cannot rewrite — because the archive is the only remaining copy of
+	// that part of the chain, and the prune mark records its path as the answer to "where did it go".
+	ArchiveDir string `yaml:"archive_dir"`
 }
 
 // Default returns the safe baseline. Everything that can be wrong by omission

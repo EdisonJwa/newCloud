@@ -6,8 +6,8 @@ package config_test
 //
 //   server.usercontent_url       user content is served from public_url, so the origin separation
 //                                the key implies does not exist — while Validate REQUIRES the key
-//   audit.retention_days         audit events are never pruned; a hash-chained log cannot delete
-//                                from its middle without looking tampered
+//   audit.retention_days         (implemented: `newcloud audit prune` records an archive boundary,
+//                                so a pruned log still verifies)
 //   auth.scim_token              no SCIM endpoint is served
 //   limits.upload_chunk_bytes    (implemented — the resumable endpoint now enforces it)
 //
@@ -47,7 +47,6 @@ func TestUnusedKeysCoversEveryInertKey(t *testing.T) {
 	got := unusedByKey(t, cfg)
 	for _, want := range []string{
 		"server.usercontent_url",
-		"audit.retention_days",
 		"auth.scim_token",
 	} {
 		if _, ok := got[want]; !ok {
@@ -55,8 +54,8 @@ func TestUnusedKeysCoversEveryInertKey(t *testing.T) {
 				"explanation. Reported: %v", want, keysOf(got))
 		}
 	}
-	if len(got) != 3 {
-		t.Fatalf("reported %d keys, want 3: %v", len(got), keysOf(got))
+	if len(got) != 2 {
+		t.Fatalf("reported %d keys, want 2: %v", len(got), keysOf(got))
 	}
 }
 
@@ -78,6 +77,7 @@ func TestUnusedKeysExplainsWhatIsMissing(t *testing.T) {
 	cfg := config.Default()
 	cfg.Server.PublicURL = "https://cloud.example.test"
 	cfg.Server.UserContentURL = "https://content.example.test"
+	cfg.Auth.SCIMToken = "scim-secret"
 	got := unusedByKey(t, cfg)
 
 	// A reason that does not name the consequence is not worth printing.
@@ -85,9 +85,8 @@ func TestUnusedKeysExplainsWhatIsMissing(t *testing.T) {
 		t.Fatalf("the content-origin reason should say where content is actually served from: %q",
 			got["server.usercontent_url"])
 	}
-	if !strings.Contains(got["audit.retention_days"], "pruned") {
-		t.Fatalf("the audit-retention reason should say the log is never pruned: %q",
-			got["audit.retention_days"])
+	if !strings.Contains(got["auth.scim_token"], "SCIM") {
+		t.Fatalf("the SCIM reason should name what is missing: %q", got["auth.scim_token"])
 	}
 }
 

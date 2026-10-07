@@ -64,7 +64,7 @@ var drillTables = []string{
 }
 
 // drillAuditTables are the partitioned audit tables, counted via their parent.
-var drillAuditTables = []string{"audit.events", "audit.anchors"}
+var drillAuditTables = []string{"audit.events", "audit.anchors", "audit.prune_marks"}
 
 // drillResult is the outcome of one drill.
 type drillResult struct {

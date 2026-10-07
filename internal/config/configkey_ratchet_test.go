@@ -36,8 +36,7 @@ var knownUnread = map[string]string{
 		"not implemented, so the isolation this key implies does not exist. Kept pinned rather than " +
 		"deleted because removing it changes every deployment's required configuration for a feature " +
 		"that is still intended.",
-	"SCIMToken":     "no SCIM endpoint exists; the key is accepted so a future one can use it",
-	"RetentionDays": "audit retention is not implemented; the page says so rather than pretending",
+	"SCIMToken": "no SCIM endpoint exists; the key is accepted so a future one can use it",
 }
 
 func TestEveryConfigKeyIsReadOrPinned(t *testing.T) {

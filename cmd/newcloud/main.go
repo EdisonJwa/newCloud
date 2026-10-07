@@ -29,6 +29,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/EdisonJwa/newCloud/internal/audit"
 	"github.com/EdisonJwa/newCloud/internal/auditverify"
 	"github.com/EdisonJwa/newCloud/internal/auth"
 	"github.com/EdisonJwa/newCloud/internal/authz"
@@ -98,9 +99,167 @@ func auditCommand(args []string) error {
 	switch args[0] {
 	case "verify":
 		return auditVerify(args[1:])
+	case "prune":
+		return auditPrune(args[1:])
 	default:
-		return fmt.Errorf("audit: unknown sub-command %q (want verify)", args[0])
+		return fmt.Errorf("audit: unknown sub-command %q (want verify or prune)", args[0])
 	}
+}
+
+// auditPrune archives and then removes events older than the retention window.
+//
+// This is a command rather than a background job because its failure mode is destructive and its
+// cost is proportional to history: an operator schedules it, watches it once, and knows what it did.
+// The archive file is written BEFORE anything is deleted, and its path is recorded in the prune mark,
+// so "where did last year's audit log go" has an answer inside the log itself.
+func auditPrune(args []string) error {
+	log := newLogger()
+
+	flags := flag.NewFlagSet("audit prune", flag.ContinueOnError)
+	days := flags.Int("days", 0, "retain this many days (default: audit.retention_days)")
+	before := flags.String("before", "", "remove events older than this date (YYYY-MM-DD)")
+	dryRun := flags.Bool("dry-run", false, "report what would be removed and stop")
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+
+	cfg, err := config.Load(configPath())
+	if err != nil {
+		return err
+	}
+	cutoff, err := pruneCutoff(cfg, *days, *before, time.Now().UTC())
+	if err != nil {
+		return err
+	}
+
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		return errors.New("audit prune: DATABASE_URL is required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	pg := storepkg.NewPG(pool)
+
+	if *dryRun {
+		n, oldest, newest, derr := pg.AuditBefore(ctx, cutoff)
+		if derr != nil {
+			return derr
+		}
+		log.Info("audit prune (dry run): nothing was removed",
+			"cutoff", cutoff.Format(time.RFC3339), "events", n,
+			"first_event", oldest, "last_event", newest)
+		return nil
+	}
+
+	// Verify BEFORE removing anything. The store's own boundary check only catches a break at the
+	// event the mark would carry; a rewrite in the middle of the range passes it. Archiving part of
+	// a log that does not verify would make the archive the only copy of a record nobody has
+	// checked, and the mark would vouch for it.
+	mark, err := pg.LatestPruneMark(ctx)
+	if err != nil {
+		return fmt.Errorf("audit prune: read prune marks: %w", err)
+	}
+	report, err := auditverify.RunFrom(ctx, pg, 1000, mark.ThroughID, verifyStart(mark))
+	if err != nil {
+		return fmt.Errorf("audit prune: verify before pruning: %w", err)
+	}
+	if !report.OK() {
+		return fmt.Errorf("audit prune: refusing to prune a log that does not verify: %v "+
+			"(broken at event %d). Repair or investigate the chain first; a prune would archive "+
+			"history that cannot be shown to be intact", report.Err, report.BrokenAt)
+	}
+
+	archivePath, err := archiveAudit(ctx, pg, cfg, cutoff)
+	if err != nil {
+		return err
+	}
+	res, err := pg.PruneAuditBefore(ctx, cutoff, archivePath)
+	if err != nil {
+		if errors.Is(err, storepkg.ErrNoAuditToPrune) {
+			log.Info("audit prune: nothing older than the cutoff", "cutoff", cutoff.Format(time.RFC3339))
+			return nil
+		}
+		return err
+	}
+	log.Info("audit pruned",
+		"events", res.Mark.Events, "through_event", res.Mark.ThroughID,
+		"archive", res.Mark.ArchivePath, "cutoff", cutoff.Format(time.RFC3339))
+	return nil
+}
+
+// archiveAudit writes the events that are about to be removed, and returns the file's path.
+//
+// The file is written and closed BEFORE the prune transaction starts, and fsync'd, because the mark
+// records its path as the place the history went. A path that points at a half-written file would be
+// worse than no path: it would look like an archive.
+func archiveAudit(ctx context.Context, pg *storepkg.PG, cfg config.Config, cutoff time.Time) (string, error) {
+	// The destination defaults next to the anchors, which is the one place an operator is already
+	// expected to send data somewhere the database cannot rewrite.
+	dir := cfg.Audit.ArchiveDir
+	if dir == "" {
+		dir = "audit-archive"
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("audit prune: create archive directory: %w", err)
+	}
+	events, err := pg.AuditEventsBefore(ctx, cutoff)
+	if err != nil {
+		return "", err
+	}
+	if len(events) == 0 {
+		return "", storepkg.ErrNoAuditToPrune
+	}
+
+	name := filepath.Join(dir, "audit-"+cutoff.UTC().Format("20060102T150405Z")+".jsonl")
+	f, err := os.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return "", fmt.Errorf("audit prune: create archive: %w", err)
+	}
+	enc := json.NewEncoder(f)
+	for i := range events {
+		// The stored hash is included on purpose: an archive is evidence, and evidence whose
+		// digests were recomputed at read time proves only that the reader is consistent.
+		if err := enc.Encode(events[i]); err != nil {
+			f.Close()
+			return "", fmt.Errorf("audit prune: write archive: %w", err)
+		}
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return "", fmt.Errorf("audit prune: sync archive: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return "", fmt.Errorf("audit prune: close archive: %w", err)
+	}
+	return name, nil
+}
+
+// pruneCutoff resolves the retention window from the flags and the configuration.
+func pruneCutoff(cfg config.Config, days int, before string, now time.Time) (time.Time, error) {
+	if before != "" {
+		t, err := time.Parse(time.RFC3339, before+"T00:00:00Z")
+		if err != nil {
+			return time.Time{}, fmt.Errorf("audit prune: --before must be YYYY-MM-DD: %w", err)
+		}
+		return t, nil
+	}
+	if days <= 0 {
+		days = cfg.Audit.RetentionDays
+	}
+	if days <= 0 {
+		return time.Time{}, errors.New("audit prune: no retention window: set audit.retention_days " +
+			"or pass --days/--before. Refusing to guess, because the guess deletes history")
+	}
+	return now.AddDate(0, 0, -days), nil
 }
 
 // auditVerify walks the chain and prints a report.
@@ -136,7 +295,21 @@ func auditVerify(args []string) error {
 	defer pool.Close()
 
 	pg := storepkg.NewPG(pool)
-	report, err := auditverify.Run(ctx, pg, *batch)
+
+	// Start from the newest archive boundary, if the log has been pruned. Verifying from genesis
+	// would report every pruned log as broken — the same answer it gives for tampering — so the
+	// boundary and the hash the archive ended at are what the check must begin with.
+	mark, merr := pg.LatestPruneMark(ctx)
+	if merr != nil {
+		return fmt.Errorf("audit verify: read prune marks: %w", merr)
+	}
+	report, err := auditverify.RunFrom(ctx, pg, *batch, mark.ThroughID,
+		verifyStart(mark))
+	if mark.ThroughID > 0 {
+		log.Info("verifying from the newest archive boundary",
+			"through_event", mark.ThroughID, "archived_events", mark.Events,
+			"archive", mark.ArchivePath)
+	}
 	if err != nil {
 		return err
 	}
@@ -880,4 +1053,16 @@ func warnAboutUnusedConfig(log *slog.Logger, cfg config.Config) {
 	for _, u := range cfg.UnusedKeys() {
 		log.Warn("configuration has no effect", "key", u.Key, "why", u.Why)
 	}
+}
+
+// verifyStart is the hash verification begins from.
+//
+// A zero mark means the log has never been pruned, and the chain starts at genesis. Passing the
+// mark's nil HashHash in that case told the verifier to expect a nil prev_hash on the first event,
+// which is never written — so a perfectly intact log reported "prev_hash does not match" at event 1.
+func verifyStart(mark storepkg.PruneMark) []byte {
+	if mark.ThroughID == 0 || len(mark.HeadHash) == 0 {
+		return audit.GenesisHash
+	}
+	return mark.HeadHash
 }

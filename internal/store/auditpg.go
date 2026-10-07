@@ -52,7 +52,16 @@ func (chainWriter) Append(ctx context.Context, tx Tx, e AuditEntry) error {
 	case err == nil:
 		prev = head
 	case errors.Is(err, pgx.ErrNoRows):
-		// First event ever: chain from genesis.
+		// Empty table. That is NOT necessarily the beginning of time: a pruned log has an
+		// archived head, and chaining the next event from genesis would start a second chain
+		// that no longer links to the archive — the mark would say the history ended at a hash
+		// the new event does not build on.
+		var markHead []byte
+		if merr := ptx.QueryRow(ctx,
+			`SELECT head_hash FROM audit.prune_marks ORDER BY through_id DESC LIMIT 1`).
+			Scan(&markHead); merr == nil {
+			prev = markHead
+		}
 	default:
 		return fmt.Errorf("store: read audit chain head: %w", translate(err))
 	}

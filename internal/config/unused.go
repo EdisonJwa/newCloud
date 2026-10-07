@@ -36,16 +36,6 @@ func (c *Config) UnusedKeys() []UnusedKey {
 		})
 	}
 
-	if c.Audit.RetentionDays > 0 {
-		out = append(out, UnusedKey{
-			Key: "audit.retention_days",
-			Why: "audit events are never pruned. Deleting rows from the middle of a hash-chained log " +
-				"is indistinguishable from tampering, so retention cannot be implemented as a " +
-				"delete: it needs an archive-and-anchor design. The value is validated and ignored, " +
-				"and the log grows for as long as the deployment lives",
-		})
-	}
-
 	if c.Auth.SCIMToken != "" {
 		out = append(out, UnusedKey{
 			Key: "auth.scim_token",
