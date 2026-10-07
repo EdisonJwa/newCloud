@@ -215,6 +215,7 @@ func writeAuditJSON(w http.ResponseWriter, rows []store.AuditRow, total int) {
 		Result     string         `json:"result"`
 		Bytes      *int64         `json:"bytes,omitempty"`
 		Metadata   map[string]any `json:"metadata,omitempty"`
+		RequestID  string         `json:"request_id,omitempty"`
 		PrevHash   string         `json:"prev_hash"`
 		Hash       string         `json:"hash"`
 	}
@@ -239,6 +240,7 @@ func writeAuditJSON(w http.ResponseWriter, rows []store.AuditRow, total int) {
 			UserAgent: r.UserAgent, Action: r.Action, TargetKind: r.TargetKind,
 			TargetID: r.TargetID, Result: r.Result, Bytes: r.Bytes, Metadata: r.Metadata,
 			PrevHash: hex.EncodeToString(r.PrevHash), Hash: hex.EncodeToString(r.Hash),
+			RequestID: r.RequestID,
 		}
 		if r.ActorUserID != nil {
 			row.ActorID = r.ActorUserID.String()

@@ -491,6 +491,12 @@ type AuditEntry struct {
 	Result      string
 	Bytes       *int64
 	Metadata    map[string]any
+	// RequestID correlates the event with the HTTP request that produced it (§10.1 request_id).
+	//
+	// Empty means the event did not come from a request — a background job, or a migration. Leaving
+	// it explicit rather than generating a synthetic id keeps "this happened outside any request"
+	// visible, which is itself worth knowing.
+	RequestID string
 }
 
 // Job is an asynchronous task queued with the business change.

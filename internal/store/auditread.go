@@ -71,6 +71,9 @@ type AuditRow struct {
 	Metadata    map[string]any
 	PrevHash    []byte
 	Hash        []byte
+	// RequestID correlates the event with the request that produced it, and is empty for events
+	// written outside one.
+	RequestID string
 }
 
 // ReadAudit is the store-level read path for the audit log.

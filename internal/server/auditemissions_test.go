@@ -229,3 +229,56 @@ func createdToken(t *testing.T, payload string) string {
 	}
 	return created.Token
 }
+
+// TestAuditRowsCarryTheRequestID is §10.1's request_id.
+//
+// The server generated a request id, logged it, and returned it — and never wrote it to the audit
+// rows. So the step that matters in an investigation, from a log line or a user's report to the exact
+// events of that request, required matching timestamps, which is guesswork under load.
+func TestAuditRowsCarryTheRequestID(t *testing.T) {
+	h := newHarness(t)
+
+	h.uploadFile(t, "correlated.txt", "bytes")
+
+	var withID, withoutID int
+	for _, e := range h.meta.AuditLog() {
+		if e.Action == "file.write" {
+			if e.RequestID == "" {
+				withoutID++
+			} else {
+				withID++
+			}
+		}
+	}
+	if withID == 0 {
+		t.Fatalf("no file.write row carried a request id (%d without). The correlation is the "+
+			"whole point of recording it.", withoutID)
+	}
+	if withoutID != 0 {
+		t.Fatalf("%d file.write rows have no request id; a handler that writes audit inside a "+
+			"transaction should inherit it from the context", withoutID)
+	}
+
+	// And an event written outside any request stays visibly uncorrelated rather than inventing an
+	// id: "this happened in a background job" is worth being able to see.
+	if err := h.meta.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+		return tx.Audit(ctx, store.AuditEntry{
+			ActorKind: "system", Action: "file.scrub", TargetKind: "blob", TargetID: "x",
+			Result: "ok",
+		})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, e := range h.meta.AuditLog() {
+		if e.Action == "file.scrub" {
+			found = true
+			if e.RequestID != "" {
+				t.Fatalf("an event outside a request invented a request id: %q", e.RequestID)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("the background event was not recorded")
+	}
+}

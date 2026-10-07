@@ -104,6 +104,7 @@ func memoryAuditRow(e AuditEntry, index int, at time.Time) AuditRow {
 		Result:      e.Result,
 		Bytes:       e.Bytes,
 		Metadata:    e.Metadata,
+		RequestID:   e.RequestID,
 	}
 }
 

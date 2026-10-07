@@ -24,7 +24,7 @@ func (s *PG) ReadAudit(ctx context.Context, f AuditFilter) ([]AuditRow, error) {
 
 	q := fmt.Sprintf(`SELECT id, ts, actor_kind, actor_user_id, COALESCE(actor_email::text, ''),
 			COALESCE(actor_ip::text, ''), user_agent, action, target_kind, target_id,
-			share_id, result, bytes, metadata, prev_hash, hash
+			share_id, result, bytes, metadata, prev_hash, hash, request_id
 		FROM audit.events
 		%s
 		ORDER BY id %s
@@ -43,7 +43,7 @@ func (s *PG) ReadAudit(ctx context.Context, f AuditFilter) ([]AuditRow, error) {
 		var r AuditRow
 		if err := rows.Scan(&r.ID, &r.Time, &r.ActorKind, &r.ActorUserID, &r.ActorEmail,
 			&r.ActorIP, &r.UserAgent, &r.Action, &r.TargetKind, &r.TargetID,
-			&r.ShareID, &r.Result, &r.Bytes, &r.Metadata, &r.PrevHash, &r.Hash); err != nil {
+			&r.ShareID, &r.Result, &r.Bytes, &r.Metadata, &r.PrevHash, &r.Hash, &r.RequestID); err != nil {
 			return nil, translate(err)
 		}
 		out = append(out, r)

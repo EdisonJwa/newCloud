@@ -835,6 +835,11 @@ func (t *memTx) Audit(ctx context.Context, e AuditEntry) error {
 	if t.m.auditFault != nil {
 		return fmt.Errorf("%w: %v", ErrAuditUnavailable, t.m.auditFault)
 	}
+	// The request id is resolved the same way the SQL backend resolves it, so a test that reads the
+	// in-memory log sees what production would record.
+	if e.RequestID == "" {
+		e.RequestID = RequestIDFromContext(ctx)
+	}
 	t.m.audit = append(t.m.audit, e)
 	t.m.auditTimes = append(t.m.auditTimes, t.m.now())
 	return nil

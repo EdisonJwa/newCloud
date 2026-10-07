@@ -86,15 +86,23 @@ func (chainWriter) Append(ctx context.Context, tx Tx, e AuditEntry) error {
 		return err
 	}
 
+	// The request id comes from the caller when it set one explicitly, and from the context
+	// otherwise. The context fallback is what makes every existing call site carry it without each
+	// one having to remember: the server puts the id there once per request.
+	requestID := e.RequestID
+	if requestID == "" {
+		requestID = RequestIDFromContext(ctx)
+	}
+
 	const q = `INSERT INTO audit.events
 		(ts, actor_kind, actor_user_id, actor_email, actor_ip, user_agent,
-		 action, target_kind, target_id, share_id, result, bytes, metadata, prev_hash, hash)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`
+		 action, target_kind, target_id, share_id, result, bytes, metadata, prev_hash, hash, request_id)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`
 	_, err = ptx.Exec(ctx, q,
 		ev.Time, string(ev.ActorKind), ev.ActorUserID, nullifyEmpty(ev.ActorEmail),
 		nullifyEmpty(ev.ActorIP), ev.UserAgent, string(ev.Action), string(ev.TargetKind),
 		ev.TargetID, ev.ShareID, string(ev.Result), ev.Bytes,
-		jsonOrEmpty(ev.Metadata), ev.PrevHash, ev.Hash)
+		jsonOrEmpty(ev.Metadata), ev.PrevHash, ev.Hash, requestID)
 	if err != nil {
 		return fmt.Errorf("store: append audit: %w", translate(err))
 	}

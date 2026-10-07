@@ -147,6 +147,20 @@ func (s *Server) Handler() http.Handler {
 	r := chi.NewRouter()
 
 	r.Use(middleware.RequestID)
+	// Carry the request id into the context the store's audit writer reads, so every event written
+	// while serving this request is correlated with the log line that describes the request itself.
+	// Without this the id reached the logs and the response, and never the audit rows.
+	r.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			id := middleware.GetReqID(r.Context())
+			if id != "" {
+				// The client can see the id too, which is what makes "quote this when you report
+				// a problem" actionable.
+				w.Header().Set("X-Request-Id", id)
+			}
+			next.ServeHTTP(w, r.WithContext(store.WithRequestID(r.Context(), id)))
+		})
+	})
 	r.Use(s.clientAddress)
 	r.Use(s.requestLogger)
 	r.Use(s.securityHeaders)
