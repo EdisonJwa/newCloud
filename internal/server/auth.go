@@ -137,6 +137,10 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// §10.1 auth_method: the events written by this handler describe an OIDC login, including the
+	// account creation it may have caused.
+	*r = *r.WithContext(store.WithAuthMethod(r.Context(), store.AuthOIDC))
+
 	role := provider.Role(claims.Groups)
 
 	// Apply the provisioning policy before anything is written (ID-04).

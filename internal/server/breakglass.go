@@ -50,6 +50,11 @@ const breakglassUsername = "breakglass"
 func (s *Server) handleBreakglassLogin(w http.ResponseWriter, r *http.Request) {
 	cfg := s.deps.Config.Auth
 
+	// §10.1 auth_method: every audit row from this handler — the success and every failure — says
+	// the local administrator credential was used. A break-glass login is the event an operator most
+	// wants to find afterwards, and a session cookie would look identical without this.
+	*r = *r.WithContext(store.WithAuthMethod(r.Context(), store.AuthBreakglass))
+
 	if !cfg.AllowLocalAdmin {
 		// 404, not 403: the same rule as everywhere else. A distinguishable refusal
 		// tells a prober that a local admin exists on this deployment.

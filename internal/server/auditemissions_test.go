@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/EdisonJwa/newCloud/internal/auth"
 	"github.com/EdisonJwa/newCloud/internal/fakeidp"
 	"github.com/EdisonJwa/newCloud/internal/store"
 )
@@ -280,5 +281,68 @@ func TestAuditRowsCarryTheRequestID(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("the background event was not recorded")
+	}
+}
+
+// TestAuditRowsSayHowTheActorAuthenticated is §10.1's auth_method.
+//
+// The log recorded who acted and from where, and not HOW they authenticated. A stolen session cookie
+// and a leaked app password look identical in every other column, and the right response differs:
+// revoking an app password is surgical, invalidating every session is not.
+func TestAuditRowsSayHowTheActorAuthenticated(t *testing.T) {
+	h := newHarness(t)
+
+	// 1. A browser session.
+	h.uploadFile(t, "via-session.txt", "bytes")
+
+	// 2. A WebDAV app password.
+	secret, _, err := auth.NewAppPasswords(h.meta).Issue(
+		context.Background(), h.user.ID, "dav-method", "rw", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	put, err := http.NewRequest("PUT", h.srv.URL+"/dav/"+h.user.Username+"/via-dav.txt",
+		strings.NewReader("dav bytes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	put.SetBasicAuth(h.user.Username, secret)
+	resp, err := h.srv.Client().Do(put)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("dav put: %d", resp.StatusCode)
+	}
+
+	// 3. A public share visit.
+	token := shareToken(t, h)
+	if s := h.do(http.MethodGet, "/s/"+token, nil, nil); s.StatusCode != http.StatusOK {
+		t.Fatalf("share page: %d", s.StatusCode)
+	}
+	h.do(http.MethodGet, "/s/"+token+"/download", nil, nil).Body.Close()
+
+	var sawSession, sawAppPassword, sawShare bool
+	for _, e := range h.meta.AuditLog() {
+		switch e.AuthMethod {
+		case store.AuthSession:
+			sawSession = true
+		case store.AuthAppPassword:
+			sawAppPassword = true
+		case store.AuthShareLink:
+			sawShare = true
+		}
+	}
+	if !sawSession {
+		t.Fatal("no event recorded the session method; a browser action and an app-password action " +
+			"would be indistinguishable in the log")
+	}
+	if !sawAppPassword {
+		t.Fatal("no event recorded the app-password method; that is the credential whose revocation " +
+			"is surgical, and the log cannot tell it from a session")
+	}
+	if !sawShare {
+		t.Fatal("no event recorded the share-link method")
 	}
 }

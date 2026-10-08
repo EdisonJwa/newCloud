@@ -840,6 +840,9 @@ func (t *memTx) Audit(ctx context.Context, e AuditEntry) error {
 	if e.RequestID == "" {
 		e.RequestID = RequestIDFromContext(ctx)
 	}
+	if e.AuthMethod == "" {
+		e.AuthMethod = AuthMethodFromContext(ctx)
+	}
 	t.m.audit = append(t.m.audit, e)
 	t.m.auditTimes = append(t.m.auditTimes, t.m.now())
 	return nil

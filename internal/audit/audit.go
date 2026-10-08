@@ -171,6 +171,9 @@ type Event struct {
 	// RequestID correlates the event with the HTTP request that produced it (§10.1). Empty for
 	// events written outside a request, which is a fact the export should preserve.
 	RequestID string
+	// AuthMethod is how the actor authenticated: session, app_password, breakglass, oidc or
+	// share_link. Empty when no authentication was involved.
+	AuthMethod string
 }
 
 // GenesisHash is the chain seed. Using a fixed non-zero value makes an empty

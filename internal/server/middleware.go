@@ -88,7 +88,11 @@ func (s *Server) requireSession(next http.Handler) http.Handler {
 		actor := authz.NewUserActor(user.ID, user.Email, role, authz.ScopeRead|authz.ScopeWrite).
 			WithUsername(user.Username)
 
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), actorKey, actor)))
+		// §10.1 auth_method: a request carrying a session cookie authenticated as a session, as
+		// opposed to a WebDAV app password. The distinction is the first thing an investigation
+		// reaches for, because revoking one is surgical and revoking the other is not.
+		ctx := store.WithAuthMethod(r.Context(), store.AuthSession)
+		next.ServeHTTP(w, r.WithContext(context.WithValue(ctx, actorKey, actor)))
 	})
 }
 

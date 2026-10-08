@@ -816,7 +816,8 @@ func (s *Server) shareRecipientEmail(r *http.Request, sh store.Share) string {
 // because "nobody knows this link was used" and "this link was used and refused" are different
 // states for the person who owns it.
 func (s *Server) auditShareRefusal(r *http.Request, action, actorKind string) {
-	err := s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
+	ctx := store.WithAuthMethod(r.Context(), store.AuthShareLink)
+	err := s.deps.Meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
 		return tx.Audit(ctx, store.AuditEntry{
 			ActorKind: actorKind, ActorIP: clientIP(r), UserAgent: r.UserAgent(),
 			Action: action, TargetKind: "share", Result: "denied",
@@ -834,7 +835,9 @@ func (s *Server) auditShareRefusal(r *http.Request, action, actorKind string) {
 // failure must not turn a working link into an error they cannot act on. The row names the share and
 // the visitor class, which is all a link can honestly say about an anonymous person.
 func (s *Server) auditShareView(r *http.Request, sh store.Share) {
-	err := s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
+	// §10.1 auth_method: a public link, not an account.
+	ctx := store.WithAuthMethod(r.Context(), store.AuthShareLink)
+	err := s.deps.Meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
 		return tx.Audit(ctx, store.AuditEntry{
 			ActorKind:  s.shareActorKind(r, sh),
 			ActorEmail: s.shareRecipientEmail(r, sh),

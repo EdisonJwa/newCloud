@@ -497,6 +497,9 @@ type AuditEntry struct {
 	// it explicit rather than generating a synthetic id keeps "this happened outside any request"
 	// visible, which is itself worth knowing.
 	RequestID string
+	// AuthMethod is how the actor authenticated (§10.1): session, app_password, breakglass, oidc or
+	// share_link. Empty means no authentication was involved.
+	AuthMethod string
 }
 
 // Job is an asynchronous task queued with the business change.

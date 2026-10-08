@@ -195,7 +195,7 @@ func (s *PG) AuditBefore(ctx context.Context, cutoff time.Time) (int64, time.Tim
 func (s *PG) AuditEventsBefore(ctx context.Context, cutoff time.Time) ([]audit.Event, error) {
 	const q = `SELECT id, ts, actor_kind, actor_user_id, COALESCE(actor_email::text, ''),
 		COALESCE(actor_ip::text,''), user_agent, action, target_kind, target_id,
-		share_id, result, bytes, metadata, prev_hash, hash, request_id
+		share_id, result, bytes, metadata, prev_hash, hash, request_id, auth_method
 		FROM audit.events
 		WHERE ts < $1
 		ORDER BY id`
@@ -211,7 +211,8 @@ func (s *PG) AuditEventsBefore(ctx context.Context, cutoff time.Time) ([]audit.E
 		var actorKind, action, targetKind, result string
 		if err := rows.Scan(&e.ID, &e.Time, &actorKind, &e.ActorUserID, &e.ActorEmail,
 			&e.ActorIP, &e.UserAgent, &action, &targetKind, &e.TargetID,
-			&e.ShareID, &result, &e.Bytes, &e.Metadata, &e.PrevHash, &e.Hash, &e.RequestID); err != nil {
+			&e.ShareID, &result, &e.Bytes, &e.Metadata, &e.PrevHash, &e.Hash, &e.RequestID,
+			&e.AuthMethod); err != nil {
 			return nil, fmt.Errorf("store: scan audit row: %w", translate(err))
 		}
 		e.ActorKind = audit.ActorKind(actorKind)

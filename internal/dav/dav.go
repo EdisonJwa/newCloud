@@ -184,6 +184,9 @@ func (h *Handler) authenticate(w http.ResponseWriter, r *http.Request) (authz.Ac
 	// client sent: taking it from the request would let a client address another
 	// user's namespace by writing a different username in the path.
 	actor := authz.NewUserActor(u.ID, u.Email, role, scope)
+	// §10.1 auth_method: every audit row written while serving this WebDAV request says the
+	// credential was an app password.
+	*r = *r.WithContext(store.WithAuthMethod(r.Context(), store.AuthAppPassword))
 	return actor.WithUsername(ownerName(u)), true
 }
 

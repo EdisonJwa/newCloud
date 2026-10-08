@@ -27,3 +27,34 @@ func RequestIDFromContext(ctx context.Context) string {
 	id, _ := ctx.Value(requestIDKey{}).(string)
 	return id
 }
+
+type authMethodKey struct{}
+
+// Authentication methods recorded on audit events (§10.1 auth_method).
+const (
+	// AuthSession is a browser session cookie.
+	AuthSession = "session"
+	// AuthAppPassword is a WebDAV app password. Distinguishing it from a session matters because
+	// the remedy differs: an app password can be revoked on its own.
+	AuthAppPassword = "app_password"
+	// AuthBreakglass is the local administrator credential.
+	AuthBreakglass = "breakglass"
+	// AuthOIDC is the identity provider's flow, recorded on the login events themselves.
+	AuthOIDC = "oidc"
+	// AuthShareLink is a public share token, with no account behind it.
+	AuthShareLink = "share_link"
+)
+
+// WithAuthMethod attaches the authentication method to the context.
+func WithAuthMethod(ctx context.Context, method string) context.Context {
+	if method == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, authMethodKey{}, method)
+}
+
+// AuthMethodFromContext returns the method carried by ctx, or "" when there is none.
+func AuthMethodFromContext(ctx context.Context) string {
+	m, _ := ctx.Value(authMethodKey{}).(string)
+	return m
+}

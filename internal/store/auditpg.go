@@ -93,16 +93,21 @@ func (chainWriter) Append(ctx context.Context, tx Tx, e AuditEntry) error {
 	if requestID == "" {
 		requestID = RequestIDFromContext(ctx)
 	}
+	authMethod := e.AuthMethod
+	if authMethod == "" {
+		authMethod = AuthMethodFromContext(ctx)
+	}
 
 	const q = `INSERT INTO audit.events
 		(ts, actor_kind, actor_user_id, actor_email, actor_ip, user_agent,
-		 action, target_kind, target_id, share_id, result, bytes, metadata, prev_hash, hash, request_id)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`
+		 action, target_kind, target_id, share_id, result, bytes, metadata, prev_hash, hash, request_id,
+		 auth_method)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`
 	_, err = ptx.Exec(ctx, q,
 		ev.Time, string(ev.ActorKind), ev.ActorUserID, nullifyEmpty(ev.ActorEmail),
 		nullifyEmpty(ev.ActorIP), ev.UserAgent, string(ev.Action), string(ev.TargetKind),
 		ev.TargetID, ev.ShareID, string(ev.Result), ev.Bytes,
-		jsonOrEmpty(ev.Metadata), ev.PrevHash, ev.Hash, requestID)
+		jsonOrEmpty(ev.Metadata), ev.PrevHash, ev.Hash, requestID, authMethod)
 	if err != nil {
 		return fmt.Errorf("store: append audit: %w", translate(err))
 	}

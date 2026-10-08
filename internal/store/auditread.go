@@ -74,6 +74,8 @@ type AuditRow struct {
 	// RequestID correlates the event with the request that produced it, and is empty for events
 	// written outside one.
 	RequestID string
+	// AuthMethod is how the actor authenticated, empty when no authentication was involved.
+	AuthMethod string
 }
 
 // ReadAudit is the store-level read path for the audit log.

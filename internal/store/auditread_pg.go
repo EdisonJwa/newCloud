@@ -43,7 +43,8 @@ func (s *PG) ReadAudit(ctx context.Context, f AuditFilter) ([]AuditRow, error) {
 		var r AuditRow
 		if err := rows.Scan(&r.ID, &r.Time, &r.ActorKind, &r.ActorUserID, &r.ActorEmail,
 			&r.ActorIP, &r.UserAgent, &r.Action, &r.TargetKind, &r.TargetID,
-			&r.ShareID, &r.Result, &r.Bytes, &r.Metadata, &r.PrevHash, &r.Hash, &r.RequestID); err != nil {
+			&r.ShareID, &r.Result, &r.Bytes, &r.Metadata, &r.PrevHash, &r.Hash, &r.RequestID,
+			&r.AuthMethod); err != nil {
 			return nil, translate(err)
 		}
 		out = append(out, r)
