@@ -288,6 +288,14 @@ type Tx interface {
 	// BlobHash returns the content address recorded for a blob, for verification that does
 	// not trust either copy on disk.
 	BlobHash(ctx context.Context, id uuid.UUID) ([]byte, error)
+	// ListOwnerNodes returns every live node an account owns, for a portable export (§9.5).
+	//
+	// Trashed nodes are excluded: the export is what the user still has, and including the bin would
+	// resurrect content they deleted. The ordering is stable (parent, then name) so two exports of an
+	// unchanged tree are byte-identical apart from the manifest timestamp, which is what makes them
+	// comparable.
+	ListOwnerNodes(ctx context.Context, ownerID uuid.UUID) ([]Node, error)
+
 	// SetUserQuota changes an account's byte limit. Zero or negative means unlimited.
 	//
 	// There was NO way to change an existing account's quota: limits.default_file_quota_bytes is

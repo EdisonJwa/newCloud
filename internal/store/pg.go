@@ -1036,3 +1036,25 @@ func (t *pgTx) SetUserQuota(ctx context.Context, userID uuid.UUID, bytes int64) 
 	}
 	return nil
 }
+
+// ListOwnerNodes returns every live node the account owns.
+func (t *pgTx) ListOwnerNodes(ctx context.Context, ownerID uuid.UUID) ([]Node, error) {
+	const q = `SELECT ` + nodeColumns + ` FROM nodes
+		WHERE owner_id = $1 AND trashed_at IS NULL
+		ORDER BY parent_id NULLS FIRST, name, id`
+	rows, err := t.tx.Query(ctx, q, ownerID)
+	if err != nil {
+		return nil, translate(err)
+	}
+	defer rows.Close()
+
+	var out []Node
+	for rows.Next() {
+		n, serr := scanNode(rows)
+		if serr != nil {
+			return nil, serr
+		}
+		out = append(out, n)
+	}
+	return out, translate(rows.Err())
+}

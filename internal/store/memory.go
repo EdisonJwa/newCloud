@@ -1162,3 +1162,32 @@ func (t *memTx) SetUserQuota(ctx context.Context, userID uuid.UUID, bytes int64)
 	t.m.quota[userID] = bytes
 	return nil
 }
+
+// ListOwnerNodes returns every live node the account owns.
+func (t *memTx) ListOwnerNodes(ctx context.Context, ownerID uuid.UUID) ([]Node, error) {
+	out := make([]Node, 0, len(t.m.nodes))
+	for _, rec := range t.m.nodes {
+		if rec.node.OwnerID != ownerID || rec.node.TrashedAt != nil {
+			continue
+		}
+		out = append(out, rec.node)
+	}
+	// Same order as the SQL backend: by parent (nil first), then name, then id for stability.
+	sort.Slice(out, func(i, j int) bool {
+		pi, pj := "", ""
+		if out[i].ParentID != nil {
+			pi = out[i].ParentID.String()
+		}
+		if out[j].ParentID != nil {
+			pj = out[j].ParentID.String()
+		}
+		if pi != pj {
+			return pi < pj
+		}
+		if out[i].Name != out[j].Name {
+			return out[i].Name < out[j].Name
+		}
+		return out[i].ID.String() < out[j].ID.String()
+	})
+	return out, nil
+}

@@ -77,6 +77,8 @@ func run(args []string) error {
 		return auditCommand(args[1:])
 	case "breakglass":
 		return breakglassCommand(args[1:])
+	case "export":
+		return exportCommand(args[1:])
 	case "drill":
 		return drillCommand(args[1:])
 	case "-h", "--help", "help":

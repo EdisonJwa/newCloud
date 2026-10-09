@@ -763,6 +763,10 @@ func Run(t *testing.T, factory Factory, opts Options) {
 		quotaChangeSuite(t, factory)
 	})
 
+	t.Run("OwnerExport", func(t *testing.T) {
+		ownerExportSuite(t, factory)
+	})
+
 	t.Run("RecipientAccess", func(t *testing.T) {
 		recipientAccessSuite(t, factory)
 	})
@@ -6476,6 +6480,103 @@ func quotaChangeSuite(t *testing.T, factory func(t *testing.T) (store.Store, uui
 			return err
 		}); !errors.Is(err, store.ErrQuota) {
 			t.Fatalf("a write after the quota was lowered below usage was allowed: %v", err)
+		}
+	})
+}
+
+// ownerExportSuite covers ListOwnerNodes, the read that a portable export (§9.5) is built on.
+//
+// The property that matters is that an export sees the SAME tree the user sees, and only their own:
+// another account's nodes, the account's trashed content, and anything else in the database must not
+// appear. A listing that leaks one of those is worse than no export command, because the file it
+// writes leaves the building.
+func ownerExportSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.UUID)) {
+	t.Helper()
+
+	t.Run("ReturnsEveryLiveNodeAndNothingElse", func(t *testing.T) {
+		s, owner := factory(t)
+		root := rootOf(t, s, owner)
+
+		dir := mkdir(t, s, owner, root.ID, "docs")
+		mkfile(t, s, owner, dir.ID, "a.txt", 10)
+		mkfile(t, s, owner, root.ID, "b.txt", 20)
+
+		// An account with no nodes gets nothing, which is the portable form of "another user's
+		// files must not appear": the filter is by owner id, and this store may hold rows for
+		// accounts the suite cannot create through the Tx interface.
+		var stranger []store.Node
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			n, lerr := tx.ListOwnerNodes(ctx, uuid.New())
+			stranger = n
+			return lerr
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if len(stranger) != 0 {
+			t.Fatalf("listing an unrelated owner returned %d nodes; the owner filter is not applied "+
+				"and an export would write somebody else's files", len(stranger))
+		}
+
+		// And one of this account's own nodes in the bin.
+		doomed := mkfile(t, s, owner, root.ID, "doomed.txt", 40)
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.Trash(ctx, doomed.ID)
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		var nodes []store.Node
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			n, lerr := tx.ListOwnerNodes(ctx, owner)
+			nodes = n
+			return lerr
+		}); err != nil {
+			t.Fatalf("list: %v", err)
+		}
+
+		names := map[string]bool{}
+		for _, n := range nodes {
+			if n.OwnerID != owner {
+				t.Fatalf("the export listed a node owned by another account: %s", n.Name)
+			}
+			names[n.Name] = true
+		}
+		for _, want := range []string{"docs", "a.txt", "b.txt"} {
+			if !names[want] {
+				t.Fatalf("the export is missing %q, which the user can see", want)
+			}
+		}
+		if names["doomed.txt"] {
+			t.Fatal("the export included a trashed node; restoring it is a separate action, and an " +
+				"export that silently resurrects deleted content is not what the user asked for")
+		}
+
+		if names[root.Name] != true {
+			// The root is a node too; the export needs it to reconstruct the tree.
+			t.Fatalf("the export is missing the account root %q", root.Name)
+		}
+	})
+
+	t.Run("IsOrderedTheSameWayBothBackends", func(t *testing.T) {
+		s, owner := factory(t)
+		root := rootOf(t, s, owner)
+		mkfile(t, s, owner, root.ID, "zeta.txt", 1)
+		mkfile(t, s, owner, root.ID, "alpha.txt", 1)
+		mkfile(t, s, owner, root.ID, "mid.txt", 1)
+
+		var nodes []store.Node
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			n, err := tx.ListOwnerNodes(ctx, owner)
+			nodes = n
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		for i := 1; i < len(nodes); i++ {
+			if nodes[i-1].Name > nodes[i].Name && nodes[i-1].ParentID == nodes[i].ParentID {
+				t.Fatalf("siblings are not ordered by name: %q before %q",
+					nodes[i-1].Name, nodes[i].Name)
+			}
 		}
 	})
 }
