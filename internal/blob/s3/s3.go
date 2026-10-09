@@ -26,6 +26,7 @@ import (
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+	"github.com/minio/minio-go/v7/pkg/encrypt"
 
 	"github.com/EdisonJwa/newCloud/internal/blob"
 )
@@ -42,6 +43,15 @@ type Config struct {
 	Secure bool
 	// Prefix namespaces keys inside a bucket that may be shared with other applications.
 	Prefix string
+	// SSEMode selects server-side encryption at rest (§9.4): "", "sse-s3" or "sse-kms".
+	//
+	// Empty means "whatever the bucket policy does", which is a legitimate deployment choice — many
+	// object stores encrypt by default and adding a header changes nothing — but it must be a
+	// choice. The requirement asks for encryption at rest as a CONFIGURABLE policy, and a deployment
+	// cannot audit what it cannot see configured.
+	SSEMode string
+	// SSEKMSKeyID names the KMS key for sse-kms. Required for that mode, ignored otherwise.
+	SSEKMSKeyID string
 }
 
 // Store is an S3-backed blob store.
@@ -49,6 +59,9 @@ type Store struct {
 	client *minio.Client
 	bucket string
 	prefix string
+	// sse is the encryption applied to every object this store writes. Nil means the header is
+	// omitted and the bucket's own policy decides.
+	sse encrypt.ServerSide
 }
 
 // New connects and verifies the bucket is reachable.
@@ -92,11 +105,44 @@ func New(ctx context.Context, cfg Config) (*Store, error) {
 		return nil, fmt.Errorf("blob/s3: bucket %q does not exist", cfg.Bucket)
 	}
 
+	sse, err := newSSE(cfg.SSEMode, cfg.SSEKMSKeyID)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Store{
 		client: client,
 		bucket: cfg.Bucket,
 		prefix: strings.Trim(cfg.Prefix, "/"),
+		sse:    sse,
 	}, nil
+}
+
+// newSSE turns the configured mode into the encryption applied to every write.
+//
+// Validated here rather than at config load: the mode is meaningless without a key for sse-kms, and
+// an unknown value silently falling back to "no encryption" is the failure this check exists to
+// prevent — a deployment would believe it had encryption at rest because it wrote a line in a file.
+func newSSE(mode, kmsKeyID string) (encrypt.ServerSide, error) {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "":
+		return nil, nil
+	case "sse-s3":
+		return encrypt.NewSSE(), nil
+	case "sse-kms":
+		if kmsKeyID == "" {
+			return nil, errors.New("blob/s3: sse_kms_key_id is required when sse is sse-kms")
+		}
+		sse, err := encrypt.NewSSEKMS(kmsKeyID, nil)
+		if err != nil {
+			return nil, fmt.Errorf("blob/s3: sse-kms: %w", err)
+		}
+		return sse, nil
+	default:
+		return nil, fmt.Errorf("blob/s3: unknown sse mode %q (want \"\", \"sse-s3\" or \"sse-kms\") "+
+			" — refusing to start rather than writing unencrypted objects a deployment believes "+
+			"are encrypted", mode)
+	}
 }
 
 // key maps a content address to an object key.
@@ -168,11 +214,15 @@ func (s *Store) Put(ctx context.Context, h blob.Hash, r io.Reader, size int64) e
 		return fmt.Errorf("blob/s3: rewind: %w", err)
 	}
 
-	_, err = s.client.PutObject(ctx, s.bucket, s.key(h), seeker, written, minio.PutObjectOptions{
+	opts := minio.PutObjectOptions{
 		ContentType: "application/octet-stream",
 		// The key is a hash, so the bytes behind it never change.
 		UserMetadata: map[string]string{"sha256": h.String()},
-	})
+	}
+	if s.sse != nil {
+		opts.ServerSideEncryption = s.sse
+	}
+	_, err = s.client.PutObject(ctx, s.bucket, s.key(h), seeker, written, opts)
 	if err != nil {
 		return fmt.Errorf("blob/s3: put %s: %w", h, err)
 	}

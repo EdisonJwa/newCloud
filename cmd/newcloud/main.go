@@ -631,21 +631,31 @@ func openS3Storage(cfg config.Config, meta storepkg.Store, log *slog.Logger) (la
 
 	s3cfg := cfg.Storage.S3
 	store, err := s3blob.New(ctx, s3blob.Config{
-		Endpoint:  s3cfg.Endpoint,
-		Bucket:    s3cfg.Bucket,
-		Region:    s3cfg.Region,
-		AccessKey: s3cfg.AccessKey,
-		SecretKey: s3cfg.SecretKey,
-		Secure:    s3cfg.UseTLS(),
-		Prefix:    s3cfg.Prefix,
+		Endpoint:    s3cfg.Endpoint,
+		Bucket:      s3cfg.Bucket,
+		Region:      s3cfg.Region,
+		AccessKey:   s3cfg.AccessKey,
+		SecretKey:   s3cfg.SecretKey,
+		Secure:      s3cfg.UseTLS(),
+		Prefix:      s3cfg.Prefix,
+		SSEMode:     s3cfg.SSE,
+		SSEKMSKeyID: s3cfg.SSEKMSKeyID,
 	})
 	if err != nil {
 		return nil, nil, err
 	}
 
+	// Say which encryption is in force. A deployment that believes it has encryption at rest and
+	// cannot see the setting in its own startup log is exactly the deployment that finds out
+	// otherwise during an audit.
+	sse := s3cfg.SSE
+	if sse == "" {
+		sse = "bucket-policy"
+	}
 	log.Info("storage ready",
 		"backend", "s3", "layout", string(layout.ModeBlob),
 		"endpoint", s3cfg.Endpoint, "bucket", s3cfg.Bucket,
+		"encryption", sse,
 		"deduplicated", true, "inspectable", false)
 
 	adapter, err := blobstore.New(store, &resolverAdapter{r: meta.Resolver()})

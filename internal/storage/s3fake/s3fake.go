@@ -43,6 +43,10 @@ type Obj struct {
 	// Meta holds the user metadata headers, which the conformance suite does not read but a
 	// caller might.
 	Meta map[string]string
+	// SSE is the server-side encryption the PUT requested, and KMSKey the key it named. Recorded
+	// so a test can prove the header was actually sent rather than only configured.
+	SSE    string
+	KMSKey string
 }
 
 // Server is a fake S3 endpoint.
@@ -325,6 +329,8 @@ func (s *Server) store(w http.ResponseWriter, r *http.Request, bucket, key strin
 			meta[strings.ToLower(k)] = v[0]
 		}
 	}
+	sse := r.Header.Get("X-Amz-Server-Side-Encryption")
+	kmsKey := r.Header.Get("X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id")
 
 	s.mu.Lock()
 	b, ok := s.buckets[bucket]
@@ -334,7 +340,7 @@ func (s *Server) store(w http.ResponseWriter, r *http.Request, bucket, key strin
 		_, _ = w.Write([]byte(`<Error><Code>NoSuchBucket</Code></Error>`))
 		return
 	}
-	b[key] = &Obj{Data: data, ETag: etag, ModTime: time.Now().UTC(), Meta: meta}
+	b[key] = &Obj{Data: data, ETag: etag, ModTime: time.Now().UTC(), Meta: meta, SSE: sse, KMSKey: kmsKey}
 	s.mu.Unlock()
 
 	w.Header().Set("ETag", `"`+etag+`"`)
@@ -752,6 +758,21 @@ func (s *Server) GetDirect(bucket, key string) ([]byte, bool) {
 }
 
 // Keys returns every key in a bucket, sorted.
+// Object returns the stored object, for tests that need more than its existence.
+func (s *Server) Object(bucket, key string) (Obj, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, ok := s.buckets[bucket]
+	if !ok {
+		return Obj{}, false
+	}
+	o, ok := b[key]
+	if !ok {
+		return Obj{}, false
+	}
+	return *o, true
+}
+
 func (s *Server) Keys(bucket string) []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

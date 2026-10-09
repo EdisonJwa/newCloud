@@ -161,6 +161,13 @@ type S3Storage struct {
 	// explicit decision rather than something inherited from a zero value.
 	Secure *bool  `yaml:"secure"`
 	Prefix string `yaml:"prefix"`
+	// SSE is the server-side encryption mode (§9.4): "", "sse-s3" or "sse-kms".
+	//
+	// Empty leaves it to the bucket policy. Anything else is validated at startup, and an unknown
+	// value is a refusal to start rather than a silent fallback to plaintext.
+	SSE string `yaml:"sse"`
+	// SSEKMSKeyID names the KMS key for sse-kms.
+	SSEKMSKeyID string `yaml:"sse_kms_key_id"`
 }
 
 // UseTLS reports whether the connection must use https.
