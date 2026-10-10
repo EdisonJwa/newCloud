@@ -274,6 +274,8 @@ func auditVerify(args []string) error {
 	flags := flag.NewFlagSet("audit verify", flag.ContinueOnError)
 	batch := flags.Int("batch", 1000, "events to read per round trip")
 	jsonOut := flags.Bool("json", false, "emit the report as JSON")
+	exportPath := flags.String("export", "",
+		"verify an exported file (JSON export, prune archive or CSV) instead of the database")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			// `-h` asks for usage; it is not a failure.
@@ -282,9 +284,26 @@ func auditVerify(args []string) error {
 		return err
 	}
 
+	// A file is verified on its own terms: each event carries its own digest and its predecessor's,
+	// so the check needs no database at all. That is what makes an export checkable on the machine
+	// it is going to, not only on the one it came from.
+	if *exportPath != "" {
+		events, lerr := auditverify.LoadFile(*exportPath)
+		if lerr != nil {
+			return lerr
+		}
+		report := auditverify.VerifyEvents(events)
+		logVerifyReport(log, report)
+		if !report.OK() {
+			return fmt.Errorf("audit verify: export is broken: %w", report.Err)
+		}
+		log.Info("export verified", "file", *exportPath, "events", report.Events)
+		return nil
+	}
+
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
-		return errors.New("audit verify: DATABASE_URL is required")
+		return errors.New("audit verify: DATABASE_URL is required (or pass --export)")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)

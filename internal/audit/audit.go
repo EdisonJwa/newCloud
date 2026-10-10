@@ -176,8 +176,18 @@ type Event struct {
 	AuthMethod string
 }
 
-// GenesisHash is the chain seed. Using a fixed non-zero value makes an empty
-// chain distinguishable from a truncated one.
+// GenesisHash is the chain seed: thirty-two zero bytes.
+//
+// The comment here used to claim that "a fixed non-zero value makes an empty chain distinguishable
+// from a truncated one". It did not, and the code never used a non-zero value: the seed is zeros, so
+// an empty log and a log truncated to nothing report the same head. Truncation is detected by the
+// external anchor (INV-09), which is where that property belongs — a sentinel inside the same database
+// the attacker controls cannot prove the database was not emptied.
+//
+// The value cannot change now without invalidating every chain ever written: each event hashes its
+// predecessor, so a different seed breaks the first link of every existing log. Correcting the comment
+// is the honest fix; rewriting history to make a comment true is the operation the chain exists to
+// prevent.
 var GenesisHash = bytes32(0x00)
 
 func bytes32(b byte) []byte {

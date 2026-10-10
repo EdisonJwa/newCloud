@@ -24,7 +24,7 @@ func (s *PG) ReadAudit(ctx context.Context, f AuditFilter) ([]AuditRow, error) {
 
 	q := fmt.Sprintf(`SELECT id, ts, actor_kind, actor_user_id, COALESCE(actor_email::text, ''),
 			COALESCE(actor_ip::text, ''), user_agent, action, target_kind, target_id,
-			share_id, result, bytes, metadata, prev_hash, hash, request_id
+			share_id, result, bytes, metadata, prev_hash, hash, request_id, auth_method
 		FROM audit.events
 		%s
 		ORDER BY id %s
