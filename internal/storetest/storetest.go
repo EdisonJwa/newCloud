@@ -14,8 +14,10 @@ package storetest
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -765,6 +767,10 @@ func Run(t *testing.T, factory Factory, opts Options) {
 
 	t.Run("OwnerExport", func(t *testing.T) {
 		ownerExportSuite(t, factory)
+	})
+
+	t.Run("RuntimeSettings", func(t *testing.T) {
+		runtimeSettingsSuite(t, factory)
 	})
 
 	t.Run("RecipientAccess", func(t *testing.T) {
@@ -6577,6 +6583,105 @@ func ownerExportSuite(t *testing.T, factory func(t *testing.T) (store.Store, uui
 				t.Fatalf("siblings are not ordered by name: %q before %q",
 					nodes[i-1].Name, nodes[i].Name)
 			}
+		}
+	})
+}
+
+// runtimeSettingsSuite covers the settings table, which existed from the first migration and had no Go
+// code touching it for the whole life of the project.
+//
+// The contract is small and the tests are about the parts that are easy to get subtly wrong: an absent
+// key means "configured default" rather than "zero", an override round-trips as the exact JSON that was
+// written (not re-encoded), and deleting an override restores the default rather than deleting the
+// concept.
+func runtimeSettingsSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.UUID)) {
+	t.Helper()
+
+	t.Run("AbsentMeansNotOverridden", func(t *testing.T) {
+		s, owner := factory(t)
+		var got map[string]json.RawMessage
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			m, err := tx.ReadSettings(ctx)
+			got = m
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("a fresh store reports %d settings; absent must mean default, not a value "+
+				"somebody has to interpret", len(got))
+		}
+		_ = owner
+	})
+
+	t.Run("RoundTripsTheExactValue", func(t *testing.T) {
+		s, owner := factory(t)
+		value := json.RawMessage(`{"nested":[1,2,3],"n":4096}`)
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.WriteSetting(ctx, "limits.max_file_bytes", value, owner)
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		var got map[string]json.RawMessage
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			m, err := tx.ReadSettings(ctx)
+			got = m
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		// Compared SEMANTICALLY, not byte for byte: the PostgreSQL column is jsonb and normalises
+		// key order and whitespace. Demanding identical bytes would fail on the backend that is
+		// actually deployed, for a difference that changes no value.
+		var want, have any
+		if err := json.Unmarshal(value, &want); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(got["limits.max_file_bytes"], &have); err != nil {
+			t.Fatalf("the stored value is not JSON: %v", err)
+		}
+		if !reflect.DeepEqual(want, have) {
+			t.Fatalf("value round-trip changed it: wrote %s, read %s",
+				value, got["limits.max_file_bytes"])
+		}
+	})
+
+	t.Run("OverwriteReplacesAndDeleteRestoresTheDefault", func(t *testing.T) {
+		s, owner := factory(t)
+		write := func(v string) {
+			t.Helper()
+			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				return tx.WriteSetting(ctx, "limits.max_file_bytes", json.RawMessage(v), owner)
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		read := func() map[string]json.RawMessage {
+			t.Helper()
+			var m map[string]json.RawMessage
+			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				got, err := tx.ReadSettings(ctx)
+				m = got
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			return m
+		}
+
+		write(`1024`)
+		write(`2048`)
+		if got := string(read()["limits.max_file_bytes"]); got != `2048` {
+			t.Fatalf("overwrite did not replace the value: %s", got)
+		}
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.DeleteSetting(ctx, "limits.max_file_bytes")
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := read()["limits.max_file_bytes"]; ok {
+			t.Fatal("deleting the override left it behind")
 		}
 	})
 }

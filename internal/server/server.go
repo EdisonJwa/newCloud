@@ -51,7 +51,10 @@ type Deps struct {
 	// path-addressing ContentStore cannot serve an old one. Nil means this deployment's layout
 	// keeps no addressable history, and the version-content endpoint says so rather than serving
 	// the wrong bytes.
-	Blobs    blob.Store
+	Blobs blob.Store
+	// Settings supplies the runtime overrides (§10.1). Nil means every limit comes from the
+	// configuration file, which is what a harness that does not care about settings wants.
+	Settings *settingsCache
 	Authz    *authz.Service
 	Tickets  *ticket.Issuer
 	Sessions *auth.Sessions
@@ -250,6 +253,11 @@ func (s *Server) Handler() http.Handler {
 			// Groups: the surface that made group sharing (SHARE-08) reachable at all. The store,
 			// the authorizer and the ACL API all supported groups already; nothing could create
 			// one or put anybody in it.
+			r.Route("/admin/settings", func(r chi.Router) {
+				r.Get("/", s.handleAdminSettings)
+				r.Put("/{key}", s.handleAdminSetSetting)
+				r.Delete("/{key}", s.handleAdminDeleteSetting)
+			})
 			r.Route("/admin/groups", func(r chi.Router) {
 				r.Post("/", s.handleAdminCreateGroup)
 				r.Post("/{id}/members", s.handleAdminAddGroupMember)

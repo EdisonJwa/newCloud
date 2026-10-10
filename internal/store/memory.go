@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path"
@@ -38,6 +39,8 @@ type Memory struct {
 	children      map[uuid.UUID]map[string]uuid.UUID // parent -> lower(name) -> child
 	roots         map[uuid.UUID]uuid.UUID
 	trashSeq      []uuid.UUID
+	// settings holds runtime overrides; empty means every key is at its configured default.
+	settings map[string]json.RawMessage
 
 	audit []AuditEntry
 	// auditTimes runs parallel to audit. The write-side entry has no timestamp by
@@ -215,19 +218,44 @@ func (m *Memory) WithTx(ctx context.Context, fn func(ctx context.Context, tx Tx)
 	// 500 on the one screen an operator reaches for when something has gone wrong.
 	m.auditTimes = work.auditTimes
 	m.jobs = work.jobs
+	// The publish step has its own list, parallel to snapshot(). A field added to one and not the
+	// other is written into the snapshot and dropped at commit — which is exactly what happened
+	// here until the conformance suite failed on the memory backend and not on PostgreSQL.
+	m.settings = work.settings
 	m.nextVersion = work.nextVersion
 	return nil
+}
+
+// cloneSettings copies the override map.
+//
+// make(map, len(m.settings)) would size the map and copy NOTHING, which looks like a copy and is an
+// empty map: the next transaction's snapshot then wipes every override at commit. That exact bug
+// shipped for ten minutes and the conformance suite caught it on the memory backend while PostgreSQL
+// passed, which is the whole reason both backends run the same suite.
+func cloneSettings(src map[string]json.RawMessage) map[string]json.RawMessage {
+	if len(src) == 0 {
+		return nil
+	}
+	out := make(map[string]json.RawMessage, len(src))
+	for k, v := range src {
+		out[k] = append(json.RawMessage(nil), v...)
+	}
+	return out
 }
 
 // snapshot returns a deep copy suitable for a transaction's private workspace.
 // Every mutating map is duplicated; the immutable scalars are copied by value.
 func (m *Memory) snapshot() *Memory {
 	work := &Memory{
-		nodes:        make(map[uuid.UUID]*memNode, len(m.nodes)),
-		children:     make(map[uuid.UUID]map[string]uuid.UUID, len(m.children)),
-		roots:        make(map[uuid.UUID]uuid.UUID, len(m.roots)),
-		usage:        make(map[uuid.UUID]int64, len(m.usage)),
-		quota:        make(map[uuid.UUID]int64, len(m.quota)),
+		nodes:    make(map[uuid.UUID]*memNode, len(m.nodes)),
+		children: make(map[uuid.UUID]map[string]uuid.UUID, len(m.children)),
+		roots:    make(map[uuid.UUID]uuid.UUID, len(m.roots)),
+		usage:    make(map[uuid.UUID]int64, len(m.usage)),
+		quota:    make(map[uuid.UUID]int64, len(m.quota)),
+		// Every map field must be listed here or a transaction writes into a snapshot that is
+		// discarded at commit. Adding a field to the struct and forgetting this function loses the
+		// write silently — the conformance suite catches it because both backends must round-trip.
+		settings:     cloneSettings(m.settings),
 		users:        make(map[uuid.UUID]*User, len(m.users)),
 		sessions:     make(map[string]*memSession, len(m.sessions)),
 		appPasswords: make(map[uuid.UUID]*AppPassword, len(m.appPasswords)),
@@ -1190,4 +1218,28 @@ func (t *memTx) ListOwnerNodes(ctx context.Context, ownerID uuid.UUID) ([]Node, 
 		return out[i].ID.String() < out[j].ID.String()
 	})
 	return out, nil
+}
+
+// ReadSettings returns the runtime overrides, if any.
+func (t *memTx) ReadSettings(ctx context.Context) (map[string]json.RawMessage, error) {
+	out := make(map[string]json.RawMessage, len(t.m.settings))
+	for k, v := range t.m.settings {
+		out[k] = append(json.RawMessage(nil), v...)
+	}
+	return out, nil
+}
+
+// WriteSetting stores one override.
+func (t *memTx) WriteSetting(ctx context.Context, key string, value json.RawMessage, by uuid.UUID) error {
+	if t.m.settings == nil {
+		t.m.settings = map[string]json.RawMessage{}
+	}
+	t.m.settings[key] = append(json.RawMessage(nil), value...)
+	return nil
+}
+
+// DeleteSetting removes an override.
+func (t *memTx) DeleteSetting(ctx context.Context, key string) error {
+	delete(t.m.settings, key)
+	return nil
 }

@@ -62,7 +62,7 @@ func (s *Server) handleUploadCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	// The cap is enforced before a byte is accepted, so a client cannot use sessions to write
 	// past the file-size limit one chunk at a time.
-	if body.Size > s.deps.Config.Limits.MaxFileBytes {
+	if body.Size > s.maxFileBytes(r.Context()) {
 		writeError(w, http.StatusRequestEntityTooLarge, "too_large", "the file exceeds the configured limit")
 		return
 	}
@@ -125,7 +125,7 @@ func (s *Server) handleUploadChunk(w http.ResponseWriter, r *http.Request) {
 	}
 	size := end - start + 1
 
-	if size > s.deps.Config.Limits.MaxFileBytes {
+	if size > s.maxFileBytes(r.Context()) {
 		writeError(w, http.StatusRequestEntityTooLarge, "too_large", "the chunk exceeds the configured limit")
 		return
 	}

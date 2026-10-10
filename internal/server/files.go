@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"path"
@@ -382,11 +383,24 @@ func (s *Server) uploadStagingDir() string {
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	actor, _ := actorFrom(r.Context())
 
-	// Cap the request before reading: a client that lies about its size would
-	// otherwise fill the disk while we stream.
-	r.Body = http.MaxBytesReader(w, r.Body, s.deps.Config.Limits.MaxFileBytes)
+	// Cap the request before reading: a client that lies about its size would otherwise fill the
+	// disk while we stream. The cap is the EFFECTIVE one: a runtime override (an administrator
+	// lowering the limit without a restart) has to reach this reader, or the setting is a number in
+	// a table that nothing obeys.
+	limit := s.maxFileBytes(r.Context())
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
 
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		// MaxBytesReader's failure is a size refusal, not a malformed request. Answering 400 for it
+		// told a client its upload was broken when it was merely too large — and it was the same
+		// answer the handler gave before the cap was read at all, which is how a limit that was not
+		// enforced still looked like it was.
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			writeError(w, http.StatusRequestEntityTooLarge, "file_too_large",
+				fmt.Sprintf("the file exceeds the %d-byte limit", limit))
+			return
+		}
 		writeError(w, http.StatusBadRequest, "bad_upload", "could not parse the upload")
 		return
 	}

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -1057,4 +1058,50 @@ func (t *pgTx) ListOwnerNodes(ctx context.Context, ownerID uuid.UUID) ([]Node, e
 		out = append(out, n)
 	}
 	return out, translate(rows.Err())
+}
+
+// ReadSettings returns every runtime override.
+//
+// Read one row at a time rather than through a generic map scan: the settings are few, and a typed
+// decode keeps a malformed value from becoming a runtime surprise in whichever handler reads it.
+func (t *pgTx) ReadSettings(ctx context.Context) (map[string]json.RawMessage, error) {
+	rows, err := t.tx.Query(ctx, `SELECT key, value FROM settings`)
+	if err != nil {
+		return nil, translate(err)
+	}
+	defer rows.Close()
+
+	out := map[string]json.RawMessage{}
+	for rows.Next() {
+		var (
+			key   string
+			value []byte
+		)
+		if err := rows.Scan(&key, &value); err != nil {
+			return nil, translate(err)
+		}
+		out[key] = json.RawMessage(value)
+	}
+	return out, translate(rows.Err())
+}
+
+// WriteSetting stores one override, replacing any previous value.
+func (t *pgTx) WriteSetting(ctx context.Context, key string, value json.RawMessage, by uuid.UUID) error {
+	var uuidArg *uuid.UUID
+	if by != uuid.Nil {
+		uuidArg = &by
+	}
+	_, err := t.tx.Exec(ctx, `
+		INSERT INTO settings (key, value, updated_at, updated_by)
+		VALUES ($1, $2, now(), $3)
+		ON CONFLICT (key) DO UPDATE
+		SET value = EXCLUDED.value, updated_at = now(), updated_by = EXCLUDED.updated_by`,
+		key, []byte(value), uuidArg)
+	return translate(err)
+}
+
+// DeleteSetting removes an override.
+func (t *pgTx) DeleteSetting(ctx context.Context, key string) error {
+	_, err := t.tx.Exec(ctx, `DELETE FROM settings WHERE key = $1`, key)
+	return translate(err)
 }

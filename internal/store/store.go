@@ -9,6 +9,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -288,6 +289,23 @@ type Tx interface {
 	// BlobHash returns the content address recorded for a blob, for verification that does
 	// not trust either copy on disk.
 	BlobHash(ctx context.Context, id uuid.UUID) ([]byte, error)
+	// ReadSettings returns every runtime setting that has been written.
+	//
+	// The settings table has existed since the first migration and had no Go code touching it: the
+	// schema promised runtime configuration and the application never delivered it, so every limit
+	// change was a restart.
+	ReadSettings(ctx context.Context) (map[string]json.RawMessage, error)
+
+	// WriteSetting stores one runtime setting, replacing any previous value.
+	//
+	// The value is validated by the caller BEFORE it reaches here: this method cannot know what a
+	// particular key means, and storing an unvalidated value would push the failure to the request
+	// that later reads it.
+	WriteSetting(ctx context.Context, key string, value json.RawMessage, by uuid.UUID) error
+
+	// DeleteSetting removes an override, returning the key to the configured default.
+	DeleteSetting(ctx context.Context, key string) error
+
 	// ListOwnerNodes returns every live node an account owns, for a portable export (§9.5).
 	//
 	// Trashed nodes are excluded: the export is what the user still has, and including the bin would

@@ -27,16 +27,20 @@ import (
 
 // knownUnemitted lists actions declared in internal/audit with no emitter outside tests.
 //
-// Two kinds are in here and they are not equally bad:
+// All three are names reserved for paths that DO NOT EXIST, which is defensible only because they are
+// counted here and the list is a ratchet in both directions: adding one without an emitter fails, and
+// emitting one without removing it fails too.
 //
-//	Missing auditing for something that happens — auth.session.revoke, admin.setting.change.
-//	    These are requirement gaps (§10.1 asks for 会话撤销 and 管理配置变更), not naming choices.
+//	admin.privileged_read  audit reads are recorded as audit.export; a distinct action would describe
+//	                       an endpoint that does not exist
+//	file.download_zip      no bulk-download feature exists (the export command writes a directory)
+//	security.anomaly       no anomaly detection exists
 //
-//	Names reserved for paths that do not exist yet — security.anomaly, admin.privileged_read.
-//	    Declaring them early is defensible; leaving them uncounted is not.
+// The list used to also carry auth.session.revoke and admin.setting.change as missing audits for
+// things that genuinely happen. Both now have emitters, which is why they are gone: that is what this
+// guard is for.
 var knownUnemitted = []string{
 	"admin.privileged_read",
-	"admin.setting.change",
 	"file.download_zip",
 	"security.anomaly",
 }

@@ -514,6 +514,7 @@ func serve() error {
 		// Set for the addressable layout only: reading a historical version needs an address,
 		// and openStorage returns nil here for the tree layout.
 		Blobs:     blobStore,
+		Settings:  server.NewSettingsCache(),
 		Authz:     authz.NewService(&authzAccessor{m: meta}),
 		Tickets:   tickets,
 		Sessions:  auth.NewSessions(tickets, meta, cfg.Auth.SessionTTL),
