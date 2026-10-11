@@ -25,8 +25,18 @@ import (
 	"github.com/EdisonJwa/newCloud/internal/store"
 )
 
-// settingKeyMaxFileBytes caps a single upload.
-const settingKeyMaxFileBytes = "limits.max_file_bytes"
+// The keys that take effect at runtime. Each one has a read point in a request path, which is what
+// makes it a setting rather than a config file entry with a table row next to it.
+const (
+	// settingKeyMaxFileBytes caps a single upload.
+	settingKeyMaxFileBytes = "limits.max_file_bytes"
+	// settingKeyChunkBytes caps one ranged upload request.
+	settingKeyChunkBytes = "limits.upload_chunk_bytes"
+	// settingKeyDefaultQuota is the quota a NEW account is created with. It has no effect on existing
+	// accounts; changing those is the per-user quota endpoint, and conflating the two would make
+	// "change the default" quietly rewrite people's limits.
+	settingKeyDefaultQuota = "limits.default_file_quota_bytes"
+)
 
 // runtimeSetting is one key that takes effect without a restart.
 type runtimeSetting struct {
@@ -42,13 +52,28 @@ var runtimeSettings = []runtimeSetting{
 	{
 		key:        settingKeyMaxFileBytes,
 		configured: func(c config.Config) int64 { return c.Limits.MaxFileBytes },
-		validate: func(v int64) error {
-			if v < 0 {
-				return fmt.Errorf("a size limit cannot be negative")
-			}
-			return nil
-		},
+		validate:   validateNonNegative,
 	},
+	{
+		key:        settingKeyChunkBytes,
+		configured: func(c config.Config) int64 { return c.Limits.UploadChunkBytes },
+		validate:   validateNonNegative,
+	},
+	{
+		key:        settingKeyDefaultQuota,
+		configured: func(c config.Config) int64 { return c.Limits.DefaultFileQuotaBytes },
+		validate:   validateNonNegative,
+	},
+}
+
+// validateNonNegative rejects a negative size. Zero is allowed and means "unset": for the chunk and
+// quota keys that is the documented "no limit"/"schema default" reading, so refusing it would make the
+// reset impossible to express.
+func validateNonNegative(v int64) error {
+	if v < 0 {
+		return fmt.Errorf("a size limit cannot be negative")
+	}
+	return nil
 }
 
 // settingsCache holds the overrides for a short interval.
@@ -293,3 +318,16 @@ func (s *Server) maxFileBytes(ctx context.Context) int64 {
 	base := s.deps.Config.Limits.MaxFileBytes
 	return s.deps.Settings.Int(ctx, s.deps.Meta, settingKeyMaxFileBytes, base)
 }
+
+// chunkBytes is the effective cap on one ranged upload request.
+func (s *Server) chunkBytes(ctx context.Context) int64 {
+	base := s.deps.Config.Limits.UploadChunkBytes
+	return s.deps.Settings.Int(ctx, s.deps.Meta, settingKeyChunkBytes, base)
+}
+
+// InitialQuota is the quota a NEW account is provisioned with, including a runtime override.
+//
+// Exported for the settings test: the provisioning paths are internal, and the property under test
+// ("the default changes without a restart, and existing accounts are untouched") is exactly the value
+// those paths would store.
+func (s *Server) InitialQuota(ctx context.Context) *int64 { return s.initialQuota(ctx) }

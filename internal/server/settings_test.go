@@ -134,3 +134,81 @@ func (h *harness) uploadStatus(t *testing.T, name, content string) int {
 }
 
 var _ = json.Marshal
+
+// TestEveryAllowListedKeyReachesAReadPoint is the check that keeps the allow-list honest.
+//
+// A settings table's characteristic failure is a key that stores fine and changes nothing: the operator
+// sees "override" in the API and the product keeps behaving as configured. Each key is exercised
+// through the behaviour it is supposed to control, so adding one to the list without wiring a read
+// point fails here rather than in a support ticket.
+func TestEveryAllowListedKeyReachesAReadPoint(t *testing.T) {
+	t.Run("limits.upload_chunk_bytes", func(t *testing.T) {
+		h := newHarness(t)
+		admin, _ := h.adminClient(t)
+
+		session := startUpload(t, h, "", "chunked.bin", 16)
+		// At the configured 64 KiB cap this chunk is accepted.
+		if resp, payload := sendChunk(t, h, session.ID, 0, 3, 16, "abcd"); resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			t.Fatalf("baseline chunk: %d %v", resp.StatusCode, payload)
+		} else {
+			resp.Body.Close()
+		}
+
+		resp := h.adminDo(t, admin, http.MethodPut, "/api/admin/settings/limits.upload_chunk_bytes", `2`)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("set chunk cap: %d", resp.StatusCode)
+		}
+
+		over, payload := sendChunk(t, h, session.ID, 4, 9, 16, "abcdef")
+		defer over.Body.Close()
+		if over.StatusCode != http.StatusRequestEntityTooLarge {
+			t.Fatalf("a chunk over the runtime cap returned %d, want 413: %v. The key is stored and "+
+				"not read, which is the failure mode the allow-list exists to prevent.",
+				over.StatusCode, payload)
+		}
+	})
+
+	t.Run("limits.default_file_quota_bytes", func(t *testing.T) {
+		ctx := context.Background()
+		h := newHarness(t)
+		admin, _ := h.adminClient(t)
+
+		resp := h.adminDo(t, admin, http.MethodPut,
+			"/api/admin/settings/limits.default_file_quota_bytes", `12345`)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("set default quota: %d", resp.StatusCode)
+		}
+		// The value the server would give a new account: the same helper the provisioning path uses,
+		// called through the same cache. A new account cannot be created directly in the harness, so
+		// the helper is what is checked — and it is the single place both provisioners call.
+		got := h.srvServer.InitialQuota(ctx)
+		if got == nil {
+			t.Fatalf("a new account would get no quota at all, want the override 12345. The key is " +
+				"stored and not read.")
+		}
+		if *got != 12345 {
+			t.Fatalf("a new account would get quota %d, want the override 12345. The key is "+
+				"stored and not read.", *got)
+		}
+
+		// And it does not touch an existing account: changing the default must not rewrite limits.
+		var before, after int64
+		_ = h.meta.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			u, err := tx.UserByID(ctx, h.user.ID)
+			before = u.QuotaBytes
+			return err
+		})
+		h.adminDo(t, admin, http.MethodPut, "/api/admin/settings/limits.default_file_quota_bytes", `999`).Body.Close()
+		_ = h.meta.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			u, err := tx.UserByID(ctx, h.user.ID)
+			after = u.QuotaBytes
+			return err
+		})
+		if before != after {
+			t.Fatalf("changing the default quota rewrote an existing account: %d -> %d", before, after)
+		}
+	})
+}

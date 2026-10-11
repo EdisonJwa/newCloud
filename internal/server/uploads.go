@@ -133,7 +133,7 @@ func (s *Server) handleUploadChunk(w http.ResponseWriter, r *http.Request) {
 	// the whole file through one chunk and make the setting meaningless. A chunk limit that is not
 	// enforced is not a limit: it does not bound the memory a single request can make the server
 	// stage, which is the reason to have one.
-	if limit := s.deps.Config.Limits.UploadChunkBytes; limit > 0 && size > limit {
+	if limit := s.chunkBytes(r.Context()); limit > 0 && size > limit {
 		writeError(w, http.StatusRequestEntityTooLarge, "chunk_too_large",
 			fmt.Sprintf("the chunk exceeds limits.upload_chunk_bytes (%d); split the upload into smaller ranges", limit))
 		return

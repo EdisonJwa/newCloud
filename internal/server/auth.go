@@ -190,7 +190,7 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 			Email:       claims.Email,
 			DisplayName: claims.Name,
 			Role:        string(role),
-			QuotaBytes:  s.initialQuota(),
+			QuotaBytes:  s.initialQuota(ctx),
 			// Carries the policy's decision into the row. Without this the pending mode
 			// computed a status that nothing stored, so it behaved exactly like open.
 			Status: decision.Status,
@@ -539,8 +539,13 @@ func (i issuerCarrier) IssuerURL() string { return i.s }
 //
 // Nil means "leave the schema default alone", which is what an operator gets by setting the key to
 // zero: the migration's value is the documented default and it stays the single source of truth.
-func (s *Server) initialQuota() *int64 {
-	if q := s.deps.Config.Limits.DefaultFileQuotaBytes; q > 0 {
+func (s *Server) initialQuota(ctx context.Context) *int64 {
+	// The runtime override wins over the config file, so an operator can change what NEW accounts get
+	// without a restart. Existing accounts are untouched: that is the per-user quota endpoint, and
+	// conflating the two would make "change the default" quietly rewrite people's limits.
+	q := s.deps.Settings.Int(ctx, s.deps.Meta, settingKeyDefaultQuota,
+		s.deps.Config.Limits.DefaultFileQuotaBytes)
+	if q > 0 {
 		return &q
 	}
 	return nil
