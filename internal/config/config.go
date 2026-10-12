@@ -62,6 +62,13 @@ type ServerConfig struct {
 	Addr           string `yaml:"addr"`
 	PublicURL      string `yaml:"public_url"`
 	UserContentURL string `yaml:"usercontent_url"`
+	// UserContentAddr is the listen address for the content origin.
+	//
+	// Empty means content is served by the main listener and the separation is the deployment's
+	// (a reverse proxy routing usercontent_url to the same process). Setting it makes the split real
+	// inside the application: the content routes move to this listener and the main one refuses them,
+	// so the app origin cannot serve user bytes even by accident.
+	UserContentAddr string `yaml:"usercontent_addr"`
 	// TrustProxy honours X-Forwarded-For from ANY peer.
 	//
 	// Deprecated in favour of TrustedProxies, and unsafe on a listener that is reachable

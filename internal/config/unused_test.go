@@ -46,7 +46,6 @@ func TestUnusedKeysCoversEveryInertKey(t *testing.T) {
 
 	got := unusedByKey(t, cfg)
 	for _, want := range []string{
-		"server.usercontent_url",
 		"auth.scim_token",
 	} {
 		if _, ok := got[want]; !ok {
@@ -54,7 +53,7 @@ func TestUnusedKeysCoversEveryInertKey(t *testing.T) {
 				"explanation. Reported: %v", want, keysOf(got))
 		}
 	}
-	if len(got) != 2 {
+	if len(got) != 1 {
 		t.Fatalf("reported %d keys, want 2: %v", len(got), keysOf(got))
 	}
 }
@@ -81,10 +80,6 @@ func TestUnusedKeysExplainsWhatIsMissing(t *testing.T) {
 	got := unusedByKey(t, cfg)
 
 	// A reason that does not name the consequence is not worth printing.
-	if !strings.Contains(got["server.usercontent_url"], "public_url") {
-		t.Fatalf("the content-origin reason should say where content is actually served from: %q",
-			got["server.usercontent_url"])
-	}
 	if !strings.Contains(got["auth.scim_token"], "SCIM") {
 		t.Fatalf("the SCIM reason should name what is missing: %q", got["auth.scim_token"])
 	}

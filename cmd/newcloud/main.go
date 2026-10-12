@@ -513,20 +513,23 @@ func serve() error {
 		Content: content,
 		// Set for the addressable layout only: reading a historical version needs an address,
 		// and openStorage returns nil here for the tree layout.
-		Blobs:     blobStore,
-		Settings:  server.NewSettingsCache(),
-		Authz:     authz.NewService(&authzAccessor{m: meta}),
-		Tickets:   tickets,
-		Sessions:  auth.NewSessions(tickets, meta, cfg.Auth.SessionTTL),
-		AppPass:   auth.NewAppPasswords(meta),
-		Shares:    shares,
-		Mailer:    mailer,
-		Provider:  provider,
-		Providers: providers,
-		Uploads:   uploads,
-		Metrics:   reg,
-		Log:       log,
-		Version:   version,
+		Blobs:    blobStore,
+		Settings: server.NewSettingsCache(),
+		// The split is decided by configuration: a content address means the application origin must
+		// stop serving user bytes, so the route moves rather than being duplicated.
+		ContentSplit: cfg.Server.UserContentAddr != "",
+		Authz:        authz.NewService(&authzAccessor{m: meta}),
+		Tickets:      tickets,
+		Sessions:     auth.NewSessions(tickets, meta, cfg.Auth.SessionTTL),
+		AppPass:      auth.NewAppPasswords(meta),
+		Shares:       shares,
+		Mailer:       mailer,
+		Provider:     provider,
+		Providers:    providers,
+		Uploads:      uploads,
+		Metrics:      reg,
+		Log:          log,
+		Version:      version,
 	}
 
 	srv, err := server.New(deps)

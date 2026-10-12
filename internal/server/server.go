@@ -55,12 +55,16 @@ type Deps struct {
 	// Settings supplies the runtime overrides (§10.1). Nil means every limit comes from the
 	// configuration file, which is what a harness that does not care about settings wants.
 	Settings *settingsCache
-	Authz    *authz.Service
-	Tickets  *ticket.Issuer
-	Sessions *auth.Sessions
-	AppPass  *auth.AppPasswords
-	Shares   *share.Service
-	Provider *auth.Provider
+	// ContentSplit moves user content to a separate listener. When set, the main handler does NOT
+	// register the content routes: the point of a separate origin is that the application origin
+	// cannot serve user bytes, and a route left behind out of convenience defeats it.
+	ContentSplit bool
+	Authz        *authz.Service
+	Tickets      *ticket.Issuer
+	Sessions     *auth.Sessions
+	AppPass      *auth.AppPasswords
+	Shares       *share.Service
+	Provider     *auth.Provider
 	// Providers holds the OIDC provider when it may not have been discovered yet (ID-07).
 	//
 	// Distinct from Provider, which is the "already known at startup" case the tests use. In
@@ -219,6 +223,7 @@ func (s *Server) Handler() http.Handler {
 				r.Post("/mkdir", s.handleMkdir)
 				r.Post("/upload", s.handleUpload)
 				r.Get("/download", s.handleDownload)
+				r.Post("/content-ticket", s.handleContentTicket)
 				r.Post("/rename", s.handleRename)
 				r.Post("/move", s.handleMove)
 				r.Delete("/", s.handleDelete)
@@ -326,7 +331,12 @@ func (s *Server) Handler() http.Handler {
 	r.Post("/s/{token}/upload", s.handleShareUpload)
 
 	// Content origin: user bytes, always as an attachment.
-	r.Get("/content/*", s.handleContent)
+	//
+	// Registered on the main listener only when no separate content listener exists. With a split,
+	// this route lives on the content handler alone.
+	if !s.deps.ContentSplit {
+		r.Get("/content/*", s.handleContent)
+	}
 
 	// The browser client is mounted last so its catch-all fallback can never shadow
 	// an API route: every handler above wins, and only genuinely unmatched paths

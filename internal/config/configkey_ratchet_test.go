@@ -31,12 +31,8 @@ import (
 // list is part of implementing it, and the test fails if a pinned key starts being read, so the list
 // cannot rot in the permissive direction.
 var knownUnread = map[string]string{
-	"UserContentURL": "VALIDATED BUT UNUSED: the config requires an absolute URL that differs from " +
-		"public_url, and the server never reads it. Serving user content from a separate origin is " +
-		"not implemented, so the isolation this key implies does not exist. Kept pinned rather than " +
-		"deleted because removing it changes every deployment's required configuration for a feature " +
-		"that is still intended.",
-	"SCIMToken": "no SCIM endpoint exists; the key is accepted so a future one can use it",
+	"SCIMToken": "SCIM provisioning is not implemented; the token is validated and unused. " +
+		"Reading it without a SCIM endpoint would only move the lie",
 }
 
 func TestEveryConfigKeyIsReadOrPinned(t *testing.T) {

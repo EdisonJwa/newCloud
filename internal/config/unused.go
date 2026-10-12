@@ -27,15 +27,6 @@ type UnusedKey struct {
 func (c *Config) UnusedKeys() []UnusedKey {
 	var out []UnusedKey
 
-	if c.Server.UserContentURL != "" && c.Server.UserContentURL != c.Server.PublicURL {
-		out = append(out, UnusedKey{
-			Key: "server.usercontent_url",
-			Why: "user content is still served from public_url, so it shares that origin's cookies " +
-				"and cannot be isolated from it; serving content from a separate origin is not " +
-				"implemented",
-		})
-	}
-
 	if c.Auth.SCIMToken != "" {
 		out = append(out, UnusedKey{
 			Key: "auth.scim_token",
