@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"sort"
@@ -53,6 +54,11 @@ func ApplySchema(ctx context.Context, pool *pgxpool.Pool) error {
 		if err != nil {
 			return fmt.Errorf("store: read %s: %w", name, err)
 		}
+		// A byte-order mark is valid UTF-8 and invisible in every editor, and PostgreSQL answers it
+		// with `syntax error at or near "\ufeff"` — a message that names nothing a person can find.
+		// Editors on Windows add one by habit, so it is stripped here rather than left as a trap that
+		// fails a migration at the worst possible moment.
+		raw = bytes.TrimPrefix(raw, []byte("\ufeff"))
 
 		// One transaction per migration: a failure leaves the schema at the
 		// previous version instead of half-way through.

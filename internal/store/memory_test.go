@@ -320,16 +320,19 @@ func TestQuotaReleasesOnDelete(t *testing.T) {
 	m.SetQuota(owner, 100)
 	file := mkfile(t, m, owner, root.ID, "a.bin", 80)
 
-	// Trashing does not release quota; only permanent deletion would, and that
-	// path is not in the memory store. Document the current behaviour:
+	// §4.3 defines the logical quota as the current version of user-VISIBLE files and lists trash
+	// separately as retained usage. This test used to assert the opposite ("trash must not silently
+	// free quota"), which was a decision made before the requirement's definition was applied: it
+	// meant a user who emptied their bin was still told they were full.
 	if err := m.WithTx(context.Background(), func(ctx context.Context, tx Tx) error {
 		return tx.Trash(ctx, file.ID)
 	}); err != nil {
 		t.Fatal(err)
 	}
 	used, _ := m.Usage(context.Background(), owner)
-	if used != 80 {
-		t.Fatalf("trash must not silently free quota (it is recoverable), got %d", used)
+	if used != 0 {
+		t.Fatalf("trashing must release the logical quota (the bytes stay held, and counted, as "+
+			"retained usage), got %d", used)
 	}
 }
 

@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+
+	"github.com/google/uuid"
 	"time"
 )
 
@@ -56,12 +58,19 @@ func (t *memTx) purgeMemory(id [16]byte) (nodes int, bytes int64) {
 		}
 		bytes += rec.node.Size
 		if rec.node.Size > 0 {
-			// Releasing can never go below zero: a negative usage would hand out
-			// free quota forever, and the PostgreSQL implementation clamps too.
-			if t.m.usage[rec.node.OwnerID] >= rec.node.Size {
-				t.m.usage[rec.node.OwnerID] -= rec.node.Size
+			// A purged node is always trashed, and trashing already released its bytes from the
+			// logical quota. Subtracting from usage here would subtract them twice and hand the
+			// account free quota it never had; the bytes leave RETAINED usage instead.
+			//
+			// Clamped at zero like the quota: an accounting bug must not produce a negative counter
+			// that silently grants unlimited storage.
+			if t.m.trashBytes == nil {
+				t.m.trashBytes = map[uuid.UUID]int64{}
+			}
+			if t.m.trashBytes[rec.node.OwnerID] >= rec.node.Size {
+				t.m.trashBytes[rec.node.OwnerID] -= rec.node.Size
 			} else {
-				t.m.usage[rec.node.OwnerID] = 0
+				t.m.trashBytes[rec.node.OwnerID] = 0
 			}
 		}
 		// Versions die with the node; their content is no longer referenced.

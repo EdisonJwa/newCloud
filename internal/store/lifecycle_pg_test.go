@@ -125,9 +125,9 @@ func TestPGPurgeTrashOnlyExpired(t *testing.T) {
 	}
 }
 
-// TestPGPurgeTrashReleasesQuota: deleted bytes that still count against the quota
-// leave a user unable to upload after cleaning up.
-func TestPGPurgeTrashReleasesQuota(t *testing.T) {
+// TestPGPurgeTrashDoesNotReleaseTheQuotaTwice: trashing already released the logical quota (§4.3),
+// so the purge must not release it again. This test used to assert the release happened at purge.
+func TestPGPurgeTrashDoesNotReleaseTheQuotaTwice(t *testing.T) {
 	pool := testPool(t)
 	if err := resetSchema(t, pool); err != nil {
 		t.Fatal(err)
@@ -146,8 +146,8 @@ func TestPGPurgeTrashReleasesQuota(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if before != 4096 {
-		t.Fatalf("the write should have consumed quota, used=%d", before)
+	if before != 0 {
+		t.Fatalf("after trashing and ageing, usage should already be released, used=%d", before)
 	}
 
 	if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
@@ -162,7 +162,7 @@ func TestPGPurgeTrashReleasesQuota(t *testing.T) {
 		t.Fatal(err)
 	}
 	if after != 0 {
-		t.Fatalf("purging must release the quota, used=%d", after)
+		t.Fatalf("purging must not release the quota a second time, used=%d", after)
 	}
 }
 

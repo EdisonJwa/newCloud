@@ -119,8 +119,13 @@ func (t *pgTx) purgeSubtree(ctx context.Context, root PurgeableTrashRoot) (nodes
 	for _, r := range collected {
 		bytes += r.size
 		if r.size > 0 {
-			if qerr := t.releaseQuota(ctx, r.ownerID, r.size); qerr != nil {
-				return 0, 0, qerr
+			// A purged node is always trashed, and trashing already released its bytes from
+			// used_bytes. Releasing from the quota here would release them TWICE and hand the account
+			// free storage; the bytes leave the retained counter instead.
+			if _, qerr := t.tx.Exec(ctx, `
+				UPDATE users SET trash_bytes = GREATEST(trash_bytes - $2, 0), updated_at = now()
+				WHERE id = $1`, r.ownerID, r.size); qerr != nil {
+				return 0, 0, translate(qerr)
 			}
 		}
 		if r.blobID != nil {

@@ -576,6 +576,25 @@ func (t *pgTx) Move(ctx context.Context, id, newParent uuid.UUID) (Node, error) 
 }
 
 func (t *pgTx) Trash(ctx context.Context, id uuid.UUID) error {
+	// Sum the bytes BEFORE marking: the update changes what a second query would see, and the sum
+	// has to describe the subtree as it was when the user asked to delete it.
+	var released int64
+	var ownerID uuid.UUID
+	if err := t.tx.QueryRow(ctx, `
+		WITH RECURSIVE subtree AS (
+		    SELECT id, owner_id, size FROM nodes WHERE id = $1 AND trashed_at IS NULL
+		    UNION ALL
+		    SELECT n.id, n.owner_id, n.size FROM nodes n JOIN subtree s ON n.parent_id = s.id
+		    WHERE n.trashed_at IS NULL
+		)
+		SELECT COALESCE(sum(size),0), owner_id FROM subtree
+		GROUP BY owner_id`, id).Scan(&released, &ownerID); err != nil {
+		if isNoRows(err) {
+			return ErrNotFound
+		}
+		return translate(err)
+	}
+
 	// A single recursive UPDATE marks the whole subtree. Doing it client-side
 	// would take one round trip per level and could leave a partially trashed
 	// tree if the connection dropped mid-way.
@@ -595,6 +614,18 @@ func (t *pgTx) Trash(ctx context.Context, id uuid.UUID) error {
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound
+	}
+	// §4.3: trashing moves the bytes from the logical quota to retained usage. Both counters are
+	// clamped so an accounting bug cannot produce a negative quota that silently grants storage.
+	if released > 0 {
+		if _, err := t.tx.Exec(ctx, `
+			UPDATE users
+			SET used_bytes = GREATEST(used_bytes - $2, 0),
+			    trash_bytes = trash_bytes + $2,
+			    updated_at = now()
+			WHERE id = $1`, ownerID, released); err != nil {
+			return translate(err)
+		}
 	}
 	return nil
 }
@@ -635,6 +666,24 @@ func (t *pgTx) Trashed(ctx context.Context, ownerID uuid.UUID, limit int) ([]Nod
 	return out, translate(rows.Err())
 }
 func (t *pgTx) Restore(ctx context.Context, id uuid.UUID) (Node, error) {
+	// The bytes come back into the logical quota, so sum them before the update clears the marks.
+	var released int64
+	var ownerID uuid.UUID
+	if err := t.tx.QueryRow(ctx, `
+		WITH RECURSIVE subtree AS (
+		    SELECT id, owner_id, size FROM nodes WHERE id = $1 AND trashed_at IS NOT NULL
+		    UNION ALL
+		    SELECT n.id, n.owner_id, n.size FROM nodes n JOIN subtree s ON n.parent_id = s.id
+		    WHERE n.trashed_at IS NOT NULL
+		)
+		SELECT COALESCE(sum(size),0), owner_id FROM subtree
+		GROUP BY owner_id`, id).Scan(&released, &ownerID); err != nil {
+		if isNoRows(err) {
+			return Node{}, ErrNotFound
+		}
+		return Node{}, translate(err)
+	}
+
 	// Restoring a directory must restore its subtree, otherwise the directory
 	// comes back empty and the children are unreachable forever: they are not in
 	// the trash listing of the parent, and their parent is no longer trashed.
@@ -649,6 +698,16 @@ func (t *pgTx) Restore(ctx context.Context, id uuid.UUID) (Node, error) {
 		WHERE id IN (SELECT id FROM subtree)`
 	if _, err := t.tx.Exec(ctx, q, id); err != nil {
 		return Node{}, translate(err)
+	}
+	if released > 0 {
+		if _, err := t.tx.Exec(ctx, `
+			UPDATE users
+			SET used_bytes = used_bytes + $2,
+			    trash_bytes = GREATEST(trash_bytes - $2, 0),
+			    updated_at = now()
+			WHERE id = $1`, ownerID, released); err != nil {
+			return Node{}, translate(err)
+		}
 	}
 	return t.Node(ctx, id)
 }

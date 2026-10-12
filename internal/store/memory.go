@@ -41,6 +41,10 @@ type Memory struct {
 	trashSeq      []uuid.UUID
 	// settings holds runtime overrides; empty means every key is at its configured default.
 	settings map[string]json.RawMessage
+	// trashBytes is bytes held by trashed nodes, per owner. §4.3 separates the logical quota
+	// (current visible content) from RETAINED usage (trash, history), so a user who empties their
+	// bin is not still told they are full.
+	trashBytes map[uuid.UUID]int64
 
 	audit []AuditEntry
 	// auditTimes runs parallel to audit. The write-side entry has no timestamp by
@@ -100,6 +104,7 @@ func NewMemory() *Memory {
 		roots:                 map[uuid.UUID]uuid.UUID{},
 		usage:                 map[uuid.UUID]int64{},
 		quota:                 map[uuid.UUID]int64{},
+		trashBytes:            map[uuid.UUID]int64{},
 		users:                 map[uuid.UUID]*User{},
 		sessions:              map[string]*memSession{},
 		appPasswords:          map[uuid.UUID]*AppPassword{},
@@ -197,6 +202,7 @@ func (m *Memory) WithTx(ctx context.Context, fn func(ctx context.Context, tx Tx)
 	m.roots = work.roots
 	m.usage = work.usage
 	m.quota = work.quota
+	m.trashBytes = work.trashBytes
 	m.users = work.users
 	m.sessions = work.sessions
 	m.appPasswords = work.appPasswords
@@ -224,6 +230,23 @@ func (m *Memory) WithTx(ctx context.Context, fn func(ctx context.Context, tx Tx)
 	m.settings = work.settings
 	m.nextVersion = work.nextVersion
 	return nil
+}
+
+// cloneTrashBytes copies the retained-usage counter.
+//
+// make(map, len(src)) would size the map and copy NOTHING — it looks like a copy and is an empty
+// map, so the next transaction's snapshot would wipe every counter at commit. This is the second time
+// that exact mistake appeared in this struct (settings, then trashBytes); both were caught by the
+// shared suite failing on the memory backend while PostgreSQL passed.
+func cloneTrashBytes(src map[uuid.UUID]int64) map[uuid.UUID]int64 {
+	if len(src) == 0 {
+		return map[uuid.UUID]int64{}
+	}
+	out := make(map[uuid.UUID]int64, len(src))
+	for k, v := range src {
+		out[k] = v
+	}
+	return out
 }
 
 // cloneSettings copies the override map.
@@ -256,6 +279,7 @@ func (m *Memory) snapshot() *Memory {
 		// discarded at commit. Adding a field to the struct and forgetting this function loses the
 		// write silently — the conformance suite catches it because both backends must round-trip.
 		settings:     cloneSettings(m.settings),
+		trashBytes:   cloneTrashBytes(m.trashBytes),
 		users:        make(map[uuid.UUID]*User, len(m.users)),
 		sessions:     make(map[string]*memSession, len(m.sessions)),
 		appPasswords: make(map[uuid.UUID]*AppPassword, len(m.appPasswords)),
@@ -676,6 +700,19 @@ func (t *memTx) trashRecursive(id uuid.UUID, depth int) error {
 	}
 	at := t.m.now()
 	rec.node.TrashedAt = &at
+	if rec.node.Kind == KindFile {
+		// Trashing moves bytes from the logical quota to retained usage. A user who deletes a file
+		// must not still be told their quota is full — that was the behaviour, in both backends,
+		// because neither touched the counter on trash.
+		t.m.usage[rec.node.OwnerID] -= rec.node.Size
+		if t.m.usage[rec.node.OwnerID] < 0 {
+			t.m.usage[rec.node.OwnerID] = 0
+		}
+		if t.m.trashBytes == nil {
+			t.m.trashBytes = map[uuid.UUID]int64{}
+		}
+		t.m.trashBytes[rec.node.OwnerID] += rec.node.Size
+	}
 	if rec.node.Kind == KindDir {
 		for _, childID := range t.m.children[id] {
 			if err := t.trashRecursive(childID, depth+1); err != nil {
@@ -758,6 +795,20 @@ func (t *memTx) restoreRecursive(id uuid.UUID, depth int) error {
 	}
 	rec.node.TrashedAt = nil
 	rec.node.ModifiedAt = t.m.now()
+	if rec.node.Kind == KindFile {
+		// The reverse of trashing: the bytes come back into the logical quota and out of retained
+		// usage. The quota check is the caller's: a restore that would exceed the limit is refused
+		// by the handler, because silently restoring over quota is how an account ends up unable to
+		// write anything.
+		if t.m.trashBytes == nil {
+			t.m.trashBytes = map[uuid.UUID]int64{}
+		}
+		t.m.trashBytes[rec.node.OwnerID] -= rec.node.Size
+		if t.m.trashBytes[rec.node.OwnerID] < 0 {
+			t.m.trashBytes[rec.node.OwnerID] = 0
+		}
+		t.m.usage[rec.node.OwnerID] += rec.node.Size
+	}
 	if rec.node.Kind == KindDir {
 		for _, childID := range t.m.children[id] {
 			if err := t.restoreRecursive(childID, depth+1); err != nil {

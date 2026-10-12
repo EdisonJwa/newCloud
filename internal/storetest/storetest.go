@@ -773,6 +773,10 @@ func Run(t *testing.T, factory Factory, opts Options) {
 		runtimeSettingsSuite(t, factory)
 	})
 
+	t.Run("RetainedUsage", func(t *testing.T) {
+		retainedUsageSuite(t, factory)
+	})
+
 	t.Run("RecipientAccess", func(t *testing.T) {
 		recipientAccessSuite(t, factory)
 	})
@@ -5754,7 +5758,11 @@ func sweepSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.UUID
 	// second half was only asserted against PostgreSQL. The in-memory implementation releases the
 	// counter too, but nothing in the shared suite noticed whether it did — which is exactly the
 	// kind of divergence this suite exists to catch, and the reason the first half lives here.
-	t.Run("PurgeTrashReleasesQuota", func(t *testing.T) {
+	// The contract CHANGED with §4.3: the logical quota counts visible content, and trash is retained
+	// usage. This case used to assert that only a purge released the bytes; it now asserts the
+	// opposite split, because a user who deletes a file must get the space back immediately (with the
+	// bytes still held, and accounted, until the retention window ends).
+	t.Run("PurgeTrashDoesNotReleaseTheQuotaTwice", func(t *testing.T) {
 		s, owner := factory(t)
 		r := rootOf(t, s, owner)
 		f := mkfile(t, s, owner, r.ID, "big.bin", 4096)
@@ -5777,8 +5785,13 @@ func sweepSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.UUID
 		}); err != nil {
 			t.Fatal(err)
 		}
-		if got := used(); got != 4096 {
-			t.Fatalf("trashing is recoverable and must keep the bytes charged; quota went to %d", got)
+		// §4.3: the logical quota counts VISIBLE content, so trashing releases it immediately. The
+		// bytes are still held (and still counted in trash accounting, which is what the retention
+		// cap will bound), but the user gets their space back without waiting out the window.
+		if got := used(); got != 0 {
+			t.Fatalf("trashing must release the logical quota; used=%d. A user who deletes a file "+
+				"and is still told they are full has no way to free space short of permanent "+
+				"deletion.", got)
 		}
 
 		// The node has to be OLDER than the retention cutoff, and a node trashed in this same
@@ -5792,10 +5805,12 @@ func sweepSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.UUID
 		}); err != nil {
 			t.Fatalf("purge: %v", err)
 		}
+		// And the purge must NOT release it a second time: the bytes left the quota at trash time.
+		// Releasing again would make used_bytes climb back up as the user deletes more, or clamp at
+		// zero while the account has real headroom — both are ways to hand out free storage.
 		if got := used(); got != 0 {
-			t.Fatalf("purging permanently deletes the data, so it must release the quota; used=%d. "+
-				"A user at their limit who empties the trash would otherwise still be unable to "+
-				"upload.", got)
+			t.Fatalf("purging changed the quota to %d; it was already released when the node was "+
+				"trashed, and a second release is a double credit", got)
 		}
 	})
 }
@@ -6684,4 +6699,98 @@ func runtimeSettingsSuite(t *testing.T, factory func(t *testing.T) (store.Store,
 			t.Fatal("deleting the override left it behind")
 		}
 	})
+}
+
+// retainedUsageSuite covers §4.3's distinction between the logical quota and retained usage.
+//
+// The requirement defines the logical quota as the current version of user-VISIBLE files, and lists
+// trash and history separately as retained usage with its own caps. Neither backend implemented that:
+// trashing a file left its bytes counted against the quota, so a user who emptied their bin was still
+// told they were full and had no way to get space back short of permanent deletion.
+func retainedUsageSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.UUID)) {
+	t.Helper()
+
+	t.Run("TrashReleasesTheLogicalQuota", func(t *testing.T) {
+		s, owner := factory(t)
+		root := rootOf(t, s, owner)
+		f := mkfile(t, s, owner, root.ID, "big.bin", 4096)
+
+		before := usageOf(t, s, owner)
+		if before < 4096 {
+			t.Fatalf("baseline usage %d does not include the file", before)
+		}
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.Trash(ctx, f.ID)
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		after := usageOf(t, s, owner)
+		if after != before-4096 {
+			t.Fatalf("usage went from %d to %d after trashing a 4096-byte file; the bytes are "+
+				"retained, not part of the logical quota (§4.3), and a user who deletes a file must "+
+				"not still be told they are full", before, after)
+		}
+	})
+
+	t.Run("RestorePutsTheBytesBack", func(t *testing.T) {
+		s, owner := factory(t)
+		root := rootOf(t, s, owner)
+		f := mkfile(t, s, owner, root.ID, "back.bin", 2048)
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.Trash(ctx, f.ID)
+		}); err != nil {
+			t.Fatal(err)
+		}
+		trashed := usageOf(t, s, owner)
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			_, rerr := tx.Restore(ctx, f.ID)
+			return rerr
+		}); err != nil {
+			t.Fatalf("restore: %v", err)
+		}
+		if got := usageOf(t, s, owner); got != trashed+2048 {
+			t.Fatalf("usage is %d after restoring; want %d (the bytes return to the logical quota)",
+				got, trashed+2048)
+		}
+	})
+
+	t.Run("PurgeDoesNotReleaseTheQuotaTwice", func(t *testing.T) {
+		s, owner := factory(t)
+		root := rootOf(t, s, owner)
+		f := mkfile(t, s, owner, root.ID, "gone.bin", 1024)
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.Trash(ctx, f.ID)
+		}); err != nil {
+			t.Fatal(err)
+		}
+		afterTrash := usageOf(t, s, owner)
+
+		// Purge everything in the bin immediately (retention zero keeps nothing).
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			_, perr := tx.PurgeTrash(ctx, 0)
+			return perr
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if got := usageOf(t, s, owner); got != afterTrash {
+			t.Fatalf("usage changed from %d to %d when the bin was purged; the bytes were already "+
+				"released at trash time and releasing again hands the account free quota",
+				afterTrash, got)
+		}
+	})
+}
+
+// usageOf reads an owner's logical usage.
+func usageOf(t *testing.T, s store.Store, owner uuid.UUID) int64 {
+	t.Helper()
+	n, err := s.Usage(context.Background(), owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
 }
