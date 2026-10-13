@@ -467,7 +467,7 @@ func (h *Handler) handleDelete(w http.ResponseWriter, r *http.Request, a authz.A
 	}
 
 	err = h.meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
-		if terr := tx.Trash(ctx, node.ID); terr != nil {
+		if terr := tx.TrashCapped(ctx, node.ID, h.trashCap(ctx)); terr != nil {
 			return terr
 		}
 		return tx.Audit(ctx, store.AuditEntry{

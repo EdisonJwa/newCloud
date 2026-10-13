@@ -879,7 +879,7 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	err = s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
-		if terr := tx.Trash(ctx, node.ID); terr != nil {
+		if terr := tx.TrashCapped(ctx, node.ID, s.maxTrashBytes(ctx)); terr != nil {
 			return terr
 		}
 		return tx.Audit(ctx, store.AuditEntry{
@@ -1149,6 +1149,11 @@ func (s *Server) writeStoreError(w http.ResponseWriter, err error) {
 			"the file changed since you last read it")
 	case errors.Is(err, store.ErrQuota):
 		writeError(w, http.StatusInsufficientStorage, "quota_exceeded", "your storage quota is full")
+	case errors.Is(err, store.ErrTrashFull):
+		// The trash is a separate resource from the quota (§4.3), so the answer names the trash:
+		// "your storage quota is full" would send the user looking at a bar that has room on it.
+		writeError(w, http.StatusInsufficientStorage, "trash_full",
+			"the trash is full; empty it before deleting more")
 	case errors.Is(err, store.ErrTooLarge), errors.Is(err, layout.ErrSizeMismatch):
 		writeError(w, http.StatusRequestEntityTooLarge, "too_large", "the file is larger than allowed")
 	case errors.Is(err, store.ErrInvalidName), errors.Is(err, layout.ErrUnsafePath),

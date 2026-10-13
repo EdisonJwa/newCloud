@@ -289,6 +289,18 @@ type Tx interface {
 	// BlobHash returns the content address recorded for a blob, for verification that does
 	// not trust either copy on disk.
 	BlobHash(ctx context.Context, id uuid.UUID) ([]byte, error)
+	// TrashCapped moves a node to the trash, refusing when the account's RETAINED usage would exceed
+	// maxRetainedBytes (§4.3: trash is retained usage with its own cap, separate from the logical
+	// quota).
+	//
+	// Refusing rather than auto-purging the oldest entry is deliberate: deleting a file the user did
+	// not choose is data loss, and a full bin is a condition they can fix in one action. A cap of
+	// zero or less means unlimited, which is the default for deployments that have not opted in.
+	//
+	// The check and the move are in one transaction, so two concurrent deletes cannot both pass a
+	// check that only one of them fits.
+	TrashCapped(ctx context.Context, id uuid.UUID, maxRetainedBytes int64) error
+
 	// ReadSettings returns every runtime setting that has been written.
 	//
 	// The settings table has existed since the first migration and had no Go code touching it: the
@@ -646,3 +658,6 @@ var ErrNotImplemented = fmt.Errorf("store: not implemented")
 
 // errNotImplemented is kept as the internal spelling so existing call sites need no change.
 var errNotImplemented = ErrNotImplemented
+
+// ErrTrashFull is returned when a move to the trash would exceed the retained-usage cap.
+var ErrTrashFull = errors.New("store: the trash is full")

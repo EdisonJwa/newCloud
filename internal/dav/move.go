@@ -272,7 +272,7 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request, a authz
 			return
 		}
 		if err := h.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
-			return tx.Trash(ctx, existing.ID)
+			return tx.TrashCapped(ctx, existing.ID, h.trashCap(ctx))
 		}); err != nil {
 			writeXMLError(w, statusForError(err), "")
 			return

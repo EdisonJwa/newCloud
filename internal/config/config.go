@@ -200,6 +200,10 @@ type LimitsConfig struct {
 	// Zero is the default and means no scrub. That is deliberate: reading stored content back is
 	// real I/O, and a deployment should opt into it rather than discover it.
 	BlobScrubPerPass int `yaml:"blob_scrub_per_pass"`
+	// MaxTrashBytes caps RETAINED trash usage per account (§4.3). Zero means unlimited, which is
+	// the safe default: a deployment that never set this must not discover a limit by being unable
+	// to delete a file.
+	MaxTrashBytes int64 `yaml:"max_trash_bytes"`
 	// BlobScrubIntervalSeconds is how often the scrub runs. Zero uses the sweep cadence (6h).
 	//
 	// Separate from the sweep because corrupted content is urgent in a way unreferenced content is

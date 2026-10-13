@@ -49,6 +49,24 @@ type Handler struct {
 	caps    layout.Caps
 	now     func() time.Time
 	log     *slog.Logger
+	// trashLimit is the retained-usage cap for the trash (§4.3). Nil means unlimited, which is the
+	// safe default: a WebDAV client deleting a file must not hit a limit the deployment never set.
+	trashLimit func(context.Context) int64
+}
+
+// WithTrashLimit supplies the retained-usage cap used by DELETE and by an overwrite that replaces
+// an existing file.
+func (h *Handler) WithTrashLimit(fn func(context.Context) int64) *Handler {
+	h.trashLimit = fn
+	return h
+}
+
+// trashCap resolves the configured cap for this request.
+func (h *Handler) trashCap(ctx context.Context) int64 {
+	if h.trashLimit == nil {
+		return 0
+	}
+	return h.trashLimit(ctx)
 }
 
 // logf emits a diagnostic line.
@@ -333,6 +351,10 @@ func statusForError(err error) int {
 		return http.StatusNotFound
 	case errors.Is(err, store.ErrConflict):
 		return http.StatusMethodNotAllowed // RFC 4918 for MKCOL/PUT onto a collection
+	case errors.Is(err, store.ErrTrashFull):
+		// 507 is what a WebDAV client understands as "not enough storage", and the trash IS a storage
+		// resource (§4.3). Reporting 500 here would make a full bin look like a server fault.
+		return http.StatusInsufficientStorage
 	case errors.Is(err, store.ErrQuota), errors.Is(err, layout.ErrSizeMismatch):
 		return http.StatusInsufficientStorage
 	case errors.Is(err, store.ErrTooLarge):

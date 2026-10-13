@@ -1164,3 +1164,39 @@ func (t *pgTx) DeleteSetting(ctx context.Context, key string) error {
 	_, err := t.tx.Exec(ctx, `DELETE FROM settings WHERE key = $1`, key)
 	return translate(err)
 }
+
+// TrashCapped moves a node to the trash, refusing when retained usage would exceed the cap.
+//
+// Both the sum and the counter are read inside the caller's transaction, so the check sees a
+// consistent snapshot and two concurrent deletes cannot both fit into one slot.
+func (t *pgTx) TrashCapped(ctx context.Context, id uuid.UUID, maxRetainedBytes int64) error {
+	if maxRetainedBytes > 0 {
+		var (
+			released int64
+			ownerID  uuid.UUID
+		)
+		if err := t.tx.QueryRow(ctx, `
+			WITH RECURSIVE subtree AS (
+			    SELECT id, owner_id, size FROM nodes WHERE id = $1 AND trashed_at IS NULL
+			    UNION ALL
+			    SELECT n.id, n.owner_id, n.size FROM nodes n JOIN subtree s ON n.parent_id = s.id
+			    WHERE n.trashed_at IS NULL
+			)
+			SELECT COALESCE(sum(size),0), owner_id FROM subtree
+			GROUP BY owner_id`, id).Scan(&released, &ownerID); err != nil {
+			if isNoRows(err) {
+				return ErrNotFound
+			}
+			return translate(err)
+		}
+		var held int64
+		if err := t.tx.QueryRow(ctx, `SELECT trash_bytes FROM users WHERE id = $1`, ownerID).
+			Scan(&held); err != nil {
+			return translate(err)
+		}
+		if held+released > maxRetainedBytes {
+			return ErrTrashFull
+		}
+	}
+	return t.Trash(ctx, id)
+}

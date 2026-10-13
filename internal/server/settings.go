@@ -32,6 +32,8 @@ const (
 	settingKeyMaxFileBytes = "limits.max_file_bytes"
 	// settingKeyChunkBytes caps one ranged upload request.
 	settingKeyChunkBytes = "limits.upload_chunk_bytes"
+	// settingKeyMaxTrashBytes caps retained trash usage per account (§4.3).
+	settingKeyMaxTrashBytes = "limits.max_trash_bytes"
 	// settingKeyDefaultQuota is the quota a NEW account is created with. It has no effect on existing
 	// accounts; changing those is the per-user quota endpoint, and conflating the two would make
 	// "change the default" quietly rewrite people's limits.
@@ -57,6 +59,11 @@ var runtimeSettings = []runtimeSetting{
 	{
 		key:        settingKeyChunkBytes,
 		configured: func(c config.Config) int64 { return c.Limits.UploadChunkBytes },
+		validate:   validateNonNegative,
+	},
+	{
+		key:        settingKeyMaxTrashBytes,
+		configured: func(c config.Config) int64 { return c.Limits.MaxTrashBytes },
 		validate:   validateNonNegative,
 	},
 	{
@@ -317,6 +324,12 @@ func rawOrConfigured(raw json.RawMessage, configured int64) any {
 func (s *Server) maxFileBytes(ctx context.Context) int64 {
 	base := s.deps.Config.Limits.MaxFileBytes
 	return s.deps.Settings.Int(ctx, s.deps.Meta, settingKeyMaxFileBytes, base)
+}
+
+// maxTrashBytes is the effective retained-usage cap for the trash (§4.3).
+func (s *Server) maxTrashBytes(ctx context.Context) int64 {
+	base := s.deps.Config.Limits.MaxTrashBytes
+	return s.deps.Settings.Int(ctx, s.deps.Meta, settingKeyMaxTrashBytes, base)
 }
 
 // chunkBytes is the effective cap on one ranged upload request.

@@ -777,6 +777,10 @@ func Run(t *testing.T, factory Factory, opts Options) {
 		retainedUsageSuite(t, factory)
 	})
 
+	t.Run("RetainedCap", func(t *testing.T) {
+		retainedCapSuite(t, factory)
+	})
+
 	t.Run("RecipientAccess", func(t *testing.T) {
 		recipientAccessSuite(t, factory)
 	})
@@ -6793,4 +6797,74 @@ func usageOf(t *testing.T, s store.Store, owner uuid.UUID) int64 {
 		t.Fatal(err)
 	}
 	return n
+}
+
+// retainedCapSuite covers TrashCapped: §4.3's server-side cap on retained usage.
+//
+// The accounting from the previous change is the prerequisite; this is the limit itself. The property
+// that matters is that a refused trash changes NOTHING — the node stays live, its bytes stay in the
+// logical quota, and the retained counter does not move. A check that refuses after mutating would be
+// worse than no check, because the user is told "no" and the data is gone anyway.
+func retainedCapSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.UUID)) {
+	t.Helper()
+
+	t.Run("RefusesWhenTheCapWouldBeExceeded", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		first := mkfile(t, s, owner, r.ID, "first.bin", 600)
+		second := mkfile(t, s, owner, r.ID, "second.bin", 600)
+
+		// 1000 bytes of retained usage: the first (600) fits, the second (600 more) does not.
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.TrashCapped(ctx, first.ID, 1000)
+		}); err != nil {
+			t.Fatalf("the first delete should fit under the cap: %v", err)
+		}
+
+		err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.TrashCapped(ctx, second.ID, 1000)
+		})
+		if !errors.Is(err, store.ErrTrashFull) {
+			t.Fatalf("a delete that exceeds the retained cap returned %v, want ErrTrashFull", err)
+		}
+
+		// Nothing changed: the refused node is still live, and it is still counted against the
+		// logical quota. Only the first file's bytes moved.
+		//
+		// The guarantee comes from the TRANSACTION, not from the check running first: a failed
+		// callback is rolled back, so an implementation that mutates before refusing is still
+		// correct. This assertion guards the other case — an implementation that mutates outside a
+		// transaction, or a backend that publishes partially on error. A mutation test that moved the
+		// check after the trash produced no failure for exactly that reason, and that is the honest
+		// reading: the ordering is not load-bearing, the atomicity is.
+		var live bool
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			n, gerr := tx.Node(ctx, second.ID)
+			live = gerr == nil && n.TrashedAt == nil
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if !live {
+			t.Fatal("the refused delete trashed the node anyway; a check that mutates before " +
+				"refusing is worse than no check")
+		}
+		if got := usageOf(t, s, owner); got != 600 {
+			t.Fatalf("after one refused delete the logical quota is %d, want 600 (the node that "+
+				"was refused must still count)", got)
+		}
+	})
+
+	t.Run("ZeroMeansUnlimited", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		big := mkfile(t, s, owner, r.ID, "huge.bin", 1<<20)
+
+		// The default: deployments that have not opted into a cap must not get one by accident.
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.TrashCapped(ctx, big.ID, 0)
+		}); err != nil {
+			t.Fatalf("a cap of zero should mean unlimited, got %v", err)
+		}
+	})
 }

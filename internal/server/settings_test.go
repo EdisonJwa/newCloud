@@ -212,3 +212,44 @@ func TestEveryAllowListedKeyReachesAReadPoint(t *testing.T) {
 		}
 	})
 }
+
+// TestTrashCapIsEnforcedThroughTheAPI covers §4.3's retained-usage cap end to end.
+//
+// The store conformance suite proves the check; this proves the SERVER passes the configured cap to
+// it, answers with the right status and code, and says "the trash is full" rather than "your quota is
+// full" — the two resources are separate, and the wrong message sends the user to look at a quota bar
+// that has room on it.
+func TestTrashCapIsEnforcedThroughTheAPI(t *testing.T) {
+	h := newHarness(t)
+	admin, _ := h.adminClient(t)
+
+	// A cap smaller than one file, set at runtime.
+	resp := h.adminDo(t, admin, http.MethodPut, "/api/admin/settings/limits.max_trash_bytes", `10`)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("set trash cap: %d", resp.StatusCode)
+	}
+
+	h.uploadFile(t, "big.bin", strings.Repeat("x", 100))
+
+	del := h.do(http.MethodDelete, "/api/files/?path=big.bin", nil, nil)
+	body := readBody(del)
+	del.Body.Close()
+	if del.StatusCode != http.StatusInsufficientStorage {
+		t.Fatalf("deleting into a full trash returned %d %s, want 507", del.StatusCode, body)
+	}
+	if !strings.Contains(body, "trash_full") {
+		t.Fatalf("the error code should name the trash, got %s", body)
+	}
+
+	// Raising the cap lets the same delete through, which proves the refusal was the cap and not
+	// something else about the request.
+	resp = h.adminDo(t, admin, http.MethodPut, "/api/admin/settings/limits.max_trash_bytes", `100000`)
+	resp.Body.Close()
+	// A successful delete is 204 No Content.
+	if del := h.do(http.MethodDelete, "/api/files/?path=big.bin", nil, nil); del.StatusCode != http.StatusNoContent {
+		code := del.StatusCode
+		del.Body.Close()
+		t.Fatalf("the delete was still refused after raising the cap: %d", code)
+	}
+}

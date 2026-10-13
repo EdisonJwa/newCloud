@@ -1294,3 +1294,27 @@ func (t *memTx) DeleteSetting(ctx context.Context, key string) error {
 	delete(t.m.settings, key)
 	return nil
 }
+
+// TrashCapped moves a node to the trash, refusing when retained usage would exceed the cap.
+func (t *memTx) TrashCapped(ctx context.Context, id uuid.UUID, maxRetainedBytes int64) error {
+	if maxRetainedBytes > 0 {
+		var released int64
+		for _, nid := range t.collectSubtree(id) {
+			if rec, ok := t.m.nodes[nid]; ok && rec.node.TrashedAt == nil {
+				released += rec.node.Size
+			}
+		}
+		if t.m.trashBytes[id2owner(t, id)]+released > maxRetainedBytes {
+			return ErrTrashFull
+		}
+	}
+	return t.Trash(ctx, id)
+}
+
+// id2owner returns the owner of a node.
+func id2owner(t *memTx, id uuid.UUID) uuid.UUID {
+	if rec, ok := t.m.nodes[id]; ok {
+		return rec.node.OwnerID
+	}
+	return uuid.Nil
+}

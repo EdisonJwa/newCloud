@@ -134,7 +134,8 @@ func New(deps Deps) (*Server, error) {
 
 	s := &Server{deps: deps, started: time.Now(), thumbs: thumbs}
 	if deps.AppPass != nil {
-		s.dav = dav.New(deps.Config, deps.Meta, deps.Content, deps.Authz, deps.AppPass).WithLogger(deps.Log)
+		s.dav = dav.New(deps.Config, deps.Meta, deps.Content, deps.Authz, deps.AppPass).WithLogger(deps.Log).
+			WithTrashLimit(s.maxTrashBytes)
 	}
 
 	// The client is embedded in the binary, so there is nothing to configure. A
