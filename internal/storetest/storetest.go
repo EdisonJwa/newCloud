@@ -781,6 +781,10 @@ func Run(t *testing.T, factory Factory, opts Options) {
 		retainedCapSuite(t, factory)
 	})
 
+	t.Run("RetainedVersions", func(t *testing.T) {
+		retainedVersionsSuite(t, factory)
+	})
+
 	t.Run("RecipientAccess", func(t *testing.T) {
 		recipientAccessSuite(t, factory)
 	})
@@ -6865,6 +6869,133 @@ func retainedCapSuite(t *testing.T, factory func(t *testing.T) (store.Store, uui
 			return tx.TrashCapped(ctx, big.ID, 0)
 		}); err != nil {
 			t.Fatalf("a cap of zero should mean unlimited, got %v", err)
+		}
+	})
+}
+
+// retainedVersionsSuite covers TrimRetainedVersions: §4.3's cap on retained HISTORY.
+//
+// The order is the property: history is a stack, so the version a user wants back is the one before the
+// current content. Trimming from the newest end would make the cap useless for its purpose.
+func retainedVersionsSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.UUID)) {
+	t.Helper()
+
+	t.Run("DropsOldestFirstAndKeepsTheNewest", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+
+		// Four writes of different sizes, each keeping the previous content as a version.
+		var nodeID uuid.UUID
+		for i, size := range []int64{100, 200, 300, 400} {
+			name := "cap.bin"
+			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				n, _, err := tx.WriteFile(ctx, store.WriteFile{
+					NewFile: store.NewFile{
+						OwnerID: owner, ParentID: r.ID, Name: name, Size: size,
+						Mime: "application/octet-stream", ETag: `"v` + string(rune('0'+i)) + `"`,
+						BlobID: newBlobHook(t), BlobHash: [32]byte{byte(i + 1)},
+					},
+					KeepVersion: true,
+				})
+				nodeID = n.ID
+				return err
+			}); err != nil {
+				t.Fatalf("write %d: %v", i, err)
+			}
+			// Distinct timestamps: the ordering key is created_at.
+			time.Sleep(2 * time.Millisecond)
+		}
+
+		versionsOf := func() []store.Version {
+			t.Helper()
+			var got []store.Version
+			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				v, err := tx.Versions(ctx, nodeID, 100)
+				got = v
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			return got
+		}
+
+		before := versionsOf()
+		if len(before) < 3 {
+			t.Fatalf("the fixture produced only %d versions; the test needs history to trim",
+				len(before))
+		}
+		var totalBefore int64
+		for _, v := range before {
+			totalBefore += v.Size
+		}
+
+		// Cap to roughly the newest entry: everything older must go, newest stays.
+		var removed int
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			n, err := tx.TrimRetainedVersions(ctx, 400)
+			removed = n
+			return err
+		}); err != nil {
+			t.Fatalf("trim: %v", err)
+		}
+		if removed == 0 {
+			t.Fatalf("nothing was trimmed with %d bytes of history against a 400-byte cap",
+				totalBefore)
+		}
+
+		after := versionsOf()
+		var totalAfter int64
+		for _, v := range after {
+			totalAfter += v.Size
+		}
+		if totalAfter > 400 {
+			t.Fatalf("history is %d bytes after trimming against a 400-byte cap", totalAfter)
+		}
+		if len(after) == 0 {
+			t.Fatal("every version was dropped; the newest history is the one a user reaches for")
+		}
+		// The newest surviving version is the one immediately before the current content.
+		highest := before[0].VersionNo
+		found := false
+		for _, v := range after {
+			if v.VersionNo == highest {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("trimming removed the NEWEST version (no. %d); it drops oldest-first",
+				highest)
+		}
+	})
+
+	t.Run("ZeroIsANoOp", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		for i := 0; i < 3; i++ {
+			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				_, _, err := tx.WriteFile(ctx, store.WriteFile{
+					NewFile: store.NewFile{
+						OwnerID: owner, ParentID: r.ID, Name: "keep.bin", Size: 100,
+						Mime: "text/plain", ETag: `"k` + string(rune('0'+i)) + `"`,
+						BlobID: newBlobHook(t), BlobHash: [32]byte{byte(i + 1)},
+					},
+					KeepVersion: true,
+				})
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var removed int
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			n, err := tx.TrimRetainedVersions(ctx, 0)
+			removed = n
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if removed != 0 {
+			t.Fatalf("a cap of zero removed %d versions; it means unlimited", removed)
 		}
 	})
 }

@@ -34,6 +34,8 @@ type Worker struct {
 	// scrubCursor is where the previous pass stopped. It is what makes the scrub cover the whole
 	// store over time instead of re-verifying the same first rows forever.
 	scrubCursor [32]byte
+	// versionByteCap bounds retained history in bytes (§4.3). Zero disables the trim.
+	versionByteCap int64
 	// scrubInterval is how often a pass runs. Separate from the sweep because the two have
 	// different costs and different urgency: the sweep reclaims unreferenced bytes and can wait
 	// six hours, while a corrupted blob is a file a user cannot open, and finding it within the
@@ -290,6 +292,11 @@ func (w *Worker) Run(ctx context.Context) {
 				w.log.Error("version expiry failed", "error", err)
 			} else if n > 0 {
 				w.log.Info("expired old versions", "count", n)
+			}
+			// The byte cap runs after the age expiry: expiring by age first means the trim usually
+			// has nothing to do, and the two policies never fight over the same row.
+			if _, err := w.TrimVersionHistory(ctx); err != nil {
+				w.log.Error("version history trim failed", "error", err)
 			}
 		}
 	}
@@ -601,4 +608,49 @@ func (w *Worker) reapExpiredJobLeases(ctx context.Context) int {
 // ReapExpiredJobLeasesForTest exposes the reaper to the package's tests.
 func (w *Worker) ReapExpiredJobLeasesForTest(ctx context.Context) int {
 	return w.reapExpiredJobLeases(ctx)
+}
+
+// WithVersionByteCap sets the retained-history byte cap.
+func (w *Worker) WithVersionByteCap(bytes int64) *Worker {
+	w.versionByteCap = bytes
+	return w
+}
+
+// TrimVersionHistory drops the oldest versions until each account's history fits the cap (§4.3).
+//
+// A sweep rather than a check on the write path: refusing a save because the account's HISTORY is full
+// would lose the content the user is trying to write, and trimming is the policy every product with
+// versioning converges on. The cost is that the cap is enforced with a delay, which is acceptable for
+// a retention limit and not for the quota — the quota is checked in the write transaction.
+func (w *Worker) TrimVersionHistory(ctx context.Context) (int, error) {
+	if w.versionByteCap <= 0 || w.meta == nil {
+		return 0, nil
+	}
+	var n int
+	err := w.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		got, terr := tx.TrimRetainedVersions(ctx, w.versionByteCap)
+		n = got
+		if terr != nil {
+			return terr
+		}
+		if got == 0 {
+			return nil
+		}
+		// Same-transaction audit, same reasoning as the sweeps above: a trimmed version has no row
+		// left to explain itself, and "the version I needed is gone" is answered by this event or by
+		// nothing.
+		return tx.Audit(ctx, store.AuditEntry{
+			ActorKind: "system", Action: "version.trim", TargetKind: "version",
+			TargetID: "retained", Result: "ok",
+			Metadata: map[string]any{"removed": got, "cap_bytes": w.versionByteCap},
+		})
+	})
+	if err != nil {
+		return 0, err
+	}
+	if n > 0 {
+		w.log.Warn("trimmed retained version history to the cap", "removed", n,
+			"cap_bytes", w.versionByteCap)
+	}
+	return n, nil
 }

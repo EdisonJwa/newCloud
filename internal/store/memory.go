@@ -1318,3 +1318,66 @@ func id2owner(t *memTx, id uuid.UUID) uuid.UUID {
 	}
 	return uuid.Nil
 }
+
+// TrimRetainedVersions drops the oldest version rows until each account's history fits capBytes.
+func (t *memTx) TrimRetainedVersions(ctx context.Context, capBytes int64) (int, error) {
+	if capBytes <= 0 {
+		return 0, nil
+	}
+
+	// Per owner, oldest entries first. CreatedAt ties are broken by node id and version number so
+	// the choice is stable: two runs against the same data remove the same rows.
+	type entry struct {
+		nodeID    uuid.UUID
+		versionNo int
+		createdAt time.Time
+		size      int64
+	}
+	byOwner := map[uuid.UUID][]entry{}
+	for _, rec := range t.m.nodes {
+		for _, v := range rec.versions {
+			byOwner[rec.node.OwnerID] = append(byOwner[rec.node.OwnerID], entry{
+				nodeID: v.NodeID, versionNo: v.VersionNo, createdAt: v.CreatedAt, size: v.Size,
+			})
+		}
+	}
+
+	removed := 0
+	for owner, entries := range byOwner {
+		sort.Slice(entries, func(i, j int) bool {
+			if !entries[i].createdAt.Equal(entries[j].createdAt) {
+				return entries[i].createdAt.Before(entries[j].createdAt)
+			}
+			if entries[i].nodeID != entries[j].nodeID {
+				return entries[i].nodeID.String() < entries[j].nodeID.String()
+			}
+			return entries[i].versionNo < entries[j].versionNo
+		})
+		var total int64
+		for _, e := range entries {
+			total += e.size
+		}
+		if total <= capBytes {
+			continue
+		}
+		for _, e := range entries {
+			if total <= capBytes {
+				break
+			}
+			rec, ok := t.m.nodes[e.nodeID]
+			if !ok {
+				continue
+			}
+			for i := range rec.versions {
+				if rec.versions[i].VersionNo == e.versionNo {
+					rec.versions = append(rec.versions[:i], rec.versions[i+1:]...)
+					total -= e.size
+					removed++
+					break
+				}
+			}
+		}
+		_ = owner
+	}
+	return removed, nil
+}

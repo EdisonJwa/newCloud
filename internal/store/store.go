@@ -289,6 +289,18 @@ type Tx interface {
 	// BlobHash returns the content address recorded for a blob, for verification that does
 	// not trust either copy on disk.
 	BlobHash(ctx context.Context, id uuid.UUID) ([]byte, error)
+	// TrimRetainedVersions drops the oldest version rows until every account's retained history fits
+	// capBytes (§4.3). A cap of zero or less is a no-op.
+	//
+	// Oldest-first rather than newest-first because history is a stack: the version a user is most
+	// likely to want back is the one before the current content, which is the newest entry.
+	//
+	// This is a sweep rather than a check on the write path. Refusing a save because the account's
+	// HISTORY is full would lose the content the user is actually trying to write; trimming is the
+	// policy every product with versioning converges on, and it is a retention limit rather than a
+	// billing one, so a delay until the next sweep is acceptable.
+	TrimRetainedVersions(ctx context.Context, capBytes int64) (int, error)
+
 	// TrashCapped moves a node to the trash, refusing when the account's RETAINED usage would exceed
 	// maxRetainedBytes (§4.3: trash is retained usage with its own cap, separate from the logical
 	// quota).

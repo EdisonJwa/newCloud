@@ -216,3 +216,81 @@ func TestExpireVersionsIsAuditedAndRepeatable(t *testing.T) {
 		t.Fatalf("an expiry that removed nothing still wrote an audit row (%d -> %d)", after, got)
 	}
 }
+
+// TestVersionByteCapTrimsAndAudits: §4.3's cap on retained history, driven through the worker.
+//
+// The store conformance suite proves the trimming order; this proves the worker CALLS it, records what
+// it did, and does nothing when the cap is unset — the half that makes the cap real in a deployment.
+//
+// Against the in-memory store rather than PostgreSQL: the property is the worker's wiring and the
+// audit row, and the PG trim itself is already covered by the shared suite.
+func TestVersionByteCapTrimsAndAudits(t *testing.T) {
+	meta := store.NewMemory()
+	owner := meta.AddUser(store.User{Username: "cap", Email: "cap@example.test", Role: "user"})
+	var root store.Node
+	if err := meta.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+		n, err := tx.EnsureRoot(ctx, owner.ID)
+		root = n
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	w := worker.New(meta, slog.New(slog.NewTextHandler(io.Discard, nil))).WithVersionByteCap(150)
+
+	var nodeID uuid.UUID
+	for i, size := range []int64{100, 100, 100} {
+		if err := meta.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			n, _, err := tx.WriteFile(ctx, store.WriteFile{
+				NewFile: store.NewFile{
+					OwnerID: owner.ID, ParentID: root.ID, Name: "capped.bin", Size: size,
+					Mime: "text/plain", ETag: `"v` + string(rune('0'+i)) + `"`,
+					BlobID: uuid.New(), BlobHash: [32]byte{byte(i + 1)},
+				},
+				KeepVersion: true,
+			})
+			nodeID = n.ID
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	n, err := w.TrimVersionHistory(context.Background())
+	if err != nil {
+		t.Fatalf("trim: %v", err)
+	}
+	if n == 0 {
+		t.Fatal("the worker trimmed nothing with 200 bytes of history against a 150-byte cap")
+	}
+
+	var kept int
+	if err := meta.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+		v, verr := tx.Versions(ctx, nodeID, 100)
+		kept = len(v)
+		return verr
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if kept == 0 {
+		t.Fatal("the trim removed all history; the newest version is the one users reach for")
+	}
+
+	var audited int
+	for _, e := range meta.AuditLog() {
+		if e.Action == "version.trim" {
+			audited++
+		}
+	}
+	if audited != 1 {
+		t.Fatalf("want one version.trim audit row, got %d. A trimmed version has no row left to "+
+			"explain itself.", audited)
+	}
+
+	// And with no cap configured the worker must touch nothing: an unset limit must not trim.
+	noCap := worker.New(meta, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if n, err := noCap.TrimVersionHistory(context.Background()); err != nil || n != 0 {
+		t.Fatalf("an unset cap trimmed %d versions (err %v); zero means unlimited", n, err)
+	}
+}

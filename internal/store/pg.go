@@ -1200,3 +1200,57 @@ func (t *pgTx) TrashCapped(ctx context.Context, id uuid.UUID, maxRetainedBytes i
 	}
 	return t.Trash(ctx, id)
 }
+
+// TrimRetainedVersions drops the oldest version rows until each account's history fits capBytes.
+//
+// The running total is computed with a window function ordered oldest-first, and every row whose
+// cumulative size exceeds the cap is dropped: that keeps the NEWEST history, which is the order a
+// user expects ("undo the last change"). Blob references are released for exactly the rows removed,
+// or their refcount stays high and the bytes are never collected.
+func (t *pgTx) TrimRetainedVersions(ctx context.Context, capBytes int64) (int, error) {
+	if capBytes <= 0 {
+		return 0, nil
+	}
+
+	const doomed = `
+		WITH ranked AS (
+			SELECT v.id, v.node_id, v.version_no,
+			       sum(v.size) OVER (PARTITION BY n.owner_id ORDER BY v.created_at DESC, v.id DESC
+			                         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running
+			FROM versions v JOIN nodes n ON n.id = v.node_id
+		)
+		SELECT v.id, v.blob_id FROM versions v
+		JOIN ranked r ON r.id = v.id
+		WHERE r.running > $1`
+	rows, err := t.tx.Query(ctx, doomed, capBytes)
+	if err != nil {
+		return 0, translate(err)
+	}
+	type victim struct {
+		id     uuid.UUID
+		blobID uuid.UUID
+	}
+	var victims []victim
+	for rows.Next() {
+		var v victim
+		if err := rows.Scan(&v.id, &v.blobID); err != nil {
+			rows.Close()
+			return 0, translate(err)
+		}
+		victims = append(victims, v)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, translate(err)
+	}
+	for _, v := range victims {
+		if _, err := t.tx.Exec(ctx, `DELETE FROM versions WHERE id = $1`, v.id); err != nil {
+			return 0, translate(err)
+		}
+		blobID := v.blobID
+		if err := t.adjustBlobRef(ctx, &blobID, -1); err != nil {
+			return 0, err
+		}
+	}
+	return len(victims), nil
+}

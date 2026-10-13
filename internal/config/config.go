@@ -204,6 +204,10 @@ type LimitsConfig struct {
 	// the safe default: a deployment that never set this must not discover a limit by being unable
 	// to delete a file.
 	MaxTrashBytes int64 `yaml:"max_trash_bytes"`
+	// MaxRetainedVersionBytes caps retained HISTORY per account in bytes (§4.3). Zero means
+	// unlimited. Enforced by a sweep, not on the write path: refusing a save because the HISTORY is
+	// full would lose the content the user is trying to write.
+	MaxRetainedVersionBytes int64 `yaml:"max_retained_version_bytes"`
 	// BlobScrubIntervalSeconds is how often the scrub runs. Zero uses the sweep cadence (6h).
 	//
 	// Separate from the sweep because corrupted content is urgent in a way unreferenced content is
