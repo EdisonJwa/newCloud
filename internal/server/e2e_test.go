@@ -165,6 +165,9 @@ func newHarnessTuned(t *testing.T, mutate func(*config.Config), tune func(*serve
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Mirrors the production wiring: a limit the server enforces in main.go but the harness forgets
+	// is a limit no test can observe, which is how "the feature exists and is not wired" ships.
+	uploads.SetMaxPendingBytes(cfg.Limits.MaxPendingUploadBytes)
 	t.Cleanup(uploads.Close)
 
 	authorizer := authz.NewService(&accessor{m: meta})

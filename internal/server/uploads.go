@@ -78,6 +78,13 @@ func (s *Server) handleUploadCreate(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusTooManyRequests, "too_many_uploads", "too many unfinished uploads")
 			return
 		}
+		if errors.Is(err, upload.ErrPendingFull) {
+			// 507 rather than 429: the count limit is a rate problem, this one is a space problem,
+			// and "retry later" would be wrong advice — the client has to finish or abort something.
+			writeError(w, http.StatusInsufficientStorage, "pending_uploads_full",
+				"unfinished uploads are using the account's staging allowance")
+			return
+		}
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}

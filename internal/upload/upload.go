@@ -38,6 +38,10 @@ var (
 	// ErrTooMany is returned when the per-owner cap on concurrent sessions is reached. It
 	// bounds the disk one account can occupy with half-finished uploads.
 	ErrTooMany = errors.New("upload: too many concurrent sessions")
+	// ErrPendingFull is returned when the declared size of an account's unfinished uploads would
+	// exceed limits.max_pending_upload_bytes. Distinct from ErrTooMany: one is "too many sessions",
+	// the other "too much outstanding data", and a client should react to them differently.
+	ErrPendingFull = errors.New("upload: pending uploads exceed the account limit")
 )
 
 // ConflictError reports that the chunk did not start where the server expected. Offset is
@@ -76,7 +80,12 @@ type Manager struct {
 	dir      string
 	ttl      time.Duration
 	perOwner int
-	now      func() time.Time
+	// maxPendingBytes caps the DECLARED size of one account's unfinished uploads (§4.3). Zero means
+	// unlimited. The sum is computed from the live sessions rather than kept as a counter: sessions
+	// are bounded by perOwner, so the sum is cheap, and a counter is one more thing that can drift
+	// out of step with the sessions it describes.
+	maxPendingBytes int64
+	now             func() time.Time
 
 	mu       sync.Mutex
 	sessions map[string]*Session
@@ -140,6 +149,17 @@ func (m *Manager) Create(owner uuid.UUID, dir, name string, total int64) (*Sessi
 
 	if m.byOwner[owner] >= m.perOwner {
 		return nil, ErrTooMany
+	}
+	if m.maxPendingBytes > 0 {
+		var pending int64
+		for _, s := range m.sessions {
+			if s.Owner == owner {
+				pending += s.Total
+			}
+		}
+		if pending+total > m.maxPendingBytes {
+			return nil, ErrPendingFull
+		}
 	}
 
 	id, err := newID()
@@ -415,4 +435,14 @@ func (c *ctxReader) Read(p []byte) (int, error) {
 		return 0, err
 	}
 	return c.r.Read(p)
+}
+
+// SetMaxPendingBytes caps the declared size of one account's unfinished uploads.
+//
+// Declared, not written: the point is to stop a client from reserving unbounded staging space, and a
+// session that never receives its bytes is already reclaimed by the TTL sweep.
+func (m *Manager) SetMaxPendingBytes(n int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.maxPendingBytes = n
 }

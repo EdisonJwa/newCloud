@@ -437,3 +437,52 @@ func TestStagingIsOutsideTheTree(t *testing.T) {
 		t.Fatal("a name must not carry a path")
 	}
 }
+
+// TestPendingBytesCap: §4.3's server-side cap on unfinished uploads.
+//
+// The declared sizes are summed from the LIVE sessions, so closing one must free its allowance. A
+// counter that is not decremented everywhere is how an account ends up permanently unable to upload,
+// which is why the sum is computed rather than maintained.
+func TestPendingBytesCap(t *testing.T) {
+	m, err := NewManager(t.TempDir(), time.Hour, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Windows cannot delete a directory whose staging files are still open, so the manager is closed
+	// before the test returns rather than left to the finalizer.
+	t.Cleanup(m.Close)
+	m.SetMaxPendingBytes(1000)
+	owner := uuid.New()
+
+	first, err := m.Create(owner, "", "a.bin", 600)
+	if err != nil {
+		t.Fatalf("first session: %v", err)
+	}
+	if _, err := m.Create(owner, "", "b.bin", 600); !errors.Is(err, ErrPendingFull) {
+		t.Fatalf("a session over the pending-byte cap returned %v, want ErrPendingFull", err)
+	}
+
+	// Aborting the first frees exactly its declared size. (Abort is the production path that
+	// forgets a session; there is no Session.Close.)
+	if err := m.Abort(owner, first.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Create(owner, "", "b.bin", 600); err != nil {
+		t.Fatalf("the allowance was not freed by closing a session: %v", err)
+	}
+
+	// Another account is unaffected: the cap is per owner, not global.
+	if _, err := m.Create(uuid.New(), "", "c.bin", 600); err != nil {
+		t.Fatalf("the cap leaked across accounts: %v", err)
+	}
+
+	// And zero means unlimited.
+	unlimited, err := NewManager(t.TempDir(), time.Hour, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(unlimited.Close)
+	if _, err := unlimited.Create(owner, "", "huge.bin", 1<<40); err != nil {
+		t.Fatalf("an unset cap refused a session: %v", err)
+	}
+}

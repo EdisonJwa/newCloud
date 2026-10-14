@@ -204,6 +204,10 @@ type LimitsConfig struct {
 	// the safe default: a deployment that never set this must not discover a limit by being unable
 	// to delete a file.
 	MaxTrashBytes int64 `yaml:"max_trash_bytes"`
+	// MaxPendingUploadBytes caps the DECLARED size of one account's unfinished uploads (§4.3). Zero
+	// means unlimited. Declared rather than written: the point is to stop a client reserving
+	// unbounded staging space, and a session that never receives its bytes is reclaimed by the TTL.
+	MaxPendingUploadBytes int64 `yaml:"max_pending_upload_bytes"`
 	// MaxRetainedVersionBytes caps retained HISTORY per account in bytes (§4.3). Zero means
 	// unlimited. Enforced by a sweep, not on the write path: refusing a save because the HISTORY is
 	// full would lose the content the user is trying to write.

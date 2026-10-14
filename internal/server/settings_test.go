@@ -14,6 +14,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/EdisonJwa/newCloud/internal/config"
 	"github.com/EdisonJwa/newCloud/internal/store"
 )
 
@@ -251,5 +252,36 @@ func TestTrashCapIsEnforcedThroughTheAPI(t *testing.T) {
 		code := del.StatusCode
 		del.Body.Close()
 		t.Fatalf("the delete was still refused after raising the cap: %d", code)
+	}
+}
+
+// TestPendingUploadCapIsEnforcedAtSessionCreation: §4.3's cap on unfinished uploads.
+//
+// Declared sizes, not written bytes: the point is to stop a client reserving unbounded staging space.
+// The status is 507 rather than 429 because "retry later" is wrong advice — the client has to finish
+// or abort something before it can start another.
+func TestPendingUploadCapIsEnforcedAtSessionCreation(t *testing.T) {
+	h := newHarnessTuned(t, func(c *config.Config) {
+		c.Limits.MaxPendingUploadBytes = 1000
+	}, nil)
+
+	start := func(name string, size int64) (int, string) {
+		t.Helper()
+		body, _ := json.Marshal(map[string]any{"name": name, "size": size, "path": ""})
+		resp := h.do(http.MethodPost, "/api/files/uploads", strings.NewReader(string(body)),
+			map[string]string{"Content-Type": "application/json"})
+		defer resp.Body.Close()
+		return resp.StatusCode, readBody(resp)
+	}
+
+	if code, payload := start("first.bin", 600); code != http.StatusCreated {
+		t.Fatalf("first session: %d %s", code, payload)
+	}
+	code, payload := start("second.bin", 600)
+	if code != http.StatusInsufficientStorage {
+		t.Fatalf("a session over the staging allowance returned %d %s, want 507", code, payload)
+	}
+	if !strings.Contains(payload, "pending_uploads_full") {
+		t.Fatalf("the error should name the staging allowance, got %s", payload)
 	}
 }

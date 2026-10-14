@@ -484,6 +484,10 @@ func serve() error {
 	if err != nil {
 		return err
 	}
+	uploads.SetMaxPendingBytes(cfg.Limits.MaxPendingUploadBytes)
+	if err != nil {
+		return err
+	}
 	defer uploads.Close()
 
 	// Expired sessions hold staging files, so the sweep has to run periodically rather than
