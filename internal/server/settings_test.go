@@ -285,3 +285,61 @@ func TestPendingUploadCapIsEnforcedAtSessionCreation(t *testing.T) {
 		t.Fatalf("the error should name the staging allowance, got %s", payload)
 	}
 }
+
+// TestAdminCanProvisionAnAccount is ID-09's management-API half: 自动化开户 without SCIM.
+//
+// The account has no IdP identity, which is the point — the store claims a pre-provisioned row by
+// username on first login, so an operator can set role and quota before the person ever signs in.
+func TestAdminCanProvisionAnAccount(t *testing.T) {
+	h := newHarness(t)
+	admin, _ := h.adminClient(t)
+
+	resp := h.adminDo(t, admin, http.MethodPost, "/api/admin/users",
+		`{"username":"provisioned","email":"p@example.test","role":"user","quota_bytes":2048}`)
+	body := readBody(resp)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create user: %d %s", resp.StatusCode, body)
+	}
+
+	// The account exists with what was asked for, and an audit row says who created it.
+	var found bool
+	if err := h.meta.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+		u, err := tx.UserByUsername(ctx, "provisioned")
+		found = err == nil && u.QuotaBytes == 2048 && u.Role == "user" && u.IsActive()
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("the created account does not match the request")
+	}
+	var audited bool
+	for _, e := range h.meta.AuditLog() {
+		if e.Action == "user.create" && e.Metadata["source"] == "admin" {
+			audited = true
+		}
+	}
+	if !audited {
+		t.Fatal("creating an account through the API was not audited; an account that appears " +
+			"without a record of who made it is how a backdoor looks")
+	}
+
+	// Re-running the provisioning must conflict rather than rewrite the account.
+	again := h.adminDo(t, admin, http.MethodPost, "/api/admin/users",
+		`{"username":"provisioned","email":"p@example.test","role":"admin"}`)
+	againBody := readBody(again)
+	again.Body.Close()
+	if again.StatusCode != http.StatusConflict {
+		t.Fatalf("re-creating the same username returned %d (%s), want 409", again.StatusCode, againBody)
+	}
+	var role string
+	_ = h.meta.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+		u, err := tx.UserByUsername(ctx, "provisioned")
+		role = u.Role
+		return err
+	})
+	if role != "user" {
+		t.Fatalf("the refused create promoted the account to %q", role)
+	}
+}

@@ -66,6 +66,19 @@ type IdentityTx interface {
 	// user who changes their email keeps their files. Keying on email would
 	// silently create a second account and orphan the first one's data.
 	UpsertIdPUser(ctx context.Context, u UpsertUser) (User, error)
+
+	// CreateUser creates a NEW account from an administrator's request (ID-09's management-API half:
+	// automated provisioning without SCIM).
+	//
+	// Unlike UpsertIdPUser this never modifies an existing row: a create that silently becomes an
+	// update would let a provisioning script change somebody's role or quota by re-running with a
+	// taken username. A duplicate username, email or (issuer, subject) is ErrConflict, and the
+	// message names the field that collided.
+	//
+	// The account may have no IdP identity, which is the point: UpsertIdPUser claims a pre-provisioned
+	// row by username on first login, so an operator can create the account, set its role and quota,
+	// and let the person's first sign-in attach to it rather than create a second one.
+	CreateUser(ctx context.Context, u UpsertUser) (User, error)
 	// ApplyIdPRole records the role the IdP now claims for an account, revoking
 	// its live sessions when that is a downgrade.
 	//

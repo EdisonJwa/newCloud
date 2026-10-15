@@ -785,6 +785,10 @@ func Run(t *testing.T, factory Factory, opts Options) {
 		retainedVersionsSuite(t, factory)
 	})
 
+	t.Run("AdminCreatedAccount", func(t *testing.T) {
+		adminCreatedAccountSuite(t, factory)
+	})
+
 	t.Run("RecipientAccess", func(t *testing.T) {
 		recipientAccessSuite(t, factory)
 	})
@@ -6996,6 +7000,96 @@ func retainedVersionsSuite(t *testing.T, factory func(t *testing.T) (store.Store
 		}
 		if removed != 0 {
 			t.Fatalf("a cap of zero removed %d versions; it means unlimited", removed)
+		}
+	})
+}
+
+// adminCreatedAccountSuite covers CreateUser: ID-09's management-API route to provisioning.
+//
+// The property that separates it from UpsertIdPUser is REFUSAL. A provisioning script re-run with a
+// taken username must not silently change that account's role or quota, because the script author
+// believes they are creating somebody new.
+func adminCreatedAccountSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.UUID)) {
+	t.Helper()
+
+	t.Run("CreatesAndThenRefusesTheSameUsername", func(t *testing.T) {
+		s, _ := factory(t)
+		quota := int64(5000)
+
+		var created store.User
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			u, err := tx.CreateUser(ctx, store.UpsertUser{
+				Username: "provisioned", Email: "p@example.test", Role: "user",
+				QuotaBytes: &quota,
+			})
+			created = u
+			return err
+		}); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		if created.ID == uuid.Nil || created.Username != "provisioned" {
+			t.Fatalf("the created account is wrong: %+v", created)
+		}
+		if created.QuotaBytes != quota {
+			t.Fatalf("quota = %d, want %d", created.QuotaBytes, quota)
+		}
+
+		// Re-running the provisioning with a DIFFERENT role must fail, not demote the account.
+		err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			_, cerr := tx.CreateUser(ctx, store.UpsertUser{
+				Username: "provisioned", Email: "p@example.test", Role: "admin",
+			})
+			return cerr
+		})
+		if !errors.Is(err, store.ErrConflict) {
+			t.Fatalf("re-creating an existing username returned %v, want ErrConflict. A create that "+
+				"becomes an update lets a script change a role by accident.", err)
+		}
+
+		// And the role did not change.
+		var role string
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			u, uerr := tx.UserByID(ctx, created.ID)
+			role = u.Role
+			return uerr
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if role != "user" {
+			t.Fatalf("the refused create changed the role to %q", role)
+		}
+	})
+
+	t.Run("RefusesDuplicateEmailAndInvalidRole", func(t *testing.T) {
+		s, _ := factory(t)
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			_, err := tx.CreateUser(ctx, store.UpsertUser{
+				Username: "email-one", Email: "shared@example.test", Role: "user",
+			})
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			_, cerr := tx.CreateUser(ctx, store.UpsertUser{
+				Username: "email-two", Email: "shared@example.test", Role: "user",
+			})
+			return cerr
+		})
+		if !errors.Is(err, store.ErrConflict) {
+			t.Fatalf("a duplicate email returned %v, want ErrConflict: two accounts on one mailbox "+
+				"is how a password reset goes to the wrong person", err)
+		}
+
+		err = s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			_, cerr := tx.CreateUser(ctx, store.UpsertUser{
+				Username: "bad-role", Email: "bad@example.test", Role: "superuser",
+			})
+			return cerr
+		})
+		if err == nil {
+			t.Fatal("an invalid role was accepted; the column's CHECK would refuse it in " +
+				"PostgreSQL, and the in-memory store must not be more permissive")
 		}
 	})
 }

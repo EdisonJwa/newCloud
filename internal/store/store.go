@@ -232,6 +232,9 @@ type Tx interface {
 	UserByIdPSubject(ctx context.Context, issuer, subject string) (User, error)
 	// UpsertIdPUser provisions or refreshes an account from IdP claims.
 	UpsertIdPUser(ctx context.Context, u UpsertUser) (User, error)
+	// CreateUser provisions a NEW account from an administrator's request (ID-09). It never
+	// modifies an existing row: duplicates are ErrConflict, not updates.
+	CreateUser(ctx context.Context, u UpsertUser) (User, error)
 	// ApplyIdPRole records the role the IdP now claims and revokes live
 	// credentials on a downgrade.
 	ApplyIdPRole(ctx context.Context, userID uuid.UUID, role string) (RoleChange, error)

@@ -271,6 +271,7 @@ func (s *Server) Handler() http.Handler {
 			})
 			r.Route("/admin/users", func(r chi.Router) {
 				r.Get("/", s.handleAdminUsers)
+				r.Post("/", s.handleAdminCreateUser)
 				r.Post("/{id}/status", s.handleAdminSetUserStatus)
 				r.Post("/{id}/quota", s.handleAdminSetQuota)
 				r.Delete("/{id}", s.handleAdminDeleteUser)

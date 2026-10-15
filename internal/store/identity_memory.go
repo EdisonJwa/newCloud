@@ -309,3 +309,49 @@ func (m *Memory) SessionsFor(userID uuid.UUID) []Session {
 	}
 	return out
 }
+
+// CreateUser creates a new account, refusing duplicates instead of updating them.
+func (t *memTx) CreateUser(ctx context.Context, in UpsertUser) (User, error) {
+	if err := validateNewUser(in); err != nil {
+		return User{}, err
+	}
+	for _, u := range t.m.users {
+		if strings.EqualFold(u.Username, in.Username) {
+			return User{}, fmt.Errorf("%w: username %q is already taken", ErrConflict, in.Username)
+		}
+		if in.Email != "" && strings.EqualFold(u.Email, in.Email) {
+			return User{}, fmt.Errorf("%w: email %q is already in use", ErrConflict, in.Email)
+		}
+		if in.Issuer != "" && in.Subject != "" &&
+			u.IdPIssuer == in.Issuer && u.IdPSubject == in.Subject {
+			return User{}, fmt.Errorf("%w: that identity already has an account", ErrConflict)
+		}
+	}
+
+	now := t.m.now()
+	u := User{
+		ID: newID(), Username: in.Username, Email: in.Email, DisplayName: in.DisplayName,
+		Role: orDefault(in.Role, "user"), Status: orDefault(in.Status, "active"),
+		IdPIssuer: in.Issuer, IdPSubject: in.Subject,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if in.QuotaBytes != nil {
+		u.QuotaBytes = *in.QuotaBytes
+		t.m.quota[u.ID] = *in.QuotaBytes
+	}
+	t.m.users[u.ID] = &u
+	return u, nil
+}
+
+// validateNewUser applies the rules the schema would enforce, so both stores refuse the same input.
+func validateNewUser(in UpsertUser) error {
+	switch {
+	case strings.TrimSpace(in.Username) == "":
+		return fmt.Errorf("%w: a username is required", ErrInvalidName)
+	case in.Role != "" && in.Role != "admin" && in.Role != "user" && in.Role != "guest":
+		return fmt.Errorf("%w: role must be admin, user or guest", ErrInvalidName)
+	case in.Status != "" && in.Status != "active" && in.Status != "disabled" && in.Status != "pending":
+		return fmt.Errorf("%w: status must be active, disabled or pending", ErrInvalidName)
+	}
+	return nil
+}

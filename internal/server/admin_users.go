@@ -356,3 +356,68 @@ func (s *Server) handleAdminSetQuota(w http.ResponseWriter, r *http.Request) {
 		"used_bytes": after.UsedBytes,
 	})
 }
+
+// handleAdminCreateUser provisions an account (ID-09's management-API half: 自动化开户).
+//
+// The account needs no IdP identity: UpsertIdPUser claims a pre-provisioned row by username on first
+// login, so an operator can create the account, set its role and quota, and let the person's first
+// sign-in attach to it rather than create a second one.
+func (s *Server) handleAdminCreateUser(w http.ResponseWriter, r *http.Request) {
+	actor, ok := s.requireAdmin(w, r)
+	if !ok {
+		return
+	}
+
+	var body struct {
+		Username    string `json:"username"`
+		Email       string `json:"email"`
+		DisplayName string `json:"display_name"`
+		Role        string `json:"role"`
+		Status      string `json:"status"`
+		QuotaBytes  *int64 `json:"quota_bytes"`
+		IdPIssuer   string `json:"idp_issuer"`
+		IdPSubject  string `json:"idp_subject"`
+	}
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+
+	var created store.User
+	err := s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
+		u, cerr := tx.CreateUser(ctx, store.UpsertUser{
+			Issuer: body.IdPIssuer, Subject: body.IdPSubject,
+			Username: body.Username, Email: body.Email, DisplayName: body.DisplayName,
+			Role: body.Role, Status: body.Status, QuotaBytes: body.QuotaBytes,
+		})
+		if cerr != nil {
+			return cerr
+		}
+		created = u
+		return tx.Audit(ctx, store.AuditEntry{
+			ActorKind: "user", ActorUserID: actor.Ptr(), ActorEmail: actor.Email(),
+			ActorIP: clientIP(r), UserAgent: r.UserAgent(),
+			Action: "user.create", TargetKind: "user", TargetID: u.ID.String(),
+			Result: "ok",
+			Metadata: map[string]any{
+				"username": u.Username, "role": u.Role, "status": u.Status,
+				"source": "admin", "quota_bytes": u.QuotaBytes,
+			},
+		})
+	})
+	if err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			writeError(w, http.StatusConflict, "conflict", err.Error())
+			return
+		}
+		if errors.Is(err, store.ErrInvalidName) {
+			writeError(w, http.StatusBadRequest, "invalid_user", err.Error())
+			return
+		}
+		s.writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"id": created.ID.String(), "username": created.Username, "email": created.Email,
+		"role": created.Role, "status": created.Status, "quota_bytes": created.QuotaBytes,
+	})
+}

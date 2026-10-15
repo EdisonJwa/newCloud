@@ -337,3 +337,68 @@ func (s *PG) EnableUser(ctx context.Context, id uuid.UUID) error {
 
 var _ FullTx = (*pgTx)(nil)
 var _ = time.Now
+
+// CreateUser creates a new account, refusing duplicates instead of updating them.
+//
+// The conflicts are checked with SELECTs first so the error can NAME the field that collided; the
+// unique indexes are still the authority, and a concurrent duplicate surfaces through translate() as
+// ErrConflict with the constraint name.
+func (t *pgTx) CreateUser(ctx context.Context, in UpsertUser) (User, error) {
+	if err := validateNewUser(in); err != nil {
+		return User{}, err
+	}
+
+	var exists bool
+	if err := t.tx.QueryRow(ctx,
+		`SELECT true FROM users WHERE username = $1`, in.Username).Scan(&exists); err == nil {
+		return User{}, fmt.Errorf("%w: username %q is already taken", ErrConflict, in.Username)
+	} else if !isNoRows(err) {
+		return User{}, translate(err)
+	}
+	if in.Email != "" {
+		if err := t.tx.QueryRow(ctx,
+			`SELECT true FROM users WHERE email = $1`, in.Email).Scan(&exists); err == nil {
+			return User{}, fmt.Errorf("%w: email %q is already in use", ErrConflict, in.Email)
+		} else if !isNoRows(err) {
+			return User{}, translate(err)
+		}
+	}
+	if in.Issuer != "" && in.Subject != "" {
+		if err := t.tx.QueryRow(ctx,
+			`SELECT true FROM users WHERE idp_issuer = $1 AND idp_subject = $2`,
+			in.Issuer, in.Subject).Scan(&exists); err == nil {
+			return User{}, fmt.Errorf("%w: that identity already has an account", ErrConflict)
+		} else if !isNoRows(err) {
+			return User{}, translate(err)
+		}
+	}
+
+	// Two statements rather than one with a nullable parameter: PostgreSQL applies the column DEFAULT
+	// only when the column is OMITTED, so passing NULL for an unset quota would violate NOT NULL. The
+	// alternative — COALESCE($n, 10737418240) — copies the schema's default into Go, where it would
+	// drift from the migration that owns it.
+	role := orDefault(in.Role, "user")
+	status := orDefault(in.Status, "active")
+	var (
+		id  uuid.UUID
+		err error
+	)
+	if in.QuotaBytes != nil {
+		err = t.tx.QueryRow(ctx, `INSERT INTO users
+			(username, email, display_name, idp_issuer, idp_subject, role, status, quota_bytes)
+			VALUES ($1, nullif($2,''), $3, nullif($4,''), nullif($5,''), $6, $7, $8)
+			RETURNING id`,
+			in.Username, in.Email, in.DisplayName, in.Issuer, in.Subject, role, status,
+			*in.QuotaBytes).Scan(&id)
+	} else {
+		err = t.tx.QueryRow(ctx, `INSERT INTO users
+			(username, email, display_name, idp_issuer, idp_subject, role, status)
+			VALUES ($1, nullif($2,''), $3, nullif($4,''), nullif($5,''), $6, $7)
+			RETURNING id`,
+			in.Username, in.Email, in.DisplayName, in.Issuer, in.Subject, role, status).Scan(&id)
+	}
+	if err != nil {
+		return User{}, translate(err)
+	}
+	return t.UserByID(ctx, id)
+}
