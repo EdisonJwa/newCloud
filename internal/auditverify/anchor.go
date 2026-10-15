@@ -40,6 +40,9 @@ type Checkpoint struct {
 	// PreviousHead links checkpoints to each other, so a deleted checkpoint leaves a
 	// gap that is visible on the next verification.
 	PreviousHead string `json:"previous_head_hex,omitempty"`
+	// Signature is the base64 Ed25519 signature over the checkpoint's canonical form, present only
+	// when a signing key is configured. Empty on an unsigned anchor, which VerifySignature refuses.
+	Signature string `json:"signature,omitempty"`
 }
 
 // FileAnchor publishes checkpoints as one JSON document per day in a directory.
@@ -53,6 +56,17 @@ type FileAnchor struct {
 	mu sync.Mutex
 	// lastHead is the most recent published head, used to link the next checkpoint.
 	lastHead string
+	// signer signs each checkpoint. Nil publishes unsigned checkpoints, which VerifySignature refuses
+	// rather than treating as valid.
+	signer *Signer
+}
+
+// WithSigner signs every checkpoint this anchor publishes.
+func (a *FileAnchor) WithSigner(s *Signer) *FileAnchor {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.signer = s
+	return a
 }
 
 // NewFileAnchor returns an anchor writing to dir.
@@ -101,6 +115,14 @@ func (a *FileAnchor) PublishWithCount(day time.Time, head []byte, count int64) e
 		Count:        count,
 		PublishedAt:  time.Now().UTC(),
 		PreviousHead: a.lastHead,
+	}
+
+	if a.signer != nil {
+		sig, serr := a.signer.Sign(cp)
+		if serr != nil {
+			return fmt.Errorf("auditverify: sign checkpoint: %w", serr)
+		}
+		cp.Signature = sig
 	}
 
 	raw, err := json.MarshalIndent(cp, "", "  ")

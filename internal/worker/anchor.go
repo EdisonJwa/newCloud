@@ -176,6 +176,9 @@ func (w *Worker) EnableAnchoring(dir string, src auditverify.RowSource) error {
 	if err != nil {
 		return err
 	}
+	if w.anchorSigner != nil {
+		a.WithSigner(w.anchorSigner)
+	}
 	w.anchor = a
 	w.chain = auditverify.NewStoreChain(src)
 	return nil

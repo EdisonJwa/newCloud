@@ -103,8 +103,13 @@ func auditCommand(args []string) error {
 		return auditVerify(args[1:])
 	case "prune":
 		return auditPrune(args[1:])
+	case "anchor-keygen":
+		return auditAnchorKeygen(args[1:])
+	case "verify-anchors":
+		return auditVerifyAnchors(args[1:])
 	default:
-		return fmt.Errorf("audit: unknown sub-command %q (want verify or prune)", args[0])
+		return fmt.Errorf("audit: unknown sub-command %q (want verify, prune, anchor-keygen or verify-anchors)",
+			args[0])
 	}
 }
 
@@ -574,6 +579,18 @@ func serve() error {
 		// the scrub is running and one who never enabled it look identical from outside.
 		log.Warn("blob integrity scrub is disabled: silent corruption will not be detected",
 			"hint", "set limits.blob_scrub_per_pass to the number of blobs to verify per cycle")
+	}
+	if cfg.Audit.AnchorSigningKeyFile != "" {
+		signer, err := auditverify.LoadSigner(cfg.Audit.AnchorSigningKeyFile)
+		if err != nil {
+			log.Error("audit anchor signing key is configured but unusable",
+				"file", cfg.Audit.AnchorSigningKeyFile, "error", err)
+			return err
+		}
+		wk = wk.WithAnchorSigner(signer)
+		log.Info("audit checkpoints will be signed",
+			"public_key", signer.PublicKeyBase64(),
+			"note", "give the public key to whoever runs `audit verify-anchors`")
 	}
 	if cfg.Audit.AnchorDir != "" {
 		if err := wk.EnableAnchoring(cfg.Audit.AnchorDir, meta); err != nil {
@@ -1104,4 +1121,93 @@ func verifyStart(mark storepkg.PruneMark) []byte {
 		return audit.GenesisHash
 	}
 	return mark.HeadHash
+}
+
+// auditAnchorKeygen writes a new Ed25519 signing key and prints its public half.
+//
+// The private half belongs somewhere the anchor files do not live: a secret manager, an operator's
+// workstation, a signing service. The public half is what auditors are given, and it is safe to paste
+// into a ticket or a monitoring config.
+func auditAnchorKeygen(args []string) error {
+	flags := flag.NewFlagSet("audit anchor-keygen", flag.ContinueOnError)
+	out := flags.String("out", "", "write the private seed here (base64); required")
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	if *out == "" {
+		return errors.New("audit anchor-keygen: --out is required")
+	}
+	signer, err := auditverify.GenerateSigner()
+	if err != nil {
+		return err
+	}
+	// O_EXCL: never overwrite a key. Losing the old one silently would invalidate every checkpoint it
+	// signed, and that is not a thing to discover after the fact.
+	f, err := os.OpenFile(*out, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("audit anchor-keygen: %w", err)
+	}
+	if _, err := f.WriteString(signer.SeedBase64() + "\n"); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	fmt.Printf("public key: %s\n", signer.PublicKeyBase64())
+	fmt.Println("Keep the private key out of the anchor directory. Give the public key to whoever " +
+		"verifies: `newcloud audit verify-anchors --dir <anchor dir> --pubkey <key>`")
+	return nil
+}
+
+// auditVerifyAnchors checks checkpoint signatures and the chain between them.
+//
+// This is the third-party check: it needs only the anchor directory and the public key, which is what
+// makes it useful to somebody who does not trust the database or the server.
+func auditVerifyAnchors(args []string) error {
+	log := newLogger()
+
+	flags := flag.NewFlagSet("audit verify-anchors", flag.ContinueOnError)
+	dir := flags.String("dir", "", "anchor directory; required")
+	pubKey := flags.String("pubkey", "", "base64 or hex Ed25519 public key; required")
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	if *dir == "" || *pubKey == "" {
+		return errors.New("audit verify-anchors: --dir and --pubkey are required")
+	}
+
+	pub, err := auditverify.ParsePublicKey(*pubKey)
+	if err != nil {
+		return err
+	}
+	anchor, err := auditverify.NewFileAnchor(*dir)
+	if err != nil {
+		return err
+	}
+	cps, err := anchor.Checkpoints()
+	if err != nil {
+		return err
+	}
+	if len(cps) == 0 {
+		return fmt.Errorf("audit verify-anchors: no checkpoints in %s; an empty anchor set proves "+
+			"nothing, and treating it as success would make deleting the directory look like a "+
+			"clean audit", *dir)
+	}
+	if err := auditverify.VerifyCheckpointSet(pub, cps); err != nil {
+		log.Error("anchor verification FAILED", "dir", *dir, "error", err)
+		return fmt.Errorf("audit verify-anchors: %w", err)
+	}
+	last := cps[len(cps)-1]
+	log.Info("anchor checkpoints verified",
+		"count", len(cps), "dir", *dir,
+		"newest_day", last.Day.UTC().Format("2006-01-02"),
+		"head", last.Head, "events", last.Count)
+	return nil
 }

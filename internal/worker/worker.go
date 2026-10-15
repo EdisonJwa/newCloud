@@ -34,6 +34,8 @@ type Worker struct {
 	// scrubCursor is where the previous pass stopped. It is what makes the scrub cover the whole
 	// store over time instead of re-verifying the same first rows forever.
 	scrubCursor [32]byte
+	// anchorSigner signs published checkpoints when the deployment configured a key.
+	anchorSigner *auditverify.Signer
 	// versionByteCap bounds retained history in bytes (§4.3). Zero disables the trim.
 	versionByteCap int64
 	// scrubInterval is how often a pass runs. Separate from the sweep because the two have
@@ -608,6 +610,14 @@ func (w *Worker) reapExpiredJobLeases(ctx context.Context) int {
 // ReapExpiredJobLeasesForTest exposes the reaper to the package's tests.
 func (w *Worker) ReapExpiredJobLeasesForTest(ctx context.Context) int {
 	return w.reapExpiredJobLeases(ctx)
+}
+
+// WithAnchorSigner signs every published checkpoint.
+//
+// Set from configuration; nil publishes unsigned checkpoints, and the startup log says which.
+func (w *Worker) WithAnchorSigner(s *auditverify.Signer) *Worker {
+	w.anchorSigner = s
+	return w
 }
 
 // WithVersionByteCap sets the retained-history byte cap.

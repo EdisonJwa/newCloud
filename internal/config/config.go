@@ -321,6 +321,13 @@ type AuditConfig struct {
 	// directory on the same volume as the metadata store makes the anchor decorative,
 	// and the deployment documentation says so.
 	AnchorDir string `yaml:"anchor_dir"`
+	// AnchorSigningKeyFile is the Ed25519 private key that signs published checkpoints (§10.2).
+	//
+	// Empty publishes UNSIGNED checkpoints, which still detect truncation as long as the anchor
+	// directory is write-protected — the location carries that property. A signed commit is the
+	// stronger one: it survives an attacker who can write to the anchor directory but does not hold
+	// the key, which is exactly the threat an unsigned file cannot answer.
+	AnchorSigningKeyFile string `yaml:"anchor_signing_key_file"`
 	// ArchiveDir is where `newcloud audit prune` writes the events it is about to remove.
 	//
 	// Empty means ./audit-archive. It should point at the same kind of place as the anchor —
