@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/EdisonJwa/newCloud/internal/share"
 	"github.com/EdisonJwa/newCloud/internal/storage/layout"
 	"github.com/EdisonJwa/newCloud/internal/store"
@@ -199,7 +201,6 @@ func (s *Server) handleShareDownload(w http.ResponseWriter, r *http.Request) {
 
 	var node store.Node
 	var filePath string
-	var ownerID = sh.OwnerID
 	err = s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
 		root, rerr := tx.Node(ctx, sh.NodeID)
 		if rerr != nil {
@@ -227,9 +228,15 @@ func (s *Server) handleShareDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The content store is keyed by owner + path, so the share root's full path is
-	// needed. It is derived from the metadata tree rather than from the request.
-	rel, err := s.pathOfNode(r.Context(), sh.OwnerID, node.ID)
+	// The content store is keyed by OWNER + path, and the owner here is the NODE's, not the share
+	// creator's. An owner-created share has the same value for both; a DELEGATED share — a grantee
+	// holding `share` on somebody else's file — has bytes that only exist under the node's owner, so
+	// using the creator looked in the wrong namespace and 404'd every delegated download.
+	contentOwner := node.OwnerID
+	if contentOwner == uuid.Nil {
+		contentOwner = sh.OwnerID
+	}
+	rel, err := s.pathOfNode(r.Context(), contentOwner, node.ID)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "not_found", "no such file")
 		return
@@ -241,7 +248,7 @@ func (s *Server) handleShareDownload(w http.ResponseWriter, r *http.Request) {
 	// failed with a 404 when the bytes were missing, so a storage fault silently
 	// consumed a visitor's last allowed download.
 	rc, err := s.deps.Content.Open(r.Context(), layout.Node{
-		Owner: ownerID.String(), Path: rel,
+		Owner: contentOwner.String(), Path: rel,
 	})
 	if err != nil {
 		s.writeStoreError(w, err)
@@ -671,6 +678,10 @@ var (
 // the files themselves stay owned and untouched. A disabled or pending owner is treated exactly like
 // an expired link — 404, the same answer every other unavailable share gets, so the response does not
 // reveal that the account exists.
+// shareOwnerActive reports whether the share's creator may still hold a public link.
+//
+// A disabled account must not keep one alive, and an unreadable owner is not "active": the safe answer
+// for an anonymous visitor.
 func (s *Server) shareOwnerActive(ctx context.Context, sh store.Share) bool {
 	var active bool
 	err := s.deps.Meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
@@ -682,7 +693,6 @@ func (s *Server) shareOwnerActive(ctx context.Context, sh store.Share) bool {
 		return nil
 	})
 	if err != nil {
-		// Unreadable owner is not "active": the safe answer for an anonymous visitor.
 		s.deps.Log.Warn("could not read the share owner's status",
 			"share", sh.ID.String(), "error", err)
 		return false

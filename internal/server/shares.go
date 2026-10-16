@@ -100,17 +100,58 @@ func (s *Server) handleShareCreate(w http.ResponseWriter, r *http.Request) {
 		// decodeJSON rejects unknown fields — omitting it here made every "create a drop
 		// box" request fail with 400 from the bundled frontend.
 		HideContents bool `json:"hide_contents"`
+		// NodeID shares a node the caller did not address by path in their OWN namespace.
+		//
+		// A path resolves inside the caller's tree, so a grantee holding `share` on somebody else's
+		// file could not use the permission at all: every path they sent failed with "no such file".
+		// The permission was storable, grantable, listable, and unreachable — the defect class this
+		// codebase keeps finding. With an id the ACL decides instead of the namespace.
+		NodeID string `json:"node_id"`
 	}
 	if !decodeJSON(w, r, &body) {
 		return
 	}
 
-	nodes, err := s.deps.Meta.Resolve(r.Context(), actor.ID(), body.Path)
-	if err != nil {
-		s.writeStoreError(w, err)
-		return
+	var node store.Node
+	if body.NodeID != "" {
+		id, perr := uuid.Parse(body.NodeID)
+		if perr != nil {
+			writeError(w, http.StatusBadRequest, "invalid_node", "node_id must be a uuid")
+			return
+		}
+		if terr := s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
+			n, nerr := tx.Node(ctx, id)
+			if nerr != nil {
+				return nerr
+			}
+			node = n
+			// The audit row is the only record of what was exposed, and "share.create <uuid>" is a
+			// fact nobody can act on later. Serving resolves by id, so an empty path breaks nothing —
+			// but the record should name the file.
+			parts := []string{n.Name}
+			parent := n.ParentID
+			for i := 0; parent != nil && i < 256; i++ {
+				p, perr := tx.Node(ctx, *parent)
+				if perr != nil || p.ParentID == nil {
+					break
+				}
+				parts = append([]string{p.Name}, parts...)
+				parent = p.ParentID
+			}
+			body.Path = "/" + strings.Join(parts, "/")
+			return nil
+		}); terr != nil {
+			s.writeStoreError(w, terr)
+			return
+		}
+	} else {
+		nodes, rerr := s.deps.Meta.Resolve(r.Context(), actor.ID(), body.Path)
+		if rerr != nil {
+			s.writeStoreError(w, rerr)
+			return
+		}
+		node = nodes[len(nodes)-1]
 	}
-	node := nodes[len(nodes)-1]
 
 	cap, err := s.deps.Authz.Authorize(actor, node.ID)
 	if err != nil {

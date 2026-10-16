@@ -181,3 +181,74 @@ func TestShareDownloadIsAuditedOncePerLogicalDownload(t *testing.T) {
 			"download; recording every range buries the events that matter.", n)
 	}
 }
+
+// TestADelegatedShareServes is SHARE-09's reachability half (转授权).
+//
+// A grantee holding `share` must be able to mint a link for somebody else's file, and that link must
+// SERVE. Two independent defects made that impossible:
+//
+//   - the create endpoint resolved a PATH in the caller's own namespace, so a grantee's request failed
+//     with "no such file" no matter what they held. The permission was storable, grantable, listable
+//     and unreachable.
+//   - the download path addressed the content store by the SHARE CREATOR's namespace. For an
+//     owner-created share the creator and the node's owner are the same; for a delegated one the bytes
+//     only exist under the node's owner, so the link 404'd even once it existed.
+//
+// The revocation half (a delegated link dying when the owner revokes the grant) is NOT asserted here.
+// It currently passes, but a mutation that removes the creator-authorization check did not make it
+// fail, so the mechanism is not identified yet and an assertion that passes for an unknown reason is
+// not evidence. That is tracked as the next step rather than claimed here.
+func TestADelegatedShareServes(t *testing.T) {
+	h := newHarness(t)
+
+	h.uploadFile(t, "delegated.txt", "delegated content")
+	mate := h.meta.AddUser(store.User{Username: "mate", Email: "mate@example.test", Role: "user"})
+	if _, err := h.meta.EnsureRoot(context.Background(), mate.ID); err != nil {
+		t.Fatal(err)
+	}
+	mateSession, err := h.sessions.Mint(context.Background(), mate.ID, mate.Email, "127.0.0.1", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	nodes, err := h.meta.Resolve(context.Background(), h.user.ID, "delegated.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeID := nodes[len(nodes)-1].ID.String()
+
+	// Ungranted: refused, and by the ACL rather than by the namespace.
+	refused := h.doAs(t, mateSession, http.MethodPost, "/api/shares/",
+		strings.NewReader(`{"node_id":"`+nodeID+`","kind":"link"}`),
+		map[string]string{"Content-Type": "application/json"})
+	refused.Body.Close()
+	if refused.StatusCode == http.StatusCreated {
+		t.Fatal("an ungranted account shared another user's file")
+	}
+
+	if code, body := h.grantAs(t, "delegated.txt", mate.Username,
+		[]string{"read", "download", "share"}, nil); code != http.StatusCreated {
+		t.Fatalf("grant: %d %+v", code, body)
+	}
+
+	create := h.doAs(t, mateSession, http.MethodPost, "/api/shares/",
+		strings.NewReader(`{"node_id":"`+nodeID+`","kind":"link"}`),
+		map[string]string{"Content-Type": "application/json"})
+	createBody := readBody(create)
+	create.Body.Close()
+	if create.StatusCode != http.StatusCreated {
+		t.Fatalf("a grantee holding share could not create a link by node id: %d %s",
+			create.StatusCode, createBody)
+	}
+	token := createdToken(t, createBody)
+
+	served := h.do(http.MethodGet, "/s/"+token+"/download", nil, nil)
+	servedBody := readBody(served)
+	served.Body.Close()
+	if served.StatusCode != http.StatusOK {
+		t.Fatalf("a delegated share did not serve: %d %s", served.StatusCode, servedBody)
+	}
+	if servedBody != "delegated content" {
+		t.Fatalf("the delegated share served %q", servedBody)
+	}
+}
