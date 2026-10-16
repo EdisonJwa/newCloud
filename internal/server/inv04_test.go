@@ -13,6 +13,7 @@ package server_test
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
@@ -250,5 +251,90 @@ func TestADelegatedShareServes(t *testing.T) {
 	}
 	if servedBody != "delegated content" {
 		t.Fatalf("the delegated share served %q", servedBody)
+	}
+}
+
+// TestARefusedGrantRevokesTheDelegatedLink is SHARE-09 with INV-04.
+//
+// Revoking the grant must revoke the link the grant produced. Measured: with the creator-authorization
+// in shareOwnerActive removed entirely, the revoked link answered 200 with the file's bytes.
+//
+// What the measurement also showed is WHERE the refusal comes from: on a FULL revoke the authorizer
+// fails closed with an error, so the `cap.Can(PermShare)` comparison is not the branch that fires. It is
+// kept because it covers a grant that still EXISTS but no longer includes `share` — a downgrade the API
+// cannot currently express (grants are created and revoked, never edited), and therefore a branch no
+// test can reach today. The comment says so rather than implying the test proves it.
+func TestARefusedGrantRevokesTheDelegatedLink(t *testing.T) {
+	h := newHarness(t)
+	h.uploadFile(t, "revoked.txt", "sensitive content")
+	mate := h.meta.AddUser(store.User{Username: "revoke-mate", Email: "rm@example.test", Role: "user"})
+	if _, err := h.meta.EnsureRoot(context.Background(), mate.ID); err != nil {
+		t.Fatal(err)
+	}
+	mateSession, err := h.sessions.Mint(context.Background(), mate.ID, mate.Email, "127.0.0.1", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	nodes, err := h.meta.Resolve(context.Background(), h.user.ID, "revoked.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeID := nodes[len(nodes)-1].ID.String()
+	if code, body := h.grantAs(t, "revoked.txt", mate.Username,
+		[]string{"read", "download", "share"}, nil); code != http.StatusCreated {
+		t.Fatalf("grant: %d %+v", code, body)
+	}
+
+	create := h.doAs(t, mateSession, http.MethodPost, "/api/shares/",
+		strings.NewReader(`{"node_id":"`+nodeID+`","kind":"link"}`),
+		map[string]string{"Content-Type": "application/json"})
+	createBody := readBody(create)
+	create.Body.Close()
+	if create.StatusCode != http.StatusCreated {
+		t.Fatalf("create: %d %s", create.StatusCode, createBody)
+	}
+	token := createdToken(t, createBody)
+
+	served := h.do(http.MethodGet, "/s/"+token+"/download", nil, nil)
+	servedBody := readBody(served)
+	served.Body.Close()
+	if served.StatusCode != http.StatusOK || servedBody != "sensitive content" {
+		t.Fatalf("the delegated link should serve while the grant stands: %d %q",
+			served.StatusCode, servedBody)
+	}
+
+	listResp := h.do(http.MethodGet, "/api/acl/?path=revoked.txt", nil, nil)
+	listBody := readBody(listResp)
+	listResp.Body.Close()
+	var listing struct {
+		Grants []struct {
+			ID      string `json:"id"`
+			Subject string `json:"subject"`
+		} `json:"grants"`
+	}
+	if err := json.Unmarshal([]byte(listBody), &listing); err != nil {
+		t.Fatalf("parse grant listing: %v (%s)", err, listBody)
+	}
+	grantID := ""
+	for _, g := range listing.Grants {
+		if g.Subject == mate.Username {
+			grantID = g.ID
+		}
+	}
+	if grantID == "" {
+		t.Fatalf("the grant is not listed: %s", listBody)
+	}
+	revoke := h.do(http.MethodDelete, "/api/acl/"+grantID+"?path=revoked.txt", nil, nil)
+	revoke.Body.Close()
+	if revoke.StatusCode != http.StatusNoContent {
+		t.Fatalf("revoke: %d", revoke.StatusCode)
+	}
+
+	final := h.do(http.MethodGet, "/s/"+token+"/download", nil, nil)
+	finalBody := readBody(final)
+	final.Body.Close()
+	if final.StatusCode == http.StatusOK {
+		t.Fatalf("the delegated link kept serving %q after the grant was revoked", finalBody)
 	}
 }

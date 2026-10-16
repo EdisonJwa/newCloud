@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/EdisonJwa/newCloud/internal/authz"
 	"github.com/EdisonJwa/newCloud/internal/share"
 	"github.com/EdisonJwa/newCloud/internal/storage/layout"
 	"github.com/EdisonJwa/newCloud/internal/store"
@@ -678,26 +679,68 @@ var (
 // the files themselves stay owned and untouched. A disabled or pending owner is treated exactly like
 // an expired link — 404, the same answer every other unavailable share gets, so the response does not
 // reveal that the account exists.
-// shareOwnerActive reports whether the share's creator may still hold a public link.
+// shareOwnerActive reports whether the share's creator may still have a public link.
 //
-// A disabled account must not keep one alive, and an unreadable owner is not "active": the safe answer
-// for an anonymous visitor.
+// Two conditions, and the second was missing:
+//
+//  1. The creator's account is ACTIVE — a disabled account must not keep a link alive.
+//  2. The node is still live, and the creator STILL HOLDS `share` on it.
+//
+// The second is what a DELEGATED link needs. A grantee can be given `share` on somebody else's file,
+// mint a link, and have that grant revoked — and checking only the account left the public link serving
+// the owner's content afterwards. Measured, not assumed: with no creator check the revoked link answers
+// 200 with the file's bytes, which makes a grant a way to turn somebody's file into a permanent public
+// URL.
+//
+// Fail closed on every error: the visitor is anonymous, and there is nobody to ask.
+//
+// The reads and the authorization are SEPARATE transactions. Authorize opens its own, and calling it
+// inside WithTx deadlocks the in-memory store (bounded at ten seconds, so it looks like a hang) and is
+// refused by the PostgreSQL store.
 func (s *Server) shareOwnerActive(ctx context.Context, sh store.Share) bool {
-	var active bool
+	var (
+		owner store.User
+		node  store.Node
+	)
 	err := s.deps.Meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
-		owner, uerr := tx.UserByID(ctx, sh.OwnerID)
+		u, uerr := tx.UserByID(ctx, sh.OwnerID)
 		if uerr != nil {
 			return uerr
 		}
-		active = owner.IsActive()
+		owner = u
+		// Node() refuses a trashed or deleted node, which is the other way a share goes stale.
+		n, nerr := tx.Node(ctx, sh.NodeID)
+		if nerr != nil {
+			return nerr
+		}
+		node = n
 		return nil
 	})
 	if err != nil {
-		s.deps.Log.Warn("could not read the share owner's status",
+		s.deps.Log.Warn("could not read the share's owner or node",
 			"share", sh.ID.String(), "error", err)
 		return false
 	}
-	return active
+	if !owner.IsActive() {
+		return false
+	}
+
+	role := authz.RoleUser
+	switch owner.Role {
+	case "admin":
+		role = authz.RoleAdmin
+	case "guest":
+		role = authz.RoleGuest
+	}
+	actor := authz.NewUserActor(owner.ID, owner.Email, role,
+		authz.ScopeRead|authz.ScopeWrite).WithUsername(owner.Username)
+	cap, cerr := s.deps.Authz.Authorize(actor, node.ID)
+	if cerr != nil {
+		s.deps.Log.Warn("could not authorize the share's creator",
+			"share", sh.ID.String(), "error", cerr)
+		return false
+	}
+	return cap.Can(authz.PermShare)
 }
 
 // handleShareThumbnail renders a preview for a visitor of a public share.
