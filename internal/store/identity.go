@@ -60,7 +60,8 @@ type SessionTx interface {
 type IdentityTx interface {
 	UserByID(ctx context.Context, id uuid.UUID) (User, error)
 	UserByIdPSubject(ctx context.Context, issuer, subject string) (User, error)
-	// UpsertIdPUser creates or updates the account for an IdP identity.
+	// UpsertIdPUser creates or updates the account for an IdP identity (ID-01: (iss, sub) is the
+	// unique external key, mapped to an immutable internal user_id; email is never the key).
 	//
 	// The (issuer, subject) pair is the key: Pocket ID's sub never changes, so a
 	// user who changes their email keeps their files. Keying on email would

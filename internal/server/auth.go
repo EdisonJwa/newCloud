@@ -141,6 +141,8 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 	// account creation it may have caused.
 	*r = *r.WithContext(store.WithAuthMethod(r.Context(), store.AuthOIDC))
 
+	// ID-05: the IdP's groups map to a platform role, and an unknown group or a missing claim must not
+	// grant elevated rights. provider.Role defaults to the lowest role for exactly that reason.
 	role := provider.Role(claims.Groups)
 
 	// Apply the provisioning policy before anything is written (ID-04).

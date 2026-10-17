@@ -623,6 +623,10 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleRename renames a file or directory in place.
+// handleRename changes a node's NAME.
+//
+// INV-05: the node id, its versions and every share reference are untouched — a path is not an
+// identity, so renaming (like moving) cannot orphan history or break an existing link.
 func (s *Server) handleRename(w http.ResponseWriter, r *http.Request) {
 	actor, _ := actorFrom(r.Context())
 

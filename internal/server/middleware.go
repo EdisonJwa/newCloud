@@ -40,6 +40,10 @@ func actorFrom(ctx context.Context) (authz.Actor, bool) {
 // The actor is resolved once and put in the request context; handlers never touch
 // the cookie or the store themselves, so there is exactly one place that decides
 // who the caller is.
+// requireSession authenticates a browser request.
+//
+// INV-04: the session row is checked on every request, not only at login, so a revoked session or a
+// disabled account takes effect on the next call rather than when a token would have expired.
 func (s *Server) requireSession(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c, err := r.Cookie(sessionCookie)

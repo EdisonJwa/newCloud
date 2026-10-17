@@ -160,6 +160,10 @@ func (s *Server) handleShareCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	// Sharing is a separate permission from writing: a group editor who cannot
 	// share must not gain that power by creating a link.
+	//
+	// SHARE-09 is the rest of that rule: a grantee holding `share` may delegate, the link dies when the
+	// grant is revoked (sharepages.go), and a share's owner never changes — transfer is not a feature,
+	// it is a new share by whoever now has the node.
 	if !cap.Can(authz.PermShare) {
 		writeError(w, http.StatusNotFound, "not_found", "no such file")
 		return

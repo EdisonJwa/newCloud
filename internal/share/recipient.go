@@ -91,6 +91,11 @@ func (s *Service) ResolveRecipient(ctx context.Context, sh store.Share, email st
 // It refuses addresses that were never invited: the code proves ownership of an address
 // the owner chose, it does not grant access to a new one. That asymmetry is the whole
 // security property, so it lives here rather than in the caller.
+// IssueRecipientCode mints a code for one invited ADDRESS.
+//
+// SHARE-03: knowing the link is not being the recipient. The code is bound to the address the owner
+// invited, sent to it, and checked against it, so forwarding the URL does not turn a stranger into the
+// invitee — and VerifyRecipientCode counts failures per (share, address), not per link.
 func (s *Service) IssueRecipientCode(ctx context.Context, sh store.Share, email string) (string, error) {
 	if s.tickets == nil {
 		return "", errors.New("share: email verification is not configured")

@@ -102,6 +102,11 @@ type Created struct {
 //
 // Ordering matters: permissions are normalised before validation, so a request
 // share cannot be created with read access even if the caller asks for it.
+// Create mints a link.
+//
+// SHARE-01: the link has its own id, its own permission set, its own expiry and its own reference to the
+// node — it is not "the file is public". normalisePermissions gives each kind the LEAST it needs, so a
+// link that forgets to ask for write cannot write.
 func (s *Service) Create(ctx context.Context, in NewShare) (Created, error) {
 	kind := in.Kind
 	if kind == "" {

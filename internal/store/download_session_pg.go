@@ -29,6 +29,11 @@ import (
 //
 // The insert is guarded by the unique index, so two concurrent first requests
 // cannot both be charged: the loser's upsert lands on the winner's row.
+// AuthorizeDownload opens or joins the download session for a share and charges it at most once.
+//
+// SHARE-07: the count is charged INSIDE the transaction that guards the cap, and a Range request that
+// belongs to an existing session joins it rather than charging again — one media playback issues dozens
+// of requests, and counting them would exhaust a limited link in seconds.
 func (t *pgTx) AuthorizeDownload(ctx context.Context, s DownloadSession, reuseExisting bool) (DownloadSession, bool, error) {
 	// A caller that omits the expiry gets the default rather than a session that
 	// is already expired. A zero timestamp here used to mean every range request

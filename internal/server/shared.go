@@ -25,6 +25,10 @@ import (
 )
 
 // handleSharedWithMe lists nodes shared with the caller.
+//
+// SHARE-10: one place to see both directions — /api/shares lists what the caller created,
+// /api/shared lists what was shared with them, and each entry carries the authorizer's CURRENT capability
+// rather than the grant that was made, so a revoked-but-still-listed inconsistency is impossible.
 func (s *Server) handleSharedWithMe(w http.ResponseWriter, r *http.Request) {
 	actor, _ := actorFrom(r.Context())
 

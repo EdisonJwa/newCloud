@@ -77,6 +77,9 @@ func (s *Server) handleSharePage(w http.ResponseWriter, r *http.Request) {
 	s.auditShareView(r, sh)
 
 	// A request share never lists its contents: the server decides, not the UI.
+	//
+	// SHARE-04: a drop box is upload-only. It cannot list, read another uploader's file, or reveal what
+	// else arrived — enforced here and not by hiding buttons in the client.
 	if sh.Kind == store.ShareRequest {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"kind":          string(sh.Kind),

@@ -161,6 +161,10 @@ func (s *Server) handleUploadChunk(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleUploadComplete publishes the staged bytes.
+// handleUploadComplete publishes staged bytes.
+//
+// INV-03: the file becomes visible only after its content is persisted and its hash verified and the
+// metadata row commits — a fault during any of those leaves no half-made file in a listing.
 func (s *Server) handleUploadComplete(w http.ResponseWriter, r *http.Request) {
 	actor, _ := actorFrom(r.Context())
 	id := chi.URLParam(r, "id")
