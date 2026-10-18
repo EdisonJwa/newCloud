@@ -171,6 +171,54 @@ func TestEveryAllowListedKeyReachesAReadPoint(t *testing.T) {
 		}
 	})
 
+	t.Run("limits.max_pending_upload_bytes", func(t *testing.T) {
+		h := newHarness(t)
+		admin, _ := h.adminClient(t)
+
+		// No cap configured: a large session is accepted.
+		start := func(size int64) int {
+			t.Helper()
+			body, _ := json.Marshal(map[string]any{"name": "cap.bin", "size": size, "path": ""})
+			resp := h.do(http.MethodPost, "/api/files/uploads", strings.NewReader(string(body)),
+				map[string]string{"Content-Type": "application/json"})
+			code := resp.StatusCode
+			resp.Body.Close()
+			return code
+		}
+		if code := start(1 << 20); code != http.StatusCreated {
+			t.Fatalf("baseline session: %d", code)
+		}
+
+		resp := h.adminDo(t, admin, http.MethodPut,
+			"/api/admin/settings/limits.max_pending_upload_bytes", `1024`)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("set pending cap: %d", resp.StatusCode)
+		}
+
+		// The NEXT request is refused without a restart — this is the property the config-only cap
+		// did not have.
+		if code := start(1 << 20); code != http.StatusInsufficientStorage {
+			t.Fatalf("a session over the runtime staging cap returned %d, want 507", code)
+		}
+	})
+
+	t.Run("limits.max_retained_version_bytes", func(t *testing.T) {
+		// The worker reads this one, so the property is the effective value the worker resolves.
+		h := newHarness(t)
+		admin, _ := h.adminClient(t)
+
+		resp := h.adminDo(t, admin, http.MethodPut,
+			"/api/admin/settings/limits.max_retained_version_bytes", `777`)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("set retained-history cap: %d", resp.StatusCode)
+		}
+		if got := h.srvServer.MaxRetainedVersionBytesForTest(context.Background()); got != 777 {
+			t.Fatalf("the worker would use %d, want the override 777", got)
+		}
+	})
+
 	t.Run("limits.default_file_quota_bytes", func(t *testing.T) {
 		ctx := context.Background()
 		h := newHarness(t)

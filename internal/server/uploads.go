@@ -72,6 +72,11 @@ func (s *Server) handleUploadCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The staging cap is applied here, from the effective setting, rather than baked into the manager
+	// at startup: an administrator lowering it must not have to restart the process for it to bite.
+	// Two concurrent requests set the same value, so the write is idempotent; a change racing a request
+	// can only make that request use the previous value, which is the same lag a cached read would give.
+	s.deps.Uploads.SetMaxPendingBytes(s.maxPendingUploadBytes(r.Context()))
 	sess, err := s.deps.Uploads.Create(actor.ID(), body.Path, name, body.Size)
 	if err != nil {
 		if errors.Is(err, upload.ErrTooMany) {

@@ -34,6 +34,10 @@ const (
 	settingKeyChunkBytes = "limits.upload_chunk_bytes"
 	// settingKeyMaxTrashBytes caps retained trash usage per account (§4.3).
 	settingKeyMaxTrashBytes = "limits.max_trash_bytes"
+	// settingKeyPendingUploadBytes caps the declared size of an account's unfinished uploads.
+	settingKeyPendingUploadBytes = "limits.max_pending_upload_bytes"
+	// settingKeyRetainedVersionBytes caps retained history in bytes.
+	settingKeyRetainedVersionBytes = "limits.max_retained_version_bytes"
 	// settingKeyDefaultQuota is the quota a NEW account is created with. It has no effect on existing
 	// accounts; changing those is the per-user quota endpoint, and conflating the two would make
 	// "change the default" quietly rewrite people's limits.
@@ -64,6 +68,16 @@ var runtimeSettings = []runtimeSetting{
 	{
 		key:        settingKeyMaxTrashBytes,
 		configured: func(c config.Config) int64 { return c.Limits.MaxTrashBytes },
+		validate:   validateNonNegative,
+	},
+	{
+		key:        settingKeyPendingUploadBytes,
+		configured: func(c config.Config) int64 { return c.Limits.MaxPendingUploadBytes },
+		validate:   validateNonNegative,
+	},
+	{
+		key:        settingKeyRetainedVersionBytes,
+		configured: func(c config.Config) int64 { return c.Limits.MaxRetainedVersionBytes },
 		validate:   validateNonNegative,
 	},
 	{
@@ -326,6 +340,20 @@ func (s *Server) maxFileBytes(ctx context.Context) int64 {
 	return s.deps.Settings.Int(ctx, s.deps.Meta, settingKeyMaxFileBytes, base)
 }
 
+// maxPendingUploadBytes is the effective cap on unfinished uploads (§4.3).
+func (s *Server) maxPendingUploadBytes(ctx context.Context) int64 {
+	base := s.deps.Config.Limits.MaxPendingUploadBytes
+	return s.deps.Settings.Int(ctx, s.deps.Meta, settingKeyPendingUploadBytes, base)
+}
+
+// maxRetainedVersionBytes is the effective cap on retained history (§4.3).
+//
+// Read by the worker rather than here, but listed with the others so the allow-list stays one place.
+func (s *Server) maxRetainedVersionBytes(ctx context.Context) int64 {
+	base := s.deps.Config.Limits.MaxRetainedVersionBytes
+	return s.deps.Settings.Int(ctx, s.deps.Meta, settingKeyRetainedVersionBytes, base)
+}
+
 // maxTrashBytes is the effective retained-usage cap for the trash (§4.3).
 func (s *Server) maxTrashBytes(ctx context.Context) int64 {
 	base := s.deps.Config.Limits.MaxTrashBytes
@@ -344,3 +372,11 @@ func (s *Server) chunkBytes(ctx context.Context) int64 {
 // ("the default changes without a restart, and existing accounts are untouched") is exactly the value
 // those paths would store.
 func (s *Server) InitialQuota(ctx context.Context) *int64 { return s.initialQuota(ctx) }
+
+// MaxRetainedVersionBytesForTest exposes the effective retained-history cap.
+//
+// Exported because the reader lives with the worker, and the property under test is that the worker
+// resolves the OVERRIDE rather than the configured value.
+func (s *Server) MaxRetainedVersionBytesForTest(ctx context.Context) int64 {
+	return s.maxRetainedVersionBytes(ctx)
+}
