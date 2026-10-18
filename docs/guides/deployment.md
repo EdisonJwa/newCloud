@@ -36,7 +36,10 @@ Create two names, both pointing at the host:
 
 The split is a security boundary, not a branding choice. A stored-XSS payload in an uploaded file
 must not be able to read the session cookie or reach the application DOM. The configuration
-validator rejects a deployment where the two URLs share an origin.
+validator rejects a deployment where the two URLs share an origin, and it also rejects a shared
+**hostname**: browsers scope cookies by hostname alone, so `cloud.example.com` and
+`cloud.example.com:8443` are two origins but one cookie jar, and the content listener would receive
+`__Host-wc_session`. Use two names, ideally in different registrable domains.
 
 Edit `deploy/Caddyfile` and replace both hostnames. Caddy obtains certificates automatically; ports
 80 and 443 must be reachable from the internet (or use DNS-01 if they are not).
@@ -176,7 +179,8 @@ being produced.
 ## 8. Hardening checklist
 
 - [ ] Both public hostnames terminate TLS; HTTP redirects to HTTPS.
-- [ ] `public_url` and `usercontent_url` are different origins.
+- [ ] `public_url` and `usercontent_url` use different hostnames (not only a different port), or the
+      `allow_same_host_content` exception is set, logged, and Cookie is stripped on content paths.
 - [ ] The application connects as `newcloud_app`, not the owner.
 - [ ] `audit.anchor_dir` is on different credentials from the database.
 - [ ] `/var/lib/newcloud` is one mount point; the startup rename probe passes.

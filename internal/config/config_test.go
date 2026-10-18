@@ -56,14 +56,68 @@ func TestContentOriginMustDiffer(t *testing.T) {
 func TestContentOriginDifferenceIsAccepted(t *testing.T) {
 	for _, ucurl := range []string{
 		"https://usercontent.example.com",
-		"https://cloud.example.com:8443", // different port is a different origin
-		"http://cloud.example.com",       // different scheme is a different origin
+		"https://content.example.com",
+		"https://cloudusercontent.example.com:8443",
+		"http://usercontent.example.com",
 	} {
 		c := valid()
 		c.Server.UserContentURL = ucurl
 		if err := c.Validate(); err != nil {
 			t.Fatalf("%s should be accepted: %v", ucurl, err)
 		}
+	}
+}
+
+// TestContentOriginMustUseADifferentHostname is WC-GAP-005.
+//
+// The origin check accepts a different port or scheme, which is correct for the browser's
+// same-origin policy and wrong for cookies. Cookies are keyed by HOSTNAME: ports and schemes are
+// not part of the key, so app https://cloud.example.com and content https://cloud.example.com:8443
+// share one cookie jar and the content listener receives __Host-wc_session on every request.
+//
+// That does not by itself leak a session — the content route never authenticates from the cookie —
+// but it makes the "separate origin isolates the session" claim false, which is the property the
+// deployment is buying. A different port is the specific shape an operator reaches for when they
+// have one certificate and one IP, so it is the shape that has to be refused explicitly.
+func TestContentOriginMustUseADifferentHostname(t *testing.T) {
+	cases := map[string]string{
+		"different port":       "https://cloud.example.com:8443",
+		"different scheme":     "http://cloud.example.com",
+		"different port http":  "http://cloud.example.com:8081",
+		"same host upper-case": "https://CLOUD.EXAMPLE.COM:8443",
+		"trailing dot on host": "https://cloud.example.com.:8443",
+	}
+	for name, ucurl := range cases {
+		t.Run(name, func(t *testing.T) {
+			c := valid()
+			c.Server.UserContentURL = ucurl
+			err := c.Validate()
+			if !errors.Is(err, ErrInvalidConfig) {
+				t.Fatalf("want ErrInvalidConfig for %q, got %v", ucurl, err)
+			}
+			if !strings.Contains(err.Error(), "hostname") && !strings.Contains(err.Error(), "HOSTNAME") {
+				t.Fatalf("the error should say the hostname must differ, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestSameHostContentIsPermittedOnlyByOptIn: the exception exists because a single-certificate
+// deployment is real, but it must be a decision with a name, not a default.
+func TestSameHostContentIsPermittedOnlyByOptIn(t *testing.T) {
+	c := valid()
+	c.Server.UserContentURL = "https://cloud.example.com:8443"
+	c.Server.AllowSameHostContent = true
+	if err := c.Validate(); err != nil {
+		t.Fatalf("the explicit opt-in should be accepted: %v", err)
+	}
+
+	// The opt-in does not license the genuinely same origin: that is still XSS-via-origin.
+	c2 := valid()
+	c2.Server.UserContentURL = "https://cloud.example.com"
+	c2.Server.AllowSameHostContent = true
+	if err := c2.Validate(); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("allow_same_host_content must not permit an identical origin, got %v", err)
 	}
 }
 

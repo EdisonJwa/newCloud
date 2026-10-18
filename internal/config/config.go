@@ -82,6 +82,14 @@ type ServerConfig struct {
 	// default for a server not behind a reverse proxy. This is the knob the requirement asks
 	// for; TrustProxy is the blunt version kept so an existing deployment does not break.
 	TrustedProxies []string `yaml:"trusted_proxies"`
+	// AllowSameHostContent permits usercontent_url to share a hostname with public_url.
+	//
+	// Off by default, because browsers key cookies by HOSTNAME and not by port or scheme: a
+	// content origin on the same host receives the app's session cookie on every request, which
+	// is the cookie-isolation property the separate origin exists to provide. Set it only when
+	// the deployment already strips Cookie at the proxy for content paths and that fact is
+	// written down; startup then logs the exception so it is not a silent choice.
+	AllowSameHostContent bool `yaml:"allow_same_host_content"`
 }
 
 type AuthConfig struct {
@@ -102,12 +110,39 @@ type AuthConfig struct {
 	AllowLocalAdmin bool             `yaml:"allow_local_admin"`
 	LocalAdmin      LocalAdminConfig `yaml:"local_admin"`
 	SCIMToken       string           `yaml:"scim_token"`
+	// RevalidateMinutes bounds how long a session or App Password may outlive an IdP-side change
+	// (ID-06, WC-GAP-001).
+	//
+	// Role and group membership are reconciled only at login, because that is the only moment the
+	// server sees the IdP's claims. A user removed from the admin group who never signs in again
+	// keeps the old role, and their WebDAV App Password — which never talks to the IdP at all —
+	// keeps it indefinitely. "Takes effect at the next login" is not a bound; it is the absence of
+	// one.
+	//
+	// With a non-zero value, a request presenting a credential whose last confirmation is older
+	// than this window is refused until the account signs in again. That converts an unbounded
+	// window into a documented, testable one, at the cost of a periodic interactive login. Zero
+	// disables the check and preserves the previous behaviour, which startup warns about.
+	//
+	// This is not an IdP event feed. A feed (SCIM, push, or a poll) is strictly better because it
+	// revokes at the moment of the change; this bounds the exposure using only what the existing
+	// OIDC flow already provides.
+	RevalidateMinutes int `yaml:"revalidate_minutes"`
 }
 
 type LocalAdminConfig struct {
 	Username     string   `yaml:"username"`
 	PasswordFile string   `yaml:"password_argon2_file"`
 	AllowedCIDRs []string `yaml:"allowed_cidrs"`
+}
+
+// RevalidateWindow is how long a credential may go unconfirmed before it must be re-established
+// interactively (ID-06, WC-GAP-001). Zero means no bound, which is the previous behaviour.
+func (a AuthConfig) RevalidateWindow() time.Duration {
+	if a.RevalidateMinutes <= 0 {
+		return 0
+	}
+	return time.Duration(a.RevalidateMinutes) * time.Minute
 }
 
 // Layout selects how files map onto physical storage. It is a deployment
@@ -175,6 +210,20 @@ type S3Storage struct {
 	SSE string `yaml:"sse"`
 	// SSEKMSKeyID names the KMS key for sse-kms.
 	SSEKMSKeyID string `yaml:"sse_kms_key_id"`
+	// VerifyAfterPut reads every object back and re-hashes it before the upload is reported as
+	// successful (WC-GAP-003, INV-03).
+	//
+	// The pre-upload hash proves the payload matched its address when it left this process. It does
+	// not prove what the store now holds: a retried multipart part can be assembled from a buffer
+	// being rewritten concurrently (a known minio-go race, documented in the implementation record),
+	// producing an object of the right length at the right key holding the wrong bytes. Only a
+	// read-back sees that.
+	//
+	// Off by default because it doubles the bytes read from the store on every upload. Turn it on
+	// for any deployment where the object store is not trusted to return what it acknowledged.
+	VerifyAfterPut bool `yaml:"verify_after_put"`
+	// VerifyMaxBytes skips the read-back above this size. Zero verifies everything.
+	VerifyMaxBytes int64 `yaml:"verify_max_bytes"`
 }
 
 // UseTLS reports whether the connection must use https.
@@ -238,6 +287,17 @@ type LimitsConfig struct {
 	// deliberately rather than by omission: there is no grace period that is safe for every
 	// deployment, because "safe" depends on how large a file this one expects to receive.
 	UploadCleanupGraceHours int `yaml:"upload_cleanup_grace_hours"`
+
+	// ThumbnailIsolation controls where image decoding happens (§6.3, WC-GAP-004).
+	//
+	//   "process" (default): decode in a child process that can be killed.
+	//   "inline":            decode in the server process, bounded only by the pixel cap and a
+	//                        deadline that cannot stop the decoder.
+	//
+	// The default is "process" because in-process decoding lets a crafted file keep consuming CPU
+	// in the request-serving process after the timeout has been returned to the client, which is
+	// the one resource a hostile upload can take without ever completing a request.
+	ThumbnailIsolation string `yaml:"thumbnail_isolation"`
 }
 
 // VersionRetention is how long an old version is kept. Zero means forever.
@@ -261,6 +321,24 @@ func (l LimitsConfig) UploadSessionTTL() time.Duration {
 		return 24 * time.Hour
 	}
 	return time.Duration(l.UploadSessionTTLHrs) * time.Hour
+}
+
+// Thumbnail isolation modes (§6.3, WC-GAP-004).
+const (
+	// ThumbnailIsolationProcess decodes in a child process that a deadline can kill.
+	ThumbnailIsolationProcess = "process"
+	// ThumbnailIsolationInline decodes in the server process. The pixel cap and the deadline still
+	// apply, but the deadline cannot stop a running decoder.
+	ThumbnailIsolationInline = "inline"
+)
+
+// ThumbnailIsolated reports whether image decoding should run in a child process.
+//
+// Any value other than the explicit opt-out isolates, so a typo or a missing key gets the safe
+// behaviour. The opposite default would mean a single misspelling silently restored the in-process
+// decoder on a deployment that asked for isolation.
+func (l LimitsConfig) ThumbnailIsolated() bool {
+	return !strings.EqualFold(strings.TrimSpace(l.ThumbnailIsolation), ThumbnailIsolationInline)
 }
 
 // MaxVersionsFor reports how many versions to keep for a layout.
@@ -360,6 +438,8 @@ func Default() Config {
 			DefaultFileQuotaBytes: 10 << 30, // 10 GiB
 			MaxProfindChildren:    100_000,
 			UploadChunkBytes:      256 << 20, // 256 MiB
+			// Decode in a child process by default (§6.3, WC-GAP-004).
+			ThumbnailIsolation: ThumbnailIsolationProcess,
 		},
 		Audit: AuditConfig{RetentionDays: 365},
 	}
@@ -468,6 +548,30 @@ func (c *Config) Validate() error {
 		return invalid("server.usercontent_url must differ from public_url in scheme, host or port (got the same origin)")
 	}
 
+	// The content origin must be a different HOSTNAME, not merely a different port or scheme.
+	//
+	// The origin check above is about the browser's same-origin policy: it is what stops an
+	// uploaded HTML file from reading the app DOM. It is not the whole isolation story, because
+	// cookies are keyed by hostname, PORT AND SCHEME ARE NOT PART OF THE KEY. So
+	// app https://cloud.example.com and content https://cloud.example.com:8443 are two web
+	// origins that still share one cookie jar: a request to the content listener carries
+	// __Host-wc_session, and every proxy, log and sidecar on that host sees a live session
+	// credential for a request that should never have needed one.
+	//
+	// The content route does not authenticate from the cookie, so this is not by itself a
+	// session-theft path; it is the reason the "a separate origin protects the session cookie"
+	// claim was too strong. Requiring a distinct host is the configuration that makes the
+	// claim true. A deployment that genuinely needs the same host can set
+	// server.allow_same_host_content and accept the documented consequence.
+	if strings.EqualFold(contentHost(pub), contentHost(uc)) && !c.Server.AllowSameHostContent {
+		return invalid("server.usercontent_url must use a different HOSTNAME from public_url, got %q on both. "+
+			"A different port or scheme is a different browser origin but the SAME cookie jar, so the "+
+			"session cookie would be sent to the content listener. Use a separate host (ideally a "+
+			"separate registrable domain), or set server.allow_same_host_content: true and document "+
+			"that the cookie reaches the content origin",
+			pub.Hostname())
+	}
+
 	// §9.4 可信源列表. A malformed entry is rejected rather than skipped: an operator who writes
 	// 10.0.0.0/8 expecting a whole network and silently gets no trusted proxies at all would see
 	// every client arrive as the reverse proxy's address, and would have no way to tell why the
@@ -501,6 +605,16 @@ func (c *Config) Validate() error {
 
 	if len([]byte(c.Auth.SessionSecret)) < 32 {
 		return invalid("auth.session_secret must be at least 32 bytes")
+	}
+
+	// An unknown isolation mode is rejected rather than defaulted. Defaulting would be safe (any
+	// value other than "inline" isolates), but it would also silently accept "proces" and leave an
+	// operator believing they had turned something on that they had not.
+	switch strings.ToLower(strings.TrimSpace(c.Limits.ThumbnailIsolation)) {
+	case "", ThumbnailIsolationProcess, ThumbnailIsolationInline:
+	default:
+		return invalid("limits.thumbnail_isolation must be %q or %q, got %q",
+			ThumbnailIsolationProcess, ThumbnailIsolationInline, c.Limits.ThumbnailIsolation)
 	}
 
 	for name, role := range c.Auth.GroupRoleMap {
@@ -612,6 +726,16 @@ func sameOrigin(a, b *url.URL) bool {
 		return false
 	}
 	return strings.EqualFold(canonicalHost(a), canonicalHost(b))
+}
+
+// contentHost normalises a URL's hostname for the cookie-jar comparison.
+//
+// The trailing dot is the one that bites: "cloud.example.com." and "cloud.example.com" resolve to
+// the same place and, per RFC 6265, a browser treats them as the same cookie domain. Comparing the
+// raw Hostname() strings would accept the dotted form as a separate host and hand back exactly the
+// shared cookie jar the check exists to refuse.
+func contentHost(u *url.URL) string {
+	return strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
 }
 
 func canonicalHost(u *url.URL) string {

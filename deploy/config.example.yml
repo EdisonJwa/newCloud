@@ -37,6 +37,14 @@ auth:
   # Generate with: openssl rand -base64 48
   # At least 32 bytes; the process refuses to start with a short one.
   session_secret: "REPLACE-WITH-32-BYTES-OF-RANDOM"
+  # How long a session or App Password may go unconfirmed before it must be
+  # renewed by signing in again (ID-06). Roles and groups are read from the IdP
+  # only at login, so without this a person removed from a group keeps the old
+  # role in an existing session — and forever in a WebDAV App Password, which
+  # never talks to the IdP again. 0 disables the check and restores the old
+  # "effective at the next login, whenever that is" behaviour (startup warns).
+  # 720 = 12 hours, matching session_ttl.
+  revalidate_minutes: 720
   # Break-glass stays off unless you explicitly need it. If enabled, allowed_cidrs
   # is mandatory: an unrestricted local admin is an internet-reachable root login.
   allow_local_admin: false
@@ -92,11 +100,35 @@ storage:
     secure: true
     # Optional key prefix, for a bucket shared with other applications.
     prefix: ""
+    # sse: server-side encryption mode, "" (bucket policy), "sse-s3" or "sse-kms".
+    sse: ""
+    # Required when sse is sse-kms.
+    sse_kms_key_id: ""
+    # Read every object back and re-hash it before reporting the upload as
+    # successful (INV-03). The pre-upload hash proves the payload matched its
+    # address when it left this process; it does not prove what the store now
+    # holds, and a retried multipart part can land corrupted at a correct address.
+    # Off by default because it doubles the bytes read from the store; turn it on
+    # for any deployment that does not fully trust its object store.
+    verify_after_put: false
+    # Skip the read-back above this many bytes; 0 verifies everything.
+    verify_max_bytes: 0
 limits:
   max_file_bytes: 1099511627776        # 1 TiB hard cap
   default_file_quota_bytes: 10737418240 # 10 GiB default per-user soft cap
   max_propfind_children: 100000        # protects a single huge directory
   upload_chunk_bytes: 268435456        # 256 MiB chunks
+  # Retained-usage caps (§4.3), separate from a user's logical quota. 0 means
+  # unlimited, which is the safe default: a deployment that never set one must
+  # not discover it by being unable to delete a file.
+  max_trash_bytes: 0                   # retained trash per account
+  max_pending_upload_bytes: 0          # declared size of unfinished uploads per account
+  max_retained_version_bytes: 0        # retained history per account
+  # Where image decoding runs (§6.3). "process" (default) decodes in a child
+  # process that the deadline can KILL; "inline" decodes in the server process,
+  # where a crafted file keeps burning CPU after the timeout because a Go
+  # goroutine cannot be cancelled.
+  thumbnail_isolation: "process"
 
   # Integrity scrub: how many blobs to read back and verify against their content
   # address each cycle. 0 disables it.
