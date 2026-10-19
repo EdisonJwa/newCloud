@@ -238,6 +238,9 @@ type Tx interface {
 	// ApplyIdPRole records the role the IdP now claims and revokes live
 	// credentials on a downgrade.
 	ApplyIdPRole(ctx context.Context, userID uuid.UUID, role string) (RoleChange, error)
+	// MarkIdPConfirmed records that the IdP has just asserted this identity's claims, which is what
+	// makes the revalidation window measurable (ID-06, WC-GAP-001).
+	MarkIdPConfirmed(ctx context.Context, userID uuid.UUID) error
 
 	// App password operations, on the transaction so that issuing a credential
 	// and recording the audit event commit together.

@@ -1204,6 +1204,40 @@ var txLockTimeout = 10 * time.Second
 // SetTxLockTimeoutForTest shortens the wait so a test can observe the failure without stalling.
 func (m *Memory) SetTxLockTimeoutForTest(d time.Duration) { m.txLockTimeout = d }
 
+// BackdateIdPConfirmation moves an account's IdP confirmation timestamp into the past.
+//
+// The revalidation window is ID-06 / WC-GAP-001, and the interesting state is "confirmed, but not
+// recently". Reaching it honestly would mean waiting out a real window, so the test seam moves the
+// stamp instead of the clock — and it moves only this field, which is the difference that matters:
+// advancing the clock would age every other timestamp with it and could not distinguish "the
+// credential is stale" from "the whole store is old".
+func (m *Memory) BackdateIdPConfirmation(id uuid.UUID, at time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	u, ok := m.users[id]
+	if !ok {
+		return ErrNotFound
+	}
+	t := at
+	u.IdPConfirmedAt = &t
+	return nil
+}
+
+// MarkBreakglassForTest turns an account into a break-glass row.
+//
+// Needed because the exemption under test is "a break-glass account is never revalidated", and the
+// only honest way to exercise it is with a row that is actually break-glass.
+func (m *Memory) MarkBreakglassForTest(id uuid.UUID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	u, ok := m.users[id]
+	if !ok {
+		return ErrNotFound
+	}
+	u.IsBreakglass = true
+	return nil
+}
+
 // lockTx takes the transaction mutex, giving up after the configured timeout.
 func (m *Memory) lockTx(ctx context.Context) error {
 	timeout := m.txLockTimeout

@@ -75,13 +75,13 @@ func (t *pgTx) RevokeUserSessions(ctx context.Context, userID string) error {
 
 const userColumns = `id, username, COALESCE(email::text,''), display_name, role, status,
 	quota_bytes, used_bytes, COALESCE(idp_issuer,''), COALESCE(idp_subject,''),
-	is_breakglass, created_at, updated_at`
+	is_breakglass, idp_confirmed_at, created_at, updated_at`
 
 func scanUser(row pgx.Row) (User, error) {
 	var u User
 	err := row.Scan(&u.ID, &u.Username, &u.Email, &u.DisplayName, &u.Role, &u.Status,
 		&u.QuotaBytes, &u.UsedBytes, &u.IdPIssuer, &u.IdPSubject,
-		&u.IsBreakglass, &u.CreatedAt, &u.UpdatedAt)
+		&u.IsBreakglass, &u.IdPConfirmedAt, &u.CreatedAt, &u.UpdatedAt)
 	if err != nil {
 		return User{}, translate(err)
 	}
@@ -140,12 +140,12 @@ func (t *pgTx) UpsertIdPUser(ctx context.Context, u UpsertUser) (User, error) {
 	// of truth for it. Writing the default into a query would have duplicated it, and the copy is
 	// what drifts.
 	const insertBase = `INSERT INTO users
-		(username, email, display_name, idp_issuer, idp_subject, role, status)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		(username, email, display_name, idp_issuer, idp_subject, role, status, idp_confirmed_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, now())
 		RETURNING ` + userColumns
 	const insertWithQuota = `INSERT INTO users
-		(username, email, display_name, idp_issuer, idp_subject, role, status, quota_bytes)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		(username, email, display_name, idp_issuer, idp_subject, role, status, quota_bytes, idp_confirmed_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
 		RETURNING ` + userColumns
 
 	var user User
@@ -224,6 +224,7 @@ func (t *pgTx) refreshIdPUser(ctx context.Context, cur User, u UpsertUser, role 
 		SET idp_issuer = $2, idp_subject = $3,
 		    email = COALESCE($4, email),
 		    display_name = COALESCE(NULLIF($5, ''), display_name),
+		    idp_confirmed_at = now(),
 		    updated_at = now()
 		WHERE id = $1
 		RETURNING ` + userColumns
@@ -240,6 +241,19 @@ func (t *pgTx) refreshIdPUser(ctx context.Context, cur User, u UpsertUser, role 
 // IdP, and a browser session may be long-lived. Writing the lower role is not enough
 // if a credential minted while the account was an admin is still accepted, so both
 // are killed. The user simply signs in again and gets the correct role.
+// MarkIdPConfirmed records the time of the IdP assertion.
+func (t *pgTx) MarkIdPConfirmed(ctx context.Context, userID uuid.UUID) error {
+	tag, err := t.tx.Exec(ctx,
+		`UPDATE users SET idp_confirmed_at = now() WHERE id = $1`, userID)
+	if err != nil {
+		return translate(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (t *pgTx) ApplyIdPRole(ctx context.Context, userID uuid.UUID, role string) (RoleChange, error) {
 	cur, err := t.UserByID(ctx, userID)
 	if err != nil {

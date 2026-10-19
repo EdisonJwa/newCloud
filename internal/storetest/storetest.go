@@ -1304,6 +1304,70 @@ func Run(t *testing.T, factory Factory, opts Options) {
 			}
 		})
 
+		// MarkIdPConfirmed is what the revalidation window is measured from (ID-06, WC-GAP-001).
+		//
+		// Two backends implement it with different mechanisms — an UPDATE here, a field assignment in
+		// memory — and a disagreement is invisible to every other test: the field would simply never
+		// move on one backend, and every account on it would look permanently stale. That is exactly
+		// the class of divergence this suite exists to catch.
+		t.Run("MarkIdPConfirmedStampsTheAccount", func(t *testing.T) {
+			s, owner := factory(t)
+			rootOf(t, s, owner)
+
+			var before store.User
+			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				got, err := tx.UserByID(ctx, owner)
+				before = got
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if before.IdPConfirmedAt != nil {
+				t.Fatalf("a fresh account should not be confirmed yet, got %v", before.IdPConfirmedAt)
+			}
+
+			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				return tx.MarkIdPConfirmed(ctx, owner)
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			var after store.User
+			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				got, err := tx.UserByID(ctx, owner)
+				after = got
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if after.IdPConfirmedAt == nil {
+				t.Fatal("MarkIdPConfirmed did not record a timestamp; every account would look " +
+					"permanently stale and the revalidation window would never be satisfiable")
+			}
+			if after.IdPConfirmedAt.IsZero() {
+				t.Fatal("the confirmation timestamp is the zero time")
+			}
+			if d := time.Since(*after.IdPConfirmedAt); d > time.Minute || d < -time.Minute {
+				t.Fatalf("the confirmation timestamp is %v away from now", d)
+			}
+
+			// A second call must succeed rather than conflict: renewing a credential is the normal
+			// case, and a store that rejected it would force a logout to stay signed in.
+			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				return tx.MarkIdPConfirmed(ctx, owner)
+			}); err != nil {
+				t.Fatalf("re-confirming an account failed: %v", err)
+			}
+
+			// An unknown account is ErrNotFound, not a silent success: a caller that mistyped an id
+			// must not believe it confirmed somebody.
+			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				return tx.MarkIdPConfirmed(ctx, uuid.New())
+			}); !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("want ErrNotFound for an unknown account, got %v", err)
+			}
+		})
+
 		t.Run("UpgradeKeepsCredentials", func(t *testing.T) {
 			s, owner := factory(t)
 			rootOf(t, s, owner)

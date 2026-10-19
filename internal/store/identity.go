@@ -34,8 +34,11 @@ type User struct {
 	IdPIssuer    string
 	IdPSubject   string
 	IsBreakglass bool
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	// IdPConfirmedAt is when the IdP last asserted this identity's role and group claims
+	// (ID-06, WC-GAP-001). Nil means never, which the revalidation check treats as stale.
+	IdPConfirmedAt *time.Time
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 
 // IsActive reports whether the account may sign in.
@@ -89,6 +92,13 @@ type IdentityTx interface {
 	// they already hold — otherwise the removal is advisory until their token
 	// expires, which for a WebDAV client can be months.
 	ApplyIdPRole(ctx context.Context, userID uuid.UUID, role string) (RoleChange, error)
+
+	// MarkIdPConfirmed records that the IdP has just asserted this identity's claims.
+	//
+	// Called from the OIDC callback, which is the only place the claims are read. It is what makes
+	// the revalidation window measurable: without it "last confirmed" has no meaning and every
+	// account would look permanently stale.
+	MarkIdPConfirmed(ctx context.Context, userID uuid.UUID) error
 }
 
 // RoleChange reports what ApplyIdPRole did.

@@ -205,6 +205,15 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 			return rerr
 		}
 
+		// ID-06 / WC-GAP-001: this is the moment the IdP vouched for the account's role and group
+		// membership, so it is the moment the revalidation clock restarts. Recorded explicitly rather
+		// than inferred from updated_at, because updated_at moves for reasons that have nothing to do
+		// with the IdP (a quota change, an administrator renaming the account) and would silently
+		// extend the window for an account nobody has re-confirmed.
+		if merr := tx.MarkIdPConfirmed(ctx, u.ID); merr != nil {
+			return merr
+		}
+
 		// Reconcile the stored role with what the IdP now claims. On a downgrade
 		// this also revokes the account's live sessions and app passwords — the
 		// T-02 requirement. Without it, "removed from the admin group" only took

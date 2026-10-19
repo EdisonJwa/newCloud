@@ -52,6 +52,19 @@ type Handler struct {
 	// trashLimit is the retained-usage cap for the trash (§4.3). Nil means unlimited, which is the
 	// safe default: a WebDAV client deleting a file must not hit a limit the deployment never set.
 	trashLimit func(context.Context) int64
+	// revalidate reports whether an account's credentials have aged past the IdP revalidation
+	// window (ID-06, WC-GAP-001). Nil disables the check.
+	//
+	// Injected rather than recomputed here so the WebDAV and session paths cannot disagree about
+	// when an account is stale: two implementations of one policy is how one of them ends up
+	// letting a demoted admin through.
+	revalidate func(store.User) bool
+}
+
+// WithRevalidation supplies the staleness predicate used to expire App Passwords.
+func (h *Handler) WithRevalidation(fn func(store.User) bool) *Handler {
+	h.revalidate = fn
+	return h
 }
 
 // WithTrashLimit supplies the retained-usage cap used by DELETE and by an overwrite that replaces
@@ -181,6 +194,19 @@ func (h *Handler) authenticate(w http.ResponseWriter, r *http.Request) (authz.Ac
 	}
 
 	if u.Status != "active" {
+		h.challenge(w)
+		return authz.Actor{}, false
+	}
+
+	// ID-06 / WC-GAP-001: an App Password is a long-lived credential that never talks to the IdP
+	// again, so it is the worst case for "removed from the admin group" — the revocation only ever
+	// happened at the next *browser* login, which a WebDAV-only user may never do. Past the
+	// revalidation window the credential is refused and the client is challenged, which is the only
+	// way this path can be re-confirmed: a Basic-auth prompt the user answers by signing in.
+	//
+	// The same exemptions as the session path apply (break-glass, no IdP identity, window disabled),
+	// which is why the predicate is shared rather than reimplemented here.
+	if h.revalidate != nil && h.revalidate(u) {
 		h.challenge(w)
 		return authz.Actor{}, false
 	}

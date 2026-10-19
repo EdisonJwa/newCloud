@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -159,7 +160,15 @@ func (t *memTx) UpsertIdPUser(ctx context.Context, in UpsertUser) (User, error) 
 		// Role is intentionally not written here: ApplyIdPRole owns it, because
 		// only it can also revoke the credentials a demotion invalidates. Writing
 		// it in both places made the change invisible to the reconciler.
-		byIdentity.UpdatedAt = t.m.now()
+		//
+		// The confirmation stamp IS written here, because this call is the login and the login is
+		// the IdP assertion (ID-06, WC-GAP-001). The PostgreSQL implementation sets it in the same
+		// UPDATE; leaving it out here made every account on the memory backend look permanently
+		// stale, which the shared conformance suite would have caught only because the revalidation
+		// predicate is exercised at the server layer.
+		now := t.m.now()
+		byIdentity.IdPConfirmedAt = &now
+		byIdentity.UpdatedAt = now
 		return *byIdentity, nil
 
 	case byName != nil:
@@ -180,8 +189,11 @@ func (t *memTx) UpsertIdPUser(ctx context.Context, in UpsertUser) (User, error) 
 		if in.DisplayName != "" {
 			byName.DisplayName = in.DisplayName
 		}
-		// See above: role reconciliation belongs to ApplyIdPRole.
-		byName.UpdatedAt = t.m.now()
+		// See above: role reconciliation belongs to ApplyIdPRole. The confirmation stamp does not:
+		// this login is the IdP assertion, so it restarts the revalidation clock (WC-GAP-001).
+		now := t.m.now()
+		byName.IdPConfirmedAt = &now
+		byName.UpdatedAt = now
 		return *byName, nil
 	}
 
@@ -227,6 +239,17 @@ func (t *memTx) UpsertIdPUser(ctx context.Context, in UpsertUser) (User, error) 
 // backend that leaves a fresh account at zero (unlimited) while PostgreSQL gives it 10 GiB is
 // exactly the divergence the shared conformance suite exists to catch.
 const defaultUserQuotaBytes int64 = 10737418240
+
+// MarkIdPConfirmed records the time of the IdP assertion (ID-06, WC-GAP-001).
+func (t *memTx) MarkIdPConfirmed(ctx context.Context, userID uuid.UUID) error {
+	u, ok := t.m.users[userID]
+	if !ok {
+		return ErrNotFound
+	}
+	now := t.m.now()
+	u.IdPConfirmedAt = &now
+	return nil
+}
 
 // ApplyIdPRole stores the claimed role and revokes credentials on a downgrade.
 //
@@ -333,7 +356,10 @@ func (t *memTx) CreateUser(ctx context.Context, in UpsertUser) (User, error) {
 		ID: newID(), Username: in.Username, Email: in.Email, DisplayName: in.DisplayName,
 		Role: orDefault(in.Role, "user"), Status: orDefault(in.Status, "active"),
 		IdPIssuer: in.Issuer, IdPSubject: in.Subject,
-		CreatedAt: now, UpdatedAt: now,
+		// A row created BY this call is being confirmed by it: the claims in `in` are the IdP's
+		// assertion. Only rows that predate the column stay unconfirmed (WC-GAP-001).
+		IdPConfirmedAt: func() *time.Time { t := now; return &t }(),
+		CreatedAt:      now, UpdatedAt: now,
 	}
 	if in.QuotaBytes != nil {
 		u.QuotaBytes = *in.QuotaBytes

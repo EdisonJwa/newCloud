@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/EdisonJwa/newCloud/internal/authz"
 	"github.com/EdisonJwa/newCloud/internal/store"
@@ -81,6 +82,23 @@ func (s *Server) requireSession(next http.Handler) http.Handler {
 			return
 		}
 
+		// ID-06 / WC-GAP-001: refuse a credential whose IdP confirmation has aged out.
+		//
+		// The role stored in this row was written by the last successful login. If the IdP has since
+		// removed this person from a group — or disabled them outright — nothing in this process knows
+		// yet, and the session keeps exercising the old role. "Effective at the next login" is not a
+		// bound when the person may never log in again.
+		//
+		// Refusing here converts that into a documented window: past auth.revalidate_minutes, the
+		// only way back in is an interactive sign-in, which re-reads the claims. It is deliberately
+		// not a silent role change — the request fails with the same 401 an expired session gets, so
+		// the client re-authenticates rather than continuing with privileges nobody has confirmed.
+		if s.credentialIsStale(user) {
+			s.clearSessionCookie(w)
+			writeError(w, http.StatusUnauthorized, "unauthenticated", "sign-in must be renewed")
+			return
+		}
+
 		role := authz.RoleGuest
 		switch user.Role {
 		case "admin":
@@ -98,6 +116,48 @@ func (s *Server) requireSession(next http.Handler) http.Handler {
 		ctx := store.WithAuthMethod(r.Context(), store.AuthSession)
 		next.ServeHTTP(w, r.WithContext(context.WithValue(ctx, actorKey, actor)))
 	})
+}
+
+// credentialIsStale reports whether this account's IdP confirmation has aged past the window
+// (ID-06, WC-GAP-001).
+//
+// The cases where it is always false are as important as the case where it is true:
+//
+//   - revalidate_minutes is 0, which is the previous behaviour and is announced at startup.
+//   - The account is break-glass. It has no IdP to be confirmed against, and expiring it would lock
+//     the only recovery path out of the system behind an identity provider that may be the thing
+//     that is broken.
+//   - The account has no IdP identity at all (created by an administrator through the management
+//     API). Its role comes from an operator, not from a claim, so there is nothing to re-derive.
+//
+// A nil IdPConfirmedAt means "never confirmed" and is stale. That is the migration case: the column
+// arrives empty on a deployment that upgrades, and the honest reading of an empty field is "we do not
+// know", not "confirmed just now". The consequence is that upgrading with a window configured forces
+// one round of interactive logins — which is the price of the bound actually applying.
+func (s *Server) credentialIsStale(user store.User) bool {
+	window := s.deps.Config.Auth.RevalidateWindow()
+	if window <= 0 {
+		return false
+	}
+	if user.IsBreakglass {
+		return false
+	}
+	if user.IdPIssuer == "" || user.IdPSubject == "" {
+		return false
+	}
+	if user.IdPConfirmedAt == nil {
+		return true
+	}
+	return time.Since(*user.IdPConfirmedAt) > window
+}
+
+// CredentialIsStaleForTest exposes the revalidation predicate.
+//
+// Exported because the exemptions (break-glass, no IdP identity, window disabled) are the part most
+// likely to be got wrong, and they are cheapest to pin directly rather than by constructing a
+// break-glass login for each case.
+func (s *Server) CredentialIsStaleForTest(user store.User) bool {
+	return s.credentialIsStale(user)
 }
 
 // userByID loads an account from the session's subject.
