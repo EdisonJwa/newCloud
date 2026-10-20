@@ -121,6 +121,17 @@ func newHarnessTuned(t *testing.T, mutate func(*config.Config), tune func(*serve
 	cfg.Server.UserContentURL = "https://content.example.test"
 	cfg.Limits.MaxProfindChildren = 100
 	cfg.Limits.MaxFileBytes = 1 << 20
+	// In-process thumbnails by default.
+	//
+	// The production default is "process" (WC-GAP-004), but a test binary cannot serve as its own
+	// decoder: thumbnail.WorkerCommand re-execs os.Executable, which under `go test` is the test
+	// binary, and the test binary runs TestMain rather than the application's main. Every
+	// thumbnail assertion would then answer 415 for a reason unrelated to the property under test.
+	//
+	// The isolation path is covered by internal/thumbnail's own tests, which re-exec the test
+	// binary through a TestMain branch that calls thumbnail.WorkerMain. Tests that specifically
+	// want the server to isolate set Thumbs themselves.
+	cfg.Limits.ThumbnailIsolation = config.ThumbnailIsolationInline
 	if mutate != nil {
 		mutate(&cfg)
 	}

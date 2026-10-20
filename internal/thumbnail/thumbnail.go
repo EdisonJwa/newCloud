@@ -113,6 +113,12 @@ type Generator struct {
 	// bounds how long a request holds a slot, and the request path treats the deadline as
 	// "no thumbnail" rather than an error the user must see.
 	timeout time.Duration
+	// iso, when set, moves the decode into a child process (WC-GAP-004).
+	//
+	// nil means in-process decoding, which is the fallback and the default. The difference is
+	// visible only in what happens to a hostile file: in-process, a deadline stops the wait and
+	// the decoder keeps running; isolated, the process is killed.
+	iso *Isolation
 }
 
 // DefaultConcurrency is how many thumbnails are decoded at once.
@@ -193,17 +199,18 @@ func (g *Generator) Generate(hash [32]byte, r io.ReadSeeker) ([]byte, error) {
 		return nil, ErrBusy
 	}
 
-	// Run the decode with a deadline. The goroutine cannot be killed, so this bounds how
-	// long the *caller* waits and how long the slot is held; the decode itself finishes
-	// or fails on its own. That is the honest limit of what Go allows for a CPU-bound
-	// library call, and it is why the pixel cap matters as well.
+	// Run the decode with a deadline. With isolation configured this is a kill, because the
+	// decoder lives in a child process that dies with its context; in-process, the goroutine
+	// cannot be killed, so this bounds how long the *caller* waits and how long the slot is held
+	// while the decode finishes or fails on its own. That asymmetry is the whole reason
+	// WC-GAP-004 exists, and it is stated here rather than left to be discovered.
 	type result struct {
 		data []byte
 		err  error
 	}
 	done := make(chan result, 1)
 	go func() {
-		data, err := g.generate(hash, r)
+		data, err := g.decode(r)
 		done <- result{data, err}
 	}()
 
@@ -214,6 +221,10 @@ func (g *Generator) Generate(hash [32]byte, r io.ReadSeeker) ([]byte, error) {
 			return nil, res.err
 		}
 		g.clearFailure(hash)
+		// Cache here rather than inside decode: the cache is keyed by content address and must
+		// be written by whichever path produced the bytes, so the isolated and in-process decoders
+		// cannot drift into caching differently.
+		g.put(hash, res.data)
 		return res.data, nil
 	case <-time.After(g.timeout):
 		g.recordFailure(hash, ErrTimeout)
@@ -287,12 +298,25 @@ func (g *Generator) clearFailure(hash [32]byte) {
 // waitBudget bounds how long a request waits for a decode slot.
 const waitBudget = 5 * time.Second
 
-// generate is the unbounded decoder; Generate wraps it with the queue and deadline.
+// generate is the cache-aware wrapper around renderPNG.
 func (g *Generator) generate(hash [32]byte, r io.ReadSeeker) ([]byte, error) {
 	if cached, ok := g.get(hash); ok {
 		return cached, nil
 	}
+	data, err := renderPNG(r)
+	if err != nil {
+		return nil, err
+	}
+	g.put(hash, data)
+	return data, nil
+}
 
+// renderPNG decodes an image and encodes a thumbnail. It has no cache and no deadline.
+//
+// Split out so the isolated child process and the in-process fallback run the SAME decoder. A child
+// that used a different code path would be a second implementation to keep in step, and the one
+// used only under isolation is exactly the one least likely to be exercised in a test run.
+func renderPNG(r io.ReadSeeker) ([]byte, error) {
 	// Read the header first to bound the decode.
 	head := make([]byte, 64)
 	n, _ := io.ReadFull(r, head)
@@ -338,10 +362,7 @@ func (g *Generator) generate(hash [32]byte, r io.ReadSeeker) ([]byte, error) {
 	if err := png.Encode(&out, dst); err != nil {
 		return nil, fmt.Errorf("thumbnail: encode: %w", err)
 	}
-
-	data := out.Bytes()
-	g.put(hash, data)
-	return data, nil
+	return out.Bytes(), nil
 }
 
 // get reads from the cache.

@@ -88,6 +88,15 @@ type Deps struct {
 	Version string
 }
 
+// ThumbnailsAreIsolatedForTest reports whether the server built an isolating decoder.
+//
+// It exists to prove the WIRING rather than the Generator's behaviour. internal/thumbnail covers
+// isolation thoroughly, and none of those tests would notice if NewServer stopped calling
+// UseSubprocess — which would leave a configuration key that is validated, documented, defaulting to
+// "process", and read by nothing that builds the decoder. That is the "implemented and not wired"
+// defect this codebase keeps finding, so the wiring gets its own assertion.
+func (s *Server) ThumbnailsAreIsolatedForTest() bool { return s.thumbs.Isolated() }
+
 // Server holds process-wide dependencies.
 type Server struct {
 	deps    Deps
@@ -130,12 +139,20 @@ func New(deps Deps) (*Server, error) {
 	thumbs := deps.Thumbs
 	if thumbs == nil {
 		thumbs = thumbnail.New()
+		// §6.3 / WC-GAP-004: decode in a child process so a crafted file cannot keep burning CPU
+		// in the request-serving process after its deadline has already been returned to the
+		// client. Applied here rather than in cmd/ so every construction path — including the
+		// tests — gets the behaviour the configuration asks for.
+		if deps.Config.Limits.ThumbnailIsolated() {
+			thumbs.UseSubprocess(thumbnail.Isolation{})
+		}
 	}
 
 	s := &Server{deps: deps, started: time.Now(), thumbs: thumbs}
 	if deps.AppPass != nil {
 		s.dav = dav.New(deps.Config, deps.Meta, deps.Content, deps.Authz, deps.AppPass).WithLogger(deps.Log).
-			WithTrashLimit(s.maxTrashBytes)
+			WithTrashLimit(s.maxTrashBytes).
+			WithRevalidation(s.credentialIsStale)
 	}
 
 	// The client is embedded in the binary, so there is nothing to configure. A
