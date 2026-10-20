@@ -52,6 +52,28 @@ type Config struct {
 	SSEMode string
 	// SSEKMSKeyID names the KMS key for sse-kms. Required for that mode, ignored otherwise.
 	SSEKMSKeyID string
+	// VerifyAfterPut reads the object back and re-hashes it before reporting success
+	// (WC-GAP-003, INV-03).
+	//
+	// Why this exists: Put hashes the INPUT before uploading, which proves the payload matched its
+	// address when it left this process — not that those bytes are what the store now holds. The
+	// client (minio-go v7.4.1) has a known race on the multipart retry path where a retried part
+	// can be assembled from a buffer being rewritten concurrently, and the observable result is a
+	// corrupted part that lands successfully at a content-addressed key. Without a read-back, the
+	// only detector is the periodic scrub, which is opt-in and samples.
+	//
+	// Off by default, and that is a deliberate trade rather than an oversight. Verification doubles
+	// the bytes read from the store and adds a round trip to every upload; on a large deployment
+	// that is a real cost for a narrow window. Leave it on wherever the store is not trusted to
+	// deliver what it acknowledged, which for a self-hosted deployment over a smaller object store
+	// is most of the time.
+	VerifyAfterPut bool
+	// VerifyMaxBytes skips the read-back above this size. Zero verifies everything.
+	//
+	// The largest uploads are the ones most likely to hit the multipart retry path, so this is not
+	// a "verify only the cheap ones" knob: set it only when the egress cost of re-reading a very
+	// large object exceeds its value, and record that the deployment accepted the gap.
+	VerifyMaxBytes int64
 }
 
 // Store is an S3-backed blob store.
@@ -62,6 +84,9 @@ type Store struct {
 	// sse is the encryption applied to every object this store writes. Nil means the header is
 	// omitted and the bucket's own policy decides.
 	sse encrypt.ServerSide
+	// verifyAfterPut and verifyMaxBytes control the post-upload read-back (WC-GAP-003).
+	verifyAfterPut bool
+	verifyMaxBytes int64
 }
 
 // New connects and verifies the bucket is reachable.
@@ -111,10 +136,12 @@ func New(ctx context.Context, cfg Config) (*Store, error) {
 	}
 
 	return &Store{
-		client: client,
-		bucket: cfg.Bucket,
-		prefix: strings.Trim(cfg.Prefix, "/"),
-		sse:    sse,
+		client:         client,
+		bucket:         cfg.Bucket,
+		prefix:         strings.Trim(cfg.Prefix, "/"),
+		sse:            sse,
+		verifyAfterPut: cfg.VerifyAfterPut,
+		verifyMaxBytes: cfg.VerifyMaxBytes,
 	}, nil
 }
 
@@ -225,6 +252,69 @@ func (s *Store) Put(ctx context.Context, h blob.Hash, r io.Reader, size int64) e
 	_, err = s.client.PutObject(ctx, s.bucket, s.key(h), seeker, written, opts)
 	if err != nil {
 		return fmt.Errorf("blob/s3: put %s: %w", h, err)
+	}
+
+	// The upload was acknowledged. That is a claim about what the store now holds, and this is where
+	// we check it rather than trusting it (WC-GAP-003).
+	if err := s.verifyStored(ctx, h, written); err != nil {
+		// A corrupted object must not be left at its own address: every later read would serve it,
+		// the deduplication index would treat the address as present, and a re-upload of the correct
+		// bytes would take the idempotent shortcut above and never repair it. Deleting makes the
+		// next attempt upload again.
+		//
+		// The delete is best-effort: if it fails, the object stays and the integrity scrub is the
+		// remaining detector. Reporting the verification failure is what matters — the caller must
+		// not be told the write succeeded.
+		if derr := s.client.RemoveObject(ctx, s.bucket, s.key(h), minio.RemoveObjectOptions{}); derr != nil {
+			return fmt.Errorf("blob/s3: verify %s: %w (and the object could not be removed: %v)",
+				h, err, derr)
+		}
+		return fmt.Errorf("blob/s3: verify %s: %w", h, err)
+	}
+	return nil
+}
+
+// verifyStored reads the object back and compares its hash to the address it is stored under.
+//
+// Written as a single pass over the object rather than a size check plus a hash, because the failure
+// mode is a corrupted PART: the size can be exactly right while the bytes are wrong, which is
+// precisely what a retried multipart upload produces.
+func (s *Store) verifyStored(ctx context.Context, h blob.Hash, size int64) error {
+	if !s.verifyAfterPut {
+		return nil
+	}
+	if s.verifyMaxBytes > 0 && size > s.verifyMaxBytes {
+		return nil
+	}
+
+	obj, err := s.client.GetObject(ctx, s.bucket, s.key(h), minio.GetObjectOptions{})
+	if err != nil {
+		return fmt.Errorf("read back: %w", err)
+	}
+	defer obj.Close()
+
+	// GetObject is lazy; Stat forces the request so a missing or unreadable object fails here
+	// rather than as a read error halfway through the hash.
+	info, err := obj.Stat()
+	if err != nil {
+		return fmt.Errorf("read back: %w", translate(err))
+	}
+	if size >= 0 && info.Size != size {
+		return fmt.Errorf("stored size is %d, uploaded %d", info.Size, size)
+	}
+
+	hasher := sha256.New()
+	n, err := io.Copy(hasher, obj)
+	if err != nil {
+		return fmt.Errorf("read back: %w", err)
+	}
+	if n != size {
+		return fmt.Errorf("stored object is %d bytes, uploaded %d", n, size)
+	}
+	var got blob.Hash
+	copy(got[:], hasher.Sum(nil))
+	if got != h {
+		return blob.ErrHashMismatch
 	}
 	return nil
 }

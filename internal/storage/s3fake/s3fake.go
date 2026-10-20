@@ -63,6 +63,14 @@ type Server struct {
 	// failAlways is the persistent form: every matching request fails, so a client's retry does
 	// not paper over the injection.
 	failAlways map[string]bool
+	// corruptPuts makes the NEXT successful PUT store bytes that differ from what was sent, while
+	// still returning 200 (WC-GAP-003).
+	//
+	// This is the failure a content-addressed store cannot detect on its own: the upload is
+	// acknowledged, the object is the right length, and the bytes are wrong. It models what a
+	// retried multipart part assembled from a concurrently-rewritten buffer produces, which is why
+	// a hash taken BEFORE the upload does not cover it.
+	corruptPuts bool
 }
 
 type multipartUpload struct {
@@ -125,6 +133,17 @@ func (s *Server) FailNextOn(method string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.failNext[method] = true
+}
+
+// CorruptNextPut makes the next successful PUT store different bytes while still returning 200.
+//
+// One-shot on purpose: the store is expected to refuse the write and DELETE the bad object, and the
+// retry that follows must be able to succeed so a test can prove the address is not permanently
+// poisoned.
+func (s *Server) CorruptNextPut() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.corruptPuts = true
 }
 
 // ObjectCount reports how many objects a bucket holds.
@@ -285,6 +304,20 @@ func (s *Server) putObject(w http.ResponseWriter, r *http.Request, bucket, key s
 	s.store(w, r, bucket, key, data)
 }
 
+// corruptBytes flips one byte, preserving length.
+//
+// Length-preserving is the point: a truncation is already caught by a size comparison, so a test
+// that used one would pass against a weaker guard than the one under test.
+func corruptBytes(data []byte) []byte {
+	if len(data) == 0 {
+		return data
+	}
+	out := make([]byte, len(data))
+	copy(out, data)
+	out[len(out)/2] ^= 0xFF
+	return out
+}
+
 // decodeAWSChunked removes AWS's `aws-chunked` transfer framing.
 //
 // The frame format is: hex-length[;chunk-signature=sig]\r\npayload\r\n, repeated, terminated by
@@ -320,6 +353,19 @@ func decodeAWSChunked(b []byte) ([]byte, error) {
 
 // store records an object and writes the response headers a client expects.
 func (s *Server) store(w http.ResponseWriter, r *http.Request, bucket, key string, data []byte) {
+	// Corruption injection, applied to the DATA and before the ETag is derived, so the stored ETag
+	// describes the stored bytes. A fake that were internally inconsistent would let a test pass by
+	// detecting the fake rather than the corruption.
+	s.mu.Lock()
+	corrupt := s.corruptPuts
+	if corrupt {
+		s.corruptPuts = false
+	}
+	s.mu.Unlock()
+	if corrupt {
+		data = corruptBytes(data)
+	}
+
 	sum := md5.Sum(data)
 	etag := hex.EncodeToString(sum[:])
 
