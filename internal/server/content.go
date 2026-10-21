@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/base64"
 	"errors"
 	"io"
@@ -73,6 +74,32 @@ func (s *Server) handleContent(w http.ResponseWriter, r *http.Request) {
 	}
 	ownerID, err := uuid.Parse(claims.Subject)
 	if err != nil {
+		writeError(w, http.StatusNotFound, "not_found", "no such content")
+		return
+	}
+
+	// WC-GAP-006 / INV-04: the ticket is a bearer capability, and a bearer capability that outlives
+	// the account's authority is a revocation hole. Until this check existed, disabling an account
+	// stopped NEW requests at requireSession while a ticket minted a second earlier kept serving
+	// bytes for the rest of its five-minute life — so "disable takes effect on the next request" was
+	// true of the API and false of the content origin.
+	//
+	// The account row is re-read here rather than trusted from the ticket because the ticket carries
+	// no status: it is a signature over (subject, path, expiry), and a status baked into it would be
+	// the status at MINT time, which is the value that is now stale. This is one indexed read on a
+	// path that has already done a metadata resolve and is about to stream a file.
+	//
+	// The consequence is deliberate and worth stating: account disable now beats ticket expiry, so an
+	// outstanding URL stops working immediately. That is the stricter of the two policies the review
+	// asked to choose between, and the cheaper one to prove.
+	if revoked, rerr := s.contentSubjectRevoked(r, ownerID); rerr != nil {
+		// A failure to determine status must not serve content. Refusing is the safe direction: the
+		// client can retry with a fresh ticket, and a disabled account cannot ride out a metadata
+		// outage. Compare share.password.verify, which fails closed for the same reason.
+		s.deps.Log.Error("content ticket: could not check account status", "error", rerr)
+		writeError(w, http.StatusNotFound, "not_found", "no such content")
+		return
+	} else if revoked {
 		writeError(w, http.StatusNotFound, "not_found", "no such content")
 		return
 	}
@@ -249,11 +276,53 @@ func (s *Server) handleContentTicket(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// contentSubjectRevoked reports whether the account behind a content ticket may no longer have its
+// bytes served (WC-GAP-006).
+//
+// "Revoked" is the account being anything other than active: disabled by an administrator, deleted,
+// or left pending by the JIT policy. It is the same predicate requireSession applies to a browser
+// request, deliberately — the content origin and the API must not disagree about whether an account
+// is live, or one of them becomes the way in.
+func (s *Server) contentSubjectRevoked(r *http.Request, userID uuid.UUID) (bool, error) {
+	var user store.User
+	err := s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
+		u, uerr := tx.UserByID(ctx, userID)
+		user = u
+		return uerr
+	})
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			// A deleted account: there is no owner left to serve bytes for.
+			return true, nil
+		}
+		return false, err
+	}
+	return !user.IsActive(), nil
+}
+
 // contentTicketTTL is how long a content URL stays valid.
 //
 // Five minutes: long enough to start a download from a listing, short enough that a URL copied into a
 // chat has stopped working before anyone can be tempted to rely on it.
+//
+// WC-GAP-006 note: this is now the OUTER bound, not the revocation window. The account status is
+// rechecked on every fetch, so disabling an account stops an outstanding ticket immediately and the
+// five minutes applies only to an account that is still active.
 func (s *Server) contentTicketTTL() time.Duration { return 5 * time.Minute }
+
+// MintExpiredContentTicketForTest mints a content ticket that is already expired.
+//
+// Exported for the expiry test and for nothing else: the property under test is that the handler
+// rejects an EXPIRED ticket, and the only honest way to produce one is with the real key and a real
+// past expiry. Handing the test a forged token would prove that a bad MAC is rejected instead, which
+// is a different and much weaker claim.
+func (s *Server) MintExpiredContentTicketForTest(userID uuid.UUID, rel string) (string, error) {
+	return s.deps.Tickets.Mint(ticket.PurposeDownload, ticket.Claims{
+		Subject: userID.String(),
+		Expiry:  time.Now().Add(-time.Minute),
+		Extra:   map[string]string{"path": rel},
+	})
+}
 
 // escapePathForURL percent-encodes each segment but keeps the separators.
 func escapePathForURL(rel string) string {

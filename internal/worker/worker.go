@@ -8,6 +8,7 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -633,12 +634,40 @@ func (w *Worker) WithVersionByteCap(bytes int64) *Worker {
 // versioning converges on. The cost is that the cap is enforced with a delay, which is acceptable for
 // a retention limit and not for the quota — the quota is checked in the write transaction.
 func (w *Worker) TrimVersionHistory(ctx context.Context) (int, error) {
-	if w.versionByteCap <= 0 || w.meta == nil {
+	if w.meta == nil {
+		return 0, nil
+	}
+	// The effective cap: a runtime override wins over the configured value, so an administrator can
+	// change how much history is retained without a restart. Read once per sweep rather than cached:
+	// the sweep runs on an interval, and a settings read per interval is cheaper than the machinery a
+	// cache would need to stay correct across processes.
+	cap := w.versionByteCap
+	if err := w.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		values, verr := tx.ReadSettings(ctx)
+		if verr != nil {
+			return verr
+		}
+		raw, ok := values["limits.max_retained_version_bytes"]
+		if !ok {
+			return nil
+		}
+		var v int64
+		if jerr := json.Unmarshal(raw, &v); jerr == nil {
+			cap = v
+		}
+		return nil
+	}); err != nil {
+		// A settings read failure falls back to the configured value: retention trimming must not stop
+		// because an override could not be read.
+		w.log.Warn("could not read the retained-history cap; using the configured value",
+			"error", err)
+	}
+	if cap <= 0 {
 		return 0, nil
 	}
 	var n int
 	err := w.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
-		got, terr := tx.TrimRetainedVersions(ctx, w.versionByteCap)
+		got, terr := tx.TrimRetainedVersions(ctx, cap)
 		n = got
 		if terr != nil {
 			return terr
@@ -652,15 +681,14 @@ func (w *Worker) TrimVersionHistory(ctx context.Context) (int, error) {
 		return tx.Audit(ctx, store.AuditEntry{
 			ActorKind: "system", Action: "version.trim", TargetKind: "version",
 			TargetID: "retained", Result: "ok",
-			Metadata: map[string]any{"removed": got, "cap_bytes": w.versionByteCap},
+			Metadata: map[string]any{"removed": got, "cap_bytes": cap},
 		})
 	})
 	if err != nil {
 		return 0, err
 	}
 	if n > 0 {
-		w.log.Warn("trimmed retained version history to the cap", "removed", n,
-			"cap_bytes", w.versionByteCap)
+		w.log.Warn("trimmed retained version history to the cap", "removed", n, "cap_bytes", cap)
 	}
 	return n, nil
 }

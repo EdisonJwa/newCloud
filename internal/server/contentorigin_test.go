@@ -8,13 +8,16 @@ package server_test
 // serve user bytes, and the content origin serves them only to a ticket that names one path.
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
 	"github.com/EdisonJwa/newCloud/internal/server"
+	"github.com/EdisonJwa/newCloud/internal/store"
 )
 
 // mintContentTicket asks the app origin for a content URL.
@@ -98,6 +101,90 @@ func TestContentEndpointRefusesWithoutOrWithAnotherPath(t *testing.T) {
 	// about the ticket being unusable.
 	if code := fetch("/content/file.txt?ticket=" + ticketParam); code != http.StatusOK {
 		t.Fatalf("the ticket stopped working for its own path: %d", code)
+	}
+}
+
+// TestATicketStopsWorkingWhenTheAccountIsDisabled is WC-GAP-006.
+//
+// A content ticket is a bearer capability with a five-minute life. Before this check, disabling an
+// account stopped new API requests at requireSession while a ticket minted a moment earlier kept
+// serving bytes until expiry — so "disable takes effect on the next request" held for the API and not
+// for the content origin, which is the one place bytes actually leave.
+//
+// The property pinned here is that the ticket stops working IMMEDIATELY, before its own expiry. The
+// alternative policy (document and accept the five-minute window) is defensible but it is a decision
+// someone has to make in writing; a silent five minutes is not.
+func TestATicketStopsWorkingWhenTheAccountIsDisabled(t *testing.T) {
+	h := newHarness(t)
+	h.uploadFile(t, "private.txt", "private bytes")
+
+	code, out := mintContentTicket(t, h, "private.txt")
+	if code != http.StatusOK {
+		t.Fatalf("mint: %d %v", code, out)
+	}
+	raw := out["url"].(string)
+
+	handler := h.srvServer.ContentHandler()
+	fetch := func() int {
+		req, _ := http.NewRequest(http.MethodGet, raw, nil)
+		req.URL.Scheme, req.URL.Host = "", ""
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	// The ticket works while the account is live. Without this the test would pass for the wrong
+	// reason — a ticket that never worked would "stop working" too.
+	if code := fetch(); code != http.StatusOK {
+		t.Fatalf("the ticket should work before the disable, got %d", code)
+	}
+
+	// Disable the account directly through the store, which is where an administrator's action and
+	// an IdP-driven deactivation both converge. SetUserStatus lives on Tx, so it needs a transaction.
+	setStatus := func(status string) {
+		t.Helper()
+		if err := h.meta.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			_, serr := tx.SetUserStatus(ctx, h.user.ID, status)
+			return serr
+		}); err != nil {
+			t.Fatalf("set status %q: %v", status, err)
+		}
+	}
+
+	setStatus("disabled")
+
+	if code := fetch(); code != http.StatusNotFound {
+		t.Fatalf("a disabled account's ticket still served content (%d). The ticket outlived the "+
+			"account's authority, which is the revocation hole INV-04 forbids.", code)
+	}
+
+	// Re-enabling restores it, which proves the check is the account status and not the ticket
+	// having been consumed or invalidated as a side effect.
+	setStatus("active")
+	if code := fetch(); code != http.StatusOK {
+		t.Fatalf("the ticket should work again after re-enabling, got %d", code)
+	}
+}
+
+// TestATicketDoesNotOutliveItsOwnExpiry keeps the existing bound honest alongside the status check.
+//
+// The expiry is verified from the MAC-protected claims, so the only honest way to test it is to mint
+// a genuinely expired ticket with the server's own key. The harness does not expose its issuer, and
+// faking one would prove that a forged token is rejected — a different, weaker property.
+func TestATicketDoesNotOutliveItsOwnExpiry(t *testing.T) {
+	h := newHarness(t)
+	h.uploadFile(t, "expiring.txt", "bytes")
+
+	tok, err := h.srvServer.MintExpiredContentTicketForTest(h.user.ID, "expiring.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req, _ := http.NewRequest(http.MethodGet, "/content/expiring.txt?ticket="+url.QueryEscape(tok), nil)
+	rec := httptest.NewRecorder()
+	h.srvServer.ContentHandler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("an expired ticket was served (%d)", rec.Code)
 	}
 }
 

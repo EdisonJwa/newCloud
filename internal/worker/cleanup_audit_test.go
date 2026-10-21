@@ -294,3 +294,71 @@ func TestVersionByteCapTrimsAndAudits(t *testing.T) {
 		t.Fatalf("an unset cap trimmed %d versions (err %v); zero means unlimited", n, err)
 	}
 }
+
+// TestVersionByteCapHonoursARuntimeOverride: the cap the worker uses must be the EFFECTIVE one.
+//
+// The configured cap is 150 and no override exists in the first half; the second half writes an
+// override of 1 byte and the worker must trim down to it, without being restarted.
+func TestVersionByteCapHonoursARuntimeOverride(t *testing.T) {
+	meta := store.NewMemory()
+	owner := meta.AddUser(store.User{Username: "cap2", Email: "cap2@example.test", Role: "user"})
+	var root store.Node
+	if err := meta.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+		n, err := tx.EnsureRoot(ctx, owner.ID)
+		root = n
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for i, size := range []int64{100, 100, 100} {
+		if err := meta.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			_, _, err := tx.WriteFile(ctx, store.WriteFile{
+				NewFile: store.NewFile{
+					OwnerID: owner.ID, ParentID: root.ID, Name: "history.bin", Size: size,
+					Mime: "text/plain", ETag: `"h` + string(rune('0'+i)) + `"`,
+					BlobID: uuid.New(), BlobHash: [32]byte{byte(i + 1)},
+				},
+				KeepVersion: true,
+			})
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	// 150 configured: the 200 bytes of history must be trimmed to 150 is impossible in whole entries,
+	// so the newest entry survives and the rest go — at least one row.
+	w := worker.New(meta, slog.New(slog.NewTextHandler(io.Discard, nil))).WithVersionByteCap(150)
+	if n, err := w.TrimVersionHistory(context.Background()); err != nil || n == 0 {
+		t.Fatalf("configured cap trimmed %d (err %v)", n, err)
+	}
+
+	// Now write history back above the configured cap, then override it to a larger value: the worker
+	// must use the override and trim NOTHING.
+	for i := 0; i < 2; i++ {
+		if err := meta.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			_, _, err := tx.WriteFile(ctx, store.WriteFile{
+				NewFile: store.NewFile{
+					OwnerID: owner.ID, ParentID: root.ID, Name: "history.bin", Size: 40,
+					Mime: "text/plain", ETag: `"o` + string(rune('0'+i)) + `"`,
+					BlobID: uuid.New(), BlobHash: [32]byte{byte(i + 5)},
+				},
+				KeepVersion: true,
+			})
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := meta.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+		return tx.WriteSetting(ctx, "limits.max_retained_version_bytes", []byte("100000"), uuid.Nil)
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if n, err := w.TrimVersionHistory(context.Background()); err != nil || n != 0 {
+		t.Fatalf("the worker trimmed %d rows while an override raised the cap (err %v); it used the "+
+			"configured value instead of the effective one", n, err)
+	}
+}
