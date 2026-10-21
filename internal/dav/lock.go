@@ -83,6 +83,22 @@ func (h *Handler) handleLock(w http.ResponseWriter, r *http.Request, a authz.Act
 		return
 	}
 
+	// A shared-lock request is REFUSED rather than silently downgraded to exclusive.
+	//
+	// The struct models both scopes and the handler never branched on it, so a client asking for
+	// <shared> received 200 with an <exclusive/> activelock — which RFC 4918 §6.1 does not allow a
+	// server to substitute. A careful client reads the response scope and notices; a careless one
+	// believes it holds a shared lock and discovers otherwise when a second member of the same
+	// document group is refused with 423.
+	//
+	// 403 with a supportedlock body is the shape §9.10.1 prescribes for "this server does not do
+	// that", and it is honest: the alternative is a lock whose meaning differs from the one asked
+	// for, which is worse than an error because it appears to work.
+	if req.Scope.Shared != nil {
+		h.writeUnsupportedLockScope(w)
+		return
+	}
+
 	// An existing lock held by someone else blocks a new exclusive lock. The
 	// database enforces this too, but failing here gives the correct status code.
 	if existing, ok := h.activeLock(ctx, node.ID); ok {
@@ -161,6 +177,24 @@ func (h *Handler) handleUnlock(w http.ResponseWriter, r *http.Request, a authz.A
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// writeUnsupportedLockScope answers a LOCK for a scope this server does not implement.
+//
+// RFC 4918 §9.10.1: 403 Forbidden. The supportedlock body is included because a client that reads it
+// can stop retrying and fall back, whereas a bare status leaves it guessing whether the request was
+// malformed or the feature is missing.
+func (h *Handler) writeUnsupportedLockScope(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	w.WriteHeader(http.StatusForbidden)
+	_, _ = w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?>
+<D:error xmlns:D="DAV:">
+  <D:lockscope>
+    <D:supportedlock>
+      <D:lockentry><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockentry>
+    </D:supportedlock>
+  </D:lockscope>
+</D:error>`))
 }
 
 func (h *Handler) writeLockResponse(w http.ResponseWriter, status int, token string, n store.Node, expires time.Time) {

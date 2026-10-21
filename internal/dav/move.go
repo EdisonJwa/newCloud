@@ -345,7 +345,24 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request, a authz
 			}
 		}
 	} else {
-		err = h.copyNode(ctx, a, src, dstParent, dstName, dstRel, r)
+		err = h.copyNode(ctx, a, src, dstParent, dstName, dstRel,
+			r.WithContext(withCopyWasOverwrite(r.Context(), existing != nil)))
+		// WC-GAP-009: a failed directory COPY must not leave a half-populated destination that
+		// LOOKS complete.
+		//
+		// Before this, a copy that failed at the fifth of ten children left a directory containing
+		// four files and reported an error. The source was intact, so nothing was lost — but the
+		// destination is a plausible-looking folder that a client may treat as the copy it asked
+		// for, especially once the error has scrolled past. T-20 asks for a failure that is
+		// "diagnosable and recoverable"; a partial tree with no marker is neither.
+		//
+		// The rollback trashes the destination subtree rather than purging it, which matters: if the
+		// compensation itself fails, the partial copy lands in the trash (where an operator can find
+		// and remove it) instead of becoming an invisible orphan. The error the client sees names what
+		// was rolled back, so "did it delete my file" has an answer.
+		if err != nil && src.IsDir() && !disableCopyRollbackForTest {
+			h.rollbackCopy(ctx, a, dstParent.ID, dstName, r)
+		}
 	}
 
 	if err != nil {
@@ -502,6 +519,93 @@ func (h *Handler) copyTree(ctx context.Context, a authz.Actor, src store.Node,
 		}
 	}
 	return nil
+}
+
+// disableCopyRollbackForTest turns the WC-GAP-009 rollback off.
+//
+// It exists so the test can demonstrate the guard is load-bearing: running the same scenario with the
+// rollback disabled must produce a visible partial destination. A test that cannot be made to fail is
+// not evidence, and package-internal state is the only way to reach both behaviours without shipping a
+// configuration key nobody should set.
+var disableCopyRollbackForTest bool
+
+// rollbackCopy trashes a partially-created destination after a failed directory COPY (WC-GAP-009).
+//
+// It is best-effort and deliberately loud when it fails: the alternative is a half-populated folder
+// presented as a copy that failed, which reads as "nothing was copied" while occupying quota. Trashing
+// rather than purging means a failed compensation still leaves the data findable.
+//
+// It only removes the destination if the destination did not exist before the copy started. An
+// overwrite that fails must not delete the previous version's replacement — the copy may have got far
+// enough to replace it, and trashing it would turn a failed COPY into the loss of whatever was there.
+// The caller passes overwrite via the request context set in handleCopyMove.
+func (h *Handler) rollbackCopy(ctx context.Context, a authz.Actor, dstParent uuid.UUID, dstName string, r *http.Request) {
+	if copyWasOverwrite(r.Context()) {
+		return
+	}
+	var victim store.Node
+	err := h.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		// Resolve the destination fresh: the copy may have failed before creating it, in which case
+		// there is nothing to roll back and ErrNotFound is the expected answer.
+		parent, perr := tx.Node(ctx, dstParent)
+		if perr != nil {
+			return perr
+		}
+		_ = parent
+		kids, kerr := tx.Children(ctx, dstParent, 100_000)
+		if kerr != nil {
+			return kerr
+		}
+		for _, k := range kids {
+			if k.Name == dstName {
+				victim = k
+				return nil
+			}
+		}
+		return store.ErrNotFound
+	})
+	if err != nil {
+		if !errors.Is(err, store.ErrNotFound) {
+			h.logf("copy rollback: could not locate partial destination %q: %v", dstName, err)
+		}
+		return
+	}
+
+	if terr := h.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		if terr := tx.Trash(ctx, victim.ID); terr != nil {
+			return terr
+		}
+		// The rollback is an auditable event in its own right: a client that saw an error and an
+		// operator looking at an item in the trash both need to know why it is there.
+		return tx.Audit(ctx, store.AuditEntry{
+			ActorKind: "system", ActorUserID: a.Ptr(), ActorEmail: a.Email(),
+			ActorIP: clientIP(r), UserAgent: r.UserAgent(),
+			Action: "file.write", TargetKind: "node", TargetID: victim.ID.String(),
+			Result: "denied",
+			Metadata: map[string]any{
+				"name":     dstName,
+				"rollback": "partial directory copy trashed",
+			},
+		})
+	}); terr != nil {
+		h.logf("copy rollback: FAILED to trash partial destination %q (node %s): %v — the "+
+			"destination is a partial copy and should be removed by hand", dstName, victim.ID, terr)
+		return
+	}
+	h.logf("copy rollback: trashed partial destination %q (node %s) after a failed directory copy",
+		dstName, victim.ID)
+}
+
+// copyWasOverwriteKey marks a COPY that replaced an existing destination.
+type copyWasOverwriteKey struct{}
+
+func withCopyWasOverwrite(ctx context.Context, v bool) context.Context {
+	return context.WithValue(ctx, copyWasOverwriteKey{}, v)
+}
+
+func copyWasOverwrite(ctx context.Context) bool {
+	v, _ := ctx.Value(copyWasOverwriteKey{}).(bool)
+	return v
 }
 
 // resolveDestination resolves a Destination header to its parent and name.
