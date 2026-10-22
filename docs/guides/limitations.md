@@ -26,8 +26,12 @@ These are product decisions, not backlog items.
   worse than an honest name search.
 - **No import from Nextcloud or other file services.** Migration tooling between `blob` and `tree`
   layouts is designed, not implemented.
-- **No data export bundle.** Files and metadata can be copied out through WebDAV; there is no
-  one-command account export.
+- **Account export covers files and metadata, not the whole account.** `newcloud export --user <name>
+  --out <dir>` writes the account's tree with real file names, a standalone JSON manifest, and a
+  SHA-256 per file verified before it reports success — so the output is readable without this
+  database. It is deliberately *not* a full backup: versions, trash, ACL grants and share links are
+  not included, and there is no import path back into the system (see the import and migration row
+  under current gaps).
 
 ## Current gaps
 
@@ -36,19 +40,19 @@ These are capabilities the requirements call for that are not implemented today.
 | Area | Current state | Missing |
 | --- | --- | --- |
 | **Group spaces** | Resource ACLs grant users and groups access to a folder. Groups can be granted `read`, `create`, `overwrite`, `rename`, `delete`, `manage_permissions`, and `download` independently. | Team-owned spaces: a folder whose owner is a group, with quota and lifecycle independent of any one account. |
-| **WebDAV sync** | `REPORT` is answered with an explicit `501`. Locking is class 2. | `REPORT` / `sync-collection`, shared locks, and the incremental-sync protocol desktop clients use for large trees. |
+| **WebDAV sync** | `REPORT` is answered with an explicit `501`. Locking is class 2, exclusive only; a `LOCK` requesting `<shared>` is refused with `403` and a `supportedlock` body naming the scope that is supported. | `REPORT` / `sync-collection`, shared locks, and the incremental-sync protocol desktop clients use for large trees. |
 | **Additional share modes** | Link, password, expiry, download cap, email recipient, drop box. | The remaining P1/P2 sharing modes in the requirements document. |
+| **IdP events** | With `auth.revalidate_minutes` set, a session or App Password past the window is refused and must be renewed interactively, so an IdP-side change takes effect within that bound. Also applies to WebDAV App Passwords. | No event source or polling, so there is no revocation *at the moment of* the change; the window is the bound, and `0` disables it. SCIM would close this properly. |
 | **SCIM** | A `scim_token` configuration key exists. | No SCIM endpoint. Provisioning is OIDC JIT or administrator action. |
-| **IdP events** | Role changes apply at the account's next login. | No event source or polling. "Removed from the group" and "permission gone" are separated by one login. |
 | **IdP metadata cache** | Startup does not depend on the IdP. Existing sessions, App Passwords, and WebDAV continue when it is offline. | A cached discovery document. Each retry is a network round trip. |
-| **Preview isolation** | Pixel, concurrency, and decode-deadline limits bound thumbnail work. | Subprocess sandboxing. Decoding still happens in the server process. |
-| **Resumable uploads across restarts** | Sessions are held in memory; an interrupted upload must restart. Content integrity is unaffected. | Durable upload sessions that survive a process restart. |
+| **Preview isolation** | Decoding runs in a child process by default (`limits.thumbnail_isolation: process`): the deadline kills the decoder instead of abandoning a goroutine, the child gets a minimal environment, its input and output are size-capped, and a child that hangs is killed. Pixel, concurrency and cooldown limits still apply. | A real OS sandbox (seccomp, namespace, cgroup memory limit). Isolation is process-level: a decoder bug can still consume memory until the kernel intervenes, and `inline` restores the old behaviour deliberately. |
+| **Resumable uploads across restarts** | Durable. Each session writes a JSON record beside its staging file, fsynced after the bytes it describes; startup recovers live sessions and resumes at the last acknowledged offset, truncating any bytes the record does not acknowledge. `TestASessionResumesAfterARestart` covers it. | Nothing at the protocol level: the client must still re-request and honour the server's offset. Cross-node resume is not available (sessions are local to one staging directory). |
 | **COPY atomicity** | A failed directory COPY leaves the source intact and a partial destination. | Snapshot or rollback of the destination. Each node commits independently. |
 | **Cursor pagination** | A row is never returned twice. Renaming an unseen row to before the cursor can hide it until the next listing. | Snapshot isolation across pages. Sorting is byte order, not client locale. |
 | **Audit slowness** | Audit failure is fail-closed, and each append is bounded by a 5s deadline, so a wedged audit store refuses writes instead of stalling them. Disk-full behavior was injected, not exercised on a real full disk. | An intermittent-but-not-wedged audit store still costs every write the full timeout before refusing it; there is no circuit breaker. |
 | **Audit replay** | Refused operations are never accepted, so there is nothing to replay. | No outbox or replay queue, by design. |
-| **Audit retention** | The table is append-only and grows monotonically. `audit.retention_days` is accepted and has no effect. | Pruning that keeps chain verification meaningful: deleting old events breaks the chain from the first retained row. |
-| **Advertised chunk size** | `limits.upload_chunk_bytes` is validated and sent to clients as advice. | Enforcement. A chunk larger than the advertised size is accepted; `max_file_bytes` is the enforced bound. |
+| **Audit retention** | `newcloud audit prune` archives then removes events older than the window, recording a signed `prune_marks` boundary so the surviving chain still verifies end to end. `audit.retention_days` is read by it. | Nothing schedules it: an operator must run it (cron, systemd timer). PG-backed prune tests skip without `TEST_DATABASE_URL`. |
+| **Chunk size** | `limits.upload_chunk_bytes` is enforced: a larger chunk is refused with `413 chunk_too_large`, and the limit is runtime-overridable. | — |
 | **Audit anchors** | Daily checkpoints detect truncation and mid-chain rewrites. | The code cannot enforce that `anchor_dir` uses different credentials from the database. That is an operator obligation. |
 | **Application role bootstrap** | `newcloud_app` can `SELECT`/`INSERT` the audit table and cannot `UPDATE`/`DELETE`/`TRUNCATE` it. | The role password is set manually after migration. A migration cannot contain it safely. |
 | **Account deletion** | Deletion moves files to trash, revokes shares and credentials, releases locks, keeps audit events, and leaves an irreversible tombstone. | Restoring a deleted account: an administrator must recover files and create a new account. |

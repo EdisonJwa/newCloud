@@ -240,22 +240,25 @@ every feature in the requirements document exists. Notable gaps:
 - **No shared or group-owned spaces.** Resource ACLs grant users and groups access to a folder;
   team ownership of a space is not implemented.
 - **`REPORT` and `sync-collection` are not implemented.** Clients receive an explicit `501`, not
-  an empty result. Shared locks are also absent.
+  an empty result. Shared locks are absent too, and a `LOCK` asking for one is refused with `403`
+  plus a `supportedlock` body rather than silently downgraded to exclusive.
 - **S3 is tested against an in-process fake and a moto server, not real object storage.** The
   backend logic is covered, including multipart behavior and fault injection, but interoperability
   with AWS S3, MinIO, Ceph, and R2 has not been exercised against those services.
-- **No IdP event source.** A role or group change takes effect at the account's next login. There
-  is no SCIM or push-based deprovisioning.
-- **Previews decode in-process.** Pixel, concurrency, and time limits bound the work; true
-  isolation would require a subprocess.
-- **Resumable upload sessions do not survive a restart.** Content integrity is unaffected; the
-  upload must be restarted.
+- **No IdP event source.** With `auth.revalidate_minutes` set, a session or App Password past the
+  window must be renewed interactively, so a role or group change takes effect within that bound. It
+  is a bound, not a notification: there is no SCIM or push-based deprovisioning.
+- **Previews decode in a child process by default** (`limits.thumbnail_isolation`). The deadline kills
+  the decoder rather than abandoning a goroutine; a real OS sandbox (seccomp, cgroup) is not used.
+- **Resumable upload sessions are durable**, but they are local to one staging directory: an
+  interrupted upload resumes after a restart, and does not follow a client to another node.
 - **Restore timing is measured to a 5.5 MiB metadata dump.** The measurements are linear within
   that range. There is no validated RTO for a 40 TiB deployment; a linear extrapolation produces
   an unusable number, which is itself the finding.
 - **No bundled Grafana dashboards.** Prometheus rules and runbooks are included; dashboards depend
   on the operator's Grafana version and are intentionally not shipped.
-- **No import from Nextcloud or other file services.**
+- **No import from Nextcloud or other file services.** `newcloud export` writes an account's files and
+  metadata as a standalone tree with a verified manifest; there is no import path back.
 - **No `blob`/`tree` migration tool.** The procedure is designed, not implemented; choose the layout
   before the first upload.
 

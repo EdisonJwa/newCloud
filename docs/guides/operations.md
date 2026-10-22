@@ -108,6 +108,41 @@ GET /api/audit?format=json
 A normal user's export covers that user's own actions plus anonymized events about their data
 (anonymous downloads, rejected recipient attempts). Only an administrator can export the full log.
 
+### Retention: pruning the log
+
+The audit table is append-only and grows monotonically, so retention is an explicit operator action
+rather than a background job. Pruning a hash chain is not `DELETE WHERE ts < cutoff`: removing the
+oldest events leaves a first survivor whose `prev_hash` points at nothing, and every later
+verification would report the log as broken — indistinguishable from tampering.
+
+```sh
+# See what would go, without removing anything.
+newcloud audit prune --days 365 --dry-run
+
+# Archive, then prune. The archive path is recorded inside the log itself.
+newcloud audit prune --days 365
+```
+
+`--days` defaults to `audit.retention_days`. With neither set, the command refuses rather than
+guessing, because the guess deletes history.
+
+What it does, in order:
+
+1. verifies the whole chain and refuses to prune one that does not verify;
+2. writes the events about to be removed to `audit.archive_dir` (default `audit-archive/`), fsynced,
+   before anything is deleted;
+3. deletes them and records an `audit.prune_marks` row: the last removed event id, the chain head at
+   that point, the event count, and the archive path.
+
+Verification then starts from the newest prune mark instead of from genesis, so the surviving chain
+is still checked end to end and an unrecorded gap is still detectable. The mark is append-only, like
+the audit schema itself.
+
+Nothing schedules this. Put it in cron or a systemd timer; the interval is your retention policy
+review, not a default.
+
+Schedule the export used for investigations as well, if your policy requires offline copies:
+
 ## Backups and drills
 
 The backup order is **`pg_dump` first, then the blobs**. The restore order is **blobs first, then

@@ -15,6 +15,19 @@ demo-run/
 shots/
 *.log
 
+# State written by `go run ./tools/demoinmem` (the no-Docker demo).
+.demo-inmem/
+
+# Stray root-level Vite output; the real bundle is written to internal/webassets/dist.
+/app.css
+/app.js
+
+# Captures produced by the UI screenshot harness.
+/demo-capture.html
+/demo-capture.template.html
+/demo-data.json
+/shell.html
+
 # The browser client: dependencies are not committed, but the build output is, because the Go
 # embed directive needs it for a plain `go build` to work.
 web/node_modules/

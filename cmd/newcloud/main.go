@@ -46,6 +46,7 @@ import (
 	"github.com/EdisonJwa/newCloud/internal/storage/layout"
 	"github.com/EdisonJwa/newCloud/internal/storage/tree"
 	storepkg "github.com/EdisonJwa/newCloud/internal/store"
+	"github.com/EdisonJwa/newCloud/internal/thumbnail"
 	"github.com/EdisonJwa/newCloud/internal/ticket"
 	"github.com/EdisonJwa/newCloud/internal/upload"
 	"github.com/EdisonJwa/newCloud/internal/worker"
@@ -54,6 +55,19 @@ import (
 var version = "dev"
 
 func main() {
+	// The isolated thumbnail decoder is this same binary re-executed with a marker in its
+	// environment (WC-GAP-004). It is checked before anything else so a worker process never
+	// parses configuration, opens a database or binds a listener: its whole job is to decode one
+	// image from stdin and exit, and anything else it did would be an attack surface with no
+	// benefit.
+	//
+	// This has to come first, and it has to be here rather than in run(), because run() reads
+	// configuration — which would make the worker fail on a deployment whose config path is not
+	// visible to it, turning every thumbnail into "no thumbnail" for a reason nobody could see.
+	if thumbnail.IsWorkerProcess() {
+		os.Exit(thumbnail.WorkerMain(os.Stdin, os.Stdout))
+	}
+
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintf(os.Stderr, "newcloud: %v\n", err)
 		os.Exit(1)
@@ -82,10 +96,11 @@ func run(args []string) error {
 	case "drill":
 		return drillCommand(args[1:])
 	case "-h", "--help", "help":
-		fmt.Printf("newcloud %s\n\nusage: newcloud [serve|migrate|healthcheck|audit verify|breakglass hash|drill]\n", version)
+		fmt.Printf("newcloud %s\n\nusage: newcloud [serve|migrate|healthcheck|audit verify|audit prune|breakglass hash|export|drill]\n", version)
 		return nil
 	default:
-		return fmt.Errorf("unknown command %q (want serve, migrate, healthcheck, audit verify, breakglass hash or drill)", cmd)
+		return fmt.Errorf("unknown command %q (want serve, migrate, healthcheck, audit verify, audit prune, "+
+			"breakglass hash, export or drill; run `newcloud help`)", cmd)
 	}
 }
 
@@ -490,6 +505,13 @@ func serve() error {
 		return err
 	}
 	uploads.SetMaxPendingBytes(cfg.Limits.MaxPendingUploadBytes)
+	// WC-GAP-002: sessions are durable, so a restart resumes transfers instead of discarding them.
+	// Say how many were picked up: an operator who sees 0 after a crash that interrupted work has
+	// learned something worth knowing, and one who sees 12 knows those clients can continue.
+	if n := uploads.Recovered(); n > 0 {
+		log.Info("resumed unfinished uploads from the staging directory", "sessions", n,
+			"dir", uploadDir)
+	}
 	if err != nil {
 		return err
 	}
@@ -607,6 +629,31 @@ func serve() error {
 	}
 	go wk.Run(ctx)
 
+	// ID-06 / WC-GAP-001: say what the deprovisioning bound actually is, because the honest answer
+	// without an IdP event feed is "however long it takes this person to sign in again".
+	if w := cfg.Auth.RevalidateWindow(); w > 0 {
+		log.Info("identity revalidation enforced", "window", w,
+			"sessions_and_app_passwords_must_be_renewed_by_signing_in_after", w)
+	} else {
+		log.Warn("identity revalidation is disabled: a role change or a removal from a group in "+
+			"the IdP does not reach an existing session or App Password until the account signs "+
+			"in again, which for a WebDAV-only account may be never. Set auth.revalidate_minutes "+
+			"to bound that window",
+			"requirement", "ID-06")
+	}
+
+	// The same-host content opt-in is a security exception, so it is announced at startup rather
+	// than left in a config file nobody re-reads. The validator permits it only when the operator
+	// asked by name; saying it out loud on every boot is what keeps it a decision.
+	if cfg.Server.AllowSameHostContent {
+		log.Warn("server.allow_same_host_content is enabled: the content origin shares a hostname "+
+			"with the application, so the session cookie is sent to the content listener. The "+
+			"browser same-origin check still holds because the port differs, but cookie isolation "+
+			"does not. Strip Cookie for content paths at the proxy if you can, and record that "+
+			"the deployment relies on this exception",
+			"host", cfg.Server.UserContentURL)
+	}
+
 	httpSrv := &http.Server{
 		Addr:              cfg.Server.Addr,
 		Handler:           srv.Handler(),
@@ -686,6 +733,9 @@ func openS3Storage(cfg config.Config, meta storepkg.Store, log *slog.Logger) (la
 		Prefix:      s3cfg.Prefix,
 		SSEMode:     s3cfg.SSE,
 		SSEKMSKeyID: s3cfg.SSEKMSKeyID,
+		// WC-GAP-003: the read-back that catches a corrupt transfer the pre-upload hash cannot.
+		VerifyAfterPut: s3cfg.VerifyAfterPut,
+		VerifyMaxBytes: s3cfg.VerifyMaxBytes,
 	})
 	if err != nil {
 		return nil, nil, err
@@ -985,14 +1035,26 @@ func openBlobStore(cfg config.Config) (blob.Store, error) {
 	}
 	if cfg.Storage.Backend == "s3" {
 		s3cfg := cfg.Storage.S3
+		// This is the SECOND place an S3 store is built (the other is in serve). Every field that
+		// changes what the backend does has to be listed in both, and the omission is silent: a
+		// store built here with a missing SSE mode writes plaintext from the backfill path while the
+		// serving path encrypts, and nothing reports it.
+		//
+		// That is not hypothetical — this call site was missing SSEMode and SSEKMSKeyID before, and
+		// the verification fields were about to be added to serve only. `TestEveryS3ConfigFieldReachesBothStores`
+		// exists so the next field cannot be added to one and forgotten in the other.
 		return s3blob.New(context.Background(), s3blob.Config{
-			Endpoint:  s3cfg.Endpoint,
-			Bucket:    s3cfg.Bucket,
-			Region:    s3cfg.Region,
-			AccessKey: s3cfg.AccessKey,
-			SecretKey: s3cfg.SecretKey,
-			Secure:    s3cfg.UseTLS(),
-			Prefix:    s3cfg.Prefix,
+			Endpoint:       s3cfg.Endpoint,
+			Bucket:         s3cfg.Bucket,
+			Region:         s3cfg.Region,
+			AccessKey:      s3cfg.AccessKey,
+			SecretKey:      s3cfg.SecretKey,
+			Secure:         s3cfg.UseTLS(),
+			Prefix:         s3cfg.Prefix,
+			SSEMode:        s3cfg.SSE,
+			SSEKMSKeyID:    s3cfg.SSEKMSKeyID,
+			VerifyAfterPut: s3cfg.VerifyAfterPut,
+			VerifyMaxBytes: s3cfg.VerifyMaxBytes,
 		})
 	}
 	return local.New(cfg.Storage.Local.Root)

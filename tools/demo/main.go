@@ -327,9 +327,13 @@ func selfSignedCert() (tls.Certificate, error) {
 		NotAfter:     time.Now().Add(7 * 24 * time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		DNSNames:     []string{"localhost"},
-		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
-		IsCA:         true,
+		// content.localhost is listed because the demo serves user content from a separate
+		// HOSTNAME, which is what server.usercontent_url requires: a different port alone is a
+		// different browser origin but the same cookie jar. Without this name the demo would be
+		// refused at startup, or serve content through a certificate error.
+		DNSNames:    []string{"localhost", "content.localhost"},
+		IPAddresses: []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
+		IsCA:        true,
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
