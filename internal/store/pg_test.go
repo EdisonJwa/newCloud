@@ -76,6 +76,14 @@ func testPool(t *testing.T) *pgxpool.Pool {
 	if err := pool.Ping(ctx); err != nil {
 		t.Fatalf("ping: %v", err)
 	}
+	// Several tests seed rows without calling resetSchema first, so relying on another
+	// test to have applied the migrations makes the package pass or fail by registration
+	// order. ApplySchema is idempotent; tests that need a clean database still reset.
+	schemaCtx, cancelSchema := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancelSchema()
+	if err := store.ApplySchema(schemaCtx, pool); err != nil {
+		t.Fatalf("apply schema: %v", err)
+	}
 	return pool
 }
 
