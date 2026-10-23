@@ -34,7 +34,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           # Must satisfy go.mod, which requires 1.26 for os.Root's write methods.
-          go-version: "1.26"
+          # 1.26.10 is the first patch with the crypto/x509 fix for GO-2026-6809;
+          # govulncheck fails the build on the stdlib advisory in 1.26.9.
+          go-version: "1.26.10"
           cache: true
 
       - name: gofmt
