@@ -184,6 +184,9 @@ being produced.
 - [ ] The application connects as `newcloud_app`, not the owner.
 - [ ] `audit.anchor_dir` is on different credentials from the database.
 - [ ] `/var/lib/newcloud` is one mount point; the startup rename probe passes.
+- [ ] `server.usercontent_addr` is set and the content vhost proxies to it, so a content path on the
+      application origin is refused by the process and by the proxy rather than only by convention.
+- [ ] The content vhost strips `Cookie` and serves only `/content/*` and `/s/*/download|thumbnail`.
 - [ ] PostgreSQL data and content are on separate disks.
 - [ ] WAL archiving is enabled, `archive_timeout` is set, and the archive disk has free space.
 - [ ] Backups run on a schedule and a restore drill has passed.
@@ -214,3 +217,61 @@ is unreachable. Creating buckets requires account-level permission that a storag
 not need, and a typo in a bucket name should fail at boot rather than silently create a second one.
 
 `tree` layout is rejected with S3: object storage has no directory hierarchy to mirror.
+
+### 9.1 Backend support matrix
+
+The client is minio-go, which speaks the S3 API rather than a specific vendor's extensions. That
+makes most compatible stores work; it does **not** make them equivalent, and this table says which
+ones have actually been exercised rather than implying they all have.
+
+| Backend | Tested how | Integrity readback (`verify_after_put`) | Notes |
+| --- | --- | --- | --- |
+| In-process fake (`internal/storage/s3fake`) | Every run: `internal/blob/s3` and the layout conformance suite | Yes — simple and multipart paths | Default in `go test`. Models the operations this server performs and returns `NotImplemented` for anything else, so a backend change that starts using a new operation fails loudly instead of passing against a guess. |
+| Local disk (`local`, `blob` layout) | Every run | Not applicable — writes are `rename(2)` and the blob name is its SHA-256 | No object store between the process and the bytes. |
+| AWS S3 | Not run in this repository | Not verified | Enable `verify_after_put` and set `verify_max_bytes: 0` unless you have measured the egress cost. Multipart is used above 16 MiB. |
+| MinIO | Not run in this repository | Not verified | The audience minio-go targets first; expected to work, unproven here. |
+| Ceph RGW | Not run | Not verified | — |
+| Cloudflare R2 | Not run | Not verified | Path-style addressing is used; R2 supports it. |
+| Backblaze B2 / Wasabi | Not run | Not verified | — |
+
+Run `TEST_S3_ENDPOINT`, `TEST_S3_BUCKET`, `TEST_S3_ACCESS_KEY`, `TEST_S3_SECRET_KEY` (and
+`TEST_S3_SECURE=1`) against a disposable bucket to exercise the conformance suite, the multipart
+path and the verification readback on a real provider. Without that run, "the S3 backend works" is a
+claim about the fake and about minio-go's framing, not about your object store.
+
+### 9.2 Recommended production profile for object storage
+
+- **`verify_after_put: true`.** The default is off because the readback doubles egress. Turn it on
+  wherever the store is not trusted to return what it acknowledged — which, for a self-hosted
+  deployment on a smaller object store, is most of the time. WC-GAP-003 is only closed for a
+  deployment that enables it.
+- **`verify_max_bytes: 0`** unless the cost of re-reading a very large object has been measured and
+  accepted in writing. Note that the largest uploads are exactly the ones that take the multipart
+  retry path, so a size bypass removes the guard where it matters most.
+- **A lifecycle rule that aborts incomplete multipart uploads** older than
+  `upload_cleanup_grace_hours`, in addition to the built-in sweep: object stores bill for stranded
+  parts indefinitely and no listing shows them.
+- **`sse: sse-s3` or `sse-kms`** if the bucket policy does not already encrypt. Leaving `sse: ""`
+  is a legitimate choice only when the bucket enforces encryption itself; an unknown value refuses
+  to start rather than writing plaintext a deployment believes is encrypted.
+
+### 9.3 Concurrent cleanup and the residual ownership window
+
+When verification proves an object is corrupt, the blob is removed so that a later upload can
+repair the address. That removal is **guarded**: the ETag the store returned from `PutObject` is
+compared against the stored object immediately before the delete, and if another writer has replaced
+the object in the meantime the delete is skipped and the address is left to the integrity scrub.
+
+The residual window is the `StatObject` → `RemoveObject` pair. S3 offers no conditional DELETE
+without object versioning, so a writer that replaces the object inside that window could still lose
+its copy. Two things keep this narrow and non-silent:
+
+- Content addressing means every correct writer sends the same bytes; the copies can differ only
+  when one of them is corrupt, which is the case being cleaned up.
+- The object was already proven not to match its address, so leaving it in place would serve
+  corruption to every subsequent reader — the worse outcome.
+
+Deployments that cannot accept even that window should enable bucket versioning: a delete then
+creates a delete marker, the previous version remains recoverable, and the address can be repaired
+by a re-upload. Record the choice in the deployment notes; `verify_after_put` and versioning are the
+two settings that determine what this window costs.

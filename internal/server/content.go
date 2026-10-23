@@ -333,11 +333,41 @@ func escapePathForURL(rel string) string {
 	return strings.Join(parts, "/")
 }
 
-// ContentHandler is the listener for the content origin (§7.1, §12).
+// refuseContentRoute answers a content-delivery path on the APPLICATION origin when a content origin
+// exists (NC-RR-006).
+//
+// It answers exactly what every other anonymous miss on that origin answers. A 404 is chosen over a
+// redirect or a 400 for two reasons: the app origin must not tell a caller that a content origin
+// exists or where, and a share token that does not resolve must be indistinguishable from one whose
+// route happens to live elsewhere. Anything more specific is a discovery oracle.
+//
+// The headers are deliberately the plain application ones. Setting an attachment disposition here
+// would suggest bytes could follow; not setting it means a client that somehow constructs this URL
+// sees a normal not-found page.
+func (s *Server) refuseContentRoute(w http.ResponseWriter, r *http.Request) {
+	s.deps.Log.Debug("content route refused on the application origin",
+		"path", r.URL.Path, "host", r.Host,
+		"hint", "user content is served by server.usercontent_addr; check the reverse proxy routes")
+	writeError(w, http.StatusNotFound, "not_found", "no such content")
+}
+
+// ContentHandler is the listener for the content origin (§7.1, §12; NC-RR-006).
 //
 // Only content routes exist here. The content origin holds a signed-in user's files, so a smaller
 // surface is the point: no API, no listing, no mutation, no session middleware reading a cookie the
 // origin does not need. What it does serve is gated by tickets or share tokens, never by a session.
+//
+// The route set is the COMPLETE inventory of everything that returns user bytes:
+//
+//	/content/{path}?ticket=...   an account's file, by ticket
+//	/s/{token}/download          a share's file
+//	/s/{token}/thumbnail         a share's preview
+//
+// Anything else — including the share landing page, the API and the SPA — is not an address on this
+// origin, and the catch-all says so regardless of the Host header. That is deliberate: the boundary
+// is enforced by the route table rather than by trusting the proxy to have routed the right vhost,
+// so a proxy that forwards the application hostname here (or this hostname to the application) gets a
+// 404 from whichever side it reaches instead of a working cross-origin path.
 func (s *Server) ContentHandler() http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)

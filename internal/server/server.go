@@ -339,21 +339,72 @@ func (s *Server) Handler() http.Handler {
 	// must be registered before routes.)
 
 	// Share landing pages and the content origin are anonymous by design.
+	//
+	// The landing page itself stays on the APPLICATION origin: it is the HTML shell, it holds the
+	// password/recipient gate, and it must be able to set the share cookie. Everything that returns
+	// user BYTES moves to the content origin when one exists (NC-RR-006).
 	r.Get("/s/{token}", s.handleSharePage)
 	r.Post("/s/{token}/verify", s.handleShareVerify)
 	// Email shares: request a code for an invited address, then exchange it.
 	r.Post("/s/{token}/recipient", s.handleShareRecipientRequest)
 	r.Post("/s/{token}/recipient/verify", s.handleShareRecipientVerify)
-	r.Get("/s/{token}/download", s.handleShareDownload)
-	// Previews are content: same token, same gate, and no permanent URL of their own.
-	r.Get("/s/{token}/thumbnail", s.handleShareThumbnail)
 	r.Post("/s/{token}/upload", s.handleShareUpload)
 
-	// Content origin: user bytes, always as an attachment.
+	// Everything that serves user bytes lives behind this check.
 	//
-	// Registered on the main listener only when no separate content listener exists. With a split,
-	// this route lives on the content handler alone.
-	if !s.deps.ContentSplit {
+	// The re-review's NC-RR-006 found the route inventory incomplete: /content/* moved to the
+	// content listener when one was configured, but /s/{token}/download and /s/{token}/thumbnail did
+	// not. Moving all three here closes the anonymous half of the boundary.
+	//
+	// What the split does and does NOT guarantee, stated precisely because the first version of this
+	// comment overclaimed it (PRG-003):
+	//
+	//   GUARANTEED: no ANONYMOUS content-delivery route is served by the application origin. A
+	//   caller with no session who constructs a content URL on this hostname is refused, whether the
+	//   URL is a ticket link (/content/*) or a share link. That is the boundary that matters for a
+	//   stored-XSS payload, because the payload has no session to begin with.
+	//
+	//   NOT CLAIMED: that no bytes at all leave this origin. Authenticated routes do serve a signed-in
+	//   user their own files: /api/files/download (attachment by default),
+	//   /api/shared/{id}/content, /api/files/version, /api/files/thumbnail, and WebDAV GET. Each is
+	//   session- or app-password-authenticated and re-checks the node's permissions on every request.
+	//   Sending them to the content origin is not possible without also handing the content origin
+	//   the ability to authenticate a session, which is the isolation the split exists to provide.
+	//
+	//   The one route that can render bytes INLINE on this origin is /api/files/download?inline=1,
+	//   and it is a vetted exception rather than an oversight: it is opt-in per request, its type
+	//   allowlist excludes SVG and every markup format, the first bytes are sniffed so a file named
+	//   .png that contains HTML is forced back to attachment, text previews are served as
+	//   text/plain, and every inline response carries nosniff plus a `sandbox` CSP. Those controls
+	//   are pinned per MIME class by internal/server/preview_test.go, and
+	//   TestEveryUserByteRouteIsClassified requires any FUTURE route that serves bytes to be
+	//   classified here before it can ship.
+	//
+	// The anonymous half is what a split can enforce structurally; the authenticated half is
+	// enforced by authorization plus those response controls, and pretending otherwise would be the
+	// same kind of unsupported claim as the one the audit found.
+	//
+	// The refusal for /content/* is a 404 rather than a redirect: a share token that does not
+	// resolve must be indistinguishable from one whose bytes live elsewhere, and the application
+	// origin must not become a directory of where content is served.
+	//
+	// The two share routes REDIRECT rather than refuse (PRG-002): the landing page and its gate live
+	// on this origin, and the grants they produce are host-only cookies that the content origin can
+	// never see. Refusing outright — which the first version of the split did — made every
+	// password-protected and recipient-verified share undownloadable, because the only URL the page
+	// could produce pointed at the one origin that rejects it. The redirect is not a hole: it runs
+	// the gate against the cookies, and only then mints a short-lived capability bound to this share
+	// and this file, which is all the content origin accepts. /content/* stays a refusal because a
+	// ticket URL is already absolute and is minted for the content origin directly.
+	if s.deps.ContentSplit {
+		r.Get("/s/{token}/download", s.handleShareDownloadRedirect)
+		r.Get("/s/{token}/thumbnail", s.handleShareThumbnailRedirect)
+		r.Get("/content/*", s.refuseContentRoute)
+	} else {
+		r.Get("/s/{token}/download", s.handleShareDownload)
+		// Previews are content: same token, same gate, and no permanent URL of their own.
+		r.Get("/s/{token}/thumbnail", s.handleShareThumbnail)
+		// Content origin: user bytes, always as an attachment.
 		r.Get("/content/*", s.handleContent)
 	}
 
@@ -380,6 +431,28 @@ func (s *Server) Handler() http.Handler {
 // alternative is a second copy of the route table, which is the problem this solves.
 func (s *Server) Routes() []string {
 	router, ok := s.Handler().(chi.Router)
+	if !ok {
+		return nil
+	}
+	var out []string
+	_ = chi.Walk(router, func(method, route string, _ http.Handler,
+		_ ...func(http.Handler) http.Handler) error {
+		out = append(out, method+" "+route)
+		return nil
+	})
+	sort.Strings(out)
+	return out
+}
+
+// ContentRoutes enumerates the content origin's own route table (NC-RR-006).
+//
+// Exists for the same reason Routes does: the boundary claim is about a complete inventory, so a
+// test must be able to ask the handler what it actually registers rather than trusting a
+// hand-maintained list. The review's finding was precisely that the inventory was incomplete — three
+// content-delivery paths existed and only one of them moved — and a test against a literal slice
+// would not have caught it either.
+func (s *Server) ContentRoutes() []string {
+	router, ok := s.ContentHandler().(chi.Router)
 	if !ok {
 		return nil
 	}

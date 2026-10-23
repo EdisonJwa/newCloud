@@ -39,6 +39,19 @@ const (
 	PurposeDownload    Purpose = "download"
 	PurposeEmailVerify Purpose = "email_verify"
 	PurposeSCIMToken   Purpose = "scim"
+	// PurposeShareContent authorises ONE share's content on the content origin after the access
+	// gate was satisfied on the application origin (PRG-002).
+	//
+	// It exists because the two origins cannot share a cookie: a password grant and a verified
+	// recipient grant are host-only cookies, deliberately, so they are never sent to the host that
+	// serves user bytes. Without a purpose-built capability the split topology made every gated
+	// share undownloadable — the landing page worked and the download link did not.
+	//
+	// Distinct from PurposeShareAccess on purpose. A share_access token IS the password/recipient
+	// grant and is honoured as a cookie; a share_content token is a narrower delegation of the
+	// verdict, is only accepted as a query credential on a content route, and cannot be replayed as
+	// a cookie to skip the gate.
+	PurposeShareContent Purpose = "share_content"
 )
 
 var errInvalid = errors.New("ticket: invalid or tampered token")

@@ -23,6 +23,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -515,7 +516,19 @@ func serve() error {
 	if err != nil {
 		return err
 	}
-	defer uploads.Close()
+	// WC-GAP-002 / NC-RR-001: shutdown must PRESERVE unfinished uploads, not delete them.
+	//
+	// This was `defer uploads.Close()`, and Close aborts every session: bytes and record both
+	// removed. So an ordinary restart, deploy or upgrade destroyed every transfer in flight, while
+	// a hard kill recovered — the opposite of what the durability work was for, and the reason the
+	// documentation's "resumable uploads across restarts" claim was false for the common case.
+	// Shutdown flushes, records and releases the handles, leaving recovery everything it needs.
+	defer func() {
+		if err := uploads.Shutdown(); err != nil {
+			log.Error("could not flush every in-flight upload session; some may not resume "+
+				"after this restart", "error", err)
+		}
+	}()
 
 	// Expired sessions hold staging files, so the sweep has to run periodically rather than
 	// only at startup.
@@ -663,7 +676,47 @@ func serve() error {
 		IdleTimeout: 120 * time.Second,
 	}
 
-	errCh := make(chan error, 1)
+	// The content origin, on its own listener (NC-RR-006, §6.3/§9.4).
+	//
+	// Why a second listener and not just a second vhost proxied to the same port: a vhost is only
+	// a boundary if the proxy enforces it, and the reference Caddyfile did not. Both hostnames were
+	// proxied to web:8080, so the content hostname reached the whole application router and the
+	// application hostname could still serve /content/* because ContentSplit was off. The hostname
+	// validation that exists is real and useful, but it never established the property being
+	// claimed: that user bytes can only be served on the content host.
+	//
+	// With this listener the property is structural:
+	//
+	//	:8080  (app)      the full router; /content/* and /s/{token}/download are NOT registered
+	//	:8081  (content)  exactly three routes; no API, no session middleware, no SPA fallback
+	//
+	// and, because the boundary must also hold when somebody configures only ONE listener, the app
+	// router refuses content paths outright when it knows of a content origin (see the two refusal
+	// handlers in server.Handler), and the content handler refuses everything that is not a content
+	// route regardless of Host. A misconfigured proxy therefore fails closed.
+	var contentSrv *http.Server
+	if addr := cfg.Server.UserContentAddr; addr != "" {
+		contentSrv = &http.Server{
+			Addr:    addr,
+			Handler: srv.ContentHandler(),
+			// The content origin streams anonymous bytes, so the header timeout matters more here
+			// than anywhere: it is the listener a stranger can reach with no credential at all.
+			ReadHeaderTimeout: 20 * time.Second,
+			IdleTimeout:       120 * time.Second,
+		}
+	} else {
+		// No separate address: the content routes stay on the application listener, gated by
+		// tickets, and the deployment is relying on its proxy for the origin separation. That is a
+		// legitimate small-deployment choice but it is NOT the property the requirement describes,
+		// so it is announced rather than silently assumed.
+		log.Warn("server.usercontent_addr is not set: content routes are served by the application "+
+			"listener, so the origin boundary depends entirely on the reverse proxy separating the "+
+			"two hostnames. Set usercontent_addr (e.g. \":8081\") and point only "+
+			"usercontent_url at it to make the boundary structural",
+			"requirement", "§6.3 / §9.4")
+	}
+
+	errCh := make(chan error, 2)
 	go func() {
 		log.Info("listening", "addr", cfg.Server.Addr, "version", version,
 			"public_url", cfg.Server.PublicURL, "issuer", cfg.Auth.Issuer)
@@ -671,6 +724,15 @@ func serve() error {
 			errCh <- err
 		}
 	}()
+	if contentSrv != nil {
+		go func() {
+			log.Info("content origin listening", "addr", contentSrv.Addr,
+				"usercontent_url", cfg.Server.UserContentURL)
+			if err := contentSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errCh <- err
+			}
+		}()
+	}
 
 	select {
 	case err := <-errCh:
@@ -681,6 +743,19 @@ func serve() error {
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	if contentSrv != nil {
+		// Shut down together: a content origin still accepting new tickets during an application
+		// drain would serve transfers nothing can revoke.
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := contentSrv.Shutdown(shutdownCtx); err != nil {
+				log.Warn("content origin shutdown", "error", err)
+			}
+		}()
+		defer wg.Wait()
+	}
 	return httpSrv.Shutdown(shutdownCtx)
 }
 

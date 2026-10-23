@@ -56,7 +56,17 @@ services:
       - /etc/newcloud:/etc/newcloud:ro
       - /var/lib/newcloud:/var/lib/newcloud
     ports:
+      # The application listener on the loopback interface. Session cookies live on
+      # this origin, so it must never be reachable except through the proxy.
       - "127.0.0.1:8080:8080"
+      # The content listener (NC-RR-006). It serves only /content/*, /s/{token}/download
+      # and /s/{token}/thumbnail, and answers 404 to everything else, so exposing it is
+      # far narrower than exposing the application. It is bound to loopback for the same
+      # reason as above: Caddy is the only thing that should reach either port.
+      #
+      # server.usercontent_addr must be ":8081" for this to have anything to talk to;
+      # without it the content routes stay on the application listener and startup warns.
+      - "127.0.0.1:8081:8081"
     depends_on:
       postgres:
         condition: service_healthy

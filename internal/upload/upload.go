@@ -410,7 +410,15 @@ func (m *Manager) Append(ctx context.Context, owner uuid.UUID, id string, start 
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	// The reap runs after the session lock is released, because reaping needs the manager lock
+	// and the lock order is manager-then-session. A no-op unless a rollback failed.
+	broken := false
+	defer func() {
+		s.mu.Unlock()
+		if broken {
+			m.reapBroken(s)
+		}
+	}()
 
 	if s.closed {
 		return 0, ErrNotFound
@@ -425,13 +433,32 @@ func (m *Manager) Append(ctx context.Context, owner uuid.UUID, id string, start 
 		return s.Offset, fmt.Errorf("upload: chunk would exceed the declared size %d", s.Total)
 	}
 
+	// Position the handle at the offset the client was told about BEFORE writing (NC-RR-002).
+	//
+	// This is not redundant with the seek in recoverOne. A file's I/O offset is independent of
+	// its length, so a previous request that wrote bytes and then rolled the LENGTH back left
+	// the handle still pointing past the truncated end. The next append would then write at
+	// that stale position and the file would grow a zero-filled hole between the acknowledged
+	// bytes and the new chunk — bytes that were never sent, hashing to something no client
+	// asked for. Seeking first makes every append land exactly where the offset says it does,
+	// whatever a failed predecessor did.
+	if _, serr := s.file.Seek(s.Offset, io.SeekStart); serr != nil {
+		s.closed = true
+		broken = true
+		return 0, fmt.Errorf("upload: seek to the acknowledged offset: %w", serr)
+	}
+
 	written, err := io.Copy(s.file, &ctxReader{ctx: ctx, r: io.LimitReader(r, size)})
 	if err != nil || written != size {
 		// A partially written chunk must not advance the offset, or the file gains a hole.
-		// Truncating back keeps the session usable after a failed request.
-		if terr := s.file.Truncate(s.Offset); terr != nil {
+		// Rolling back means BOTH truncating the extra bytes and repositioning the handle: see
+		// rollbackLocked. If that cannot be done the session is unusable rather than resumable,
+		// because resuming would splice bytes of unknown provenance into the user's file.
+		if rerr := s.rollbackLocked(s.Offset); rerr != nil {
 			s.closed = true
-			return 0, fmt.Errorf("upload: write failed and the staging file could not be repaired: %w", err)
+			broken = true
+			return 0, fmt.Errorf("upload: write failed and the staging file could not be "+
+				"repaired (%v); this session must be restarted: %w", rerr, err)
 		}
 		if err != nil {
 			return s.Offset, fmt.Errorf("upload: write chunk: %w", err)
@@ -448,8 +475,11 @@ func (m *Manager) Append(ctx context.Context, owner uuid.UUID, id string, start 
 	if err := s.file.Sync(); err != nil {
 		// The bytes are written but not durable. Rolling the offset back is the safe move: the
 		// client retries the chunk, which is cheap, whereas pretending it is durable is not.
-		if terr := s.file.Truncate(s.Offset); terr != nil {
+		if rerr := s.rollbackLocked(s.Offset); rerr != nil {
 			s.closed = true
+			broken = true
+			return 0, fmt.Errorf("upload: sync failed and the staging file could not be "+
+				"repaired (%v); this session must be restarted: %w", rerr, err)
 		}
 		return s.Offset, fmt.Errorf("upload: sync chunk: %w", err)
 	}
@@ -458,11 +488,61 @@ func (m *Manager) Append(ctx context.Context, owner uuid.UUID, id string, start 
 	s.touched = m.now()
 	if err := m.persist(s); err != nil {
 		// The offset could not be recorded. Report the chunk as unacknowledged and roll back, so
-		// the in-memory state never claims more than the disk will resume to.
+		// the in-memory state never claims more than the disk will resume to. Rolling back the
+		// MEMORY alone is not enough: the bytes are on disk, and without truncating them the
+		// retry would be appended after them (that was NC-RR-002's second half, and it left a
+		// file containing the chunk twice).
 		s.Offset = prev
+		if rerr := s.rollbackLocked(prev); rerr != nil {
+			s.closed = true
+			broken = true
+			return 0, fmt.Errorf("upload: could not record the offset and the staging file "+
+				"could not be repaired (%v); this session must be restarted: %w", rerr, err)
+		}
 		return s.Offset, fmt.Errorf("upload: record offset: %w", err)
 	}
 	return s.Offset, nil
+}
+
+// rollbackLocked restores the staging file to `to` after a failed append.
+//
+// Both halves are load-bearing, which is exactly what NC-RR-002 found missing:
+//
+//	Truncate(to) drops the bytes the failed chunk wrote past the acknowledged offset.
+//	Seek(to)     moves the HANDLE back, so the retried chunk is written at `to`.
+//
+// In Go, and in every POSIX filesystem, truncating a file does not change the file
+// description's offset. Doing only the truncate leaves the next write positioned past the new
+// end, and the kernel fills the gap with zeroes — a file longer than the client's own size,
+// containing bytes nobody sent. The caller must therefore treat an error from here as fatal to
+// the session rather than retrying the truncate.
+func (s *Session) rollbackLocked(to int64) error {
+	if err := s.file.Truncate(to); err != nil {
+		return fmt.Errorf("truncate to %d: %w", to, err)
+	}
+	if _, err := s.file.Seek(to, io.SeekStart); err != nil {
+		return fmt.Errorf("seek to %d: %w", to, err)
+	}
+	return nil
+}
+
+// reapBroken discards a session whose staging file could not be rolled back (NC-RR-002).
+//
+// The file is left for the caller to delete along with the record, so a later restart cannot
+// resurrect a session whose bytes are of unknown provenance. Doing it here rather than inline in
+// Append is a lock-order requirement: the manager lock must be taken before the session lock, so
+// the session cannot be removed from the map while Append still holds its own lock.
+func (m *Manager) reapBroken(s *Session) {
+	m.mu.Lock()
+	if _, live := m.sessions[s.ID]; live {
+		m.forgetLocked(s)
+	}
+	m.mu.Unlock()
+
+	s.mu.Lock()
+	_ = s.file.Close()
+	s.mu.Unlock()
+	m.discard(s)
 }
 
 // persist writes the session's metadata record atomically.
@@ -637,8 +717,11 @@ func (m *Manager) Sweep() int {
 	return len(victims)
 }
 
-// Close aborts every live session and removes its staging file. It exists for shutdown and
-// for tests that abandon sessions; the per-request paths handle themselves.
+// Close aborts every live session and removes its staging file. It exists for tests that abandon
+// sessions and for an operator-initiated purge; the per-request paths handle themselves.
+//
+// It is NOT what a graceful shutdown should call (NC-RR-001). Deletion is a deliberate act, and an
+// ordinary stop-and-start is not one: see Shutdown.
 func (m *Manager) Close() {
 	m.mu.Lock()
 	live := make([]*Session, 0, len(m.sessions))
@@ -656,6 +739,67 @@ func (m *Manager) Close() {
 		s.mu.Unlock()
 		m.discard(s)
 	}
+}
+
+// Shutdown stops serving uploads WITHOUT destroying the work in flight (NC-RR-001).
+//
+// Why this is separate from Close, and why Close was the defect: main registered
+// `defer uploads.Close()`, so every ordinary restart, deploy or upgrade aborted every live session
+// and deleted its staging bytes and record. A SIGKILL crash recovered; a clean `systemctl restart`
+// did not. The documentation claimed sessions survive restarts unconditionally, and that claim was
+// false for the lifecycle people actually use.
+//
+// What a shutdown must do is make the CURRENT state durable and then release the handles:
+//
+//  1. fsync each staging file, so the bytes the client was told about are on disk and not merely
+//     in the page cache of a process that is about to exit;
+//  2. persist each record with a fresh touch time, so a session is not resurrected-then-expired by
+//     the TTL sweep immediately after an upgrade;
+//  3. close the file handle, because the next process needs to open it and Windows will refuse
+//     while this one still holds it;
+//  4. leave the bytes and the record exactly where recovery looks for them.
+//
+// Deletion stays available through Abort (an explicit client action) and Sweep (expiry). Nothing in
+// the normal lifecycle should reach for it, which is why the destructive variant is now named for
+// what it does rather than for when it happens to be called.
+//
+// Errors are returned in aggregate rather than at the first failure: one session that could not be
+// synced must not prevent the other eleven from being written out, and the caller wants to log
+// which ones are at risk.
+func (m *Manager) Shutdown() error {
+	m.mu.Lock()
+	live := make([]*Session, 0, len(m.sessions))
+	for _, s := range m.sessions {
+		live = append(live, s)
+	}
+	m.sessions = map[string]*Session{}
+	m.byOwner = map[uuid.UUID]int{}
+	m.mu.Unlock()
+
+	var errs []error
+	for _, s := range live {
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			continue
+		}
+		s.touched = m.now()
+		// Record first, then close: the record must never describe bytes that are not durable,
+		// and the bytes here are already written. Syncing updates nothing observable, so the
+		// ordering that matters is that both happen before the handle is released.
+		if err := s.file.Sync(); err != nil {
+			errs = append(errs, fmt.Errorf("upload: sync %s: %w", s.ID, err))
+		}
+		if err := m.persist(s); err != nil {
+			errs = append(errs, fmt.Errorf("upload: record %s: %w", s.ID, err))
+		}
+		s.closed = true
+		if err := s.file.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("upload: close %s: %w", s.ID, err))
+		}
+		s.mu.Unlock()
+	}
+	return errors.Join(errs...)
 }
 
 // Dir reports the staging directory, so the caller can compute a session's file path for

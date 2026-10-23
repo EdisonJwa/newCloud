@@ -171,7 +171,22 @@ func (s *Server) handleShareDownload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "this link is not available")
 		return
 	}
+	// The access gate, or the capability that stands in for it on the content origin.
+	//
+	// The gate reads host-only cookies, which by design never reach this origin; without the
+	// capability branch, a split deployment would 404 every password-protected and
+	// recipient-verified download even though the visitor had just satisfied the gate. The two
+	// paths are mutually exclusive and the capability is only consulted when present and valid.
 	verdict := s.gate(r, sh)
+	grant := s.downloadGrantHash(r, sh)
+	actorKind := s.shareActorKind(r, sh)
+	actorEmail := s.shareRecipientEmail(r, sh)
+	if g, ok := s.shareContentCapability(r, sh.ID, "download"); ok {
+		verdict = gateResult{Email: g.Email}
+		grant = g.Grant
+		actorKind = g.Actor
+		actorEmail = g.Email
+	}
 	if !verdict.allowed() {
 		writeError(w, http.StatusNotFound, "not_found", "this link is not available")
 		return
@@ -270,11 +285,9 @@ func (s *Server) handleShareDownload(w http.ResponseWriter, r *http.Request) {
 	//   - later Range requests and retries join it and pay nothing,
 	//   - a different visitor, or the same visitor downloading another file, pays,
 	//   - a session minted for one version never serves another.
-	grant := s.downloadGrantHash(r, sh)
-	// Resolved BEFORE the transaction below: the visitor's identity is a read, and doing it inside
-	// the charging transaction would re-enter the store from within it.
-	actorKind := s.shareActorKind(r, sh)
-	actorEmail := s.shareRecipientEmail(r, sh)
+	// grant, actorKind and actorEmail were resolved above, because for a capability-authenticated
+	// request they come from the capability rather than from cookies.
+	//
 	// A Range request continues a download already authorised; a plain GET is a
 	// fresh download and is charged as one. That is the distinction the owner's
 	// "max downloads" setting actually means.
@@ -772,9 +785,15 @@ func (s *Server) handleShareThumbnail(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "this link is not available")
 		return
 	}
-	if !s.gate(r, sh).allowed() {
-		writeError(w, http.StatusNotFound, "not_found", "this link is not available")
-		return
+	// Same two-path gate as the download: the cookie gate on a single-origin deployment, or the
+	// capability the application origin minted after that gate passed (PRG-002). Previews are
+	// content too, so they moved to the content origin with the download and need the same
+	// accommodation for host-only cookies.
+	if _, ok := s.shareContentCapability(r, sh.ID, "thumbnail"); !ok {
+		if !s.gate(r, sh).allowed() {
+			writeError(w, http.StatusNotFound, "not_found", "this link is not available")
+			return
+		}
 	}
 
 	wantName := r.URL.Query().Get("name")

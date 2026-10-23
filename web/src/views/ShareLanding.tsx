@@ -8,9 +8,9 @@
 import { useEffect, useState } from "react";
 import {
   APIError,
-  downloadURL,
   fetchShareLanding,
   requestShareCode,
+  shareDownloadURL,
   uploadToShare,
   verifyShareCode,
   verifySharePassword,
@@ -202,7 +202,7 @@ export function ShareLanding({ token }: { token: string }) {
             </>
           ) : landing.can_read ? (
             <>
-              <a className="btn primary" href={downloadURL(landing.label ?? "")}>
+              <a className="btn primary" href={shareDownloadURL(token)}>
                 <Icon name="download" size={13} />
                 {t("share.download")}
               </a>

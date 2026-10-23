@@ -185,6 +185,42 @@ func (s *Store) key(h blob.Hash) string {
 	return path.Join(s.prefix, hex[0:2], hex[2:4], hex)
 }
 
+// ErrVerifyUnavailable reports that a stored object could not be read back, so nothing is known
+// about whether its bytes are the ones that were uploaded (NC-RR-003).
+//
+// The distinction this type exists to carry is the whole of NC-RR-003:
+//
+//	Corrupt — the object was read and its bytes do NOT hash to the address. That is evidence.
+//	Unavailable — the readback failed (timeout, 5xx, 403, a transport reset). That is the ABSENCE
+//	              of evidence, and the two must not be handled the same way.
+//
+// The defect was that every verification error triggered RemoveObject, so a transient GET failure
+// deleted a blob that had been written successfully. With several writers deduplicating onto one
+// content address, the object may also have been placed by somebody else entirely, which makes
+// deleting it on an inconclusive read an unqualified destructive act on another caller's data.
+var ErrVerifyUnavailable = errors.New("blob/s3: stored object could not be verified")
+
+// verifyMismatch marks a DEFINITIVE verification failure: the object was read and its content does
+// not match its address, or its metadata cannot possibly describe a correct object.
+//
+// It wraps blob.ErrHashMismatch so that a caller which only cares "the bytes and the address
+// disagree" keeps working unchanged, while a caller that must distinguish evidence from the absence
+// of it (Put's cleanup decision) can ask the more specific question via errors.As.
+type verifyMismatch struct{ reason string }
+
+func (e *verifyMismatch) Error() string {
+	return "blob/s3: stored object is corrupt: " + e.reason + ": " + blob.ErrHashMismatch.Error()
+}
+
+// Unwrap keeps blob.ErrHashMismatch in the chain for existing callers and tests.
+func (e *verifyMismatch) Unwrap() error { return blob.ErrHashMismatch }
+
+// isMismatch reports whether err is evidence of corruption rather than absence of evidence.
+func isMismatch(err error) bool {
+	var m *verifyMismatch
+	return errors.As(err, &m)
+}
+
 // Put stores the payload under h.
 //
 // The bytes are hashed before they are uploaded. That costs one extra pass over the staging
@@ -193,10 +229,19 @@ func (s *Store) key(h blob.Hash) string {
 // every user. Uploading first and checking afterwards would leave the bad object in place
 // exactly when something is already going wrong.
 func (s *Store) Put(ctx context.Context, h blob.Hash, r io.Reader, size int64) error {
-	if _, err := s.Stat(ctx, h); err == nil {
-		return nil // idempotent: the content address is already present
-	} else if !errors.Is(err, blob.ErrNotFound) {
+	exists, err := s.statExisting(ctx, h)
+	if err != nil {
 		return err
+	}
+	if exists {
+		// Idempotent: the content address is already present (NC-RR-004).
+		//
+		// Returning here unconditionally was a defect when verification is enabled. The address
+		// being PRESENT says nothing about its bytes: an older or concurrently corrupted object
+		// sits under the same key, and the upload of correct bytes cannot repair it. A dedup hit
+		// is a place where a deployment that asked for integrity checking should get it, not a
+		// shortcut past it. When verification is off this is still the cheap, correct answer.
+		return s.verifyExisting(ctx, h)
 	}
 
 	body := r
@@ -249,27 +294,128 @@ func (s *Store) Put(ctx context.Context, h blob.Hash, r io.Reader, size int64) e
 	if s.sse != nil {
 		opts.ServerSideEncryption = s.sse
 	}
-	_, err = s.client.PutObject(ctx, s.bucket, s.key(h), seeker, written, opts)
+	upload, err := s.client.PutObject(ctx, s.bucket, s.key(h), seeker, written, opts)
 	if err != nil {
 		return fmt.Errorf("blob/s3: put %s: %w", h, err)
 	}
 
 	// The upload was acknowledged. That is a claim about what the store now holds, and this is where
 	// we check it rather than trusting it (WC-GAP-003).
+	//
+	// The two failure classes are handled differently on purpose (NC-RR-003):
+	//
+	//	A corrupt object is evidence. It must not be left at its own address: every later read
+	//	would serve it, the dedup index would treat the address as present, and a re-upload of
+	//	the correct bytes would take the idempotent path and never repair it.
+	//
+	//	An unverifiable object proves nothing. A GET that timed out, a 5xx, a permissions blip or a
+	//	cancelled request says the readback did not happen, not that the bytes are wrong. Deleting
+	//	on that basis destroys a valid blob — and with concurrent dedup writers the object may not
+	//	even be the one this call uploaded. It is reported and the object is LEFT ALONE; the
+	//	periodic scrub remains the detector for corruption nobody managed to observe.
 	if err := s.verifyStored(ctx, h, written); err != nil {
-		// A corrupted object must not be left at its own address: every later read would serve it,
-		// the deduplication index would treat the address as present, and a re-upload of the correct
-		// bytes would take the idempotent shortcut above and never repair it. Deleting makes the
-		// next attempt upload again.
+		if !isMismatch(err) {
+			return fmt.Errorf("blob/s3: verify %s: object left in place because the readback was "+
+				"inconclusive: %w", h, err)
+		}
+		// The mismatch is proven, but ownership is not (PRG-006).
 		//
-		// The delete is best-effort: if it fails, the object stays and the integrity scrub is the
-		// remaining detector. Reporting the verification failure is what matters — the caller must
-		// not be told the write succeeded.
-		if derr := s.client.RemoveObject(ctx, s.bucket, s.key(h), minio.RemoveObjectOptions{}); derr != nil {
+		// Between this call's PUT and this removal, another writer deduplicating onto the same
+		// content address may have REPLACED the object with its own copy — which, if that writer's
+		// bytes are correct, is a valid object this call would now delete. Content addressing makes
+		// that rare (every writer sends the same bytes), but "rare" is not "impossible": the two
+		// copies can differ precisely when one of them is corrupt, which is the situation here.
+		//
+		// So the removal is guarded by the ETag of the object this call wrote. If the stored ETag no
+		// longer matches, somebody else owns the key now and this call must not touch it. The check
+		// narrows the window to Stat->Delete rather than eliminating it, because S3 offers no
+		// conditional DELETE without object versioning; that residual window is documented in
+		// docs/guides/deployment.md rather than papered over.
+		switch derr := s.removeIfStillOurs(ctx, h, upload.ETag); {
+		case errors.Is(derr, errObjectReplaced):
+			return fmt.Errorf("blob/s3: verify %s: %w (the object was replaced by another writer "+
+				"after verification, so it was NOT removed; the integrity scrub will re-check it)",
+				h, err)
+		case derr != nil:
 			return fmt.Errorf("blob/s3: verify %s: %w (and the object could not be removed: %v)",
 				h, err, derr)
 		}
 		return fmt.Errorf("blob/s3: verify %s: %w", h, err)
+	}
+	return nil
+}
+
+// errObjectReplaced reports that the object at a key is no longer the one this call wrote.
+var errObjectReplaced = errors.New("blob/s3: the object was replaced by another writer")
+
+// removeIfStillOurs deletes the object at h only if it is still the version this call uploaded,
+// identified by the ETag the store returned from PutObject.
+//
+// This is the "establish ownership before destructive cleanup" requirement from the audit's PRG-006.
+// An unconditional RemoveObject is unsafe under concurrent deduplicating writers: the object at a
+// hash key may have been replaced between verification and deletion, and deleting another writer's
+// freshly uploaded object would destroy valid content in the middle of someone else's upload.
+//
+// An empty wantETag means the store did not report one (some S3-compatible servers omit it); in
+// that case there is nothing to compare, so the removal proceeds and the caller's log records the
+// weaker guarantee. Refusing to clean up at all would leave a proven-corrupt object at its address
+// for every future reader, which is the worse failure.
+func (s *Store) removeIfStillOurs(ctx context.Context, h blob.Hash, wantETag string) error {
+	if wantETag != "" {
+		info, err := s.client.StatObject(ctx, s.bucket, s.key(h), minio.StatObjectOptions{})
+		if err != nil {
+			return fmt.Errorf("stat before removal: %w", translate(err))
+		}
+		if got := strings.Trim(info.ETag, `"`); got != strings.Trim(wantETag, `"`) {
+			return errObjectReplaced
+		}
+	}
+	return s.client.RemoveObject(ctx, s.bucket, s.key(h), minio.RemoveObjectOptions{})
+}
+
+// statExisting reports whether an object already exists at h.
+//
+// Split out so Put's two paths read clearly: the distinction between "absent, so upload it" and
+// "present, so decide whether to verify it" is the whole of NC-RR-004, and it is easier to see when
+// it is a named function returning a bool rather than an if/else-with-assignment.
+func (s *Store) statExisting(ctx context.Context, h blob.Hash) (bool, error) {
+	if _, err := s.Stat(ctx, h); err != nil {
+		if errors.Is(err, blob.ErrNotFound) {
+			return false, nil
+		}
+		// An inconclusive Stat is not "absent". Uploading over it is safe (the key is immutable),
+		// but reporting the store as broken is more useful than guessing.
+		return false, err
+	}
+	return true, nil
+}
+
+// verifyExisting applies the integrity contract to a deduplication hit (NC-RR-004).
+//
+// When verification is disabled this is the historical cheap no-op, and that is a documented
+// trade rather than an oversight: re-reading every duplicate upload doubles egress on the path
+// with the most traffic.
+//
+// When it is enabled, a Hit is checked like any other write, and for the same reason. The
+// alternative — trusting the key because it exists — means the ONE state a verifying deployment
+// most needs to detect (a corrupt object already at an address) is the state that verification
+// skips. A mismatch is an error; a successful check permits the caller's write to be treated as
+// done. An inconclusive readback is still not evidence of corruption, so it is reported without
+// any destructive action, and a mismatch is NOT deleted here: unlike the post-PUT path this call
+// did not create the object, so it cannot know who else references it.
+func (s *Store) verifyExisting(ctx context.Context, h blob.Hash) error {
+	if !s.verifyAfterPut {
+		return nil
+	}
+	info, err := s.Stat(ctx, h)
+	if err != nil {
+		return fmt.Errorf("blob/s3: verify existing %s: %w", h, err)
+	}
+	if s.verifyMaxBytes > 0 && info.Size > s.verifyMaxBytes {
+		return nil
+	}
+	if err := s.verifyStored(ctx, h, info.Size); err != nil {
+		return fmt.Errorf("blob/s3: existing object %s failed verification: %w", h, err)
 	}
 	return nil
 }
@@ -279,6 +425,15 @@ func (s *Store) Put(ctx context.Context, h blob.Hash, r io.Reader, size int64) e
 // Written as a single pass over the object rather than a size check plus a hash, because the failure
 // mode is a corrupted PART: the size can be exactly right while the bytes are wrong, which is
 // precisely what a retried multipart upload produces.
+//
+// The returned error distinguishes the two outcomes NC-RR-003 is about:
+//
+//	*verifyMismatch          the object was read and its content is wrong — evidence of corruption.
+//	ErrVerifyUnavailable     the object could not be read — no evidence either way.
+//
+// Every "could not read" path returns the second, and every "read it and the bytes are wrong" path
+// returns the first. Callers act on the difference; a caller that treats them alike is the defect
+// this type was introduced to make impossible to write by accident.
 func (s *Store) verifyStored(ctx context.Context, h blob.Hash, size int64) error {
 	if !s.verifyAfterPut {
 		return nil
@@ -289,32 +444,37 @@ func (s *Store) verifyStored(ctx context.Context, h blob.Hash, size int64) error
 
 	obj, err := s.client.GetObject(ctx, s.bucket, s.key(h), minio.GetObjectOptions{})
 	if err != nil {
-		return fmt.Errorf("read back: %w", err)
+		return fmt.Errorf("%w: open readback: %v", ErrVerifyUnavailable, translate(err))
 	}
 	defer obj.Close()
 
 	// GetObject is lazy; Stat forces the request so a missing or unreadable object fails here
-	// rather than as a read error halfway through the hash.
+	// rather than as a read error halfway through the hash. Everything Stat can report is a
+	// readback problem, never proof about content.
 	info, err := obj.Stat()
 	if err != nil {
-		return fmt.Errorf("read back: %w", translate(err))
+		return fmt.Errorf("%w: stat readback: %v", ErrVerifyUnavailable, translate(err))
 	}
 	if size >= 0 && info.Size != size {
-		return fmt.Errorf("stored size is %d, uploaded %d", info.Size, size)
+		return &verifyMismatch{reason: fmt.Sprintf("stored size is %d, uploaded %d", info.Size, size)}
 	}
 
 	hasher := sha256.New()
 	n, err := io.Copy(hasher, obj)
 	if err != nil {
-		return fmt.Errorf("read back: %w", err)
+		// A partially delivered body: the transport failed mid-read. That is the same absence of
+		// evidence as a failed Stat, NOT a truncated object — a short read surfaces as an error,
+		// while a genuinely short object is caught by the size comparison above.
+		return fmt.Errorf("%w: read back: %v", ErrVerifyUnavailable, err)
 	}
-	if n != size {
-		return fmt.Errorf("stored object is %d bytes, uploaded %d", n, size)
+	if n != info.Size {
+		return &verifyMismatch{reason: fmt.Sprintf("stored object is %d bytes, its metadata says %d",
+			n, info.Size)}
 	}
 	var got blob.Hash
 	copy(got[:], hasher.Sum(nil))
 	if got != h {
-		return blob.ErrHashMismatch
+		return &verifyMismatch{reason: fmt.Sprintf("content hashes to %s, address is %s", got, h)}
 	}
 	return nil
 }

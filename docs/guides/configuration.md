@@ -25,7 +25,7 @@ keys with inline rationale.
 | `addr` | `:8080` | Listen address. TLS terminates in front of the process. |
 | `public_url` | required | Absolute URL of the authenticated application. Used for OIDC redirects and share links. |
 | `usercontent_url` | required | Absolute URL of the content origin. Must use a **different hostname** from `public_url`, not merely a different port or scheme. |
-| `usercontent_addr` | empty | Listen address for the content origin. Setting it makes the split real inside the process: the content routes move to this listener and the main one refuses them. Empty means the proxy does the routing. |
+| `usercontent_addr` | empty | Listen address for the content origin (NC-RR-006). Setting it makes the split real inside the process: the content routes (`/content/*`, `/s/{token}/download`, `/s/{token}/thumbnail`) move to this listener and the main listener answers 404 to all three. Empty means the proxy does the routing, and startup warns that the boundary is then the proxy's job alone. The reference deployment sets `":8081"`. |
 | `trusted_proxies` | `[]` | CIDRs allowed to set `X-Forwarded-For` (§9.4). Empty means no peer is trusted and the header is ignored, which is correct without a reverse proxy. |
 | `trust_proxy` | `false` | **Deprecated.** Trusts `X-Forwarded-For` from *any* peer, which lets a caller choose its own address and with it every address-derived decision (break-glass CIDR, per-IP throttles, the audit `ActorIP`). Use `trusted_proxies`. |
 | `allow_same_host_content` | `false` | Permit `usercontent_url` to share a hostname with `public_url`. See below before setting it. |
@@ -107,7 +107,7 @@ arranged.
 | `s3.prefix` | empty | Key prefix for a bucket shared with other applications. |
 | `s3.sse` | empty | Server-side encryption: `""` (bucket policy), `sse-s3`, or `sse-kms`. An unknown value refuses to start rather than writing plaintext a deployment believes is encrypted. |
 | `s3.sse_kms_key_id` | — | KMS key for `sse-kms`. Required for that mode. |
-| `s3.verify_after_put` | `false` | Read every object back and re-hash it before reporting success (INV-03). The pre-upload hash proves the payload matched its address when it left the process; it does not prove what the store now holds. Doubles bytes read per upload — enable it for any store you do not fully trust. |
+| `s3.verify_after_put` | `false` | Read every object back and re-hash it before reporting success (INV-03, WC-GAP-003, NC-RR-003/004). The pre-upload hash proves the payload matched its address when it left the process; it does not prove what the store now holds. When enabled it applies to **deduplication hits** as well as new uploads, so a pre-existing corrupt object at an address is detected rather than accepted. A readback that fails to complete (timeout, 5xx, 403, transport reset) is reported as an error but does **not** delete the object: an unverifiable object is not a corrupt one. Doubles bytes read per upload — enable it for any store you do not fully trust. |
 | `s3.verify_max_bytes` | `0` | Skip the read-back above this size. `0` verifies everything. |
 
 `blob` deduplicates identical content and stores a new version as a difference. `tree` mirrors the

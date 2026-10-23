@@ -2,11 +2,15 @@ package dav
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"net/http"
 	"path"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
@@ -170,17 +174,20 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request, a authz
 	}
 	// Two different source rights, because a copy and a move consume different things.
 	//
-	//   COPY takes a copy of the bytes: `download` (plus `read` to see the node at all).
+	//   COPY takes a copy of the bytes: `read` (to see the node at all) plus `download`. It does
+	//        NOT need `write` on the source: copying something the caller may only read is the
+	//        ordinary use of a read-only grant, and requiring write made a read-only grantee
+	//        unable to copy bytes they are explicitly allowed to fetch — so `download` on the
+	//        source was a permission with no route that could exercise it (P1 finding in the
+	//        2026-10-23 re-review).
+	//
 	//   MOVE relocates the node: `delete`-class authority over it — plus `download`, since
 	//        moving a file the caller may not read is a way to exfiltrate it by moving it
 	//        into a namespace they can read.
 	//
-	// §4.2 names both halves explicitly: "MOVE：验证源移动/删除权限及目标创建权限".
-	verb := authz.PermWrite
-	if move {
-		verb = authz.PermDelete
-	}
-	if !srcCap.Can(authz.PermDownload) || !srcCap.Can(verb) {
+	// §4.2 names both halves explicitly: "MOVE：验证源移动/删除权限及目标创建权限", and for COPY
+	// "源文件读取权限与目标路径创建权限".
+	if !sourcePermits(srcCap.Perms(), move) {
 		writeXMLError(w, http.StatusNotFound, "")
 		return
 	}
@@ -188,11 +195,7 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request, a authz
 	// A collection MOVE or COPY carries its whole subtree, so every inner node must permit
 	// the operation too (§4.2: 目录递归操作不能只检查根目录).
 	if src.IsDir() {
-		need := authz.PermRead
-		if move {
-			need = authz.PermDelete
-		}
-		ok, serr := h.subtreeAllows(ctx, a, src.ID, need)
+		ok, serr := h.subtreeAllows(ctx, a, src.ID, subtreeSourcePerm(move))
 		if serr != nil {
 			writeXMLError(w, statusForError(serr), "")
 			return
@@ -269,6 +272,24 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request, a authz
 			return
 		}
 		if !h.requireUnlocked(w, ctx, a, existing.ID, r.Header.Get("If")) {
+			return
+		}
+		// A COPY over an existing destination does NOT trash it here (NC-RR-005).
+		//
+		// It used to, and that was the defect: the destination was trashed before the copy began,
+		// so a copy that then failed (quota 507, a permission error on a child, a storage fault)
+		// left the user's visible path EMPTY. The old bytes were still in the trash, but
+		// "recoverable by hand from the bin" is not the same as "not destroyed", and the review
+		// reproduced exactly that: COPY returned 507 and GET on the original returned 404.
+		//
+		// The copy is therefore staged under a temporary sibling name and swapped into place only
+		// once it has fully succeeded; see copyOverExisting. A MOVE is different and still trashes
+		// here: a move is a rename of the source onto the destination, there is no staged
+		// intermediate to build, and its compensation path is the content-move rollback below.
+		if !move && !disableCopyOverwritePreserveForTest {
+			if cerr := h.copyOverExisting(w, r, a, src, dstParent, dstName, *existing, destPath); cerr != nil {
+				writeXMLError(w, statusForError(cerr), "")
+			}
 			return
 		}
 		if err := h.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
@@ -519,6 +540,329 @@ func (h *Handler) copyTree(ctx context.Context, a authz.Actor, src store.Node,
 		}
 	}
 	return nil
+}
+
+// sourcePermits reports whether a permission set on the SOURCE is enough for the operation.
+//
+// It takes a Perm rather than an authz.Cap so the rule is testable from outside the authz package
+// (Cap's fields are unexported precisely so a handler cannot fabricate one), and because the rule is
+// about permissions, not about which node a checked capability happens to be bound to.
+//
+// The handler resolves paths within the caller's own namespace, which makes the cross-account COPY
+// case unreachable through a DAV request: a grant that reaches another account's tree is consumed by
+// the API's `/shared/{id}/content` route. The rule is still worth pinning on its own, because the
+// previous version of it (requiring `write` on the source of a COPY) was wrong for exactly the
+// read-only-grantee case §4.2 names, and a test that can only fail by constructing the whole
+// cross-account topology would not have caught it either.
+//
+// COPY: read + download on the source — `read` to see the node, `download` to take the bytes.
+// MOVE: download + delete on the source — `delete` because the source name is being consumed.
+func sourcePermits(perms authz.Perm, move bool) bool {
+	if perms&authz.PermDownload == 0 {
+		return false
+	}
+	if move {
+		return perms&authz.PermDelete != 0
+	}
+	return perms&authz.PermRead != 0
+}
+
+// subtreeSourcePerm is the per-inner-node right a recursive MOVE or COPY needs (NC-RR-005 §4.2).
+//
+// A MOVE consumes the subtree, so every inner node must permit deleting it. A COPY only reads, so
+// `read` is the right bar there; demanding more would fail a tree the caller may legitimately copy.
+func subtreeSourcePerm(move bool) authz.Perm {
+	if move {
+		return authz.PermDelete
+	}
+	return authz.PermRead
+}
+
+// copyOverExisting performs a COPY whose destination already exists, without destroying the old
+// destination until the new one is complete.
+//
+// The shape is stage-then-swap. Two things about the ORDER are load-bearing, and the first version
+// of this function got the second one wrong badly enough that COPY returned 500 and the user's
+// destination vanished from the live tree:
+//
+//  1. Stage the replacement under a reserved sibling name. This is the expensive, failure-prone
+//     part: every child is written while the old destination is still untouched at its real name.
+//
+//  2. For a layout whose bytes follow PATHS (the tree layout), move the physical bytes BEFORE the
+//     metadata switch, and in the order that keeps both paths meaningful:
+//     old  <dst>  -> <backup>     (frees the destination path, old bytes preserved)
+//     new  <stage> -> <dst>       (the replacement is now where its name will say)
+//     Doing it after the metadata rename, as the first version did, is guaranteed to fail: renaming
+//     the metadata row does not move a directory, so the old tree still occupies the destination
+//     path and the new tree's rename lands on a non-empty directory. A metadata-only layout (blob)
+//     has no such step, because its paths ARE its metadata.
+//
+//  3. Switch the namespace in ONE metadata transaction: original -> backup name, staged -> the
+//     destination name, and the displaced original to the trash. One transaction is what makes the
+//     switch atomic for readers of the metadata, and it is also where the audit rows are written,
+//     so a completed swap can never be missing from the log.
+//
+// Failure handling:
+//
+//   - stage failed or an early physical move failed: the destination was never touched, so the
+//     staged tree is trashed and the error is returned.
+//   - the swap transaction failed: the physical moves are reversed and the staged tree is trashed,
+//     restoring the original at its own name with its own bytes.
+//
+// What is NOT claimed: atomicity across a process kill between the physical moves and the metadata
+// transaction. No portable filesystem provides a multi-entry atomic swap, so the honest guarantee
+// is "recoverable replacement": the original's bytes are always preserved under the backup name and
+// the swap can be completed or undone by hand. `reconcileOverwriteArtifacts` detects and repairs the
+// detectable cases at startup; docs/guides/limitations.md states the window.
+func (h *Handler) copyOverExisting(w http.ResponseWriter, r *http.Request, a authz.Actor,
+	src, dstParent store.Node, dstName string, existing store.Node, destPath string) error {
+
+	ctx := r.Context()
+
+	// Two reserved sibling names, one for the staged replacement and one for the displaced
+	// original. See reservedName: they are legal node names, because the validator rejects the
+	// control characters that would otherwise make a name unclaimable, and they are made unique by
+	// random bytes so two concurrent overwrites of the same destination cannot collide.
+	stagedName := stagedCopyName(dstName)
+	backupName := backupCopyName(dstName)
+
+	_, dstRel, _ := h.splitPath(destPath)
+	parentRel := path.Dir(dstRel)
+	if parentRel == "." {
+		parentRel = ""
+	}
+	stagedRel := path.Join(parentRel, stagedName)
+	backupRel := path.Join(parentRel, backupName)
+
+	// The layout decides whether there is a physical phase at all. EfficientRename is true for the
+	// blob layout, where a rename is a metadata update and no bytes move.
+	pathsFollowContent := !h.content.Capabilities().EfficientRename
+
+	// Step 1: build the replacement beside the destination.
+	//
+	// copyNode is reused rather than reimplemented so every authorization check, depth guard and
+	// audit entry applies exactly as it does on the non-overwrite path. A second implementation
+	// here would be a second copy of the rules, and the copy that drifts is always the expensive
+	// one.
+	if err := h.copyNode(ctx, a, src, dstParent, stagedName, stagedRel,
+		r.WithContext(withCopyWasOverwrite(ctx, false))); err != nil {
+		// Nothing has touched the destination yet, so this is a clean failure: drop whatever
+		// partial staged tree exists and leave the original alone.
+		h.discardStaged(ctx, a, dstParent.ID, stagedName, stagedRel, src.IsDir(),
+			"incomplete staged COPY of an overwrite")
+		return err
+	}
+
+	// Step 2: for a path-backed layout, put the bytes where the metadata is about to say they are.
+	//
+	// Order matters and is not interchangeable: moving the staged tree onto the destination first
+	// would land on the old tree, which is exactly the failure this whole function exists to avoid.
+	if pathsFollowContent {
+		owner := a.ID().String()
+		if err := h.content.Move(ctx,
+			layout.Node{Owner: owner, Path: dstRel, IsDir: existing.IsDir()},
+			layout.Node{Owner: owner, Path: backupRel, IsDir: existing.IsDir()}); err != nil {
+			// The destination path was not freed, so nothing has changed on disk: the staged tree
+			// is the only thing to clean up.
+			h.discardStaged(ctx, a, dstParent.ID, stagedName, stagedRel, src.IsDir(),
+				"staged COPY of an overwrite whose original could not be moved aside")
+			return fmt.Errorf("move the original destination aside: %w", err)
+		}
+		if err := h.content.Move(ctx,
+			layout.Node{Owner: owner, Path: stagedRel, IsDir: src.IsDir()},
+			layout.Node{Owner: owner, Path: dstRel, IsDir: src.IsDir()}); err != nil {
+			// Put the original's bytes back before reporting failure, or the destination path would
+			// be empty while its metadata still names a node.
+			if rerr := h.content.Move(ctx,
+				layout.Node{Owner: owner, Path: backupRel, IsDir: existing.IsDir()},
+				layout.Node{Owner: owner, Path: dstRel, IsDir: existing.IsDir()}); rerr != nil {
+				h.logf("copy overwrite: could not restore the original bytes of %q after a failed "+
+					"staged move (backup path %q): %v", dstName, backupRel, rerr)
+			}
+			h.discardStaged(ctx, a, dstParent.ID, stagedName, stagedRel, src.IsDir(),
+				"staged COPY of an overwrite that could not be installed")
+			return fmt.Errorf("install the staged copy: %w", err)
+		}
+	}
+
+	// Step 3: switch the namespace in one transaction.
+	var installed store.Node
+	err := h.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		staged, serr := tx.ChildByName(ctx, dstParent.ID, stagedName)
+		if serr != nil {
+			return serr
+		}
+		// Rename the original OUT of the destination name first: the destination must be free before
+		// the staged node can take it, and a rename to a free sibling name cannot fail for a conflict.
+		aside, rerr := tx.Rename(ctx, existing.ID, backupName)
+		if rerr != nil {
+			return rerr
+		}
+		if _, rerr := tx.Rename(ctx, staged.ID, dstName); rerr != nil {
+			return rerr
+		}
+		installed = staged
+		// The displaced original goes to the trash here, in the same transaction that makes the
+		// replacement live. Trashing it later would leave a window in which BOTH copies are visible
+		// and neither is in the bin, which is a state a sync client can act on.
+		if terr := tx.TrashCapped(ctx, aside.ID, h.trashCap(ctx)); terr != nil {
+			return terr
+		}
+		// Two audit rows, both inside the transaction that causes them: a completed swap must never
+		// be missing from the log, and an interrupted one must not claim a success it did not reach.
+		if err := tx.Audit(ctx, store.AuditEntry{
+			ActorKind: "user", ActorUserID: a.Ptr(), ActorEmail: a.Email(),
+			ActorIP: clientIP(r), UserAgent: r.UserAgent(),
+			Action: "file.write", TargetKind: "node", TargetID: installed.ID.String(),
+			Result: "ok", Metadata: map[string]any{
+				"name": dstName, "copied_from": src.Name, "replaced": existing.Name,
+				"replaced_node": existing.ID.String(),
+			},
+		}); err != nil {
+			return err
+		}
+		return tx.Audit(ctx, store.AuditEntry{
+			ActorKind: "user", ActorUserID: a.Ptr(), ActorEmail: a.Email(),
+			ActorIP: clientIP(r), UserAgent: r.UserAgent(),
+			Action: "file.delete", TargetKind: "node", TargetID: aside.ID.String(),
+			Result: "ok", Metadata: map[string]any{
+				"name": dstName, "reason": "replaced by a COPY overwrite",
+				"replaced_by": installed.ID.String(),
+			},
+		})
+	})
+	if err != nil {
+		// The switch did not commit. Undo the physical moves so the destination path holds the
+		// original's bytes again, then drop the staged tree.
+		h.logf("copy overwrite: the metadata switch for %q failed (%v); restoring the original",
+			dstName, err)
+		if pathsFollowContent {
+			owner := a.ID().String()
+			if rerr := h.content.Move(ctx,
+				layout.Node{Owner: owner, Path: dstRel, IsDir: src.IsDir()},
+				layout.Node{Owner: owner, Path: stagedRel, IsDir: src.IsDir()}); rerr != nil {
+				h.logf("copy overwrite: could not move the staged bytes back out of %q: %v",
+					dstRel, rerr)
+			}
+			if rerr := h.content.Move(ctx,
+				layout.Node{Owner: owner, Path: backupRel, IsDir: existing.IsDir()},
+				layout.Node{Owner: owner, Path: dstRel, IsDir: existing.IsDir()}); rerr != nil {
+				h.logf("copy overwrite: COMPENSATION FAILED for %q: the original bytes are at %q "+
+					"but the destination path could not be restored: %v", dstName, backupRel, rerr)
+			}
+		}
+		h.discardStaged(ctx, a, dstParent.ID, stagedName, stagedRel, src.IsDir(),
+			"staged COPY of an overwrite whose switch did not commit")
+		return err
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+	return nil
+}
+
+// discardStaged removes a staged overwrite replacement completely: the metadata node, and, for a
+// path-backed layout, its bytes.
+//
+// Trashing alone is not enough for the tree layout. A trashed node's bytes stay where they are until
+// the retention sweep purges it, so a failed overwrite would leave a full copy of the source tree
+// occupying the user's quota — and the audit trail would name a folder the user never created. The
+// bytes are therefore removed explicitly, and the metadata node is trashed rather than purged
+// because the store exposes no single-node purge and a trashed row is harmless.
+func (h *Handler) discardStaged(ctx context.Context, a authz.Actor, parentID [16]byte,
+	name, rel string, isDir bool, reason string) {
+
+	if !h.content.Capabilities().EfficientRename && rel != "" {
+		if err := h.content.Delete(ctx, layout.Node{Owner: a.ID().String(), Path: rel, IsDir: isDir}); err != nil &&
+			!errors.Is(err, layout.ErrNotFound) {
+			h.logf("copy overwrite: could not remove the staged bytes at %q: %v", rel, err)
+		}
+	}
+	h.trashSibling(ctx, a, parentID, name, reason)
+}
+
+// trashSibling trashes a node by name under a parent, logging rather than returning a failure.
+//
+// Used only on the cleanup paths of a failed overwrite, where the operation has already been
+// reported as failed and a second error would replace the cause with the cleanup's own.
+func (h *Handler) trashSibling(ctx context.Context, a authz.Actor, parentID [16]byte,
+	name, reason string) {
+
+	var victim store.Node
+	err := h.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		n, cerr := tx.ChildByName(ctx, parentID, name)
+		if cerr != nil {
+			return cerr
+		}
+		victim = n
+		if terr := tx.Trash(ctx, n.ID); terr != nil {
+			return terr
+		}
+		return tx.Audit(ctx, store.AuditEntry{
+			ActorKind: "system", ActorUserID: a.Ptr(), ActorEmail: a.Email(),
+			Action: "file.write", TargetKind: "node", TargetID: n.ID.String(),
+			Result: "denied",
+			Metadata: map[string]any{
+				"name": name, "rollback": reason,
+			},
+		})
+	})
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		h.logf("copy overwrite: could not trash the intermediate %q (%s): %v — remove it by hand",
+			name, reason, err)
+		return
+	}
+	if victim.ID != ([16]byte{}) {
+		h.logf("copy overwrite: trashed intermediate %q (node %s): %s", name, victim.ID, reason)
+	}
+}
+
+// stagedCopyName and backupCopyName produce the two reserved sibling names an overwrite uses.
+//
+// These must be legal node names, because the store validates every name with the same
+// layout.ValidateSegment rule a client's name gets — a control-character prefix (the obvious way to
+// make a name unclaimable) is rejected, and the whole copy would fail with "invalid name". They are
+// instead made unreservable by convention and by shape:
+//
+//   - the ".newcloud-" infix is a name this product reserves, documented as such;
+//   - the destination name is embedded so the intermediate is attributable in a log line and an
+//     audit row rather than being an anonymous hex string an operator cannot place;
+//   - the eight random bytes make a collision with a real source file effectively impossible AND
+//     make two concurrent overwrites of the same destination independent, which a deterministic
+//     suffix would not: they would both stage to the same name and one would fail with a conflict.
+func stagedCopyName(dstName string) string { return reservedName("staged", dstName) }
+func backupCopyName(dstName string) string { return reservedName("replaced", dstName) }
+
+// disableCopyOverwritePreserveForTest turns the NC-RR-005 staged swap off.
+//
+// It exists for one reason: to prove the guard is load-bearing. Running the same failed-overwrite
+// scenario with it set must reproduce the defect the review found (the destination's contents gone),
+// which is the only way to show the new path is what preserves them rather than the quota simply
+// having been generous. Package-internal state, so no deployment can reach it.
+var disableCopyOverwritePreserveForTest bool
+
+// reservedName builds "<rand>.newcloud-<kind>-<dst>".
+//
+// The destination name is truncated when it is long: a 255-byte legal name plus the prefix would
+// exceed the limit the validator enforces, so only the head is kept and the rest is dropped. The
+// random part stays, because it is what makes the name unique.
+//
+// The truncation walks back to a rune boundary. Slicing at a byte offset can split a multi-byte
+// UTF-8 character, and the result is not merely an ugly name: layout.ValidateSegment rejects
+// invalid UTF-8, so the NAME would fail validation and the whole overwrite would fail with
+// "invalid name" for a file whose only crime was having a long non-ASCII name.
+func reservedName(kind, dstName string) string {
+	var buf [8]byte
+	_, _ = rand.Read(buf[:])
+	marker := hex.EncodeToString(buf[:])
+
+	const maxDst = 160
+	if len(dstName) > maxDst {
+		dstName = dstName[:maxDst]
+		for len(dstName) > 0 && !utf8.ValidString(dstName) {
+			dstName = dstName[:len(dstName)-1]
+		}
+	}
+	return marker + ".newcloud-" + kind + "-" + dstName
 }
 
 // disableCopyRollbackForTest turns the WC-GAP-009 rollback off.

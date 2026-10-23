@@ -250,6 +250,21 @@ export const inlineURL = (path: string): string =>
 export const thumbnailURL = (path: string): string =>
   `/api/files/thumbnail?path=${encodeURIComponent(path)}`;
 
+// A share's download URL.
+//
+// It points at the share route, not at /api/files/download. The landing page is anonymous — it has
+// no session and, once the content origin is split out, no cookie either — so an authenticated API
+// route is the wrong address both for authorization and for origin: the bytes belong to the content
+// vhost (NC-RR-006), which is the one the share download route lives on.
+//
+// `name` selects a child of a shared directory; omitting it downloads the shared file itself.
+// Putting the path in `label` (the old behaviour) was wrong: label is a human-readable title the
+// owner typed, not a filesystem path.
+export const shareDownloadURL = (token: string, name?: string): string => {
+  const base = `/s/${encodeURIComponent(token)}/download`;
+  return name ? `${base}?name=${encodeURIComponent(name)}` : base;
+};
+
 // The public share landing speaks a different, unauthenticated protocol: no session, and the
 // same URL answers HTML to a navigation and JSON to a fetch. None of that belongs in the
 // generated client, which assumes a signed-in JSON API.

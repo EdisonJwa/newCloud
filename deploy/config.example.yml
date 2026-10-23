@@ -1,9 +1,23 @@
 server:
+  # The application listener. This origin holds session cookies.
+  addr: ":8080"
   # The authenticated application shell. This origin holds session cookies.
   public_url: "https://cloud.example.com"
   # User content lives on a different origin so a stored-XSS payload in an
   # uploaded file cannot reach the session cookie or the app's DOM.
   usercontent_url: "https://usercontent.example.com"
+  # The content listener (NC-RR-006). REQUIRED for a real origin boundary.
+  #
+  # With this set, the application listener does not register the content routes at
+  # all and /s/{token}/download and /s/{token}/thumbnail move here with /content/*.
+  # The reverse proxy must send only usercontent_url to this port (see Caddyfile)
+  # and must refuse content paths on the application vhost — both are configured in
+  # deploy/Caddyfile and both are needed.
+  #
+  # Leave it unset only for a single-origin deployment where a ticket-gated
+  # /content/* on the app listener is acceptable; startup then warns that the origin
+  # separation depends entirely on the proxy.
+  usercontent_addr: ":8081"
   # Peers allowed to set X-Forwarded-For (§9.4). Empty means no peer is trusted and
   # the header is ignored, which is correct unless a reverse proxy is in front.
   # List the proxy's address, not the clients': a client can send any header value.

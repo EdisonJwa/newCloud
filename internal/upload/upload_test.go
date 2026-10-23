@@ -117,12 +117,20 @@ func TestAppendRejectsWrongOffset(t *testing.T) {
 
 // TestFailedChunkDoesNotAdvanceOffset: a request that dies mid-chunk must leave the session
 // exactly where it was, or the next resume writes into a hole.
+//
+// The fixture was wrong until NC-RR-002, and the way it was wrong is worth recording: it declared
+// a total of 6, acknowledged 3, and then asked to append 4 bytes. 3+4 > 6, so the request was
+// rejected by the size check before the body was read — the test asserted the rejection of an
+// oversized range while its name and comment claimed to cover a mid-stream failure. It therefore
+// passed against an append path that corrupted the file on every genuine mid-stream error.
+//
+// The chunk now fits inside the declared total, so the copy actually runs and fails part-way.
 func TestFailedChunkDoesNotAdvanceOffset(t *testing.T) {
 	m := newManager(t)
 	owner := uuid.New()
 	ctx := context.Background()
 
-	s, err := m.Create(owner, "", "f.bin", 6)
+	s, err := m.Create(owner, "", "f.bin", 8)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,21 +138,25 @@ func TestFailedChunkDoesNotAdvanceOffset(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// A reader that fails after two of the four promised bytes.
+	// A reader that fails after two of the four promised bytes. 3+4 = 7 <= 8, so this reaches the
+	// write path; the failure is a mid-stream one, which is the case under test.
 	r := io.MultiReader(strings.NewReader("de"), &failingReader{})
 	if _, err := m.Append(ctx, owner, s.ID, 3, r, 4); err == nil {
 		t.Fatal("a failing reader must fail the append")
 	}
 
-	if _, err := m.Append(ctx, owner, s.ID, 3, strings.NewReader("def"), 3); err != nil {
+	if _, err := m.Append(ctx, owner, s.ID, 3, strings.NewReader("defgh"), 5); err != nil {
 		t.Fatalf("resume after a failed chunk: %v", err)
 	}
 	f, _, err := m.Finish(owner, s.ID)
 	if err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
-	if got := readStaged(t, f); got != "abcdef" {
-		t.Fatalf("content = %q, want abcdef", got)
+	// The bytes matter, not just the offset: the old version of this test would have passed with
+	// a zero-filled hole here, because it only ever looked at the offset.
+	if got := readStaged(t, f); got != "abcdefgh" {
+		t.Fatalf("content = %q, want abcdefgh. A hole means the retried chunk was written past "+
+			"the rolled-back end.", got)
 	}
 }
 
