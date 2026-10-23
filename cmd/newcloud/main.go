@@ -924,9 +924,19 @@ func (a *resolverAdapter) Children(ctx context.Context, owner, dir string, limit
 func migrate() error {
 	log := newLogger()
 
-	cfg, err := config.Load(configPath())
+	cfgPath := configPath()
+	cfg, err := config.Load(cfgPath)
 	if err != nil {
-		return err
+		// migrate needs DATABASE_URL, not the full serving configuration. Minimal
+		// deployments and CI have no /etc/newcloud/config.yml, and refusing to run
+		// there would make the documented `DATABASE_URL=... newcloud migrate`
+		// command unusable. An explicitly named config that is missing is still an
+		// error; only the default path falls back to defaults.
+		if os.Getenv("NEWCLOUD_CONFIG") != "" || !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		log.Warn("config file not found; using defaults for migrate", "path", cfgPath)
+		cfg = config.Default()
 	}
 
 	dsn := os.Getenv("DATABASE_URL")
