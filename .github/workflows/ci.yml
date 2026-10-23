@@ -54,14 +54,20 @@ jobs:
       - name: S3-compatible server for the object-store tests
         # moto rather than MinIO: no registry pull to depend on, and these tests need S3
         # semantics, not MinIO's implementation of them.
+        #
+        # A venv keeps moto's dependencies away from the runner's distro packages: the
+        # system pyOpenSSL is old enough that current cryptography removed GEN_EMAIL, and
+        # boto3 then fails to import before the server ever starts.
         run: |
-          python -m pip install --quiet "moto[server]"
-          moto_server -p 19000 &
+          python -m venv "$RUNNER_TEMP/moto"
+          "$RUNNER_TEMP/moto/bin/python" -m pip install --quiet --upgrade pip
+          "$RUNNER_TEMP/moto/bin/python" -m pip install --quiet "moto[server]"
+          "$RUNNER_TEMP/moto/bin/moto_server" -p 19000 &
           for _ in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:19000/ >/dev/null 2>&1; then break; fi
             sleep 1
           done
-          python - <<'PY'
+          "$RUNNER_TEMP/moto/bin/python" - <<'PY'
           import boto3
           s3 = boto3.client(
               "s3", endpoint_url="http://127.0.0.1:19000", region_name="us-east-1",
@@ -143,7 +149,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.26"
+          go-version: "1.26.10"
       - name: govulncheck
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest
@@ -171,7 +177,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.26"
+          go-version: "1.26.10"
       - name: apply migrations through the binary
         env:
           DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/newcloud?sslmode=disable
