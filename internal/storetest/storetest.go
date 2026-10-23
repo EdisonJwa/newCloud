@@ -443,6 +443,15 @@ func Run(t *testing.T, factory Factory, opts Options) {
 		r := rootOf(t, s, owner)
 		const n = 8
 
+		// Create the blob rows before opening the transactions. The PostgreSQL hook
+		// writes through the pool, so calling it inside a transaction acquires a
+		// second connection while the first is still held; eight concurrent writers
+		// then deadlock against the default pool size.
+		blobs := make([]uuid.UUID, n)
+		for i := range blobs {
+			blobs[i] = newBlobHook(t)
+		}
+
 		var wg sync.WaitGroup
 		errs := make([]error, n)
 		start := make(chan struct{})
@@ -454,7 +463,7 @@ func Run(t *testing.T, factory Factory, opts Options) {
 				errs[i] = s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
 					_, err := tx.CreateFile(ctx, store.NewFile{
 						OwnerID: owner, ParentID: r.ID, Name: "same.txt",
-						Size: 1, BlobID: newBlobHook(t),
+						Size: 1, BlobID: blobs[i],
 					})
 					return err
 				})
@@ -2141,13 +2150,18 @@ func Run(t *testing.T, factory Factory, opts Options) {
 			}
 			a := addUser(t, s, "active-one")
 
-			_ = s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
-				got, _ := tx.ListUsers(ctx, "", 100)
+			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				got, gerr := tx.ListUsers(ctx, "", 100)
 				all = got
 				pend, perr := tx.ListUsers(ctx, store.StatusPending, 100)
 				pending = pend
+				if gerr != nil {
+					return gerr
+				}
 				return perr
-			})
+			}); err != nil {
+				t.Fatal(err)
+			}
 
 			if len(all) < 2 {
 				t.Fatalf("want at least the two accounts we made, got %d", len(all))
