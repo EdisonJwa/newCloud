@@ -3,19 +3,28 @@
 	# otherwise a stored-XSS payload in an uploaded file can read the session
 	# cookie and drive the authenticated UI.
 	#
-	# NC-RR-006: the boundary is enforced in THREE places, and all three are needed.
+	# Where the boundary is enforced, and what each layer is responsible for:
 	#
-	#   1. This proxy: the application vhost refuses every content-delivery path
-	#      outright, and the content vhost refuses everything that is not one.
-	#   2. The application listener (:8080): with server.usercontent_addr set it does
-	#      not register the content routes at all; with it unset they are gated by a
-	#      ticket, which is the documented smaller-deployment mode.
-	#   3. The content listener (:8081): it registers exactly three routes and answers
-	#      404 to everything else, whatever Host header it is given.
+	#   1. This proxy. The application vhost refuses /content/* outright so a
+	#      cross-origin content URL aimed at the wrong hostname dies before it
+	#      reaches the application, and the attempt shows up in the proxy log. The
+	#      content vhost proxies ONLY the content listener.
 	#
-	# Only (1) was present before, and it was inactive because both vhosts proxied to
-	# the same port while usercontent_addr was unset. The hostname validation that did
-	# exist never established "user bytes are served only on the content host".
+	#   2. The application listener (:8080). It refuses /content/* and answers the
+	#      two share content routes with a redirect to the content origin carrying a
+	#      short-lived capability. It does NOT serve share bytes itself, because the
+	#      landing page's gate is the only place the password/recipient cookies are
+	#      available — the content hostname never receives them.
+	#
+	#   3. The content listener (:8081). Three routes, 404 to everything else
+	#      whatever Host header it is given.
+	#
+	# What none of this does: authenticated API routes (/api/files/download,
+	# /api/files/version, /api/files/thumbnail, /api/shared/{id}/content) and WebDAV
+	# still serve a signed-in user their own bytes on the application origin. That is
+	# deliberate and documented in docs/guides/limitations.md; moving them would hand
+	# the content origin session authentication, which is the isolation the split
+	# exists to provide.
 	#
 	# Prerequisites in config.yml:
 	#
@@ -39,39 +48,22 @@
 			-Server
 		}
 
-		# Refuse user-content paths on the application origin.
+		# Refuse /content/* on the application origin.
 		#
-		# The server refuses these itself, so this looks redundant — it is not. It
-		# stops the request before it reaches the application at all, which means:
-		#   - a future route accidentally registered on the app origin is unreachable;
-		#   - the application's own 404 does not have to be the only thing standing
-		#     between the app's cookie jar and a user's file;
-		#   - the refusal is visible in the proxy log, which is what tells an operator
-		#     that something is generating cross-origin content URLs.
-		#
-		# /s/{token}/download and /s/{token}/thumbnail are included because they are
-		# content routes too. Leaving them out was the original gap: the share landing
-		# page stays on this origin (it holds the password cookie) but its BYTES do
-		# not, and the route inventory has to reflect both facts.
-		# Refuse ONLY /content/* on the application origin.
-		#
-		# The server refuses it too, so this looks redundant — it is not. It stops the request
-		# before it reaches the application at all, and it makes a cross-origin content URL being
-		# generated against the app hostname visible in the proxy log.
-		#
-		# /s/{token}/download and /s/{token}/thumbnail are deliberately NOT refused here. Those two
-		# paths must be handled by the application origin, because that origin is the only one that
-		# holds the password/recipient gate cookies. It answers them with a redirect to the content
-		# origin carrying a short-lived capability bound to that share and file (PRG-002). Blocking
-		# them at the proxy is what made every gated share undownloadable: the browser stayed on
-		# cloud.example.com, got a 404, and the visitor had no way to reach the bytes.
+		# /s/{token}/download and /s/{token}/thumbnail are deliberately NOT refused here.
+		# They must reach the application, which runs the share's gate against its own
+		# host-only cookies and then redirects to the content origin with a capability.
+		# Blocking them at the proxy is what made every password-protected and
+		# recipient-verified share undownloadable: the browser stayed on this hostname,
+		# got a 404, and the visitor had no way to reach the bytes (PRG-002).
 		@content path /content/*
 		handle @content {
 			respond "Not Found" 404
 		}
-		# Both branches are `handle` blocks so they are mutually exclusive. A bare
-		# `reverse_proxy` next to a `handle` would be ordered by directive priority and could
-		# run for the refused path too, which would defeat the refusal.
+
+		# Both branches are `handle` blocks so they stay mutually exclusive. A bare
+		# `reverse_proxy` beside a `handle` is ordered by directive priority and can run
+		# for the refused path too, which would defeat the refusal.
 		handle {
 			reverse_proxy web:8080
 		}
@@ -92,25 +84,22 @@
 			-Server
 		}
 
-		# This vhost proxies ONLY the content listener. Pointing it at web:8080 would
-		# work only while the application happened to refuse those same paths, and
-		# the point of the split is to not depend on that.
+		# This vhost proxies ONLY the content listener. Pointing it at web:8080 would work
+		# only while the application happened to refuse the same paths, and the point of
+		# the split is not to depend on that.
 		reverse_proxy web:8081 {
 			# Strip the incoming Cookie header on the way UPSTREAM (PRG-004).
 			#
-			# `header { -Cookie }` in a Caddyfile manipulates RESPONSE headers; it does not
-			# touch the request the backend receives. The previous version used that and its
-			# comment claimed it stopped the content origin from ever seeing a session cookie,
-			# which was simply false. `header_up` is the request direction.
+			# `header { -Cookie }` manipulates RESPONSE headers in Caddy; it does not touch
+			# the request the backend receives. The earlier version of this file used that
+			# and its comment claimed the content origin never sees a session cookie, which
+			# was false. `header_up` is the request direction.
 			#
-			# This is defence in depth, not the boundary: the browser does not send the app's
-			# host-only cookies to this hostname in the first place, and the content listener
-			# reads no session cookie. It exists so that a proxy misconfiguration, a rewritten
-			# Host, or a future non-host-only cookie cannot silently reintroduce the exposure.
+			# Defence in depth rather than the boundary: the browser does not send the app's
+			# host-only cookies to this hostname, and the content listener reads no session
+			# cookie. It exists so that a proxy misconfiguration, a rewritten Host, or a
+			# future non-host-only cookie cannot silently reintroduce the exposure.
 			header_up -Cookie
-			# The ticket travels in the query string and must not be echoed back in a redirect
-			# or a log the client can read.
-			header_up -X-Forwarded-Cookie
 		}
 	}
 }

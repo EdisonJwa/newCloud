@@ -109,7 +109,12 @@ func (a *resolverAdapter) Children(ctx context.Context, owner, dir string, limit
 }
 
 // authzAccessor adapts the metadata store to authz.Accessor.
-type authzAccessor struct{ m *store.Memory }
+// authzAccessor adapts the metadata store to authz.Accessor.
+//
+// The field is the interface rather than *store.Memory so the same adapter serves the memory
+// harness and the PostgreSQL one: a test that exercises the overwrite on real PostgreSQL must not
+// have to reimplement the authorization wiring, because the wiring is part of what is under test.
+type authzAccessor struct{ m store.Store }
 
 func (a *authzAccessor) LoadNode(id uuid.UUID) (authz.Node, error) {
 	var n store.Node

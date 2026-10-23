@@ -195,6 +195,32 @@ being produced.
 - [ ] Retention values are chosen; `0` is understood as "keep forever".
 - [ ] The host firewall exposes only 80/443 and the administrative network.
 
+## 8.1 Running the PostgreSQL test suite (release evidence)
+
+Most of the store, audit and DAV-over-PostgreSQL tests are **skipped** unless `TEST_DATABASE_URL`
+is set, so a plain `go test ./...` on a workstation proves nothing about the backend production
+uses. To produce actual evidence:
+
+```powershell
+# A disposable cluster. Never point this at a database whose contents matter:
+# the schema is applied idempotently, but several audit tests DROP and recreate it.
+initdb -D $env:TEMP\nc-pg -U newcloud --pwfile=pw.txt -A scram-sha-256 --no-locale
+pg_ctl -D $env:TEMP\nc-pg -o "-p 55432" -l pg.log start
+createdb -h 127.0.0.1 -p 55432 -U newcloud newcloud_test
+
+$env:TEST_DATABASE_URL = "postgres://newcloud:...@127.0.0.1:55432/newcloud_test?sslmode=disable"
+go test -p 1 ./... -count=1
+```
+
+**`-p 1` is required, not cosmetic.** Several audit tests reset the schema with
+`DROP SCHEMA ... CASCADE`. `go test ./...` runs one process per package in parallel, so the store
+package and the audit package will drop the schema under each other and both fail with errors that
+look like product bugs. Run the PG suite serialized, or give each package its own database.
+
+The DAV overwrite path is covered on real PostgreSQL by `TestCopyOverwriteOnPostgreSQL` (both
+layouts) and `TestTheOverwriteIsAuditedOnPostgreSQL`, which assert the live bytes, the trash entry
+and both audit rows in one committed transaction.
+
 ## 9. S3 instead of local content storage
 
 S3 removes the content volume, not the staging volume. Resumable uploads are staged on local disk
