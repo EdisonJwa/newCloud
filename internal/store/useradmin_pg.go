@@ -48,7 +48,7 @@ func (t *pgTx) ListUsers(ctx context.Context, status string, limit int) ([]User,
 		var u User
 		if serr := rows.Scan(&u.ID, &u.Username, &u.Email, &u.DisplayName, &u.Role, &u.Status,
 			&u.QuotaBytes, &u.UsedBytes, &u.IdPIssuer, &u.IdPSubject,
-			&u.IsBreakglass, &u.CreatedAt, &u.UpdatedAt); serr != nil {
+			&u.IsBreakglass, &u.IdPConfirmedAt, &u.CreatedAt, &u.UpdatedAt); serr != nil {
 			return nil, translate(serr)
 		}
 		out = append(out, u)
