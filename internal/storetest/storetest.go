@@ -4639,6 +4639,68 @@ func lockSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.UUID)
 			t.Fatalf("a new lock must not be blocked by an expired one: %v", err)
 		}
 	})
+
+	// LocksInSubtree is what makes DELETE and MOVE of a collection honour a lock on a child
+	// (2026-10-24 review, H2). A per-node check would be one query per descendant, so the
+	// subtree query has to be right about the boundary: everything under the root, the root
+	// itself, nothing beside it, and nothing expired.
+	t.Run("LocksInSubtreeCoversTheSubtreeAndNothingElse", func(t *testing.T) {
+		s, owner := factory(t)
+		holder := otherUser(t, s, "lock-holder8")
+		r := rootOf(t, s, owner)
+
+		dir := mkdir(t, s, owner, r.ID, "fenced")
+		inner := mkdir(t, s, owner, dir.ID, "inner")
+		deep := mkfile(t, s, owner, inner.ID, "deep.txt", 4)
+		outer := mkfile(t, s, owner, r.ID, "beside.txt", 4)
+
+		lockOn := func(t *testing.T, nodeID uuid.UUID, token string, expires time.Time) {
+			t.Helper()
+			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				return tx.CreateLock(ctx, store.Lock{
+					Token: token, NodeID: nodeID, UserID: &holder,
+					Depth: "0", TimeoutSec: 3600, CreatedAt: time.Now(), ExpiresAt: expires,
+				})
+			}); err != nil {
+				t.Fatalf("lock %s: %v", token, err)
+			}
+		}
+		lockOn(t, dir.ID, "tok-dir", future(time.Hour))
+		lockOn(t, deep.ID, "tok-deep", future(time.Hour))
+		lockOn(t, outer.ID, "tok-outer", future(time.Hour))
+		// An expired lock below the root must not be reported: it does not block anything.
+		lockOn(t, inner.ID, "tok-stale", future(-time.Minute))
+		drainExpired(t, s)
+
+		var locks []store.Lock
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			l, err := tx.LocksInSubtree(ctx, dir.ID)
+			locks = l
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		seen := map[string]bool{}
+		for _, l := range locks {
+			seen[l.Token] = true
+		}
+		if !seen["tok-dir"] {
+			t.Error("the root's own lock is missing; a MOVE of the collection affects it")
+		}
+		if !seen["tok-deep"] {
+			t.Error("a lock two levels down is missing; DELETE would destroy it silently")
+		}
+		if seen["tok-outer"] {
+			t.Error("a lock OUTSIDE the subtree was reported; the fence would over-block a sibling")
+		}
+		if seen["tok-stale"] {
+			t.Error("an expired lock was reported; it does not block anything")
+		}
+		if len(locks) != 2 {
+			t.Fatalf("got %d locks, want 2 (the root and one descendant)", len(locks))
+		}
+	})
 }
 
 // groupSuite covers group identity and membership on both backends.

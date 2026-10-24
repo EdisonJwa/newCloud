@@ -84,6 +84,49 @@ func (t *memTx) LocksForUser(ctx context.Context, userID uuid.UUID) ([]Lock, err
 	return out, nil
 }
 
+// LocksInSubtree lists every live lock on the node or below it.
+//
+// The memory backend walks the node map instead of the lock map: locks are few and nodes
+// are many, but the subtree is what bounds the answer, and iterating nodes here keeps the
+// same meaning as the PostgreSQL recursive query without a second index to maintain.
+func (t *memTx) LocksInSubtree(ctx context.Context, rootID uuid.UUID) ([]Lock, error) {
+	now := t.m.now()
+	var out []Lock
+	for id, rec := range t.m.nodes {
+		if rec.node.TrashedAt != nil {
+			continue
+		}
+		if !t.isDescendantOrSelf(rootID, id) {
+			continue
+		}
+		if l, ok := t.m.locks[id]; ok && l.ExpiresAt.After(now) {
+			out = append(out, *l)
+		}
+	}
+	return out, nil
+}
+
+// isDescendantOrSelf reports whether id is rootID or has it as an ancestor.
+//
+// The depth bound is a safety valve, not a product limit: a cycle in the node map would
+// otherwise hang the request that is trying to delete it.
+func (t *memTx) isDescendantOrSelf(rootID, id uuid.UUID) bool {
+	if id == rootID {
+		return true
+	}
+	cur, ok := t.m.nodes[id]
+	for depth := 0; ok && depth < 256; depth++ {
+		if cur.node.ParentID == nil {
+			return false
+		}
+		if *cur.node.ParentID == rootID {
+			return true
+		}
+		cur, ok = t.m.nodes[*cur.node.ParentID]
+	}
+	return false
+}
+
 // ActiveLocks returns every live lock, for the cleanup worker in tests.
 func (m *Memory) ActiveLocks() []Lock {
 	m.mu.RLock()

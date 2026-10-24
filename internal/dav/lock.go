@@ -317,17 +317,7 @@ func (h *Handler) lockBlocksAtDepth(ctx context.Context, a authz.Actor, nodeID [
 	if !anyDepth && lock.Depth != "infinity" {
 		return false
 	}
-	// The holder may write through its own lock, and only by submitting the
-	// token. Accepting the write without the token would make the lock advisory,
-	// which is worse than no lock: the client believes it is protected.
-	if lock.UserID != nil && *lock.UserID == a.ID() {
-		for _, tok := range submittedTokens(ifHeader) {
-			if tok == lock.Token {
-				return false
-			}
-		}
-	}
-	return true
+	return lockBlocksFor(lock, a, ifHeader)
 }
 
 // requireUnlocked writes the 423 response when a lock blocks the write.
@@ -402,6 +392,27 @@ func (h *Handler) lockAncestorsDepth(ctx context.Context, a authz.Actor, parentI
 		parentID = *parent
 	}
 	return false
+}
+
+// lockBlocksFor reports whether a specific lock blocks this actor's write.
+//
+// It is the decision lockBlocksAtDepth makes after fetching one lock, factored out so the
+// same rule can be applied to a LIST of locks found in a subtree without asking the store
+// once per node. Two callers need it: the per-node check every write makes, and DELETE/MOVE
+// of a collection, which must honour a lock on any descendant.
+//
+// The holder may write through its own lock, and only by submitting the token. Accepting the
+// write without the token would make the lock advisory, which is worse than no lock: the
+// client believes it is protected.
+func lockBlocksFor(lock store.Lock, a authz.Actor, ifHeader string) bool {
+	if lock.UserID != nil && *lock.UserID == a.ID() {
+		for _, tok := range submittedTokens(ifHeader) {
+			if tok == lock.Token {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // newLockToken mints an opaquelocktoken as required by RFC 4918.

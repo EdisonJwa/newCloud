@@ -255,6 +255,58 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request, a authz
 		return nil
 	})
 
+	// Locks on the collections a COPY or MOVE changes.
+	//
+	// Both requests add a member to the destination's collection, and MOVE removes one from
+	// the source's. A Depth: 0 lock protects exactly that membership, so the handler has to
+	// consult it — before this, a client could lock a folder and another client could still
+	// COPY a file into it or MOVE one out with 201/204 (2026-10-24 review, H2).
+	//
+	// The depth split is the same one PUT makes: when the destination already exists the
+	// request changes that member's CONTENT, so only a Depth: infinity ancestor reaches it;
+	// when it does not exist the request changes the parent's membership, which a Depth: 0
+	// lock covers.
+	if existing != nil {
+		if h.lockAncestorsInfinityOnly(ctx, a, dstParent.ID, r.Header.Get("If")) {
+			writeXMLError(w, http.StatusLocked, "lock-token-submitted")
+			return
+		}
+	} else if h.lockAncestors(ctx, a, dstParent.ID, r.Header.Get("If")) {
+		writeXMLError(w, http.StatusLocked, "lock-token-submitted")
+		return
+	}
+	if move && src.ParentID != nil {
+		if h.lockAncestors(ctx, a, *src.ParentID, r.Header.Get("If")) {
+			writeXMLError(w, http.StatusLocked, "lock-token-submitted")
+			return
+		}
+	}
+
+	// A MOVE of a collection relocates every descendant, and a COPY of one reads every
+	// descendant's bytes. A lock on a child is therefore at stake in both, and the holder
+	// may only proceed by submitting its token.
+	if src.IsDir() {
+		var held []store.Lock
+		if lerr := h.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+			l, err := tx.LocksInSubtree(ctx, src.ID)
+			held = l
+			return err
+		}); lerr != nil {
+			writeXMLError(w, statusForError(lerr), "")
+			return
+		}
+		for _, l := range held {
+			// The source node's own lock was already checked above; this covers children.
+			if l.NodeID == src.ID {
+				continue
+			}
+			if lockBlocksFor(l, a, r.Header.Get("If")) {
+				writeXMLError(w, http.StatusLocked, "lock-token-submitted")
+				return
+			}
+		}
+	}
+
 	// A destination that IS the source is not an overwrite, and obeying the request as one destroys
 	// the very resource it names. The fourth review (2026-10-23) reproduced it: MOVE onto its own URI
 	// found "the destination exists", trashed it — the source node — then performed a move that was a
@@ -1024,6 +1076,16 @@ func (h *Handler) rollbackCopy(ctx context.Context, a authz.Actor, created []cre
 				return derr
 			} else if len(props) > 0 {
 				continue
+			}
+			// A successful LOCK changes no node field the snapshot compares, so it is invisible
+			// to every check above — and the rollback would trash a file whose lock the client
+			// was told had succeeded, then revoke the lock with it (R11). A lock is a success
+			// the same way a PROPPATCH is, so it gets the same treatment: leave the node alone
+			// and let the operator find it.
+			if _, lerr := tx.ActiveLock(ctx, exp.ID); lerr == nil {
+				continue
+			} else if !errors.Is(lerr, store.ErrNotFound) {
+				return lerr
 			}
 			if exp.IsDir {
 				kids, kerr := tx.Children(ctx, exp.ID, 1)

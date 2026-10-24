@@ -571,6 +571,30 @@ func (h *Handler) handleDelete(w http.ResponseWriter, r *http.Request, a authz.A
 		return
 	}
 
+	// A lock anywhere in the subtree blocks the delete.
+	//
+	// DELETE removes every descendant, so a lock on a child is a lock on something this
+	// request is about to destroy. The node's own lock and its ancestors were checked above;
+	// the children were not, and a client that locked a file could watch a DELETE of its
+	// parent collection return 204 (2026-10-24 review, H2).
+	if node.IsDir() {
+		var held []store.Lock
+		if lerr := h.meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
+			l, err := tx.LocksInSubtree(ctx, node.ID)
+			held = l
+			return err
+		}); lerr != nil {
+			writeXMLError(w, statusForError(lerr), "")
+			return
+		}
+		for _, l := range held {
+			if lockBlocksFor(l, a, r.Header.Get("If")) {
+				writeXMLError(w, http.StatusLocked, "lock-token-submitted")
+				return
+			}
+		}
+	}
+
 	err = h.meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
 		if terr := tx.TrashCapped(ctx, node.ID, h.trashCap(ctx)); terr != nil {
 			return terr

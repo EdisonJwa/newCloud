@@ -97,6 +97,45 @@ func (t *pgTx) LocksForUser(ctx context.Context, userID uuid.UUID) ([]Lock, erro
 	return out, translate(rows.Err())
 }
 
+func (t *pgTx) scanLockRows(ctx context.Context, q string, args ...any) ([]Lock, error) {
+	rows, err := t.tx.Query(ctx, q, args...)
+	if err != nil {
+		return nil, translate(err)
+	}
+	defer rows.Close()
+
+	var out []Lock
+	for rows.Next() {
+		l, serr := scanLock(rows)
+		if serr != nil {
+			return nil, serr
+		}
+		out = append(out, l)
+	}
+	return out, translate(rows.Err())
+}
+
+// LocksInSubtree lists every live lock on the node or below it.
+//
+// One recursive query rather than one per descendant: DELETE of a collection with a
+// thousand files must not become a thousand round trips, and the answer is needed before
+// anything is destroyed, so the cost lands on the refusal path rather than the happy one.
+func (t *pgTx) LocksInSubtree(ctx context.Context, rootID uuid.UUID) ([]Lock, error) {
+	const q = `
+		WITH RECURSIVE subtree AS (
+		    SELECT id FROM nodes WHERE id = $1
+		    UNION ALL
+		    SELECT n.id FROM nodes n JOIN subtree s ON n.parent_id = s.id
+		)
+		SELECT l.token, l.node_id, l.user_id, l.owner_xml, l.depth, l.timeout_sec,
+		       l.created_at, l.expires_at
+		FROM lock_tokens l
+		JOIN subtree s ON s.id = l.node_id
+		WHERE l.expires_at > now()
+		ORDER BY l.created_at`
+	return t.scanLockRows(ctx, q, rootID)
+}
+
 func scanLock(row pgx.Row) (Lock, error) {
 	var l Lock
 	err := row.Scan(&l.Token, &l.NodeID, &l.UserID, &l.OwnerXML, &l.Depth,

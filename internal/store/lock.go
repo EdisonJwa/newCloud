@@ -40,4 +40,10 @@ type LockTx interface {
 	ExpireLocks(ctx context.Context) (int, error)
 	// LocksForUser lists a user's live locks, for the cleanup worker and the UI.
 	LocksForUser(ctx context.Context, userID uuid.UUID) ([]Lock, error)
+	// LocksInSubtree lists every live lock on the node and its descendants.
+	//
+	// DELETE and MOVE of a collection destroy or relocate the whole subtree, so a lock
+	// anywhere inside it is a lock on something the request is about to affect. Asking per
+	// node would be one query per descendant; this is one query per request.
+	LocksInSubtree(ctx context.Context, rootID uuid.UUID) ([]Lock, error)
 }

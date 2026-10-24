@@ -269,6 +269,10 @@ type Tx interface {
 	DeleteLock(ctx context.Context, nodeID uuid.UUID, token string, userID uuid.UUID) (bool, error)
 	ExpireLocks(ctx context.Context) (int, error)
 	LocksForUser(ctx context.Context, userID uuid.UUID) ([]Lock, error)
+	// LocksInSubtree lists every live lock on the node and its descendants, which is
+	// what DELETE and MOVE of a collection must consult before destroying or moving
+	// content somebody else holds a lock on.
+	LocksInSubtree(ctx context.Context, rootID uuid.UUID) ([]Lock, error)
 
 	// WebDAV dead properties. Windows Explorer and macOS Finder store per-file
 	// metadata here and misbehave when it does not survive a reconnect.
