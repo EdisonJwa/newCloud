@@ -114,6 +114,11 @@ A normal user's export covers that user's own actions plus anonymized events abo
 make release VERSION=v1.2.3
 ```
 
+The pipeline is `tools/release`, a Go program rather than the shell script it used to be, so it runs
+wherever the toolchain does — including Windows, where the old target failed on `rm -rf` and
+`sha256sum`. It clears `dist/` first, because a leftover binary would otherwise ship under the new
+version number with a checksum file attesting to it.
+
 Produces, in `dist/`:
 
 - one binary per platform (`linux`, `darwin`, `windows` × `amd64`, `arm64`), cross-compiled with

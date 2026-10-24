@@ -106,16 +106,6 @@ sbom:
 # toolchain. -trimpath keeps the build path out of the binary, which is both a reproducibility and a
 # disclosure question.
 release:
-	@rm -rf $(DIST)
-	@mkdir -p $(DIST)
-	@set -e; for p in $(PLATFORMS); do \
-		os=$${p%/*}; arch=$${p#*/}; \
-		out="$(DIST)/newcloud-$(VERSION)-$$os-$$arch"; \
-		if [ "$$os" = "windows" ]; then out="$$out.exe"; fi; \
-		echo "  $$os/$$arch"; \
-		CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch $(GO) build -trimpath \
-			-ldflags '$(LDFLAGS)' -o "$$out" ./cmd/newcloud; \
-	done
-	@$(MAKE) --no-print-directory sbom
-	@cd $(DIST) && sha256sum * > SHA256SUMS
+	$(GO) run ./tools/release -dist "$(DIST)" -version "$(VERSION)" \
+		-platforms "$(PLATFORMS)" -ldflags '$(LDFLAGS)'
 	@echo "release artifacts in $(DIST)/ for $(VERSION)"
