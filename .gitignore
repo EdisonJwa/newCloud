@@ -47,3 +47,6 @@ config.yml
 
 # Standalone UI-kit checkout destined for its own repository, not this one.
 /cirrus-ui/
+
+# Review-session scratch: subsystem notes, screenshots and a HEAD snapshot copy.
+/.review-notes/
