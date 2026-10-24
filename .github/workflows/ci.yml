@@ -109,6 +109,37 @@ jobs:
         # it verbatim and hit a startup error with no obvious cause.
         run: go test ./internal/config/ -run TestExampleConfig -count=1 -v
 
+  windows:
+    # The same build and CLI, on the platform users and developers actually build from.
+    #
+    # This job exists because of a specific failure: `make release` was a POSIX shell script inside
+    # the Makefile, and on Windows make invoked `rm -rf` directly, so the release path failed before
+    # building anything — while CI stayed green, because every other job runs on Linux. A
+    # single-platform matrix cannot see a platform-specific build path, and this project ships a
+    # Windows binary.
+    #
+    # No service container here: the PostgreSQL suites skip when TEST_DATABASE_URL is unset, and what
+    # remains still covers compilation, the in-memory backend, the CLI and the release tool. That is
+    # the right scope — the point is the platform, not a second copy of the conformance run.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.10"
+      - name: build
+        run: go build ./...
+      - name: test
+        run: go test -count=1 ./...
+      - name: release pipeline
+        # The regression this job is named for. Two platforms keep it quick; the shape is what is
+        # under test, and an empty artefact directory fails here rather than at a tag.
+        run: |
+          go run ./tools/release -dist dist-ci -version v0.0.0-ci -platforms "windows/amd64 linux/amd64"
+          if (-not (Test-Path dist-ci/SHA256SUMS)) { throw "the release produced no SHA256SUMS" }
+          if (-not (Test-Path dist-ci/newcloud-v0.0.0-ci-windows-amd64.exe)) { throw "the release produced no windows binary" }
+          Get-ChildItem dist-ci
+
   web:
     # The browser client is TypeScript that ships as bytes inside the Go binary, so it is
     # checked like any other build artifact: it must typecheck, it must build, and the
