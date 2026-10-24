@@ -1085,9 +1085,15 @@ func (s *Server) handleVersions(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"path":     path.Join("/", rel),
 		"versions": out,
-		// The layout decides how much history is affordable: tree stores a full
-		// copy per version, blob stores only the differences.
+		// The layout decides how much history is affordable: the tree layout stores no per-version
+		// content at all, while the blob layout keeps only the differences.
 		"cheap_versions": s.deps.Content.Capabilities().CheapVersions,
+		// A client has to know whether the history it is looking at can be RESTORED before offering
+		// the action. On the tree layout the rows are a record of changes and the superseded bytes are
+		// gone, so a Restore button there is a promise the deployment cannot keep — it would answer
+		// 409 every time. This is a capability, not a hint: the UI disables the action on it, and the
+		// handler refuses for the same reason.
+		"version_content_available": s.deps.Blobs != nil,
 	})
 }
 
@@ -1120,6 +1126,18 @@ func (s *Server) handleRestoreVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A version can only be restored where its BYTES can be restored. The version's content lives at
+	// a content address, which the tree layout does not keep: its bytes are at the path, and the
+	// overwrite that created the version replaced them there. Restoring would flip the node's ETag
+	// and size to the old version while the path still serves the current bytes — a success that did
+	// not happen, which is the shape of failure this project keeps removing. handleVersionContent
+	// refuses for the same reason; this is the write half of that refusal.
+	if s.deps.Blobs == nil {
+		writeError(w, http.StatusConflict, "no_version_content",
+			"this storage layout does not keep addressable version history, so a version cannot be restored")
+		return
+	}
+
 	var restored store.Node
 	err = s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
 		n, rerr := tx.RestoreVersion(ctx, node.ID, body.Version, actor.Ptr())
@@ -1138,7 +1156,7 @@ func (s *Server) handleRestoreVersion(w http.ResponseWriter, r *http.Request) {
 		s.writeStoreError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, toFileJSON(restored, body.Path))
+	writeJSON(w, http.StatusOK, toFileJSON(restored, relOfChain(nodes)))
 }
 
 // maxVersions adapts retention to the layout: the tree layout pays for a full
@@ -1342,8 +1360,10 @@ func (s *Server) handleVersionContent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if s.deps.Blobs == nil {
-		// The tree layout stores one copy per version at a path, not an address, so there is
-		// nothing to open here. Saying so is better than streaming the current bytes.
+		// The tree layout keeps its bytes at the path, and an overwrite replaces them there: the
+		// superseded version's content is not retained anywhere, so there is nothing to open. (The
+		// version ROW exists, because the metadata layer records the change.) Saying so is better than
+		// streaming the current bytes under the label of an older version.
 		writeError(w, http.StatusConflict, "no_version_content",
 			"this storage layout does not keep addressable version history")
 		return
@@ -1416,5 +1436,7 @@ func (s *Server) nodeForVersionContent(r *http.Request, actor authz.Actor,
 	if err != nil {
 		return store.Node{}, "", err
 	}
-	return nodes[len(nodes)-1], rel, nil
+	// The returned path is the OWNER's content path, from the resolved chain: the caller passed the
+	// listing's "/docs/a.txt" and a path-backed store will not accept that spelling.
+	return nodes[len(nodes)-1], relOfChain(nodes), nil
 }

@@ -68,6 +68,10 @@ type harness struct {
 	// blobRoot is the local content-addressed root, read by tests that reason about what a backup
 	// copy of the blob tree would contain.
 	blobRoot string
+	// treeRoot is the path-backed content store's directory, empty unless the harness was built on
+	// the tree layout. Tests read it to assert on the BYTES: a leftover after a failed operation can
+	// hold quota while no listing names it.
+	treeRoot string
 }
 
 // rootNode returns the harness account's root directory.

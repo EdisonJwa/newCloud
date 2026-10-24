@@ -159,4 +159,75 @@ func TestSharedFileVersionsNeedTheVersionRight(t *testing.T) {
 	if !strings.Contains(listBody, `"version":1`) {
 		t.Fatalf("the version list does not name version 1: %s", listBody)
 	}
+	// The list must say whether those versions can be RESTORED, because the panel renders an action
+	// from it. On this layout they can.
+	if !strings.Contains(listBody, `"version_content_available":true`) {
+		t.Fatalf("the version list does not report that its content is restorable: %s", listBody)
+	}
+}
+
+// TestRestoringAVersionMakesItsBytesCurrent is the write half of the same feature.
+//
+// It asserts the CONTENT, not the status: the whole class of defect this project keeps removing is an
+// operation that answers 200 and does not do what it said. A restore that flips the node's ETag and
+// size while the path still serves the newer bytes passes every status-only check.
+func TestRestoringAVersionMakesItsBytesCurrent(t *testing.T) {
+	h := newHarness(t)
+	h.uploadFile(t, "doc.txt", "first version")
+	h.uploadFile(t, "doc.txt", "second version")
+
+	resp := h.do(http.MethodPost, "/api/files/restore-version",
+		jsonBody(t, map[string]any{"path": "doc.txt", "version": 1}),
+		map[string]string{"Content-Type": "application/json"})
+	body := readBody(resp)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("restore version 1: %d %s", resp.StatusCode, body)
+	}
+
+	if code, got := downloadText(t, h, "doc.txt"); code != http.StatusOK || got != "first version" {
+		t.Fatalf("after restoring version 1 the file is %d %q, want the first version's bytes", code, got)
+	}
+}
+
+// TestATreeLayoutRefusesToRestoreAVersionItCannotRestore is the layout half.
+//
+// The tree layout keeps its bytes at the path, so overwriting a file replaces the superseded version
+// instead of copying it: the version ROW survives but its content does not. Restoring it would report
+// success while the path kept serving the new bytes — a false claim about a user's data, which is the
+// failure mode the audit trace is about. Refusing is the honest answer, and the file must be left
+// exactly as it was.
+func TestATreeLayoutRefusesToRestoreAVersionItCannotRestore(t *testing.T) {
+	h := harnessOn(t, "tree", nil)
+	h.uploadFile(t, "doc.txt", "first version")
+	h.uploadFile(t, "doc.txt", "second version")
+	before := h.resolveNode(t, "doc.txt")
+
+	// The list has to say that this history is not restorable: the panel hides the action on it, and
+	// a client that ignores the flag gets the same refusal from the endpoint below.
+	if body := readBody(h.do(http.MethodGet, "/api/files/versions?path=doc.txt", nil, nil)); !strings.Contains(
+		body, `"version_content_available":false`) {
+		t.Fatalf("the tree layout's version list does not report that its content is not "+
+			"restorable: %s", body)
+	}
+
+	resp := h.do(http.MethodPost, "/api/files/restore-version",
+		jsonBody(t, map[string]any{"path": "doc.txt", "version": 1}),
+		map[string]string{"Content-Type": "application/json"})
+	body := readBody(resp)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("restore-version on the tree layout answered %d (%s); it must refuse (%d) rather "+
+			"than flip metadata over bytes it cannot restore", resp.StatusCode, body, http.StatusConflict)
+	}
+
+	if code, got := downloadText(t, h, "doc.txt"); code != http.StatusOK || got != "second version" {
+		t.Fatalf("the refused restore changed the file: %d %q", code, got)
+	}
+	after := h.resolveNode(t, "doc.txt")
+	if after.ETag != before.ETag || after.Size != before.Size || after.ID != before.ID {
+		t.Fatalf("the refused restore changed the node (etag %q->%q, size %d->%d, id %s->%s); a "+
+			"refusal must not be half-applied", before.ETag, after.ETag, before.Size, after.Size,
+			before.ID, after.ID)
+	}
 }
