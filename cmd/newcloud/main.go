@@ -167,9 +167,16 @@ func auditPrune(args []string) error {
 		return err
 	}
 
-	dsn := os.Getenv("DATABASE_URL")
+	// The prune runs as whichever role the DSN names, and the application role cannot do it:
+	// it is granted INSERT and SELECT on audit.events only, because an append-only log the
+	// application can delete from is not append-only. A separate variable lets an operator point
+	// this one command at the schema owner without changing what the server runs as.
+	dsn := os.Getenv("AUDIT_PRUNE_DATABASE_URL")
 	if dsn == "" {
-		return errors.New("audit prune: DATABASE_URL is required")
+		dsn = os.Getenv("DATABASE_URL")
+	}
+	if dsn == "" {
+		return errors.New("audit prune: DATABASE_URL (or AUDIT_PRUNE_DATABASE_URL) is required")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
@@ -190,6 +197,22 @@ func auditPrune(args []string) error {
 			"cutoff", cutoff.Format(time.RFC3339), "events", n,
 			"first_event", oldest, "last_event", newest)
 		return nil
+	}
+
+	// Can this role prune at all? Asked BEFORE the expensive verification and before the archive
+	// is written: discovering it from a permission error after the archive exists means the
+	// command half-succeeded, which is the worst shape for a destructive maintenance command.
+	role, missing, err := pg.PrunePrivileges(ctx)
+	if err != nil {
+		return fmt.Errorf("audit prune: check privileges: %w", err)
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("audit prune: role %q cannot prune: missing %s. "+
+			"The application role is granted INSERT and SELECT on audit.events and nothing else, "+
+			"on purpose — an audit log the application can delete from is not append-only. Run this "+
+			"as the schema owner: set AUDIT_PRUNE_DATABASE_URL to its DSN, or run the command as "+
+			"that role. Nothing was archived and nothing was deleted",
+			role, strings.Join(missing, " and "))
 	}
 
 	// Verify BEFORE removing anything. The store's own boundary check only catches a break at the

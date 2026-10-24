@@ -60,6 +60,34 @@ func (s *PG) LatestPruneMark(ctx context.Context) (PruneMark, error) {
 	return m, nil
 }
 
+// PrunePrivileges reports whether the connected role can actually prune.
+//
+// The application role is granted INSERT and SELECT on audit.events and nothing more
+// (migrations/0001_init.sql), which is the property that makes the log append-only: an
+// application that can DELETE from its own audit log does not have one. Pruning therefore
+// needs a role that owns the schema, and a command that discovers that only when the DELETE
+// fails has already written the archive — a destructive maintenance command that half-succeeds
+// (2026-10-24 review, M17).
+//
+// It returns the connected role's name and what it is missing, so the caller can say both.
+func (s *PG) PrunePrivileges(ctx context.Context) (role string, missing []string, err error) {
+	row := s.pool.QueryRow(ctx, `
+		SELECT current_user,
+		       has_table_privilege(current_user, 'audit.events', 'DELETE'),
+		       has_table_privilege(current_user, 'audit.prune_marks', 'INSERT')`)
+	var canDelete, canMark bool
+	if err := row.Scan(&role, &canDelete, &canMark); err != nil {
+		return "", nil, translate(err)
+	}
+	if !canDelete {
+		missing = append(missing, "DELETE on audit.events")
+	}
+	if !canMark {
+		missing = append(missing, "INSERT on audit.prune_marks")
+	}
+	return role, missing, nil
+}
+
 // PruneAuditBefore removes every event older than cutoff and records the boundary.
 //
 // The rows are returned BEFORE they are deleted so the caller can archive them: this method does not

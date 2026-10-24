@@ -126,12 +126,27 @@ newcloud audit prune --days 365
 `--days` defaults to `audit.retention_days`. With neither set, the command refuses rather than
 guessing, because the guess deletes history.
 
+**Run it as the schema owner, not as the application role.** The migrations grant
+`newcloud_app` `INSERT, SELECT` on `audit.events` and nothing else, which is what makes the log
+append-only: an application that can `DELETE` from its own audit log does not have one. Prune
+therefore needs a role that owns the schema. Point this one command at it without changing what
+the server runs as:
+
+```sh
+AUDIT_PRUNE_DATABASE_URL=postgres://newcloud_owner@db/newcloud newcloud audit prune --days 365
+```
+
+The command checks the connected role's privileges *before* it verifies the chain or writes the
+archive, and refuses with the missing privilege named — so a wrong role costs nothing. `--dry-run`
+only reads, so it works as either role.
+
 What it does, in order:
 
-1. verifies the whole chain and refuses to prune one that does not verify;
-2. writes the events about to be removed to `audit.archive_dir` (default `audit-archive/`), fsynced,
+1. checks that the connected role can actually delete events and record a mark;
+2. verifies the whole chain and refuses to prune one that does not verify;
+3. writes the events about to be removed to `audit.archive_dir` (default `audit-archive/`), fsynced,
    before anything is deleted;
-3. deletes them and records an `audit.prune_marks` row: the last removed event id, the chain head at
+4. deletes them and records an `audit.prune_marks` row: the last removed event id, the chain head at
    that point, the event count, and the archive path.
 
 Verification then starts from the newest prune mark instead of from genesis, so the surviving chain
