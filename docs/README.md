@@ -29,9 +29,11 @@ document was written.
 | --- | --- |
 | [Functional requirements](reference/functional-requirements.md) | The requirements baseline and the gap analysis that drove the build |
 | [Implementation record](reference/implementation-record.md) | Which contracts are implemented, which tests pin them, and what remains open |
+| [ADR-0013 implementation record](reference/adr-0013-implementation-record.md) | Phase 0 regression evidence and Phase 1 consistency-foundation status |
 | [Interface design](reference/interface-design.md) | The Atlas direction: layout, tokens, components, and interaction rules |
 | [Interface redesign: Atrium](reference/interface-atrium.md) | Why the first two directions failed, and the structure that replaced them |
 | [Browser-only failures](reference/browser-only-failures.md) | Two defects that only appeared in a real browser, and the guards added afterward |
+| [Cirrus 9.1 integration plan](reference/cirrus-9.1-integration-plan.md) | Freeze record, gap matrix, API/database changes, and phased plan for adopting the approved Cirrus 9.1 design |
 
 ## Decision records
 
@@ -47,6 +49,7 @@ the old one stays in the repository with its original date.
 | [0007](adr/0007-s3-storage.md) | S3-compatible object storage as a second backend | Accepted |
 | [0008](adr/0008-resumable-uploads.md) | Resumable chunked uploads without tus or S3 multipart | Accepted |
 | [0012](adr/0012-cursor-contract.md) | Cursor pagination for directory listings | Accepted |
+| [0013](adr/0013-file-operation-consistency.md) | Operation-private staging, conditional publish, and the file-operation correctness contract | Accepted (v2.1.1) |
 
 ## Conventions
 

@@ -167,5 +167,7 @@ S3 removes the local content volume but not the staging volume. `tree` layout re
 object storage has no directory hierarchy to mirror.
 
 See [ADR-0002](../adr/0002-backend-skeleton.md) for the credential model,
-[ADR-0003](../adr/0003-storage-layout.md) for the storage decision, and
-[ADR-0004](../adr/0004-metadata-store.md) for the store contract.
+[ADR-0003](../adr/0003-storage-layout.md) for the storage decision,
+[ADR-0004](../adr/0004-metadata-store.md) for the store contract, and
+[ADR-0013](../adr/0013-file-operation-consistency.md) (Accepted) for the file-operation
+consistency architecture that governs the next storage changes.

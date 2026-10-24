@@ -174,6 +174,7 @@ Design decisions are recorded as ADRs in [docs/adr/](docs/adr/):
 - [ADR-0007: S3 storage backend](docs/adr/0007-s3-storage.md)
 - [ADR-0008: Resumable chunked uploads](docs/adr/0008-resumable-uploads.md)
 - [ADR-0012: Cursor pagination contract](docs/adr/0012-cursor-contract.md)
+- [ADR-0013: File-operation consistency](docs/adr/0013-file-operation-consistency.md) (Accepted)
 
 The evidence behind the claims in this README — the tests, the manual verification, and the
 remaining gaps — is in [docs/reference/implementation-record.md](docs/reference/implementation-record.md).
