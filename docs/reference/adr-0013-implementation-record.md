@@ -290,6 +290,30 @@ table accumulated across subtests. The PG factory now clears it; both versions p
 5. `git diff --check`, build, vet, normal tests, race tests pass on the Phase 1 commit.
 6. Separate implementation review approves the Phase 1R entry.
 
+### 6a. First slice, in the order it has to happen
+
+Written down after the 2026-10-24 review's M4 (2026-10-25): the artefact-name leak and
+restore naming are one fix, and restore naming has to go first.
+
+1. **Restore must not hand out a reserved name.** `swap.Install` displaces the destination to
+   `<rand>.newcloud-replaced-<name>` and trashes it under that name, so `tx.Restore` today
+   returns a live node whose name is an artefact. The primary key for a node is its id, and the
+   name index is partial on live rows, so the name is free to change; only the PATH is not,
+   because on the `tree` layout the content path is derived from parent + name.
+2. **So the fix belongs in the restore handler, not in the store.** `internal/server/files.go`
+   `handleRestore` already resolves the trashed node, authorises the parent, and calls
+   `tx.Restore`. Give it: choose a usable name (strip everything up to and including
+   `.newcloud-replaced-`; on collision append ` (n)`), then perform the name change and the byte
+   move together with `swap.Relocate` — the same primitive the rename path uses, which is why
+   the tree layout does not desync. The WebDAV side has no RESTORE method, so there is one
+   entry point to change.
+3. **Then the addressability guard can land.** `swap.IsReservedSegment` plus a refusal in
+   `dav.splitPath` (and the API's path parser) — a one-liner each once step 2 is in, and it must
+   NOT land before it: with restore still producing artefact names, the guard turns "restore"
+   into "silently produce an unreachable file". The existing expectation that a restored node is
+   readable over HTTP is the check that keeps the two in the right order
+   (`internal/dav/treelayout_test.go`, the case that caught this).
+
 ## 7. Phase 0/1 acceptance checklist
 
 | Criterion | Status |
