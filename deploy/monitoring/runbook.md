@@ -395,3 +395,35 @@ Restoring the blob is always safe. Deleting the row is not: it discards the file
 second full-time workload. The scrub verifies a bounded number of blobs per pass and logs the total
 it read, so its cost is visible. A pass that finds nothing is not proof of health — it is the absence
 of evidence in that sample, which is why the interval matters more than the limit.
+## Content missing
+
+**Alert:** `NewCloudContentMissing` — `increase(newcloud_content_missing_total[15m]) > 0`.
+
+A file's metadata row exists, the caller was allowed to read it, and the storage backend could not
+produce the bytes. This is **not** a missing file: the product answers `500 content_missing` for it
+precisely so it cannot be confused with `404`, which means "there is no such row". Something
+destroyed or moved content that the database still believes in.
+
+1. Find what was affected. The server logs one line per occurrence:
+
+   ```sh
+   journalctl -u newcloud | grep 'content missing for'
+   ```
+
+   Each line names the node id, the file name, the path and the owner. The download route logs the
+   fuller line; every other route logs the short one and relies on the shared mapping.
+
+2. Check the storage backend for that path.
+   - `tree` layout: the bytes live at `<root>/<owner>/<path>`. If the file is there and the row is
+     wrong, the row is the problem; if it is gone, the content is.
+   - `blob` layout: the row names a `blobs` row, and the bytes live at `<root>/ab/cd/<sha256>`. A
+     missing blob is a storage-level loss, not an application one.
+
+3. Restore from backup. `deploy/backup/restore-drill.md` describes the procedure; the drill exists
+   so that this step is not the first time it is tried.
+
+4. Afterwards, decide why. A single file points at media corruption or a manual delete; a burst
+   points at a failed `rsync`, a wrong `storage.local.root`, or a container mounting the wrong
+   volume. The second is far more common than the first, and the fix is configuration.
+
+Do not silence this alert. A `content_missing` that is expected is a file somebody has lost.

@@ -574,6 +574,9 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		//   403 — the caller may not read it (Authorize failed earlier)
 		//   500 — the file exists, the caller may read it, and its bytes are gone
 		if errors.Is(err, layout.ErrNotFound) {
+			if s.deps.Metrics != nil {
+				s.deps.Metrics.ObserveContentMissing()
+			}
 			s.deps.Log.Error("content missing for an existing file: the metadata row says the "+
 				"bytes are on the storage backend and they are not",
 				"node", node.ID.String(), "name", node.Name, "path", rel,
@@ -1204,6 +1207,9 @@ func (s *Server) writeStoreError(w http.ResponseWriter, err error) {
 		// "blob missing but row present → error, never 404". It was mapped to 404 here, so every
 		// route that opens content without its own handling — archive, thumbnail, share download,
 		// content ticket — reported a file people can see in a listing as a file that does not exist.
+		if s.deps.Metrics != nil {
+			s.deps.Metrics.ObserveContentMissing()
+		}
 		s.deps.Log.Error("content missing for a file whose metadata exists", "error", err)
 		writeError(w, http.StatusInternalServerError, "content_missing",
 			"this file's metadata exists but its content is missing on the storage backend; an "+

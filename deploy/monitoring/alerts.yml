@@ -350,3 +350,18 @@ groups:
             The drill is what turns a backup into evidence (INV-08). A quarterly cadence is what
             restore-drill.md asks for; this fires when one has been skipped by more than a week.
           runbook: "deploy/backup/restore-drill.md"
+  # A file whose metadata exists and whose bytes the storage backend could not produce. This should
+  # be zero forever: a single occurrence means somebody's file is broken and can only be recovered
+  # from a backup, so it pages on the first one rather than on a rate.
+  - alert: NewCloudContentMissing
+    expr: increase(newcloud_content_missing_total[15m]) > 0
+    labels:
+      severity: critical
+    annotations:
+      summary: "a file's content is missing on the storage backend"
+      description: |
+        The metadata row exists and the caller was allowed to read it, but the storage layer could
+        not produce the bytes. This is not a missing file — it is damage, and 404 vs 500 is the
+        difference the failure table insists on. Check the storage backend for the files named in
+        the server log ("content missing for"), then restore them from a backup.
+      runbook: "deploy/monitoring/runbook.md#content-missing"

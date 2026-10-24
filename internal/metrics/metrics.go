@@ -43,6 +43,11 @@ type Registry struct {
 	// davRequests counts WebDAV requests, so the conflict rate has a denominator.
 	davRequests atomic.Uint64
 
+	// contentMissing counts responses for a file whose metadata exists and whose bytes the storage
+	// layer could not produce. It is the only signal that distinguishes storage damage from a
+	// missing file, and it should be zero forever: a non-zero rate means an operator has to look.
+	contentMissing atomic.Uint64
+
 	// uploads is keyed by result ("ok", "too_large", "failed", "aborted").
 	uploads sync.Map // map[string]*atomic.Uint64
 
@@ -130,6 +135,15 @@ func (r *Registry) ObserveUpload(result string) {
 func (r *Registry) ObserveThumbnail(result string) {
 	counter(&r.thumbnails, result).Add(1)
 }
+
+// ObserveContentMissing records a file whose metadata exists but whose bytes do not.
+func (r *Registry) ObserveContentMissing() {
+	r.contentMissing.Add(1)
+}
+
+// ContentMissing reports how many times storage damage was served, for tests and for callers that
+// want the number without scraping the exposition endpoint.
+func (r *Registry) ContentMissing() uint64 { return r.contentMissing.Load() }
 
 // SetBlobScrub reports the last integrity pass: how many blobs were read, how many disagreed with
 // their address, and how many were referenced but absent.
@@ -245,6 +259,7 @@ func (r *Registry) write(w http.ResponseWriter) {
 	fmt.Fprintln(w, "# HELP newcloud_dav_conflicts_total WebDAV 409/412 responses (lock contention or a stale etag).")
 	fmt.Fprintln(w, "# TYPE newcloud_dav_conflicts_total counter")
 	fmt.Fprintf(w, "newcloud_dav_conflicts_total %d\n", r.davConflicts.Load())
+	fmt.Fprintf(w, "newcloud_content_missing_total %d\n", r.contentMissing.Load())
 
 	writeCounterMap(w, "newcloud_uploads_total", "Upload outcomes.", &r.uploads)
 	writeCounterMap(w, "newcloud_thumbnails_total", "Thumbnail decode outcomes.", &r.thumbnails)
@@ -338,25 +353,27 @@ func splitKey(k string) (string, string) {
 
 // Snapshot is a point-in-time copy, for tests and the admin view.
 type Snapshot struct {
-	HTTPRequests map[string]uint64
-	DAVRequests  uint64
-	DAVConflicts uint64
-	Uploads      map[string]uint64
-	QueuePending int64
-	QueueRunning int64
-	QueueFailed  int64
+	HTTPRequests   map[string]uint64
+	DAVRequests    uint64
+	DAVConflicts   uint64
+	ContentMissing uint64
+	Uploads        map[string]uint64
+	QueuePending   int64
+	QueueRunning   int64
+	QueueFailed    int64
 }
 
 // Snapshot returns the current values.
 func (r *Registry) Snapshot() Snapshot {
 	s := Snapshot{
-		HTTPRequests: map[string]uint64{},
-		Uploads:      map[string]uint64{},
-		DAVRequests:  r.davRequests.Load(),
-		DAVConflicts: r.davConflicts.Load(),
-		QueuePending: r.jobsPending.Load(),
-		QueueRunning: r.jobsRunning.Load(),
-		QueueFailed:  r.jobsFailed.Load(),
+		HTTPRequests:   map[string]uint64{},
+		Uploads:        map[string]uint64{},
+		DAVRequests:    r.davRequests.Load(),
+		DAVConflicts:   r.davConflicts.Load(),
+		ContentMissing: r.contentMissing.Load(),
+		QueuePending:   r.jobsPending.Load(),
+		QueueRunning:   r.jobsRunning.Load(),
+		QueueFailed:    r.jobsFailed.Load(),
 	}
 	r.httpRequests.Range(func(k, v any) bool {
 		s.HTTPRequests[k.(string)] = v.(*atomic.Uint64).Load()

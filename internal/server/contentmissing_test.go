@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/EdisonJwa/newCloud/internal/metrics"
 	"github.com/EdisonJwa/newCloud/internal/server"
 	"github.com/EdisonJwa/newCloud/internal/storage/layout"
 )
@@ -67,5 +68,32 @@ func TestAMissingContentFileIsNotReportedAsAbsentOnOtherRoutes(t *testing.T) {
 	}
 	if !strings.Contains(body, "content_missing") {
 		t.Fatalf("the error did not name the condition: %s", body)
+	}
+}
+
+// The condition must be countable, or the alert on it is dead by configuration.
+func TestContentMissingIsCounted(t *testing.T) {
+	var reg *metrics.Registry
+	h := newHarnessTuned(t, nil, func(d *server.Deps) {
+		reg = metrics.New()
+		d.Metrics = reg
+		d.Content = missingOpenContent{ContentStore: d.Content}
+	})
+	h.uploadFile(t, "ghost2.txt", "bytes")
+
+	first := h.do(http.MethodGet, "/api/files/download?path=ghost2.txt", nil, nil)
+	first.Body.Close()
+	if first.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("setup: expected the missing-content answer, got %d", first.StatusCode)
+	}
+	// The thumbnail route reports the same condition but does NOT reach this counter — measured, not
+	// assumed: it answers 500 content_missing and counts nothing. The download path is the one the
+	// alert depends on, and limitations.md records the gap rather than implying coverage.
+	second := h.do(http.MethodGet, "/api/files/thumbnail?path=ghost2.txt", nil, nil)
+	second.Body.Close()
+
+	if got := reg.ContentMissing(); got != 1 {
+		t.Fatalf("the download of a file with missing content counted %d, want 1: the alert on "+
+			"this condition would be dead by configuration", got)
 	}
 }
