@@ -301,7 +301,7 @@ are one small fix away.
 |---|---|---|
 | `TestPhase0ReaderNeverSeesTheReplacementWindow` | A physical move of a node's content, with the metadata untouched, and a reader arriving in between | The read path must not derive a content location from `parent + name`. Either the location is recorded per node (indirection) or reads are fenced against the writer that moves it. A lock alone does not help: the reproduction performs the move outside any operation, so no writer holds anything to fence against. |
 | `TestPhase0ADeleteDoesNotMoveAConcurrentWritersBytes` | **Closed** by a repair rather than by an ordering: after the namespace step refuses, the delete asks whether the live path is occupied. Occupied means a writer committed after the move and its bytes are the live ones, so the moved copy is left alone; empty means the moved bytes were the writer's, and they go back. The reproduction passes, and removing the check makes it fail again. | Two orderings were measured and neither closes the window: content-first moves a late writer's bytes, namespace-first moves a writer who created a file at the freed path. The repair therefore lives on the failure path; the journal is still the structural answer for the general case. |
-| `TestPhase0LegacyWriterBypassesDeleteFence` | A writer that does not join the fence, landing in the window between a delete's content move and its metadata rename | The operation journal. The window is real — `swap.Retire` moves content, then renames metadata, then trashes, and a writer arriving between the first two steps still updates the OLD node, which the trash then takes with it. A fence cannot stop a writer that does not take one; what catches it is recording the intent before the move so recovery can tell "this writer's bytes are the live ones" from "these are the ones being retired". |
+| `TestPhase0LegacyWriterBypassesDeleteFence` | A writer that does not join the fence, landing in the window between a delete's content move and its metadata rename | The operation journal — **which now exists for this path** (rounds 44-46: transitions, INTENT recorded before the content move, and an `op-recovery` duty for what a crash leaves open). The reproduction still fails, correctly: its writer does not take a fence, so recording intent lets recovery explain the state afterwards but cannot stop a writer that never asked. Closing it for such a writer needs the writer path to consult the journal — a fence with participants. The window is real — `swap.Retire` moves content, then renames metadata, then trashes, and a writer arriving between the first two steps still updates the OLD node, which the trash then takes with it. A fence cannot stop a writer that does not take one; what catches it is recording the intent before the move so recovery can tell "this writer's bytes are the live ones" from "these are the ones being retired". |
 | `TestPhase0BackfillMovesNewLiveBytes` | A maintenance process moving bytes that a live node now owns | The same indirection as the first row. It is also the least urgent of the three: no code in this tree performs that move. |
 
 Two of the three are therefore the read-side half of the ADR (§ "OpenLive"), and the third is the
@@ -313,6 +313,37 @@ The delete relocation is worth separating from them, because it is the one that 
 is now fixed: a deleted file used to keep occupying its path until the retention sweep, which blocked
 no-replace publish on this layout and left the retained copy addressable at a name that no longer
 existed. That is `TestPhase0DeleteReleasesTheTreeLivePath`, and it passes.
+### 6c. Read indirection: declined, with the condition that would reopen it
+
+The remaining half of Phase 2A is reading content by a recorded identity rather than by
+`parent + name`. It is not implemented, and this is a decision rather than an omission.
+
+The two reproductions that need it (`TestPhase0ReaderNeverSeesTheReplacementWindow`,
+`TestPhase0BackfillMovesNewLiveBytes`) both perform a **physical move of content outside the store**,
+with the metadata untouched, and then expect a reader to see the original bytes. On a layout whose
+content lives at its path, that is not a race to be fixed but a state the layout cannot represent: the
+bytes are at no addressable location, and nothing the store did or did not do changes that. Recording
+the location per node does not help either — the recorded location is the same path the move emptied.
+
+What the product does instead was built deliberately and measured: the read path distinguishes "no
+such row" from "row exists, bytes missing", answers `500 content_missing` for the second (never `404`),
+counts it as `newcloud_content_missing_total`, pages on it through `NewCloudContentMissing`, and the
+runbook says how to find the affected files and what a burst usually means. That is the honest
+response to a failure the layout cannot prevent: make it loud, countable and diagnosable.
+
+**What would reopen this decision.** One of these becoming true:
+
+1. Content must be shared between paths (deduplication across nodes), which requires an identity
+   anyway and makes the indirection free.
+2. A layout is introduced whose content addressing is objective-independent (the blob layout already
+   is; this would be a tree-like view over it).
+3. An operator reports a real out-of-band move in production. That is the case the detection above is
+   designed to surface, and it would be the evidence that the failure is reachable rather than
+   theoretical.
+
+Until one of those holds, building the indirection would add a per-node content table, a second way to
+resolve every read, and a migration — to protect against a state the deployment cannot create, while
+the detectable consequence is already covered end to end.
 ### 6a. First slice, in the order it has to happen
 
 Written down after the 2026-10-24 review's M4 (2026-10-25): the artefact-name leak and

@@ -26,7 +26,7 @@ the source of truth for "fixed", and this record is the source of truth for "ver
 These are not defects waiting to be fixed; they are properties of a chosen design, documented so they
 are not rediscovered as surprises.
 
-- **The tree layout's three red reproductions.** They simulate bytes moved outside the store. On a
+- **The tree layout's three red reproductions**, and the decision not to build read indirection for them: see [adr-0013-implementation-record.md](adr-0013-implementation-record.md) §6c for the reasoning and the three conditions that would reopen it. They simulate bytes moved outside the store. On a
   layout whose content lives at its path, a reader that was not told about the move cannot follow it,
   and no journalling changes that. The product's answer is to detect and report it: `500
   content_missing` (never `404`), a counter, a `critical` alert, and a runbook section. The blob
