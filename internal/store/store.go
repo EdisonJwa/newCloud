@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/EdisonJwa/newCloud/internal/audit"
+	"github.com/EdisonJwa/newCloud/internal/consistency"
 )
 
 // Kind distinguishes files from directories.
@@ -215,6 +216,12 @@ type Tx interface {
 	// Audit appends an event to the audit log in the same transaction.
 	Audit(ctx context.Context, e AuditEntry) error
 
+	// CompleteOperation moves one PUBLISHING operation to COMMITTED in the same
+	// transaction as the visibility change. It refuses an operation whose owner
+	// or kind differs from the publish request, and it refuses an empty id:
+	// publication without a journal row is not recoverable.
+	CompleteOperation(ctx context.Context, opID, ownerID uuid.UUID, kind string) error
+
 	// EnsureRoot provisions the owner's root directory inside the transaction, so
 	// an account cannot exist without a place to put files.
 	EnsureRoot(ctx context.Context, ownerID uuid.UUID) (Node, error)
@@ -409,6 +416,9 @@ type Tx interface {
 	AddGroupMember(ctx context.Context, groupID, userID uuid.UUID, role string) error
 	RemoveGroupMember(ctx context.Context, groupID, userID uuid.UUID) error
 	GroupsForUser(ctx context.Context, userID uuid.UUID) ([]Group, error)
+	// Groups lists every group, ordered by name: the admin screen needs to show what exists before
+	// an operator can decide who belongs to it.
+	Groups(ctx context.Context) ([]Group, error)
 	GroupMembers(ctx context.Context, groupID uuid.UUID) ([]GroupMember, error)
 
 	// Retention: permanent deletion of expired trash and versions.
@@ -612,6 +622,11 @@ type Store interface {
 	// It returns a plain []Node rather than a path string so that callers work
 	// with identities, not names.
 	Resolve(ctx context.Context, ownerID uuid.UUID, path string) ([]Node, error)
+
+	// PublishBlob commits the metadata half of a Blob-layout staged publish.
+	// The content store has already written the immutable blob; this is the
+	// conditional visibility decision. It is not used by handlers until Phase 1R.
+	PublishBlob(ctx context.Context, req consistency.BlobPublish) error
 
 	// AuditRows and AuditHead are the read side of the audit log, used by the anchor
 	// verifier. A backend that keeps no sealed chain returns ErrNoChain from AuditHead.

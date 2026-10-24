@@ -85,6 +85,18 @@ func (t *memTx) GroupsForUser(ctx context.Context, userID uuid.UUID) ([]Group, e
 	return out, nil
 }
 
+// Groups lists every group, ordered by name.
+//
+// Sorted here rather than left in insertion order so it matches the SQL's ORDER BY name: an
+// ordering that differs between backends makes "the admin screen lists groups alphabetically" pass
+// on one and fail on the other.
+func (t *memTx) Groups(ctx context.Context) ([]Group, error) {
+	out := make([]Group, len(t.m.groups))
+	copy(out, t.m.groups)
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
 func (t *memTx) GroupMembers(ctx context.Context, groupID uuid.UUID) ([]GroupMember, error) {
 	var out []GroupMember
 	for _, m := range t.m.groupMembers {

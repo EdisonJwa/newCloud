@@ -43,6 +43,12 @@ type GroupTx interface {
 	RemoveGroupMember(ctx context.Context, groupID, userID uuid.UUID) error
 	// GroupsForUser lists the groups an account belongs to.
 	GroupsForUser(ctx context.Context, userID uuid.UUID) ([]Group, error)
+	// Groups lists every group, ordered by name.
+	//
+	// Added for the admin screen: an operator has to be able to see which groups exist before
+	// deciding who belongs to one, and until this existed the only way to discover a group was to
+	// already know its name.
+	Groups(ctx context.Context) ([]Group, error)
 	// GroupMembers lists an account's membership rows.
 	GroupMembers(ctx context.Context, groupID uuid.UUID) ([]GroupMember, error)
 }

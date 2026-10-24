@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/EdisonJwa/newCloud/internal/consistency"
 )
 
 // Memory is an in-memory Store used by tests and by the pre-database wiring.
@@ -78,6 +80,12 @@ type Memory struct {
 	// clockOffset lets a test move time forward without sleeping. Nil means "use the
 	// real clock".
 	clockOffset *offsetFlag
+	// ADR-0013 Phase 1 foundations. They are separate from the snapshot fields above:
+	// no handler uses them yet, and the Phase 1 tests pin their contract before the
+	// Phase 1R migration starts.
+	journal   *consistency.MemoryJournal
+	revisions map[uuid.UUID]consistency.Revision
+	stagedBy  map[uuid.UUID]*uuid.UUID
 }
 
 var _ Store = (*Memory)(nil)
@@ -121,6 +129,9 @@ func NewMemory() *Memory {
 		shareUploadEvents:     nil,
 		sharePasswordAttempts: nil,
 		now:                   time.Now,
+		journal:               consistency.NewMemoryJournal(),
+		revisions:             make(map[uuid.UUID]consistency.Revision),
+		stagedBy:              make(map[uuid.UUID]*uuid.UUID),
 	}
 	// Route every timestamp through the offset-aware clock, so a test can advance time
 	// and have job scheduling, lease expiry and retention all move together.
@@ -229,6 +240,7 @@ func (m *Memory) WithTx(ctx context.Context, fn func(ctx context.Context, tx Tx)
 	// here until the conformance suite failed on the memory backend and not on PostgreSQL.
 	m.settings = work.settings
 	m.nextVersion = work.nextVersion
+	m.journal = work.journal
 	return nil
 }
 
@@ -275,6 +287,7 @@ func (m *Memory) snapshot() *Memory {
 		roots:    make(map[uuid.UUID]uuid.UUID, len(m.roots)),
 		usage:    make(map[uuid.UUID]int64, len(m.usage)),
 		quota:    make(map[uuid.UUID]int64, len(m.quota)),
+		journal:  m.journal.Clone(),
 		// Every map field must be listed here or a transaction writes into a snapshot that is
 		// discarded at commit. Adding a field to the struct and forgetting this function loses the
 		// write silently — the conformance suite catches it because both backends must round-trip.
@@ -793,8 +806,33 @@ func (t *memTx) restoreRecursive(id uuid.UUID, depth int) error {
 		// deleted on purpose.
 		return nil
 	}
+
+	// The name index is not a copy of the row: it maps (parent, folded name) to an id, and a trashed
+	// node's entry can be taken over while it sits in the bin — checkName deliberately tolerates a
+	// trashed occupant, and attach() overwrites the entry when a sibling is created or renamed onto
+	// the name. Restoring without rebinding therefore produced a node that exists, is not trashed, and
+	// cannot be resolved by any path: "Restore succeeded" and the file was still invisible.
+	//
+	// Two outcomes, and both have to match PostgreSQL:
+	//
+	//   - the name is free (or its entry still points here): rebind, so the node is reachable;
+	//   - a DIFFERENT live node holds the name now: refuse with ErrConflict. PostgreSQL's unique index
+	//     is partial on live rows, so its UPDATE fails with the same class of error rather than
+	//     colliding two rows on one name.
+	//
+	// This is checked before anything is mutated, so a refusal leaves the node in the bin.
+	if rec.node.ParentID != nil {
+		if holder, taken := t.m.children[*rec.node.ParentID][nameKey(rec.node.Name)]; taken && holder != id {
+			if held, ok := t.m.nodes[holder]; ok && held.node.TrashedAt == nil {
+				return fmt.Errorf("%w: a live node already holds the name %q", ErrConflict, rec.node.Name)
+			}
+		}
+	}
 	rec.node.TrashedAt = nil
 	rec.node.ModifiedAt = t.m.now()
+	if rec.node.ParentID != nil {
+		t.attach(*rec.node.ParentID, rec.node)
+	}
 	if rec.node.Kind == KindFile {
 		// The reverse of trashing: the bytes come back into the logical quota and out of retained
 		// usage. The quota check is the caller's: a restore that would exceed the limit is refused
@@ -897,6 +935,11 @@ func (t *memTx) RestoreVersion(ctx context.Context, nodeID uuid.UUID, versionNo 
 	var sum [32]byte
 	copy(sum[:], victim.SHA256)
 	rec.node.ETag = ETagForHash(sum)
+	// The resolver reads rec.blob to answer "which content is at this path", so it has to move with
+	// the node. Updating only the node row left the in-memory store serving the version that was
+	// replaced — a divergence from PostgreSQL, where the resolver reads nodes.blob_id. It made every
+	// restore-version assertion pass or fail for the wrong reason.
+	rec.blob = sum
 	rec.node.ModifiedAt = t.m.now()
 	if delta > 0 {
 		t.m.usage[rec.node.OwnerID] += delta
@@ -1042,7 +1085,20 @@ func (m *Memory) Usage(ctx context.Context, ownerID uuid.UUID) (int64, error) {
 }
 
 // SetQuota sets the byte limit for an owner. Zero or negative means unlimited.
+//
+// It serialises with TRANSACTIONS, not merely with other mutations.
+//
+// A transaction snapshots the whole store and publishes its maps wholesale at commit, so a quota
+// written between a transaction's snapshot and its commit is silently replaced by the old value.
+// That is not hypothetical: the app-password "touch" runs such a transaction in the background after
+// every authenticated request, so a test that set a quota immediately after a request (raise it, make
+// an upload fail, lift it, retry) intermittently found the quota still at the old value — the retry
+// failed as if the limit had never been lifted. The same hole could make a test pass for the wrong
+// reason. Holding txMu, which every transaction holds for its whole duration, puts this write either
+// before a transaction's snapshot or after its commit, never inside.
 func (m *Memory) SetQuota(ownerID uuid.UUID, limit int64) {
+	m.txMu.Lock()
+	defer m.txMu.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.quota[ownerID] = limit

@@ -98,6 +98,26 @@ func (t *pgTx) GroupMembers(ctx context.Context, groupID uuid.UUID) ([]GroupMemb
 	return out, translate(rows.Err())
 }
 
+// Groups lists every group, ordered by name.
+func (t *pgTx) Groups(ctx context.Context) ([]Group, error) {
+	const q = `SELECT ` + groupColumns + ` FROM groups ORDER BY name`
+	rows, err := t.tx.Query(ctx, q)
+	if err != nil {
+		return nil, translate(err)
+	}
+	defer rows.Close()
+
+	var out []Group
+	for rows.Next() {
+		g, serr := scanGroup(rows)
+		if serr != nil {
+			return nil, serr
+		}
+		out = append(out, g)
+	}
+	return out, translate(rows.Err())
+}
+
 var _ GroupTx = (*pgTx)(nil)
 
 // GroupByID resolves a group by id.

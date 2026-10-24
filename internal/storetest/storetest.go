@@ -16,6 +16,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"reflect"
 	"strings"
@@ -26,6 +27,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/EdisonJwa/newCloud/internal/audit"
+	"github.com/EdisonJwa/newCloud/internal/consistency"
 	"github.com/EdisonJwa/newCloud/internal/store"
 )
 
@@ -34,6 +36,13 @@ import (
 type Factory func(t *testing.T) (s store.Store, owner uuid.UUID)
 
 // Options selects the parts of the suite an implementation supports.
+
+func contentHash() [32]byte {
+	u := uuid.New()
+	var h [32]byte
+	copy(h[:], u[:])
+	return h
+}
 
 func mkdir(t *testing.T, s store.Store, owner, parent uuid.UUID, name string) store.Node {
 	t.Helper()
@@ -157,6 +166,41 @@ func Run(t *testing.T, factory Factory, opts Options) {
 		}
 	})
 
+	t.Run("CompleteOperationIsTransactional", func(t *testing.T) {
+		s, owner := factory(t)
+		j, ok := s.(consistency.Journal)
+		if !ok {
+			t.Fatalf("store %T does not expose the operation journal", s)
+		}
+		opID := uuid.New()
+		if _, err := j.Create(context.Background(), consistency.Operation{ID: opID, OwnerID: owner, Kind: "upload"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := j.Transition(context.Background(), opID, consistency.StateIntent, consistency.StateStaging); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := j.Transition(context.Background(), opID, consistency.StateStaging, consistency.StatePublishing); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.CompleteOperation(ctx, opID, uuid.New(), "upload")
+		}); err == nil {
+			t.Fatal("CompleteOperation accepted a mismatched owner")
+		}
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.CompleteOperation(ctx, opID, owner, "upload")
+		}); err != nil {
+			t.Fatal(err)
+		}
+		op, err := j.Get(context.Background(), opID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if op.State != consistency.StateCommitted {
+			t.Fatalf("CompleteOperation left state %s, want COMMITTED", op.State)
+		}
+	})
+
 	t.Run("ResolveIsCaseExact", func(t *testing.T) {
 		s, owner := factory(t)
 		r := rootOf(t, s, owner)
@@ -200,6 +244,100 @@ func Run(t *testing.T, factory Factory, opts Options) {
 		b := mkfile(t, s, owner, r.ID, "a.txt", 2)
 		if b.ID == a.ID {
 			t.Fatal("recreating a deleted name must make a new node")
+		}
+	})
+
+	// A restored node must become REACHABLE. The fourth review (2026-10-23 §5) reproduced the other
+	// outcome: Restore returned successfully, the node's trashed_at was nil, and no path resolved to
+	// it, because the name index entry had been taken over while it was in the bin. "Restore
+	// succeeded" and "the file can be opened" have to be the same statement on every backend.
+	t.Run("RestoreRebindsTheNameAfterTheNameWasTakenAndFreed", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		original := mkfile(t, s, owner, r.ID, "a.txt", 1)
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.Trash(ctx, original.ID)
+		}); err != nil {
+			t.Fatal(err)
+		}
+		// The name is reused while the original is in the bin, then freed again: the index no longer
+		// points at the trashed node.
+		replacement := mkfile(t, s, owner, r.ID, "a.txt", 2)
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.Trash(ctx, replacement.ID)
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			_, rerr := tx.Restore(ctx, original.ID)
+			return rerr
+		}); err != nil {
+			t.Fatalf("restore: %v", err)
+		}
+
+		nodes, err := s.Resolve(context.Background(), owner, "a.txt")
+		if err != nil {
+			t.Fatalf("a restored node must be resolvable by its path, got %v", err)
+		}
+		if got := nodes[len(nodes)-1]; got.ID != original.ID || got.TrashedAt != nil {
+			t.Fatalf("the path resolves to %s (trashed=%v), want the restored node %s",
+				got.ID, got.TrashedAt != nil, original.ID)
+		}
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			n, cerr := tx.ChildByName(ctx, r.ID, "a.txt")
+			if cerr != nil {
+				return cerr
+			}
+			if n.ID != original.ID {
+				return fmt.Errorf("ChildByName returned %s, want %s", n.ID, original.ID)
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("the restored node is not in its parent's children: %v", err)
+		}
+	})
+
+	// The other half: a name held by a LIVE sibling cannot be restored into. PostgreSQL refuses this
+	// through its partial unique index; the in-memory backend used to accept it and produce a node
+	// that existed and could not be found by any path.
+	t.Run("RestoreOntoALiveSiblingIsRefused", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		original := mkfile(t, s, owner, r.ID, "a.txt", 1)
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.Trash(ctx, original.ID)
+		}); err != nil {
+			t.Fatal(err)
+		}
+		live := mkfile(t, s, owner, r.ID, "a.txt", 2)
+
+		err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			_, rerr := tx.Restore(ctx, original.ID)
+			return rerr
+		})
+		if !errors.Is(err, store.ErrConflict) {
+			t.Fatalf("restoring onto a name a live sibling holds: want ErrConflict, got %v", err)
+		}
+
+		// The refusal left the node in the bin, and the live sibling is still the one the path names.
+		nodes, rerr := s.Resolve(context.Background(), owner, "a.txt")
+		if rerr != nil || nodes[len(nodes)-1].ID != live.ID {
+			t.Fatalf("the live sibling must keep the name: %v", rerr)
+		}
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			n, nerr := tx.NodeIncludingTrashed(ctx, original.ID)
+			if nerr != nil {
+				return nerr
+			}
+			if n.TrashedAt == nil {
+				return fmt.Errorf("the refused restore un-trashed node %s", original.ID)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
 		}
 	})
 
@@ -776,6 +914,88 @@ func Run(t *testing.T, factory Factory, opts Options) {
 
 	t.Run("OwnerExport", func(t *testing.T) {
 		ownerExportSuite(t, factory)
+	})
+
+	t.Run("BlobPublishIsConditional", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		h := contentHash()
+		j, ok := s.(consistency.Journal)
+		if !ok {
+			t.Fatalf("store %T does not expose the operation journal", s)
+		}
+		var epoch uint64
+		var epochSet bool
+		var err error
+		if e, ok := s.(interface {
+			PublishEpoch(context.Context) (uint64, bool, error)
+		}); ok {
+			epoch, epochSet, err = e.PublishEpoch(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		opID := uuid.New()
+		if _, err := j.Create(context.Background(), consistency.Operation{ID: opID, OwnerID: owner, Kind: "upload"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := j.Transition(context.Background(), opID, consistency.StateIntent, consistency.StateStaging); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := j.Transition(context.Background(), opID, consistency.StateStaging, consistency.StatePublishing); err != nil {
+			t.Fatal(err)
+		}
+		req := consistency.BlobPublish{
+			OperationID: opID, OperationKind: "upload", Owner: owner.String(), Path: "published.txt",
+			Hash: h, Size: 7, EpochSet: epochSet, ExpectedEpoch: epoch,
+		}
+		if err := s.PublishBlob(context.Background(), req); err != nil {
+			t.Fatalf("publish: %v", err)
+		}
+		if op, err := j.Get(context.Background(), opID); err != nil || op.State != consistency.StateCommitted {
+			t.Fatalf("publish did not commit the journal in the same transaction: %+v, %v", op, err)
+		}
+		nodes, err := s.Resolve(context.Background(), owner, "published.txt")
+		if err != nil {
+			t.Fatalf("published node missing: %v", err)
+		}
+		if nodes[len(nodes)-1].ParentID == nil || *nodes[len(nodes)-1].ParentID != r.ID {
+			t.Fatalf("published node has the wrong parent: %+v", nodes[len(nodes)-1])
+		}
+		if err := s.PublishBlob(context.Background(), req); !errors.Is(err, consistency.ErrPublishExists) {
+			t.Fatalf("second no-replace = %v, want ErrPublishExists", err)
+		}
+
+		h2 := contentHash()
+		op2 := uuid.New()
+		if _, err := j.Create(context.Background(), consistency.Operation{ID: op2, OwnerID: owner, Kind: "upload"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := j.Transition(context.Background(), op2, consistency.StateIntent, consistency.StateStaging); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := j.Transition(context.Background(), op2, consistency.StateStaging, consistency.StatePublishing); err != nil {
+			t.Fatal(err)
+		}
+		req2 := consistency.BlobPublish{
+			OperationID: op2, OperationKind: "upload", Owner: owner.String(), Path: "published.txt",
+			Hash: h2, Size: 8, Replace: true, ExpectedETag: `"stale"`,
+			EpochSet: epochSet, ExpectedEpoch: epoch,
+		}
+		if err := s.PublishBlob(context.Background(), req2); !errors.Is(err, store.ErrPrecondition) {
+			t.Fatalf("stale replace = %v, want ErrPrecondition", err)
+		}
+		req2.ExpectedETag = nodes[len(nodes)-1].ETag
+		if err := s.PublishBlob(context.Background(), req2); err != nil {
+			t.Fatalf("safe replace: %v", err)
+		}
+		after, err := s.Resolve(context.Background(), owner, "published.txt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if after[len(after)-1].ETag == nodes[len(nodes)-1].ETag {
+			t.Fatal("safe replace did not change the ETag")
+		}
 	})
 
 	t.Run("RuntimeSettings", func(t *testing.T) {
@@ -4296,6 +4516,33 @@ func groupSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.UUID
 		}
 	})
 
+	t.Run("GroupsListsEveryGroupAlphabetically", func(t *testing.T) {
+		s, _ := factory(t)
+		// Created out of order on purpose: the admin screen renders this list as it arrives, and an
+		// unordered one makes rows appear to shuffle between refreshes.
+		createGroup(t, s, "zeta")
+		createGroup(t, s, "alpha")
+
+		var groups []store.Group
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			out, err := tx.Groups(ctx)
+			groups = out
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if len(groups) != 2 {
+			t.Fatalf("Groups returned %d groups, want 2", len(groups))
+		}
+		// Both backends must agree on this ordering — the SQL is ORDER BY name and the memory
+		// implementation sorts the same way — because an admin screen that reorders between
+		// deployments is a difference nobody would look for.
+		if groups[0].Name != "alpha" || groups[1].Name != "zeta" {
+			t.Fatalf("Groups returned %q then %q, want alpha then zeta",
+				groups[0].Name, groups[1].Name)
+		}
+	})
+
 	t.Run("AddMemberIsIdempotent", func(t *testing.T) {
 		s, _ := factory(t)
 		g := createGroup(t, s, "ops")
@@ -6690,6 +6937,7 @@ func ownerExportSuite(t *testing.T, factory func(t *testing.T) (store.Store, uui
 			}
 		}
 	})
+
 }
 
 // runtimeSettingsSuite covers the settings table, which existed from the first migration and had no Go

@@ -38,6 +38,13 @@ func TestPGConformance(t *testing.T) {
 		if _, err := pool.Exec(context.Background(), `DELETE FROM jobs`); err != nil {
 			t.Fatalf("clear jobs: %v", err)
 		}
+		// Groups are global, like jobs, and the conformance suite creates several
+		// across subtests. Without this the Groups ordering case sees rows from an
+		// earlier subtest and reports "5 groups, want 2" — a test-isolation failure,
+		// not a store failure. Clear the dependent rows first.
+		if _, err := pool.Exec(context.Background(), `DELETE FROM group_members; DELETE FROM groups`); err != nil {
+			t.Fatalf("clear groups: %v", err)
+		}
 		owner := newUser(t, pool)
 		s := store.NewPG(pool)
 		s.EnableAudit()
