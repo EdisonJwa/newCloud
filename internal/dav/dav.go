@@ -37,6 +37,7 @@ import (
 	"github.com/EdisonJwa/newCloud/internal/config"
 	"github.com/EdisonJwa/newCloud/internal/storage/layout"
 	"github.com/EdisonJwa/newCloud/internal/store"
+	"github.com/EdisonJwa/newCloud/internal/swap"
 )
 
 // Handler serves WebDAV at a configured prefix.
@@ -291,7 +292,13 @@ func (h *Handler) splitPath(urlPath string) (owner, rel string, err error) {
 	if err != nil {
 		return "", "", err
 	}
-	_ = segs
+	// A swap's staging name is a by-product of another request, not a resource. 404 rather than
+	// 403 so the refusal cannot be used to probe whether an overwrite is in progress here.
+	for _, seg := range segs {
+		if swap.IsReservedSegment(seg) {
+			return "", "", store.ErrNotFound
+		}
+	}
 	return owner, rel, nil
 }
 

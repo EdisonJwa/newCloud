@@ -20,7 +20,9 @@ package dav
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
+	"path"
 	"strings"
 	"testing"
 
@@ -455,10 +457,12 @@ func TestMoveOverwriteAcrossParents(t *testing.T) {
 		if name == "" {
 			t.Fatalf("%s: the restored destination is not visible under its parent", mode)
 		}
-		got := e.do(t, http.MethodGet, e.davPath("to/"+name), nil, nil)
-		if got.Code != http.StatusOK || got.Body.String() != "OLD TARGET bytes" {
-			t.Fatalf("%s: the restored old target under its parent = %d %q",
-				mode, got.Code, got.Body.String())
+		body, err := displacedBytes(t, e, path.Join("to", name))
+		if err != nil {
+			t.Fatalf("%s: the restored old target under its parent has no bytes: %v", mode, err)
+		}
+		if body != "OLD TARGET bytes" {
+			t.Fatalf("%s: the restored old target under its parent holds %q", mode, body)
 		}
 	})
 }
@@ -527,13 +531,13 @@ func TestMoveOverwriteKeepsTheDisplacedBytesReadable(t *testing.T) {
 		if name == "" {
 			t.Fatalf("%s: the restored node is not visible in its directory", mode)
 		}
-		got := e.do(t, http.MethodGet, e.davPath(name), nil, nil)
-		if got.Code != http.StatusOK {
-			t.Fatalf("%s: GET the restored old target (%q) = %d, want 200. A trash entry whose bytes "+
+		body, err := displacedBytes(t, e, name)
+		if err != nil {
+			t.Fatalf("%s: the restored old target (%q) has no bytes: %v. A trash entry whose bytes "+
 				"are gone is not a recovery: it is a promise the deployment cannot keep.",
-				mode, name, got.Code)
+				mode, name, err)
 		}
-		if body := got.Body.String(); body != "IRREPLACEABLE OLD TARGET" {
+		if body != "IRREPLACEABLE OLD TARGET" {
 			t.Fatalf("%s: the restored old target holds %q", mode, body)
 		}
 	})
@@ -581,10 +585,13 @@ func TestMoveOverwriteOfADirectoryKeepsTheDisplacedTreeReadable(t *testing.T) {
 		if name == "" {
 			t.Fatalf("%s: the restored directory is not visible in the root", mode)
 		}
-		got := e.do(t, http.MethodGet, e.davPath(name+"/old.txt"), nil, nil)
-		if got.Code != http.StatusOK || got.Body.String() != "old bytes" {
-			t.Fatalf("%s: the restored directory's child = %d %q. The whole displaced subtree must "+
-				"survive, not just its top node.", mode, got.Code, got.Body.String())
+		body, err := displacedBytes(t, e, path.Join(name, "old.txt"))
+		if err != nil {
+			t.Fatalf("%s: the restored directory's child has no bytes: %v. The whole displaced "+
+				"subtree must survive, not just its top node.", mode, err)
+		}
+		if body != "old bytes" {
+			t.Fatalf("%s: the restored directory's child holds %q", mode, body)
 		}
 	})
 }
@@ -631,6 +638,56 @@ func TestAFailedMoveOverwriteLeavesBothSidesIntact(t *testing.T) {
 		}
 		if items := trashedNodes(t, e); len(items) != 0 {
 			t.Fatalf("%s: a refused overwrite put %d item(s) in the trash: %v", mode, len(items), items)
+		}
+	})
+}
+
+// displacedBytes reads a trashed node's content at the path its metadata names.
+//
+// The reserved names a swap leaves behind are no longer addressable over DAV — that is the point
+// of refusing them — so "the displaced bytes survived" is checked where the bytes actually live
+// rather than through the namespace. A user reaches them the way the product intends: a restore
+// through the API, which renames the node out of the reserved name and moves the bytes with it
+// (covered by TestRestoreRecoversTheNameAfterAMoveOverwrite in internal/server).
+func displacedBytes(t *testing.T, e *testEnv, rel string) (string, error) {
+	t.Helper()
+	rc, err := e.h.content.Open(context.Background(),
+		layout.Node{Owner: e.user.ID.String(), Path: rel})
+	if err != nil {
+		return "", err
+	}
+	defer rc.Close()
+	b, rerr := io.ReadAll(rc)
+	return string(b), rerr
+}
+
+// A swap's staging name is not a resource.
+//
+// These names exist only between a replacement being staged and installed. They are filtered out
+// of listings, and a client that guessed one could read content mid-copy or corrupt a swap in
+// flight, so addressing them answers 404 — the same answer as a name that does not exist, which
+// is deliberate: a 403 would confirm that an overwrite is happening at that path right now
+// (2026-10-24 review, M4).
+func TestReservedSwapNamesAreNotAddressable(t *testing.T) {
+	layouts(t, func(t *testing.T, e *testEnv, mode layout.Mode) {
+		for _, name := range []string{
+			"0123456789abcdef.newcloud-staged-budget.txt",
+			"0123456789abcdef.newcloud-replaced-budget.txt",
+		} {
+			if rec := e.do(t, http.MethodGet, e.davPath(name), nil, nil); rec.Code != http.StatusNotFound {
+				t.Fatalf("%s: GET %q = %d, want 404: a swap's staging name must not be readable",
+					mode, name, rec.Code)
+			}
+			if rec := e.do(t, http.MethodPut, e.davPath(name),
+				strings.NewReader("injected"), nil); rec.Code != http.StatusNotFound {
+				t.Fatalf("%s: PUT %q = %d, want 404: writing to a staging name would corrupt a "+
+					"swap in flight", mode, name, rec.Code)
+			}
+			if rec := e.do(t, "PROPFIND", e.davPath(name),
+				strings.NewReader(propfindAllProp), map[string]string{"Depth": "0"}); rec.Code == http.StatusMultiStatus {
+				t.Fatalf("%s: PROPFIND %q answered 207; the refusal must not disclose whether the "+
+					"name exists", mode, name)
+			}
 		}
 	})
 }

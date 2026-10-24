@@ -254,7 +254,14 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request, a authz.Acto
 	ctx := r.Context()
 
 	// The parent must exist and be writable; PUT does not create directories.
-	_, rel, _ := h.splitPath(r.URL.Path)
+	_, rel, serr := h.splitPath(r.URL.Path)
+	if serr != nil {
+		// splitPath refuses a swap's staging name, and PUT used to discard that error and fall
+		// through to 409. Writing to a staging name would corrupt a swap another request is in
+		// the middle of, so the refusal has to be honoured here (2026-10-24 review, M4).
+		writeXMLError(w, statusForError(serr), "")
+		return
+	}
 	if rel == "" {
 		writeXMLError(w, http.StatusConflict, "")
 		return

@@ -68,7 +68,7 @@ func TestRestoreRecoversTheNameAfterAMoveOverwrite(t *testing.T) {
 	status, out := postBatch(t, h, map[string]any{
 		"op":        "move",
 		"overwrite": true,
-		"items": []map[string]string{{"from": "replacement.txt", "to": "budget.txt"}},
+		"items":     []map[string]string{{"from": "replacement.txt", "to": "budget.txt"}},
 	})
 	if status != http.StatusOK && status != http.StatusMultiStatus {
 		t.Fatalf("move over an existing name: %d (%v)", status, out)

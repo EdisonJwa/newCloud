@@ -268,15 +268,15 @@ func TestTheReplacedDestinationIsRecoverableInEveryLayout(t *testing.T) {
 			t.Fatalf("%s: the restored node is not visible in the tree root", mode)
 		}
 
-		got := e.do(t, http.MethodGet, e.davPath(restoredName), nil, nil)
-		if got.Code != http.StatusOK {
-			t.Fatalf("%s: GET the restored original (%q) = %d, want 200. The trash row exists but "+
+		restoredBody, rerr := displacedBytes(t, e, restoredName)
+		if rerr != nil {
+			t.Fatalf("%s: the restored original (%q) has no bytes: %v. The trash row exists but "+
 				"its bytes were not preserved, so the previous version is only nominally "+
-				"recoverable.", mode, restoredName, got.Code)
+				"recoverable.", mode, restoredName, rerr)
 		}
-		if body := got.Body.String(); body != "the precious original" {
+		if restoredBody != "the precious original" {
 			t.Fatalf("%s: the restored original holds %q, want the previous version's bytes",
-				mode, body)
+				mode, restoredBody)
 		}
 	})
 }

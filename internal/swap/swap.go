@@ -48,6 +48,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path"
+	"strings"
 	"unicode/utf8"
 
 	"github.com/google/uuid"
@@ -351,6 +352,18 @@ func trashSibling(ctx context.Context, d Deps, in Request, name, reason string) 
 		d.Log.Warn("swap: trashed an intermediate node",
 			"name", name, "node", victim.ID.String(), "reason", reason)
 	}
+}
+
+// IsReservedSegment reports whether a path segment is a name this package generates.
+//
+// Those names are transient: they exist between a replacement being staged and being installed,
+// and they are filtered out of listings. They must be unaddressable too — a client that guessed
+// one could read content mid-copy, or write to it and corrupt a swap another request is in the
+// middle of (2026-10-24 review, M4). Enforcing that only became safe once restore stopped handing
+// those names back to users.
+func IsReservedSegment(name string) bool {
+	return strings.Contains(name, ".newcloud-staged-") ||
+		strings.Contains(name, ".newcloud-replaced-")
 }
 
 // StagedName is the reserved sibling name a replacement is built under.
