@@ -262,6 +262,10 @@ type Tx interface {
 	SessionLive(ctx context.Context, jti string) (bool, error)
 	RevokeSession(ctx context.Context, jti string) error
 	RevokeUserSessions(ctx context.Context, userID string) error
+	// PruneSessions deletes dead session rows past the retention horizon, so the table
+	// stays proportional to active users instead of to every login ever made. The
+	// retention rule lives with the implementations (see identity_prune.go).
+	PruneSessions(ctx context.Context, olderThan time.Duration) (int64, error)
 
 	// UserByID and UserByIdPSubject are the identity reads used during login.
 	UserByID(ctx context.Context, id uuid.UUID) (User, error)
@@ -288,6 +292,15 @@ type Tx interface {
 	// what "the account was disabled" has to mean for WebDAV clients.
 	RevokeUserAppPasswords(ctx context.Context, userID uuid.UUID) (int, error)
 	ListAppPasswords(ctx context.Context, userID uuid.UUID) ([]AppPassword, error)
+
+	// Nextcloud login-flow-v2 state (ADR-0015). The poll deletes the row and the caller
+	// mints the credential in the SAME request, so a flow cannot be consumed twice; the
+	// approval is conditional for the same reason.
+	CreateLoginFlow(ctx context.Context, f LoginFlow, pollHash, loginHash [32]byte) error
+	LoginFlowByLoginHash(ctx context.Context, loginHash [32]byte) (LoginFlow, error)
+	ApproveLoginFlow(ctx context.Context, loginHash [32]byte, userID uuid.UUID, at time.Time) (LoginFlow, error)
+	ConsumeLoginFlow(ctx context.Context, pollHash [32]byte, at time.Time) (LoginFlow, error)
+	DeleteExpiredLoginFlows(ctx context.Context, now time.Time) (int, error)
 
 	// WebDAV lock operations. Locks are durable because an in-memory lock system
 	// breaks under restart or a second process, silently corrupting co-edited
@@ -319,6 +332,7 @@ type Tx interface {
 	// metadata here and misbehave when it does not survive a reconnect.
 	SetDeadProp(ctx context.Context, nodeID uuid.UUID, space, name, value string) error
 	DeadProps(ctx context.Context, nodeID uuid.UUID) ([]DeadProp, error)
+	DeadPropsFor(ctx context.Context, nodeIDs []uuid.UUID) (map[uuid.UUID][]DeadProp, error)
 	DeleteDeadProp(ctx context.Context, nodeID uuid.UUID, space, name string) error
 
 	// Share operations.
@@ -472,6 +486,14 @@ type Tx interface {
 
 	// Retention: permanent deletion of expired trash and versions.
 	PurgeTrash(ctx context.Context, retention time.Duration) (PurgeResult, error)
+	// PurgeTrashFor is the user-initiated "empty trash" (core-scope §3).
+	//
+	// It sits next to PurgeTrash rather than in a separate interface because the two MUST share
+	// the accounting and the recursive delete: the acceptance criterion is that a concurrent purge
+	// and delete cannot double-release a refcount, and that property is only true if there is one
+	// implementation of the release. This is the same routine, scoped to one owner, ignoring
+	// retention, and bounded so a huge bin does not hold one request open.
+	PurgeTrashFor(ctx context.Context, ownerID uuid.UUID, maxRoots int) (PurgeResult, error)
 	// ExpireRetained moves nodes whose share retention has lapsed into the trash.
 	//
 	// Into the trash, not out of the database: retention is a policy about how long deliveries
@@ -481,6 +503,11 @@ type Tx interface {
 	ShareRateTx
 	// SharePasswordTx is the password-guess throttle (SHARE-02 尝试上限).
 	SharePasswordTx
+	// SocialTx is favorites, tags and comments (core-scope §4, §5, §6).
+	//
+	// Embedded rather than folded into this block because the three arrived together and share the
+	// node-id addressing rule; keeping them in their own file is what lets that rule be stated once.
+	SocialTx
 	ExpireVersions(ctx context.Context, retention time.Duration) (int, error)
 
 	// Enqueue adds an asynchronous job in the same transaction.
@@ -492,6 +519,39 @@ type Tx interface {
 	FailJob(ctx context.Context, id int64, cause error, permanent bool) (bool, error)
 	ReapExpiredLeases(ctx context.Context) (int, error)
 	JobCounts(ctx context.Context) (pending, running, failed int, err error)
+
+	// Mounts: external storage pointed at a folder, never copied (ADR-0014).
+	//
+	// The mount row is a pointer: the mount-point folder is an ordinary nodes row and
+	// nothing below it is ever stored. These methods manage the pointer, not the
+	// contents — a provider answers for those, live.
+	CreateMount(ctx context.Context, m NewMount) (Mount, error)
+	// MountByNodeID answers "is this node a mount point, and what does it point at".
+	//
+	// ErrNotFound means it is an ordinary folder. The pairing is unique (mounts.node_id
+	// is UNIQUE), so this is the one question both HTTP surfaces ask on every path that
+	// resolves to a directory, and the answer is what decides whether resolution
+	// continues in the database or hands the remaining segments to a provider.
+	MountByNodeID(ctx context.Context, nodeID uuid.UUID) (Mount, error)
+	MountByID(ctx context.Context, id uuid.UUID) (Mount, error)
+	// MountsForOwner lists the mounts whose point lives in this owner's tree.
+	MountsForOwner(ctx context.Context, ownerID uuid.UUID) ([]Mount, error)
+	// AllMounts is the operator view. A mount dials outward with stored credentials;
+	// the list of where it dials is exactly what an operator must be able to see.
+	AllMounts(ctx context.Context) ([]Mount, error)
+	// DeleteMount removes the mount row and its mount-point node in one transaction.
+	//
+	// The node is hard-deleted, not trashed: it is a pointer, not data, and a trashed
+	// mount point would be a folder that resolves to a remote nobody can reach through
+	// it. The remote's data is untouched — unmounting is not deletion, and the API says
+	// so rather than implying it. Refuses a mount whose node grew live children, which
+	// by construction cannot happen (nothing below a mount point is ever stored) and is
+	// checked anyway because "by construction" is exactly what a later change erodes.
+	DeleteMount(ctx context.Context, id uuid.UUID) error
+	// SetMountHealth records the outcome of the last reachability check. It is
+	// advisory — a stale "ok" must never authorize anything — but it is what the mount
+	// list shows an operator instead of making them probe by hand.
+	SetMountHealth(ctx context.Context, id uuid.UUID, status, detail string, at time.Time) error
 }
 
 // NewNode is the input for creating a directory.
@@ -521,6 +581,13 @@ type NewFile struct {
 	// link whose retention is shortened afterwards must not retroactively delete older
 	// deliveries; lengthening it must not extend them either.
 	RetainUntil *time.Time
+	// ModifiedAt, when set, is the modification time the CLIENT asked for — the WebDAV
+	// Nextcloud client sends it as X-OC-Mtime, and a sync client compares it against its
+	// local clock. Nil means "now", which is the right answer for every other writer.
+	//
+	// It is deliberately not part of the ETag: the ETag identifies content, and an upload
+	// that only re-stamps a timestamp is still the same bytes.
+	ModifiedAt *time.Time
 }
 
 // UpdateFile replaces a file's content.
@@ -549,6 +616,9 @@ type UpdateFile struct {
 	// what it contained, but never who made it. Nil is legitimate for background work, but a
 	// user-initiated save must name the user.
 	By *uuid.UUID
+	// ModifiedAt, when set, replaces the server's clock for this write (X-OC-Mtime). See
+	// NewFile.ModifiedAt.
+	ModifiedAt *time.Time
 }
 
 // WriteFile is an upsert with a precondition: it creates the file when the name
@@ -588,6 +658,35 @@ type Version struct {
 	SHA256    []byte
 	CreatedAt time.Time
 	CreatedBy *uuid.UUID
+}
+
+// NewMount is the input for recording an external mount (ADR-0014).
+type NewMount struct {
+	ID       uuid.UUID
+	NodeID   uuid.UUID
+	OwnerID  uuid.UUID
+	Name     string
+	Scheme   string
+	Endpoint string
+	// RootPath is the path inside the remote that the mount is rooted at, so one remote can
+	// back several mounts without exposing all of itself to any one of them.
+	RootPath string
+	Username string
+	// SecretEnc is the credential's AES-256-GCM ciphertext. The store never sees plaintext:
+	// the cipher lives above it, keyed by the file from mounts.secret_file.
+	SecretEnc []byte
+	ReadOnly  bool
+	CreatedBy uuid.UUID
+}
+
+// Mount is one recorded external mount. It is a pointer, not a copy (ADR-0014): the node is
+// the folder users see, and every request below it asks the remote live.
+type Mount struct {
+	NewMount
+	CreatedAt    time.Time
+	HealthStatus string
+	HealthDetail string
+	HealthAt     *time.Time
 }
 
 // AuditEntry is a single audit record, mirrored from internal/audit.Event but

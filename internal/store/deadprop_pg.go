@@ -28,6 +28,34 @@ func (t *pgTx) DeadProps(ctx context.Context, nodeID uuid.UUID) ([]DeadProp, err
 	return scanDeadProps(rows)
 }
 
+func (t *pgTx) DeadPropsFor(ctx context.Context, nodeIDs []uuid.UUID) (map[uuid.UUID][]DeadProp, error) {
+	out := make(map[uuid.UUID][]DeadProp, len(nodeIDs))
+	if len(nodeIDs) == 0 {
+		return out, nil
+	}
+	// The ids travel as text and are cast, so the array encoding cannot depend on how the
+	// driver maps a slice of the google/uuid type.
+	ids := make([]string, len(nodeIDs))
+	for i, id := range nodeIDs {
+		ids[i] = id.String()
+	}
+	const q = `SELECT node_id, namespace, name, value FROM dead_props
+		WHERE node_id = ANY($1::uuid[]) ORDER BY node_id, namespace, name`
+	rows, err := t.tx.Query(ctx, q, ids)
+	if err != nil {
+		return nil, translate(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var p DeadProp
+		if err := rows.Scan(&p.NodeID, &p.Space, &p.Name, &p.Value); err != nil {
+			return nil, translate(err)
+		}
+		out[p.NodeID] = append(out[p.NodeID], p)
+	}
+	return out, translate(rows.Err())
+}
+
 func (t *pgTx) DeleteDeadProp(ctx context.Context, nodeID uuid.UUID, space, name string) error {
 	const q = `DELETE FROM dead_props WHERE node_id = $1 AND namespace = $2 AND name = $3`
 	_, err := t.tx.Exec(ctx, q, nodeID, space, name)

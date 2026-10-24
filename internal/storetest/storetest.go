@@ -1438,6 +1438,145 @@ func Run(t *testing.T, factory Factory, opts Options) {
 		retainedVersionsSuite(t, factory)
 	})
 
+	t.Run("Mounts", func(t *testing.T) {
+		s, owner := factory(t)
+		root := rootOf(t, s, owner)
+		other := addUser(t, s, "mount-bystander")
+		otherRoot := rootOf(t, s, other.ID)
+
+		newMount := func(name string, parent uuid.UUID, ownerID uuid.UUID) store.Mount {
+			var m store.Mount
+			err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				node, nerr := tx.CreateDir(ctx, store.NewNode{OwnerID: ownerID, ParentID: parent, Name: name})
+				if nerr != nil {
+					return nerr
+				}
+				m, nerr = tx.CreateMount(ctx, store.NewMount{
+					ID: uuid.New(), NodeID: node.ID, OwnerID: ownerID, Name: name,
+					Scheme: "webdav", Endpoint: "https://remote.example.test/dav",
+					RootPath: "/docs", Username: "u", SecretEnc: []byte("ciphertext"),
+					ReadOnly: false, CreatedBy: ownerID,
+				})
+				return nerr
+			})
+			if err != nil {
+				t.Fatalf("create mount %q: %v", name, err)
+			}
+			return m
+		}
+
+		alice := newMount("team-webdav", root.ID, owner)
+		shared := newMount("archive", root.ID, owner)
+		theirs := newMount("theirs", otherRoot.ID, other.ID)
+
+		// The pairing lookups both directions, and a plain folder is not a mount.
+		plain := mkdir(t, s, owner, root.ID, "plain")
+		var byNode, byID store.Mount
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			var err error
+			byNode, err = tx.MountByNodeID(ctx, alice.NodeID)
+			if err != nil {
+				return err
+			}
+			byID, err = tx.MountByID(ctx, shared.ID)
+			if err != nil {
+				return err
+			}
+			if _, err = tx.MountByNodeID(ctx, plain.ID); !errors.Is(err, store.ErrNotFound) {
+				if err == nil {
+					return errors.New("a plain directory resolved to a mount")
+				}
+				return fmt.Errorf("plain dir as mount: %w", err)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if byNode.ID != alice.ID || byID.ID != shared.ID {
+			t.Fatalf("pairing lookups returned the wrong mounts: %+v %+v", byNode, byID)
+		}
+
+		// Owner scoping, and the operator view sees every mount.
+		var mine, all []store.Mount
+		_ = s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			var err error
+			mine, err = tx.MountsForOwner(ctx, owner)
+			if err != nil {
+				return err
+			}
+			all, err = tx.AllMounts(ctx)
+			return err
+		})
+		if len(mine) != 2 || len(all) != 3 {
+			t.Fatalf("owner scoping: %d for owner, %d overall", len(mine), len(all))
+		}
+
+		// Health is advisory bookkeeping, but it must persist.
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.SetMountHealth(ctx, theirs.ID, "ok", "", time.Now())
+		}); err != nil {
+			t.Fatal(err)
+		}
+		var after store.Mount
+		_ = s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			var err error
+			after, err = tx.MountByID(ctx, theirs.ID)
+			return err
+		})
+		if after.HealthStatus != "ok" || after.HealthAt == nil {
+			t.Fatalf("health did not persist: %+v", after)
+		}
+
+		// DeleteMount refuses a mount point that grew children, then removes both rows.
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			_, err := tx.CreateDir(ctx, store.NewNode{OwnerID: other.ID, ParentID: theirs.NodeID, Name: "stray"})
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.DeleteMount(ctx, theirs.ID)
+		}); err == nil {
+			t.Fatal("a mount point with children must not be deletable")
+		}
+		// Trash the stray child, then the deletion goes through: the guard is about LIVE
+		// children, matching the SQL's partial predicate.
+		var strayID uuid.UUID
+		_ = s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			n, err := tx.ChildByName(ctx, theirs.NodeID, "stray")
+			strayID = n.ID
+			return err
+		})
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.Trash(ctx, strayID)
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.DeleteMount(ctx, theirs.ID)
+		}); err != nil {
+			t.Fatalf("delete mount after clearing children: %v", err)
+		}
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			_, err := tx.MountByID(ctx, theirs.ID)
+			if !errors.Is(err, store.ErrNotFound) {
+				return err
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("mount row survived DeleteMount: %v", err)
+		}
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			_, err := tx.Node(ctx, theirs.NodeID)
+			if !errors.Is(err, store.ErrNotFound) {
+				return err
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("mount node survived DeleteMount: %v", err)
+		}
+	})
+
 	t.Run("AdminCreatedAccount", func(t *testing.T) {
 		adminCreatedAccountSuite(t, factory)
 	})
@@ -1470,6 +1609,23 @@ func Run(t *testing.T, factory Factory, opts Options) {
 					t.Fatalf("a backend that does not model blob lifecycle returned %v, want "+
 						"ErrNotImplemented. Returning an empty list would let the sweep report a "+
 						"clean run on a backend that never looked.", err)
+				}
+			})
+
+			// DeleteBlob is the other half of the pair, and it used to be the worse lie: it
+			// returned nil on this backend, so a sweep could report bytes reclaimed that no
+			// backend ever dropped.
+			t.Run("DeleteBlobAlsoReportsTheGap", func(t *testing.T) {
+				s, owner := factory(t)
+				rootOf(t, s, owner)
+
+				err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+					return tx.DeleteBlob(ctx, uuid.New())
+				})
+				if !errors.Is(err, store.ErrNotImplemented) {
+					t.Fatalf("DeleteBlob on a backend with no blob rows returned %v, want "+
+						"ErrNotImplemented: nil reports a deletion it cannot perform and a "+
+						"reference check it cannot make.", err)
 				}
 			})
 			return
@@ -1541,6 +1697,69 @@ func Run(t *testing.T, factory Factory, opts Options) {
 				return err
 			}); err != nil {
 				t.Fatalf("deleting one blob disturbed another: %v", err)
+			}
+		})
+
+		// The orphan at birth. BlobIDFor creates the row before anything references it; a
+		// publish that fails after that point (quota 507, If-Match 412, a name fold 409)
+		// abandons a row with refcount 0 and collect_after NULL — the dropped-reference clock
+		// never starts, so a collector that required collect_after to be set kept every failed
+		// upload forever. The grace the caller passes has to cover this case too, measured from
+		// the row's creation, or it is only a grace for references that existed and died.
+		t.Run("AbandonedUploadBecomesCollectable", func(t *testing.T) {
+			s, owner := factory(t)
+			rootOf(t, s, owner)
+
+			var hash [32]byte
+			hash[0] = 0x7e
+			orphan := s.BlobIDFor(context.Background(), hash, 4242)
+
+			// Fresh: inside its grace, not collectable. The grace exists so the sweep cannot
+			// race the upload that is about to reference the row.
+			var refs []store.BlobRef
+			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				got, err := tx.CollectableBlobs(ctx, time.Hour)
+				refs = got
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			for _, ref := range refs {
+				if ref.ID == orphan {
+					t.Fatal("an unreferenced blob created moments ago was collectable with an hour of grace")
+				}
+			}
+
+			// Grace elapsed: a zero grace is already past for any committed row, so this is the
+			// deterministic stand-in for ageing the row past a real window.
+			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				got, err := tx.CollectableBlobs(ctx, 0)
+				refs = got
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, ref := range refs {
+				if ref.ID == orphan {
+					found = true
+					if ref.Size != 4242 {
+						t.Fatalf("candidate reported size %d, want 4242: the sweep's reclaim accounting reads this", ref.Size)
+					}
+				}
+			}
+			if !found {
+				t.Fatal("an abandoned blob (never referenced, past its grace) never became " +
+					"collectable: requiring collect_after to be set makes every failed publish " +
+					"permanent garbage")
+			}
+
+			// And the sweep can actually remove it, so the case cannot pass on a collector that
+			// lists candidates but cannot act on them.
+			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				return tx.DeleteBlob(ctx, orphan)
+			}); err != nil {
+				t.Fatalf("DeleteBlob on the abandoned blob: %v", err)
 			}
 		})
 	})
@@ -3717,6 +3936,23 @@ func Run(t *testing.T, factory Factory, opts Options) {
 			}
 		})
 	})
+
+	// Nextcloud login-flow v2 (ADR-0015): the state behind the browser→client handshake.
+	// It lives here because "exactly one poll may collect the credential" and "only the
+	// account that approved may claim the flow" are guarantees both backends must make.
+	t.Run("LoginFlows", LoginFlowCases(factory))
+
+	// The social substrate (core-scope §4, §5, §6) and the owner-scoped purge (§3) and the
+	// filtered search (§7.1). They live in social.go beside this file, and they are in the SHARED
+	// suite for the reason the ratchet in conformance_ratchet_test.go states: each of these is
+	// implemented twice — a SQL statement and a Go loop — and a case that only one backend runs
+	// proves nothing about the other.
+	t.Run("Favorites", func(t *testing.T) { favoriteSuite(t, factory) })
+	t.Run("Tags", func(t *testing.T) { tagSuite(t, factory) })
+	t.Run("Comments", func(t *testing.T) { commentSuite(t, factory) })
+	t.Run("FilteredSearch", func(t *testing.T) { filteredSearchSuite(t, factory) })
+	t.Run("OwnerTrashPurge", func(t *testing.T) { ownerPurgeSuite(t, factory) })
+	t.Run("SocialAnnotations", func(t *testing.T) { socialAnnotationSuite(t, factory) })
 }
 
 // upsertUser runs UpsertIdPUser in a transaction.
@@ -4336,6 +4572,45 @@ func versionLifecycleSuite(t *testing.T, factory func(t *testing.T) (store.Store
 		}
 	}
 
+	// Quota follows the row the operation actually saw, not a size some earlier read observed.
+	// These are single-transaction sequences, so they pin the arithmetic itself; the concurrent
+	// interleaving that used to break it is pinned by the PostgreSQL-gated tests that can force
+	// the read-then-write window deterministically.
+	t.Run("QuotaFollowsTheSizeThroughVersions", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		file := mkfile(t, s, owner, r.ID, "quota.txt", 100)
+
+		writeVersion(t, s, owner, file.ID, 1) // replaces 100 bytes with 11, keeping 100 as v1
+		if got := usageOf(t, s, owner); got != 11 {
+			t.Fatalf("usage %d after replacing 100 bytes with 11, want 11: the quota moves by the "+
+				"delta, not by the new size, or every rewrite double-charges", got)
+		}
+
+		// Restoring the LARGER first version must charge the growth. A restore that grows the
+		// file without moving the quota is a way to exceed the limit without ever being refused.
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			_, err := tx.RestoreVersion(ctx, file.ID, 1, nil)
+			return err
+		}); err != nil {
+			t.Fatalf("restore larger version: %v", err)
+		}
+		if got := usageOf(t, s, owner); got != 100 {
+			t.Fatalf("usage %d after restoring the 100-byte version, want 100", got)
+		}
+
+		// And back down: a restore that shrinks the file must release the difference.
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			_, err := tx.RestoreVersion(ctx, file.ID, 2, nil)
+			return err
+		}); err != nil {
+			t.Fatalf("restore smaller version: %v", err)
+		}
+		if got := usageOf(t, s, owner); got != 11 {
+			t.Fatalf("usage %d after restoring the 11-byte version, want 11", got)
+		}
+	})
+
 	t.Run("RestoreVersionSwapsCurrentAndKeepsIt", func(t *testing.T) {
 		s, owner := factory(t)
 		r := rootOf(t, s, owner)
@@ -4690,6 +4965,69 @@ func deadPropSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.U
 			return tx.DeleteDeadProp(ctx, f.ID, ns, "never-set")
 		}); err != nil {
 			t.Fatalf("deleting an absent property: %v", err)
+		}
+	})
+
+	// DeadPropsFor is the batch read a PROPFIND listing uses. It has to agree with the
+	// per-node read on BOTH backends: the in-memory version is a loop and the PostgreSQL
+	// one is one `= ANY` query, which is exactly the shape that can diverge quietly.
+	t.Run("BulkReadAgreesWithPerNodeRead", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+
+		a := mkfile(t, s, owner, r.ID, "a.txt", 1)
+		b := mkfile(t, s, owner, r.ID, "b.txt", 1)
+		c := mkfile(t, s, owner, r.ID, "c.txt", 1)
+		set(t, s, a.ID, "one")
+		set(t, s, b.ID, "two")
+
+		var bulk map[uuid.UUID][]store.DeadProp
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			got, err := tx.DeadPropsFor(ctx, []uuid.UUID{a.ID, b.ID, c.ID})
+			bulk = got
+			return err
+		}); err != nil {
+			t.Fatalf("bulk read: %v", err)
+		}
+		if len(bulk[a.ID]) != 1 || bulk[a.ID][0].Value != "one" {
+			t.Fatalf("node a: %+v", bulk[a.ID])
+		}
+		if len(bulk[b.ID]) != 1 || bulk[b.ID][0].Value != "two" {
+			t.Fatalf("node b: %+v", bulk[b.ID])
+		}
+		if _, present := bulk[c.ID]; present {
+			t.Fatalf("a node with no properties must be absent from the map, not an empty "+
+				"slice: got %+v", bulk[c.ID])
+		}
+
+		// Both nodes must match what the single-node read returns, in the same order.
+		for _, n := range []store.Node{a, b} {
+			want := read(t, s, n.ID)
+			got := bulk[n.ID]
+			if len(got) != len(want) {
+				t.Fatalf("node %s: bulk returned %d props, per-node %d", n.Name, len(got), len(want))
+			}
+			for i := range want {
+				if got[i].Space != want[i].Space || got[i].Name != want[i].Name ||
+					got[i].Value != want[i].Value {
+					t.Fatalf("node %s prop %d: bulk %+v, per-node %+v", n.Name, i, got[i], want[i])
+				}
+			}
+		}
+
+		// An empty request must be an empty map, not an error and not a nil map: the
+		// caller ranges over it.
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			got, err := tx.DeadPropsFor(ctx, nil)
+			if got == nil {
+				t.Fatal("DeadPropsFor(nil) returned a nil map")
+			}
+			if len(got) != 0 {
+				t.Fatalf("DeadPropsFor(nil) returned %d entries", len(got))
+			}
+			return err
+		}); err != nil {
+			t.Fatal(err)
 		}
 	})
 }
@@ -5428,6 +5766,65 @@ func credentialSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid
 		if live(t, s, jti) {
 			t.Fatal("a revoked session still reports itself live, so logging out would not end " +
 				"the session")
+		}
+	})
+
+	// Session retention. The prune exists to bound the sessions table, and the rule worth
+	// pinning across backends is which rows count as dead: a revoked row dies at revoked_at, an
+	// unrevoked one at expires_at, and a LIVE session is untouchable even at olderThan zero — a
+	// sweep racing a login must not be able to collect the credential that login just minted.
+	t.Run("PruneSessionsRemovesOnlyRowsPastTheWindow", func(t *testing.T) {
+		s, owner := factory(t)
+		liveJTI := mkSession(t, s, owner)
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.CreateSession(ctx, store.Session{
+				ID: uuid.New().String(), UserID: owner, IP: "127.0.0.1", UserAgent: "prune",
+				ExpiresAt: time.Now().Add(-48 * time.Hour),
+			})
+		}); err != nil {
+			t.Fatal(err)
+		}
+		revokedJTI := mkSession(t, s, owner)
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.RevokeSession(ctx, revokedJTI)
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		// A day-long window removes the long-expired row and nothing else: the freshly revoked
+		// row has not been dead for the window, and the live row is not dead at all. The count
+		// is a lower bound because a store-backed database keeps rows from earlier subtests;
+		// the boundary this case pins is which of THIS test's rows survive.
+		var n int64
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			got, err := tx.PruneSessions(ctx, 24*time.Hour)
+			n = got
+			return err
+		}); err != nil {
+			t.Fatalf("prune: %v", err)
+		}
+		if n < 1 {
+			t.Fatal("a 24-hour window pruned nothing; it must at least take the row that expired 48 hours ago")
+		}
+		if !live(t, s, liveJTI) {
+			t.Fatal("the live session did not survive a prune that must not touch live rows")
+		}
+
+		// At zero the just-revoked row has been dead long enough, and the live row STILL
+		// survives — being dead, not merely old, is what makes a row collectible.
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			got, err := tx.PruneSessions(ctx, 0)
+			n = got
+			return err
+		}); err != nil {
+			t.Fatalf("prune at zero: %v", err)
+		}
+		if n < 1 {
+			t.Fatal("a zero window pruned nothing; the freshly revoked row has been dead since now")
+		}
+		if !live(t, s, liveJTI) {
+			t.Fatal("a zero-length window collected a LIVE session; a sweep racing a login must " +
+				"never be able to remove the credential that login just minted")
 		}
 	})
 
@@ -7882,6 +8279,117 @@ func retainedUsageSuite(t *testing.T, factory func(t *testing.T) (store.Store, u
 				afterTrash, got)
 		}
 	})
+
+	// A subtree under one directory is not necessarily one owner's bytes: group spaces and
+	// ACL-shared folders hold files whose owner_id is the WRITER's, not the folder's. Reading
+	// the subtree sum with a one-row scan charged only the first owner the query happened to
+	// return and stranded every other owner's bytes — invisible to a single-owner test, which
+	// is why the second account here is the point of the case, not decoration.
+	t.Run("MixedOwnerTrashMovesEachOwnersBytes", func(t *testing.T) {
+		s, ownerA := factory(t)
+		rootA := rootOf(t, s, ownerA)
+		b := addUser(t, s, "mixown-trash-"+strings.ToLower(uuid.NewString()[:8]))
+		dir := mkdir(t, s, ownerA, rootA.ID, "shared")
+		mkfile(t, s, ownerA, dir.ID, "a.txt", 1000)
+		mkfile(t, s, b.ID, dir.ID, "b.bin", 3000)
+
+		usedA, usedB := usageOf(t, s, ownerA), usageOf(t, s, b.ID)
+		trashA, trashB := trashBytesOf(t, s, ownerA), trashBytesOf(t, s, b.ID)
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.Trash(ctx, dir.ID)
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		if got := usageOf(t, s, ownerA); got != usedA-1000 {
+			t.Fatalf("owner A usage %d, want %d: A's own bytes must leave the logical quota at trash time",
+				got, usedA-1000)
+		}
+		if got := usageOf(t, s, b.ID); got != usedB-3000 {
+			t.Fatalf("owner B usage %d, want %d: B's file sat in A's directory, but the bytes are B's — "+
+				"leaving them charged means B pays for content they can no longer reach", got, usedB-3000)
+		}
+		if got := trashBytesOf(t, s, ownerA); got != trashA+1000 {
+			t.Fatalf("owner A retained usage %d, want %d: the bytes are retained, not freed", got, trashA+1000)
+		}
+		if got := trashBytesOf(t, s, b.ID); got != trashB+3000 {
+			t.Fatalf("owner B retained usage %d, want %d: B's bytes moved to retained usage too, or the "+
+				"retention cap is bounding a counter that never received them", got, trashB+3000)
+		}
+
+		// The purge pairs with the credit: it releases per node from each owner's retained
+		// counter, so after it runs BOTH owners are back where they started. A whole-subtree
+		// retention window is a window per account, not a window for whoever owned the root.
+		time.Sleep(25 * time.Millisecond)
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			_, err := tx.PurgeTrash(ctx, time.Millisecond)
+			return err
+		}); err != nil {
+			t.Fatalf("purge: %v", err)
+		}
+		if got := usageOf(t, s, ownerA); got != usedA-1000 {
+			t.Fatalf("owner A usage moved to %d on purge; the logical quota was already released at trash time", got)
+		}
+		if got := usageOf(t, s, b.ID); got != usedB-3000 {
+			t.Fatalf("owner B usage moved to %d on purge; the logical quota was already released at trash time", got)
+		}
+		if got := trashBytesOf(t, s, ownerA); got != trashA {
+			t.Fatalf("owner A retained usage %d after purge, want %d: purging must release the retained bytes of every owner in the subtree", got, trashA)
+		}
+		if got := trashBytesOf(t, s, b.ID); got != trashB {
+			t.Fatalf("owner B retained usage %d after purge, want %d: purging must release the retained bytes of every owner in the subtree", got, trashB)
+		}
+	})
+
+	// The restore-side twin: bringing a mixed-owner subtree back must credit EACH owner, or
+	// restore quietly moves bytes between accounts.
+	t.Run("MixedOwnerRestorePutsEachOwnersBytesBack", func(t *testing.T) {
+		s, ownerA := factory(t)
+		rootA := rootOf(t, s, ownerA)
+		b := addUser(t, s, "mixown-rest-"+strings.ToLower(uuid.NewString()[:8]))
+		dir := mkdir(t, s, ownerA, rootA.ID, "shared")
+		fileB := mkfile(t, s, b.ID, dir.ID, "b.bin", 3000)
+
+		usedA, usedB := usageOf(t, s, ownerA), usageOf(t, s, b.ID)
+		trashA, trashB := trashBytesOf(t, s, ownerA), trashBytesOf(t, s, b.ID)
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.Trash(ctx, dir.ID)
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			_, err := tx.Restore(ctx, dir.ID)
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		if got := usageOf(t, s, ownerA); got != usedA {
+			t.Fatalf("owner A usage %d after restore, want %d", got, usedA)
+		}
+		if got := usageOf(t, s, b.ID); got != usedB {
+			t.Fatalf("owner B usage %d after restore, want %d: B's file came back, so B's bytes must come back with it", got, usedB)
+		}
+		if got := trashBytesOf(t, s, ownerA); got != trashA {
+			t.Fatalf("owner A retained usage %d after restore, want %d", got, trashA)
+		}
+		if got := trashBytesOf(t, s, b.ID); got != trashB {
+			t.Fatalf("owner B retained usage %d after restore, want %d: a restore that leaves B's bytes in the retained counter bills B for content they can see again", got, trashB)
+		}
+		var liveB store.Node
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			n, nerr := tx.Node(ctx, fileB.ID)
+			liveB = n
+			return nerr
+		}); err != nil {
+			t.Fatalf("B's file is not live after the restore: %v", err)
+		}
+		if liveB.Size != 3000 {
+			t.Fatalf("restored file size %d, want 3000", liveB.Size)
+		}
+	})
 }
 
 // usageOf reads an owner's logical usage.
@@ -7892,6 +8400,32 @@ func usageOf(t *testing.T, s store.Store, owner uuid.UUID) int64 {
 		t.Fatal(err)
 	}
 	return n
+}
+
+// trashBytesOf reads an owner's retained (trash) usage.
+//
+// §4.3 has two counters, and asserting only the logical one lets the retained half of every
+// quota bug through: a mixed-owner subtree that trashes one owner's bytes but not another's
+// looks correct if the test only reads Usage. Neither backend exposes trash_bytes through the
+// Store interface, so the suite reads it through each backend's inspection surface — the same
+// trade the audit-count hook makes, resolved here instead of per-runner because both backends
+// can answer.
+func trashBytesOf(t *testing.T, s store.Store, owner uuid.UUID) int64 {
+	t.Helper()
+	switch impl := s.(type) {
+	case *store.Memory:
+		return impl.TrashUsage(owner)
+	case *store.PG:
+		var b int64
+		if err := impl.Pool().QueryRow(context.Background(),
+			`SELECT trash_bytes FROM users WHERE id = $1`, owner).Scan(&b); err != nil {
+			t.Fatalf("read trash_bytes: %v", err)
+		}
+		return b
+	default:
+		t.Skipf("backend %T does not expose retained usage to the suite", s)
+		return 0
+	}
 }
 
 // retainedCapSuite covers TrashCapped: §4.3's server-side cap on retained usage.

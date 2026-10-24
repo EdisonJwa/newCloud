@@ -184,6 +184,80 @@ func (t *pgTx) purgeSubtree(ctx context.Context, root PurgeableTrashRoot) (nodes
 	return int(tag.RowsAffected()), bytes, nil
 }
 
+// PurgeTrashFor permanently deletes one account's entire trash (core-scope §3).
+//
+// It reuses purgeSubtree, which is the point: the accounting (trash_bytes down, blob refcount
+// down, one recursive delete, versions released first) is the one that the worker's retention
+// sweep runs and that the conformance suite already pins. A second implementation for the
+// user-initiated path would be a second set of those statements, and the first bug in it would be
+// a double refcount release — the acceptance criterion §3 names.
+//
+// The differences from PurgeTrash, and why each is deliberate:
+//
+//   - It is scoped to ONE owner. "Empty trash" is a user action on their own bin; the owner id is
+//     in the statement that selects the roots, so a caller cannot reach another account's rows by
+//     passing a different id — the authz layer decides who may act, and this decides what "their
+//     trash" is.
+//   - It ignores retention. The user is overriding the window; that is the whole feature.
+//   - It is bounded. A bin with a million entries must not hold one request open; the caller runs
+//     it again, and PurgeResult.More says whether it needs to.
+//   - The root selection mirrors the listing's "root of a trashed subtree" rule, but additionally
+//     treats a trashed node whose parent belongs to SOMEBODY ELSE as a root. That happens when an
+//     account is deleted and its files are binned: the foreign file has a trashed parent it can
+//     never be reached through, so the trash listing shows it, and an empty-trash that skipped it
+//     would leave an item the user can see and cannot remove.
+func (t *pgTx) PurgeTrashFor(ctx context.Context, ownerID uuid.UUID, maxRoots int) (PurgeResult, error) {
+	var res PurgeResult
+	if maxRoots <= 0 {
+		maxRoots = 500
+	}
+
+	const rootsQ = `SELECT n.id, n.owner_id, n.name, n.trashed_at
+		FROM nodes n
+		WHERE n.owner_id = $1
+		  AND n.trashed_at IS NOT NULL
+		  AND (n.parent_id IS NULL OR NOT EXISTS (
+		        SELECT 1 FROM nodes p
+		        WHERE p.id = n.parent_id
+		          AND p.trashed_at IS NOT NULL
+		          AND p.owner_id = n.owner_id))
+		ORDER BY n.trashed_at DESC, n.id DESC
+		LIMIT $2`
+
+	rows, err := t.tx.Query(ctx, rootsQ, ownerID, maxRoots)
+	if err != nil {
+		return res, translate(err)
+	}
+	var roots []PurgeableTrashRoot
+	for rows.Next() {
+		var r PurgeableTrashRoot
+		if err := rows.Scan(&r.NodeID, &r.OwnerID, &r.Name, &r.TrashedAt); err != nil {
+			rows.Close()
+			return res, translate(err)
+		}
+		roots = append(roots, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return res, translate(err)
+	}
+
+	for _, root := range roots {
+		subtree, bytes, perr := t.purgeSubtree(ctx, root)
+		if perr != nil {
+			return res, perr
+		}
+		res.Nodes += subtree
+		res.Bytes += bytes
+		res.Roots++
+	}
+	// The batch limit was hit, so there may be more. Answering "done" here would be the exact
+	// failure the spec forbids: a caller that trusts a timeout would leave a bin it believes is
+	// empty.
+	res.More = len(roots) == maxRoots
+	return res, nil
+}
+
 // ExpireVersions deletes version rows past the retention window.
 func (t *pgTx) ExpireVersions(ctx context.Context, retention time.Duration) (int, error) {
 	if retention <= 0 {
@@ -277,8 +351,10 @@ func (t *pgTx) ExpireRetained(ctx context.Context) (int, error) {
 	}
 
 	for _, id := range roots {
-		// Summed while the subtree is still live; after the mark it reads as zero.
-		released, ownerID, uerr := t.subtreeUsage(ctx, id)
+		// Summed while the subtree is still live; after the mark it reads as zero. Per owner:
+		// a retained subtree can be mixed-owner, and the same QueryRow-over-GROUP-BY trap that
+		// charged only one owner on Trash would have applied here.
+		usage, uerr := t.subtreeUsage(ctx, id, false)
 		if uerr != nil {
 			// A node that vanished between the SELECT and here is not an error: the caller's
 			// transaction is a snapshot of sorts, and another expiry pass may have taken it.
@@ -287,21 +363,14 @@ func (t *pgTx) ExpireRetained(ctx context.Context) (int, error) {
 			}
 			return 0, uerr
 		}
-		if merr := t.markTrashed(ctx, id, nil); merr != nil {
+		if _, merr := t.markTrashed(ctx, id, nil); merr != nil {
 			if errors.Is(merr, ErrNotFound) {
 				continue
 			}
 			return 0, merr
 		}
-		if released > 0 {
-			if _, qerr := t.tx.Exec(ctx, `
-				UPDATE users
-				SET used_bytes = GREATEST(used_bytes - $2, 0),
-				    trash_bytes = trash_bytes + $2,
-				    updated_at = now()
-				WHERE id = $1`, ownerID, released); qerr != nil {
-				return 0, translate(qerr)
-			}
+		if err := t.chargeBytesToTrash(ctx, usage); err != nil {
+			return 0, err
 		}
 	}
 	return len(roots), nil

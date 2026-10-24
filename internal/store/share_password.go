@@ -51,7 +51,10 @@ type SharePasswordTx interface {
 	//
 	// Recording BEFORE the hash comparison is what makes the cap hold under parallel guessing: a
 	// caller that recorded only failures would leave a window in which concurrent guesses all
-	// observed "under the limit".
+	// observed "under the limit". The share service records optimistically as a failure — inside
+	// the same transaction that reads the count — and records a second, success row when the
+	// comparison succeeds. The optimistic failure row keeps counting toward the cap; that is the
+	// accepted price of a cap that a parallel burst cannot talk its way around.
 	RecordPasswordAttempt(ctx context.Context, shareID uuid.UUID, ip string, succeeded bool) error
 	// PrunePasswordAttempts deletes attempts older than the given age, bounding the table.
 	PrunePasswordAttempts(ctx context.Context, olderThan time.Duration) (int, error)

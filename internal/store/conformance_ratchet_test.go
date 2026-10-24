@@ -50,9 +50,9 @@ func TestSharedSuiteCoversEveryNewTxMethod(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	suite, err := os.ReadFile(filepath.Join(root, "internal", "storetest", "storetest.go"))
-	if err != nil {
-		t.Fatal(err)
+	body := storetestSource(t, root)
+	if len(body) == 0 {
+		t.Fatal("the shared suite is empty; this check would pass vacuously")
 	}
 
 	// Only the Tx interface: Store embeds it and a few wrappers, and the question here is what a
@@ -87,7 +87,6 @@ func TestSharedSuiteCoversEveryNewTxMethod(t *testing.T) {
 		allowed[name] = true
 	}
 
-	body := string(suite)
 	var grew []string
 	for name := range methods {
 		if allowed[name] {
@@ -127,6 +126,36 @@ func TestSharedSuiteCoversEveryNewTxMethod(t *testing.T) {
 		t.Fatalf("knownUncovered is out of date:\n  %s\n\nRemove these names so the ratchet "+
 			"records the improvement and can catch a regression later.", strings.Join(stale, "\n  "))
 	}
+}
+
+// storetestSource returns the whole shared suite, not one file of it.
+//
+// The ratchet used to read internal/storetest/storetest.go by name. That was correct when
+// the suite was one file; once per-concept blocks moved into their own files (login flows,
+// mounts), a method covered there looked uncovered, and the natural fix — adding it to
+// knownUncovered — would have quietly hidden it from both backends. The claim is about the
+// PACKAGE, so the check reads the package.
+func storetestSource(t *testing.T, root string) string {
+	t.Helper()
+	dir := filepath.Join(root, "internal", "storetest")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b strings.Builder
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") ||
+			strings.HasSuffix(e.Name(), "_test.go") {
+			continue
+		}
+		raw, rerr := os.ReadFile(filepath.Join(dir, e.Name()))
+		if rerr != nil {
+			t.Fatal(rerr)
+		}
+		b.Write(raw)
+		b.WriteString("\n")
+	}
+	return b.String()
 }
 
 // repoRootOf walks up to the module root.
@@ -299,9 +328,9 @@ func TestSharedSuiteCoversEveryStoreMethod(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	suite, err := os.ReadFile(filepath.Join(root, "internal", "storetest", "storetest.go"))
-	if err != nil {
-		t.Fatal(err)
+	body := storetestSource(t, root)
+	if len(body) == 0 {
+		t.Fatal("the shared suite is empty; this check would pass vacuously")
 	}
 
 	text := string(src)
@@ -325,7 +354,6 @@ func TestSharedSuiteCoversEveryStoreMethod(t *testing.T) {
 	// Methods that cannot be exercised in the shared suite, each with the reason.
 	uncovered := map[string]string{}
 
-	body := string(suite)
 	var missing []string
 	for name := range methods {
 		if _, ok := uncovered[name]; ok {

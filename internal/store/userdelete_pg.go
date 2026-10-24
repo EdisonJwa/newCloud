@@ -4,6 +4,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/google/uuid"
@@ -31,13 +32,69 @@ func (t *pgTx) DeleteUser(ctx context.Context, id uuid.UUID) (DeleteUserResult, 
 	// Trashing (instead of deleting rows) keeps the retention window meaningful and keeps the
 	// blob references intact, so the collector — not this method — decides when the bytes go.
 	// It also means a mistaken deletion is recoverable by an administrator during that window.
-	tag, err := t.tx.Exec(ctx, `
-		UPDATE nodes SET trashed_at = now(), modified_at = now()
-		WHERE owner_id = $1 AND trashed_at IS NULL AND parent_id IS NOT NULL`, id)
+	//
+	// The WHOLE subtree under each of the account's nodes goes, whatever its owner_id: a
+	// group space or an ACL-shared folder holds other users' files, and trashing only the
+	// account's own rows used to strand those under a trashed ancestor — unreachable, absent
+	// from every trash listing, still charged to their owner, and never reached by the purge
+	// (which follows trashed roots). The account's own top-level entries are what seed the
+	// walk: a node whose live parent is also the account's is covered by that parent's
+	// subtree. Foreign files nested directly under foreign folders are reached when their
+	// containing folder belongs to the account being deleted, which is the only way this
+	// step can be responsible for them.
+	const ownedTops = `
+		SELECT id FROM nodes
+		WHERE owner_id = $1 AND trashed_at IS NULL AND parent_id IS NOT NULL
+		  AND NOT EXISTS (
+		    SELECT 1 FROM nodes p
+		    WHERE p.id = parent_id AND p.owner_id = $1 AND p.trashed_at IS NULL)`
+	rows, err := t.tx.Query(ctx, ownedTops, id)
 	if err != nil {
 		return res, translate(err)
 	}
-	res.NodesTrashed = int(tag.RowsAffected())
+	var tops []uuid.UUID
+	for rows.Next() {
+		var top uuid.UUID
+		if err := rows.Scan(&top); err != nil {
+			rows.Close()
+			return res, translate(err)
+		}
+		tops = append(tops, top)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return res, translate(err)
+	}
+
+	for _, top := range tops {
+		// The same accounting Trash does, because this IS a trash: each owner's bytes in the
+		// subtree — the account's and anyone else's — move from used_bytes to trash_bytes,
+		// or the owner of a stranded file keeps paying for bytes they can no longer reach.
+		usage, uerr := t.subtreeUsage(ctx, top, false)
+		if uerr != nil {
+			// An earlier iteration's subtree walk already took this node; its bytes were
+			// accounted there. Any other error is real and must abort the deletion — a
+			// partially accounted deletion is exactly what this transaction exists to
+			// prevent.
+			if !errors.Is(uerr, ErrNotFound) {
+				return res, uerr
+			}
+			continue
+		}
+		marked, merr := t.markTrashed(ctx, top, nil)
+		if merr != nil {
+			// Same reason as above: a node listed a moment ago can already be trashed by an
+			// earlier iteration that contained it.
+			if errors.Is(merr, ErrNotFound) {
+				continue
+			}
+			return res, merr
+		}
+		res.NodesTrashed += marked
+		if err := t.chargeBytesToTrash(ctx, usage); err != nil {
+			return res, err
+		}
+	}
 
 	// 2. Shares the account issued are revoked: a capability must not outlive its issuer.
 	stag, err := t.tx.Exec(ctx, `

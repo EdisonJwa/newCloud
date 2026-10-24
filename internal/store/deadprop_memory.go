@@ -35,6 +35,20 @@ func (t *memTx) DeadProps(ctx context.Context, nodeID uuid.UUID) ([]DeadProp, er
 	return out, nil
 }
 
+func (t *memTx) DeadPropsFor(ctx context.Context, nodeIDs []uuid.UUID) (map[uuid.UUID][]DeadProp, error) {
+	out := make(map[uuid.UUID][]DeadProp, len(nodeIDs))
+	for _, id := range nodeIDs {
+		props, err := t.DeadProps(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if len(props) > 0 {
+			out[id] = props
+		}
+	}
+	return out, nil
+}
+
 func (t *memTx) DeleteDeadProp(ctx context.Context, nodeID uuid.UUID, space, name string) error {
 	delete(t.m.deadProps[nodeID], [2]string{space, name})
 	return nil

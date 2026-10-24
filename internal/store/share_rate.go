@@ -17,6 +17,7 @@ package store
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -28,6 +29,44 @@ import (
 // means wait. They lead a visitor to different next steps and an operator to different causes, so
 // collapsing them would make both less useful.
 var ErrShareRateLimited = errors.New("store: share upload rate exceeded")
+
+// Recipient-code issuance limit (SHARE-02, mail-bomb half).
+//
+// Every verification code is an outbound email a visitor triggers, so issuance needs the same
+// rolling-window treatment uploads get: the honest representation is the events themselves, and a
+// counter a concurrent request could double-spend is not a limit. The events REUSE the
+// share_otp_attempts table rather than adding one: it is already keyed (share_id, email), already
+// indexed on (share_id, email, attempted_at), already pruned, and its rows already mean "something
+// happened to this address's codes". Issuance rows carry succeeded = true and reason = 'issued', so
+// OTPFailureCount — which counts NOT succeeded — is unaffected by them.
+const (
+	// RecipientCodeWindow is how far back issued codes count.
+	RecipientCodeWindow = 15 * time.Minute
+	// RecipientCodeMaxIssuance is how many codes one address may be sent inside
+	// RecipientCodeWindow. Generous for a human (five codes in a quarter hour is
+	// already a struggling mail client), far below what a spam run needs.
+	RecipientCodeMaxIssuance = 5
+)
+
+// ErrRecipientCodeRateLimited is returned when an address has been sent its allowance
+// of verification codes inside the window.
+var ErrRecipientCodeRateLimited = errors.New("store: recipient code issuance rate exceeded")
+
+// RecipientCodeRateTx is the issuance rate-limit surface.
+//
+// It is a separate interface rather than part of ShareOTPTx because the two answer
+// different questions (how many codes were SENT vs how many guesses were REFUSED),
+// and a store that can answer one is not required to answer the other; callers that
+// care type-assert, and a store without the surface simply does not limit issuance.
+type RecipientCodeRateTx interface {
+	// AllowRecipientCodeIssue counts the codes issued for this (share, address) inside
+	// the window and, when there is room, records this one — a single atomic decision,
+	// for the same reason AllowShareUpload is: a separate count followed by a separate
+	// insert lets two concurrent requests both observe "one under the limit".
+	// It returns ErrRecipientCodeRateLimited when the window is full, without recording.
+	AllowRecipientCodeIssue(ctx context.Context, shareID uuid.UUID, email string,
+		limit int64, window time.Duration) error
+}
 
 // ShareRateTx is the rate-limit surface.
 type ShareRateTx interface {
@@ -59,3 +98,86 @@ type ShareUploadEvent struct {
 	IP      string
 	Bytes   int64
 }
+
+// AllowRecipientCodeIssue is the in-memory implementation of the issuance limit.
+//
+// It lives in this file rather than share_rate_memory.go because the surface and both
+// of its backends were introduced together and are reviewed together: the counting
+// predicate here must stay byte-for-byte the same idea as the SQL predicate below, or
+// the two backends disagree about when the window is full — the exact class of
+// divergence the shared suites exist to catch.
+func (t *memTx) AllowRecipientCodeIssue(ctx context.Context, shareID uuid.UUID, email string,
+	limit int64, window time.Duration) error {
+
+	if limit <= 0 {
+		return nil
+	}
+
+	now := t.m.now()
+	cutoff := now.Add(-window)
+
+	// Transactions are serialised in this backend, so count-then-record is atomic
+	// here in a way it would not be in PostgreSQL — which is why the SQL version is
+	// a single statement.
+	n := int64(0)
+	for _, a := range t.m.otpAttempts {
+		if a.ShareID == shareID && strings.EqualFold(a.Email, email) &&
+			a.Reason == recipientCodeIssuedReason && a.At.After(cutoff) {
+			n++
+		}
+	}
+	if n >= limit {
+		return ErrRecipientCodeRateLimited
+	}
+
+	t.m.otpAttempts = append(t.m.otpAttempts, OTPAttempt{
+		ShareID: shareID, Email: strings.ToLower(email),
+		Success: true, Reason: recipientCodeIssuedReason, At: now,
+	})
+	return nil
+}
+
+// AllowRecipientCodeIssue is the PostgreSQL implementation of the issuance limit.
+//
+// One statement, mirroring AllowShareUpload's guarded insert: the INSERT can only
+// produce a row when the window has room, and a transaction-scoped advisory lock on
+// the (share, address) pair serialises just the decision, so two concurrent requests
+// cannot both count "one under the limit" and both record.
+func (t *pgTx) AllowRecipientCodeIssue(ctx context.Context, shareID uuid.UUID, email string,
+	limit int64, window time.Duration) error {
+
+	if limit <= 0 {
+		return nil
+	}
+
+	email = strings.ToLower(email)
+	if _, err := t.tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtext($1::text))`,
+		shareID.String()+":"+email); err != nil {
+		return translate(err)
+	}
+
+	const q = `INSERT INTO share_otp_attempts (share_id, email, succeeded, reason)
+		SELECT $1, $2, true, $3
+		WHERE (SELECT count(*) FROM share_otp_attempts
+		        WHERE share_id = $1 AND email = $2 AND succeeded AND reason = $3
+		          AND attempted_at > now() - $4::interval) < $5`
+	tag, err := t.tx.Exec(ctx, q, shareID, email, recipientCodeIssuedReason,
+		intervalOf(window), limit)
+	if err != nil {
+		return translate(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrRecipientCodeRateLimited
+	}
+	return nil
+}
+
+// recipientCodeIssuedReason marks an issuance event in share_otp_attempts.
+//
+// The rows share the table with verification attempts; both backends must filter on
+// this exact string.
+const recipientCodeIssuedReason = "issued"
+
+var _ RecipientCodeRateTx = (*memTx)(nil)
+var _ RecipientCodeRateTx = (*pgTx)(nil)

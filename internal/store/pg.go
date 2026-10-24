@@ -45,6 +45,11 @@ type PG struct {
 	auditTimeout time.Duration
 	now          func() time.Time
 	resolver     Resolver
+	// stallBeforeLockForTest, when set, runs inside UpdateFile and RestoreVersion between the
+	// unlocked read and the row lock. Test-only: "a concurrent writer commits in that window" is
+	// a race no deterministic test can otherwise hit, and it is exactly the window where a stale
+	// snapshot turns into a wrong quota delta or a wrong refusal. Nil in every non-test process.
+	stallBeforeLockForTest func(ctx context.Context)
 }
 
 // AuditWriter appends an audit entry within the caller's transaction, computing
@@ -75,6 +80,11 @@ const DefaultAuditAppendTimeout = 5 * time.Second
 
 // SetAuditAppendTimeoutForTest overrides the bound so a test does not have to wait for it.
 func (s *PG) SetAuditAppendTimeoutForTest(d time.Duration) { s.auditTimeout = d }
+
+// SetPreLockStallForTest installs the callback UpdateFile and RestoreVersion run between their
+// unlocked read and their row lock, so a test can commit a concurrent write into exactly that
+// window and pin the read-after-lock behaviour. Passing nil removes it.
+func (s *PG) SetPreLockStallForTest(fn func(ctx context.Context)) { s.stallBeforeLockForTest = fn }
 
 // Pool exposes the pool for maintenance tasks (partitions, sweeps).
 func (s *PG) Pool() *pgxpool.Pool { return s.pool }
@@ -292,12 +302,12 @@ func (t *pgTx) CreateFile(ctx context.Context, n NewFile) (Node, error) {
 	}
 
 	// Reference the blob row for referential integrity and refcount.
-	const q = `INSERT INTO nodes (parent_id, owner_id, owner_group_id, name, name_key, kind, size, mime, etag, blob_id, retain_until)
-		VALUES ($1, $2, $3, $4, $5, 'file', $6, $7, $8, $9, $10)
+	const q = `INSERT INTO nodes (parent_id, owner_id, owner_group_id, name, name_key, kind, size, mime, etag, blob_id, retain_until, modified_at)
+		VALUES ($1, $2, $3, $4, $5, 'file', $6, $7, $8, $9, $10, COALESCE($11, now()))
 		RETURNING ` + nodeColumns
 	node, err := scanNode(t.tx.QueryRow(ctx, q,
 		n.ParentID, n.OwnerID, n.OwnerGroupID, n.Name, nameKey(n.Name),
-		n.Size, n.Mime, n.ETag, n.BlobID, n.RetainUntil))
+		n.Size, n.Mime, n.ETag, n.BlobID, n.RetainUntil, n.ModifiedAt))
 	if err != nil {
 		return Node{}, err
 	}
@@ -309,6 +319,8 @@ func (t *pgTx) CreateFile(ctx context.Context, n NewFile) (Node, error) {
 }
 
 func (t *pgTx) UpdateFile(ctx context.Context, u UpdateFile) (Node, error) {
+	// This first read only decides "exists and is a file". Everything the write
+	// depends on is re-read below, under the lock.
 	current, err := t.Node(ctx, u.NodeID)
 	if err != nil {
 		return Node{}, err
@@ -316,10 +328,24 @@ func (t *pgTx) UpdateFile(ctx context.Context, u UpdateFile) (Node, error) {
 	if current.Kind != KindFile {
 		return Node{}, fmt.Errorf("%w: not a file", ErrInvalidName)
 	}
+	if t.s.stallBeforeLockForTest != nil {
+		t.s.stallBeforeLockForTest(ctx)
+	}
 	// The precondition is evaluated against the row as locked by this
 	// transaction. Combined with the row lock taken below, that makes the check
 	// and the write one step: a competing writer cannot slip between them.
 	if err := t.lockNode(ctx, u.NodeID); err != nil {
+		return Node{}, err
+	}
+	// Re-read under the lock, and compute everything from THAT row. Between the
+	// read above and lockNode a concurrent writer can commit a new size and ETag;
+	// the lock makes this transaction wait for that writer, but only a fresh read
+	// sees the row it left behind. Expect or the quota delta computed from the
+	// stale snapshot would refuse a correctly-preconditioned write (the stale
+	// ETag no longer describes the row) or bill the difference between the wrong
+	// pair of sizes — while the comment claiming "one step" made it look safe.
+	current, err = t.Node(ctx, u.NodeID)
+	if err != nil {
 		return Node{}, err
 	}
 	if !u.Expect.Matches(current.ETag, true) {
@@ -358,10 +384,10 @@ func (t *pgTx) UpdateFile(ctx context.Context, u UpdateFile) (Node, error) {
 	// locked. Two lines of redundancy buy the guarantee that survives a future
 	// refactor which drops the lock: the write itself refuses to clobber a
 	// different version.
-	const q = `UPDATE nodes SET size = $2, mime = $3, etag = $4, blob_id = $5, modified_at = now()
+	const q = `UPDATE nodes SET size = $2, mime = $3, etag = $4, blob_id = $5, modified_at = COALESCE($7, now())
 		WHERE id = $1 AND trashed_at IS NULL AND etag = $6
 		RETURNING ` + nodeColumns
-	node, err := scanNode(t.tx.QueryRow(ctx, q, u.NodeID, u.Size, u.Mime, u.ETag, u.BlobID, current.ETag))
+	node, err := scanNode(t.tx.QueryRow(ctx, q, u.NodeID, u.Size, u.Mime, u.ETag, u.BlobID, current.ETag, u.ModifiedAt))
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			// The row was there a moment ago and the predicate matched, so a
@@ -423,7 +449,7 @@ func (t *pgTx) WriteFile(ctx context.Context, w WriteFile) (Node, bool, error) {
 			NodeID: existing.ID, Size: w.Size, Mime: w.Mime, ETag: w.ETag,
 			BlobID: w.BlobID, BlobHash: w.BlobHash,
 			KeepVersion: w.KeepVersion, MaxVersions: w.MaxVersions,
-			By: w.By,
+			By: w.By, ModifiedAt: w.ModifiedAt,
 		})
 		if uerr != nil {
 			return Node{}, false, uerr
@@ -603,52 +629,114 @@ func (t *pgTx) Move(ctx context.Context, id, newParent uuid.UUID) (Node, error) 
 }
 
 func (t *pgTx) Trash(ctx context.Context, id uuid.UUID) error {
-	released, ownerID, err := t.subtreeUsage(ctx, id)
+	usage, err := t.subtreeUsage(ctx, id, false)
 	if err != nil {
 		return err
 	}
-	if err := t.markTrashed(ctx, id, nil); err != nil {
+	if _, err := t.markTrashed(ctx, id, nil); err != nil {
 		return err
 	}
-	if released > 0 {
-		// §4.3: trashing moves the bytes from the logical quota to retained usage. Both counters
-		// are clamped so an accounting bug cannot produce a negative quota that silently grants
-		// storage.
+	return t.chargeBytesToTrash(ctx, usage)
+}
+
+// ownerBytes pairs one account with the bytes an operation moves for it.
+//
+// A subtree is mixed-owner wherever writes are: group spaces and ACL-shared folders hold files
+// whose owner_id is the writer's, not the folder's. Quota lives on the user row, so every byte
+// moved between used_bytes and trash_bytes has to be attributed to the owner of the node it came
+// from — a single (sum, owner) answer can only ever be right for one of them.
+type ownerBytes struct {
+	owner uuid.UUID
+	bytes int64
+}
+
+// subtreeUsage sums the bytes under a node, per owner.
+//
+// Summed BEFORE the rows are marked trashed: the mark changes what a second query would
+// see, and the number has to describe the subtree as it was when the user asked to delete
+// it. trashed selects which state the subtree is read in (false = live, true = in the bin),
+// which is what makes the same walk serve Trash and Restore.
+//
+// One row PER OWNER, scanned with a row loop. The original shape aggregated with GROUP BY
+// owner_id and read the answer with QueryRow, which consumes exactly one row: in a
+// mixed-owner subtree only the first owner's bytes moved between used_bytes and
+// trash_bytes, and every other owner's files were neither released on trash nor credited
+// back on restore — silently, and in the direction that under-counts usage.
+func (t *pgTx) subtreeUsage(ctx context.Context, id uuid.UUID, trashed bool) ([]ownerBytes, error) {
+	mark := "IS NULL"
+	if trashed {
+		mark = "IS NOT NULL"
+	}
+	q := `
+		WITH RECURSIVE subtree AS (
+		    SELECT id, owner_id, size FROM nodes WHERE id = $1 AND trashed_at ` + mark + `
+		    UNION ALL
+		    SELECT n.id, n.owner_id, n.size FROM nodes n JOIN subtree s ON n.parent_id = s.id
+		    WHERE n.trashed_at ` + mark + `
+		)
+		SELECT owner_id, COALESCE(sum(size),0) FROM subtree GROUP BY owner_id`
+	rows, err := t.tx.Query(ctx, q, id)
+	if err != nil {
+		return nil, translate(err)
+	}
+	defer rows.Close()
+
+	var out []ownerBytes
+	for rows.Next() {
+		var u ownerBytes
+		if err := rows.Scan(&u.owner, &u.bytes); err != nil {
+			return nil, translate(err)
+		}
+		out = append(out, u)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, translate(err)
+	}
+	if len(out) == 0 {
+		// The root matched nothing: it is gone, or already in the requested state.
+		return nil, ErrNotFound
+	}
+	return out, nil
+}
+
+// chargeBytesToTrash moves each owner's bytes from the logical quota to retained usage.
+//
+// §4.3: trashing moves the bytes between the two counters, and both are clamped so an
+// accounting bug cannot produce a negative quota that silently grants storage.
+func (t *pgTx) chargeBytesToTrash(ctx context.Context, usage []ownerBytes) error {
+	for _, u := range usage {
+		if u.bytes <= 0 {
+			continue
+		}
 		if _, err := t.tx.Exec(ctx, `
 			UPDATE users
 			SET used_bytes = GREATEST(used_bytes - $2, 0),
 			    trash_bytes = trash_bytes + $2,
 			    updated_at = now()
-			WHERE id = $1`, ownerID, released); err != nil {
+			WHERE id = $1`, u.owner, u.bytes); err != nil {
 			return translate(err)
 		}
 	}
 	return nil
 }
 
-// subtreeUsage sums the live bytes under a node and returns the owner.
-//
-// Summed BEFORE the rows are marked trashed: the mark changes what a second query would
-// see, and the number has to describe the subtree as it was when the user asked to delete
-// it.
-func (t *pgTx) subtreeUsage(ctx context.Context, id uuid.UUID) (int64, uuid.UUID, error) {
-	var released int64
-	var ownerID uuid.UUID
-	if err := t.tx.QueryRow(ctx, `
-		WITH RECURSIVE subtree AS (
-		    SELECT id, owner_id, size FROM nodes WHERE id = $1 AND trashed_at IS NULL
-		    UNION ALL
-		    SELECT n.id, n.owner_id, n.size FROM nodes n JOIN subtree s ON n.parent_id = s.id
-		    WHERE n.trashed_at IS NULL
-		)
-		SELECT COALESCE(sum(size),0), owner_id FROM subtree
-		GROUP BY owner_id`, id).Scan(&released, &ownerID); err != nil {
-		if isNoRows(err) {
-			return 0, uuid.Nil, ErrNotFound
+// creditBytesFromTrash is the restore-side inverse of chargeBytesToTrash: each owner's
+// bytes leave retained usage and come back into the logical quota.
+func (t *pgTx) creditBytesFromTrash(ctx context.Context, usage []ownerBytes) error {
+	for _, u := range usage {
+		if u.bytes <= 0 {
+			continue
 		}
-		return 0, uuid.Nil, translate(err)
+		if _, err := t.tx.Exec(ctx, `
+			UPDATE users
+			SET used_bytes = used_bytes + $2,
+			    trash_bytes = GREATEST(trash_bytes - $2, 0),
+			    updated_at = now()
+			WHERE id = $1`, u.owner, u.bytes); err != nil {
+			return translate(err)
+		}
 	}
-	return released, ownerID, nil
+	return nil
 }
 
 // markTrashed sets trashed_at on the whole subtree in one statement.
@@ -659,7 +747,10 @@ func (t *pgTx) subtreeUsage(ctx context.Context, id uuid.UUID) (int64, uuid.UUID
 // expect (nil = unconditional) is evaluated INSIDE the statement that trashes. Under READ
 // COMMITTED a separate read would let a concurrent writer commit between the read and the
 // write, and the writer's row would then be trashed by a request that never saw it.
-func (t *pgTx) markTrashed(ctx context.Context, id uuid.UUID, expect *Precondition) error {
+//
+// It returns the number of rows it marked, which is what a caller reporting "how much
+// entered the trash" counts instead of guessing from its own bookkeeping.
+func (t *pgTx) markTrashed(ctx context.Context, id uuid.UUID, expect *Precondition) (int, error) {
 	const q = `
 		WITH RECURSIVE subtree AS (
 		    SELECT id FROM nodes WHERE id = $1 AND trashed_at IS NULL
@@ -677,30 +768,37 @@ func (t *pgTx) markTrashed(ctx context.Context, id uuid.UUID, expect *Preconditi
 	}
 	tag, err := t.tx.Exec(ctx, q, id, etag)
 	if err != nil {
-		return translate(err)
+		return 0, translate(err)
 	}
 	if tag.RowsAffected() == 0 {
 		// Two causes, and they are different answers: the node changed under us (412, the
 		// caller's If-Match no longer describes it), or it is gone (404).
 		if expect != nil && etag != "" {
 			if _, gerr := t.Node(ctx, id); gerr == nil {
-				return ErrPrecondition
+				return 0, ErrPrecondition
 			} else if errors.Is(gerr, ErrNotFound) {
-				return ErrNotFound
+				return 0, ErrNotFound
 			} else {
-				return gerr
+				return 0, gerr
 			}
 		}
-		return ErrNotFound
+		return 0, ErrNotFound
 	}
-	return nil
+	return int(tag.RowsAffected()), nil
 }
 
-// Trashed lists trashed nodes that are the roots of their deleted subtree.
+// Trashed lists trashed nodes that are the roots of their deleted subtree, as far as THIS
+// owner is concerned.
 //
-// "Root of a trashed subtree" means the node is trashed but its parent is not — that
-// is what distinguishes an item the user deleted from a child that went along with
-// it. Listing every trashed row instead would present a deleted folder and all its
+// "Root of a trashed subtree" means the node is trashed and its parent is either not trashed
+// or trashed under a DIFFERENT owner's account. That is what distinguishes an item the user
+// deleted from a child that went along with it — and the ownership clause is what keeps the
+// definition from stranding other people's files: when an account is deleted (or a shared
+// folder is binned), another user's file inside it is trashed by someone else's action, its
+// parent offers no path to it, and the person who could restore the whole subtree may be gone
+// forever. For that file the owner's own trash listing is the only door left, so the listing
+// treats the owner boundary as a root even though a trashed ancestor technically exists.
+// Listing every trashed row instead would present a deleted folder and all its
 // contents as independent, separately-restorable items.
 func (t *pgTx) Trashed(ctx context.Context, ownerID uuid.UUID, limit int) ([]Node, error) {
 	return t.TrashedAfter(ctx, ownerID, "", limit)
@@ -732,7 +830,9 @@ func (t *pgTx) TrashedAfter(ctx context.Context, ownerID uuid.UUID, cursor strin
 		        n.parent_id IS NULL
 		     OR NOT EXISTS (
 		          SELECT 1 FROM nodes p
-		          WHERE p.id = n.parent_id AND p.trashed_at IS NOT NULL
+		          WHERE p.id = n.parent_id
+		            AND p.trashed_at IS NOT NULL
+		            AND p.owner_id = n.owner_id
 		        )
 		  )
 		AND ($2::timestamptz IS NULL OR (n.trashed_at, n.id) < ($2::timestamptz, $3::uuid))
@@ -783,22 +883,13 @@ func FormatTrashCursor(n Node) string {
 	return fmt.Sprintf("%d:%s", n.TrashedAt.UTC().UnixNano(), n.ID)
 }
 func (t *pgTx) Restore(ctx context.Context, id uuid.UUID) (Node, error) {
-	// The bytes come back into the logical quota, so sum them before the update clears the marks.
-	var released int64
-	var ownerID uuid.UUID
-	if err := t.tx.QueryRow(ctx, `
-		WITH RECURSIVE subtree AS (
-		    SELECT id, owner_id, size FROM nodes WHERE id = $1 AND trashed_at IS NOT NULL
-		    UNION ALL
-		    SELECT n.id, n.owner_id, n.size FROM nodes n JOIN subtree s ON n.parent_id = s.id
-		    WHERE n.trashed_at IS NOT NULL
-		)
-		SELECT COALESCE(sum(size),0), owner_id FROM subtree
-		GROUP BY owner_id`, id).Scan(&released, &ownerID); err != nil {
-		if isNoRows(err) {
-			return Node{}, ErrNotFound
-		}
-		return Node{}, translate(err)
+	// The bytes come back into the logical quota, so sum them before the update clears the
+	// marks — per owner, for the same reason Trash charges per owner: a restored subtree can
+	// be mixed-owner, and crediting one account for another's bytes is the same bug in
+	// reverse.
+	usage, err := t.subtreeUsage(ctx, id, true)
+	if err != nil {
+		return Node{}, err
 	}
 
 	// Restoring a directory must restore its subtree, otherwise the directory
@@ -816,15 +907,8 @@ func (t *pgTx) Restore(ctx context.Context, id uuid.UUID) (Node, error) {
 	if _, err := t.tx.Exec(ctx, q, id); err != nil {
 		return Node{}, translate(err)
 	}
-	if released > 0 {
-		if _, err := t.tx.Exec(ctx, `
-			UPDATE users
-			SET used_bytes = used_bytes + $2,
-			    trash_bytes = GREATEST(trash_bytes - $2, 0),
-			    updated_at = now()
-			WHERE id = $1`, ownerID, released); err != nil {
-			return Node{}, translate(err)
-		}
+	if err := t.creditBytesFromTrash(ctx, usage); err != nil {
+		return Node{}, err
 	}
 	return t.Node(ctx, id)
 }
@@ -870,6 +954,19 @@ func (t *pgTx) RestoreVersion(ctx context.Context, nodeID uuid.UUID, versionNo i
 		return Node{}, translate(err)
 	}
 
+	if t.s.stallBeforeLockForTest != nil {
+		t.s.stallBeforeLockForTest(ctx)
+	}
+	// Lock the row BEFORE reading it. This method rewrites size, ETag and blob_id and moves
+	// quota by the difference between the restored size and the current one, so the row it
+	// diffs against must be the row it locks. Without the lock, a concurrent update that
+	// commits between the read and the write is silently overwritten with the restored
+	// content, and the quota moves by a delta computed from a snapshot that no longer
+	// describes anything — the same stale-read window UpdateFile closed, on a path that
+	// did not even have the lock to narrow it.
+	if err := t.lockNode(ctx, nodeID); err != nil {
+		return Node{}, err
+	}
 	current, err := t.Node(ctx, nodeID)
 	if err != nil {
 		return Node{}, err
@@ -1297,36 +1394,15 @@ func (t *pgTx) TrashCapped(ctx context.Context, id uuid.UUID, maxRetainedBytes i
 // it — instead of trashing that writer's successful update along with the row it belonged to.
 func (t *pgTx) TrashCappedExpect(ctx context.Context, id uuid.UUID, maxRetainedBytes int64,
 	expect *Precondition) error {
-	if maxRetainedBytes <= 0 {
-		if expect == nil {
-			return t.Trash(ctx, id)
-		}
-		released, ownerID, err := t.subtreeUsage(ctx, id)
-		if err != nil {
-			return err
-		}
-		if err := t.markTrashed(ctx, id, expect); err != nil {
-			return err
-		}
-		if released > 0 {
-			if _, qerr := t.tx.Exec(ctx, `
-				UPDATE users
-				SET used_bytes = GREATEST(used_bytes - $2, 0),
-				    trash_bytes = trash_bytes + $2,
-				    updated_at = now()
-				WHERE id = $1`, ownerID, released); qerr != nil {
-				return translate(qerr)
-			}
-		}
-		return nil
-	}
-
-	released, ownerID, err := t.subtreeUsage(ctx, id)
+	usage, err := t.subtreeUsage(ctx, id, false)
 	if err != nil {
 		return err
 	}
-	if err := t.markTrashed(ctx, id, expect); err != nil {
+	if _, err := t.markTrashed(ctx, id, expect); err != nil {
 		return err
+	}
+	if maxRetainedBytes <= 0 {
+		return t.chargeBytesToTrash(ctx, usage)
 	}
 
 	// The cap is enforced by the WHERE clause of the counter update, not by a read
@@ -1338,25 +1414,30 @@ func (t *pgTx) TrashCappedExpect(ctx context.Context, id uuid.UUID, maxRetainedB
 	// 1000-byte cap left trash_bytes at 4800 (2026-10-24 review, H15). Here the same
 	// UPDATE both decides and charges, so the row lock serialises the two.
 	//
-	// A zero row count means the cap would have been exceeded. Returning ErrTrashFull
-	// rolls the whole transaction back — including the mark above — so a refused delete
-	// leaves the tree exactly as it was.
-	tag, err := t.tx.Exec(ctx, `
-		UPDATE users
-		SET used_bytes = GREATEST(used_bytes - $2, 0),
-		    trash_bytes = trash_bytes + $2,
-		    updated_at = now()
-		WHERE id = $1 AND trash_bytes + $2 <= $3`, ownerID, released, maxRetainedBytes)
-	if err != nil {
-		return translate(err)
-	}
-	if tag.RowsAffected() == 0 {
-		if released == 0 {
-			// Nothing to charge and the row matched nothing: the owner row is missing,
-			// which is a different failure from a full bin.
-			return ErrNotFound
+	// Per owner, because the cap bounds each account's retained usage and the subtree can
+	// be mixed-owner: charging the whole subtree to the directory's owner would refuse a
+	// delete that fits and move bytes between accounts that are not each other's.
+	//
+	// A zero row count means the cap would have been exceeded — or, when there is nothing
+	// to charge, that the owner row is missing, which is a different failure from a full
+	// bin. Returning the error rolls the whole transaction back — including the mark
+	// above — so a refused delete leaves the tree exactly as it was.
+	for _, u := range usage {
+		tag, err := t.tx.Exec(ctx, `
+			UPDATE users
+			SET used_bytes = GREATEST(used_bytes - $2, 0),
+			    trash_bytes = trash_bytes + $2,
+			    updated_at = now()
+			WHERE id = $1 AND trash_bytes + $2 <= $3`, u.owner, u.bytes, maxRetainedBytes)
+		if err != nil {
+			return translate(err)
 		}
-		return ErrTrashFull
+		if tag.RowsAffected() == 0 {
+			if u.bytes == 0 {
+				return ErrNotFound
+			}
+			return ErrTrashFull
+		}
 	}
 	return nil
 }

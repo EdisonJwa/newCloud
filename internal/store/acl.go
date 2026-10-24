@@ -142,22 +142,6 @@ const AllPerms = PermRead | PermWrite | PermDelete | PermShare |
 	PermDownload | PermCreate | PermOverwrite | PermRename | PermMove |
 	PermManagePermissions | PermViewHistory
 
-// ExpandComposite turns the coarse bits into the fine ones they imply, matching
-// authz.expandComposite. Keeping the rule in both places is unavoidable without a
-// shared package; the conformance test cross-checks it.
-func ExpandComposite(p Perm) Perm {
-	if p&PermWrite != 0 {
-		p |= PermCreate | PermOverwrite
-	}
-	if p&PermRead != 0 {
-		p |= PermDownload
-	}
-	if p&PermReadVersions != 0 {
-		p |= PermViewHistory
-	}
-	return p
-}
-
 // aclPermNames maps each bit to its stored name.
 //
 // Order matters only for readability of the stored list; decoding is by name, so

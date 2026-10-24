@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -98,18 +99,30 @@ func (t *pgTx) UserByIdPSubject(ctx context.Context, issuer, subject string) (Us
 	return scanUser(t.tx.QueryRow(ctx, q, issuer, subject))
 }
 
+// BreakglassIssuer marks the local break-glass identity in the (issuer, subject) key.
+//
+// It lives here rather than at the call site because the store is what must recognise
+// it: the break-glass account's row carries is_breakglass, and the revalidation
+// exemption in the server reads that column rather than the issuer string.
+const BreakglassIssuer = "local://breakglass"
+
 // UpsertIdPUser provisions or refreshes an account from IdP claims.
 //
 // ON CONFLICT targets (idp_issuer, idp_subject) so a second login updates the
 // existing row instead of creating a duplicate. The username is left alone after
 // creation: it appears in WebDAV URLs and share links, and silently renaming it
 // would break those for everyone except the user.
+//
+// A login carrying the break-glass issuer also writes is_breakglass on every path
+// (insert, refresh, and the byName claim), so the flag the revalidation exemption
+// reads is never missing from the row it describes.
 func (t *pgTx) UpsertIdPUser(ctx context.Context, u UpsertUser) (User, error) {
 	role := orDefault(u.Role, "guest")
 	username := u.Username
 	if username == "" {
 		username = u.Subject
 	}
+	isBreakglass := u.Issuer == BreakglassIssuer
 
 	// Look first, then write; do not rely on ON CONFLICT here.
 	//
@@ -118,7 +131,7 @@ func (t *pgTx) UpsertIdPUser(ctx context.Context, u UpsertUser) (User, error) {
 	// created ahead of time. A failed statement aborts the whole PostgreSQL
 	// transaction, so "try the insert, catch the conflict, try something else" is
 	// not available: after the first failure every later query returns 25P02.
-	existing, err := t.lookupIdPUser(ctx, u.Issuer, u.Subject, username)
+	existing, err := t.lookupIdPUser(ctx, u.Issuer, u.Subject, username, u.Email)
 	if err != nil {
 		return User{}, err
 	}
@@ -128,7 +141,7 @@ func (t *pgTx) UpsertIdPUser(ctx context.Context, u UpsertUser) (User, error) {
 			// would make "disable" meaningless.
 			return User{}, errors.New("store: account is disabled")
 		}
-		return t.refreshIdPUser(ctx, *existing, u, role)
+		return t.refreshIdPUser(ctx, *existing, u, role, isBreakglass)
 	}
 
 	// The status comes from the caller so the provisioning policy (ID-04) can create an
@@ -139,23 +152,27 @@ func (t *pgTx) UpsertIdPUser(ctx context.Context, u UpsertUser) (User, error) {
 	// omits the column entirely, so the DEFAULT declared in the migration stays the single source
 	// of truth for it. Writing the default into a query would have duplicated it, and the copy is
 	// what drifts.
+	//
+	// is_breakglass is written on INSERT rather than patched afterwards: the column exists in
+	// the schema, so the row is born with the flag the revalidation exemption reads.
 	const insertBase = `INSERT INTO users
-		(username, email, display_name, idp_issuer, idp_subject, role, status, idp_confirmed_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+		(username, email, display_name, idp_issuer, idp_subject, role, status, is_breakglass, idp_confirmed_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
 		RETURNING ` + userColumns
 	const insertWithQuota = `INSERT INTO users
-		(username, email, display_name, idp_issuer, idp_subject, role, status, quota_bytes, idp_confirmed_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+		(username, email, display_name, idp_issuer, idp_subject, role, status, is_breakglass, quota_bytes, idp_confirmed_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
 		RETURNING ` + userColumns
 
 	var user User
 	if u.QuotaBytes != nil {
 		user, err = scanUser(t.tx.QueryRow(ctx, insertWithQuota, username,
 			nullableString(u.Email), u.DisplayName, u.Issuer, u.Subject, role, status,
-			*u.QuotaBytes))
+			isBreakglass, *u.QuotaBytes))
 	} else {
 		user, err = scanUser(t.tx.QueryRow(ctx, insertBase, username,
-			nullableString(u.Email), u.DisplayName, u.Issuer, u.Subject, role, status))
+			nullableString(u.Email), u.DisplayName, u.Issuer, u.Subject, role, status,
+			isBreakglass))
 	}
 	if err != nil {
 		// A recycled address is the expected collision, and it must not surface as a
@@ -181,7 +198,17 @@ func (t *pgTx) UpsertIdPUser(ctx context.Context, u UpsertUser) (User, error) {
 // The username fallback is what makes a pre-provisioned account claimable on first
 // login. It returns the row rather than updating it so the caller decides whether
 // claiming is safe.
-func (t *pgTx) lookupIdPUser(ctx context.Context, issuer, subject, username string) (*User, error) {
+//
+// BEHAVIOUR CHANGE (2026-10-25 review): a claim now requires the login to present the
+// account's own address — non-empty and equal to the stored email, case-insensitively
+// (both columns are citext). Callers pass the IdP's address only when the IdP did not
+// mark it email_verified=false (see the server's effectiveLoginEmail), so "email is
+// non-empty" here means "an address the IdP did not explicitly refuse to vouch for".
+// The old rule — whichever identity first produced the same username claimed the row —
+// handed an administrator-created account to whoever guessed its name. Deployments
+// relying on username-claim must pre-fill the account's email to match the IdP's; a
+// username-only collision is now the same ErrConflict a subject mismatch gets.
+func (t *pgTx) lookupIdPUser(ctx context.Context, issuer, subject, username, email string) (*User, error) {
 	const byIdentity = `SELECT ` + userColumns + ` FROM users
 		WHERE idp_issuer = $1 AND idp_subject = $2`
 	u, err := scanUser(t.tx.QueryRow(ctx, byIdentity, issuer, subject))
@@ -200,6 +227,15 @@ func (t *pgTx) lookupIdPUser(ctx context.Context, issuer, subject, username stri
 		if byNameUser.IdPSubject != "" && byNameUser.IdPSubject != subject {
 			return nil, fmt.Errorf("%w: username %q belongs to another identity", ErrConflict, username)
 		}
+		// A pre-provisioned row (no identity yet) is claimable only with the account's
+		// own verified address. A row created with no address at all can never be
+		// claimed this way — there is nothing to match, and failing closed costs one
+		// administrator action (set the email) where failing open hands over the
+		// account.
+		if byNameUser.Email == "" || email == "" || !strings.EqualFold(byNameUser.Email, email) {
+			return nil, fmt.Errorf("%w: username %q is claimable only by a login presenting "+
+				"its own verified address", ErrConflict, username)
+		}
 		return &byNameUser, nil
 	}
 	if errors.Is(err, ErrNotFound) {
@@ -217,19 +253,26 @@ func (t *pgTx) lookupIdPUser(ctx context.Context, issuer, subject, username stri
 // was always false and a demotion never revoked the credentials minted under the old
 // role. Role is owned by ApplyIdPRole, which is the only place that can also revoke
 // what the change invalidates.
-func (t *pgTx) refreshIdPUser(ctx context.Context, cur User, u UpsertUser, role string) (User, error) {
+//
+// isBreakglass is OR-ed into the column rather than assumed: the refresh path also
+// serves the byName CLAIM of a pre-provisioned row, which may predate the flag and
+// whose issuer becomes the break-glass issuer exactly here.
+func (t *pgTx) refreshIdPUser(ctx context.Context, cur User, u UpsertUser, role string,
+	isBreakglass bool) (User, error) {
+
 	// The username is intentionally not updated: it appears in WebDAV URLs and share
 	// links, so renaming it would break existing paths for everyone else.
 	const q = `UPDATE users
 		SET idp_issuer = $2, idp_subject = $3,
 		    email = COALESCE($4, email),
 		    display_name = COALESCE(NULLIF($5, ''), display_name),
+		    is_breakglass = is_breakglass OR $6,
 		    idp_confirmed_at = now(),
 		    updated_at = now()
 		WHERE id = $1
 		RETURNING ` + userColumns
 	return scanUser(t.tx.QueryRow(ctx, q, cur.ID, u.Issuer, u.Subject,
-		nullableString(u.Email), u.DisplayName))
+		nullableString(u.Email), u.DisplayName, isBreakglass))
 }
 
 // ApplyIdPRole stores the role the IdP now claims and, on a downgrade, revokes the
@@ -241,6 +284,45 @@ func (t *pgTx) refreshIdPUser(ctx context.Context, cur User, u UpsertUser, role 
 // IdP, and a browser session may be long-lived. Writing the lower role is not enough
 // if a credential minted while the account was an admin is still accepted, so both
 // are killed. The user simply signs in again and gets the correct role.
+// MarkBreakglassUser records that this account is the break-glass administrator's row
+// (users.is_breakglass).
+//
+// The flag is what the revalidation exemption reads, and the break-glass login is the
+// only writer that can set it truthfully: an ordinary IdP login must never mark its
+// row break-glass, so there is no claim parameter for it. The upsert writes the column
+// directly on the PostgreSQL path; this explicit call exists so the in-memory backend —
+// whose upsert writes only the profile fields — records the same fact, keeping the two
+// stores in agreement about a row an operator will look at during an incident.
+//
+// Best-effort by contract: a failure here leaves the flag unset until the next
+// break-glass login, which is the next time anything needs it. Callers log and
+// continue rather than failing an otherwise-successful authentication.
+func MarkBreakglassUser(ctx context.Context, s Store, id uuid.UUID) error {
+	return s.WithTx(ctx, func(ctx context.Context, tx Tx) error {
+		switch t := tx.(type) {
+		case *pgTx:
+			tag, err := t.tx.Exec(ctx,
+				`UPDATE users SET is_breakglass = true, updated_at = now() WHERE id = $1`, id)
+			if err != nil {
+				return translate(err)
+			}
+			if tag.RowsAffected() == 0 {
+				return ErrNotFound
+			}
+			return nil
+		case *memTx:
+			u, ok := t.m.users[id]
+			if !ok {
+				return ErrNotFound
+			}
+			u.IsBreakglass = true
+			return nil
+		default:
+			return errors.New("store: break-glass flag requires a known metadata backend")
+		}
+	})
+}
+
 // MarkIdPConfirmed records the time of the IdP assertion.
 func (t *pgTx) MarkIdPConfirmed(ctx context.Context, userID uuid.UUID) error {
 	tag, err := t.tx.Exec(ctx,

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"sort"
 
 	"github.com/google/uuid"
 	"time"
@@ -97,6 +98,64 @@ func (t *memTx) collectSubtree(id [16]byte) [][16]byte {
 		}
 	}
 	return out
+}
+
+// PurgeTrashFor permanently deletes one account's entire trash (core-scope §3).
+//
+// Same order as the SQL version — select roots, account per subtree, delete — and the same
+// accounting routine, because the acceptance criterion is that a concurrent purge and delete
+// cannot double-release a refcount, and that guarantee lives in one place or in none.
+func (t *memTx) PurgeTrashFor(ctx context.Context, ownerID uuid.UUID, maxRoots int) (PurgeResult, error) {
+	var res PurgeResult
+	if maxRoots <= 0 {
+		maxRoots = 500
+	}
+
+	// Roots of trashed subtrees this account owns. A trashed ancestor owned by somebody ELSE does
+	// not disqualify the node: the trash listing shows it (it can only be reached from here), so
+	// emptying the bin has to remove it too.
+	type candidate struct {
+		root PurgeableTrashRoot
+	}
+	var found []candidate
+	for _, rec := range t.m.nodes {
+		n := rec.node
+		if n.OwnerID != ownerID || n.TrashedAt == nil {
+			continue
+		}
+		if n.ParentID != nil {
+			if parent, ok := t.m.nodes[*n.ParentID]; ok &&
+				parent.node.TrashedAt != nil && parent.node.OwnerID == n.OwnerID {
+				continue
+			}
+		}
+		found = append(found, candidate{root: PurgeableTrashRoot{
+			NodeID: n.ID, OwnerID: n.OwnerID, Name: n.Name, TrashedAt: *n.TrashedAt,
+		}})
+	}
+
+	// Newest first, matching the SQL ORDER BY, so a bounded batch takes the same rows on both
+	// backends and a caller paging through them sees a consistent order.
+	sort.Slice(found, func(i, j int) bool {
+		if found[i].root.TrashedAt.Equal(found[j].root.TrashedAt) {
+			return found[i].root.NodeID.String() > found[j].root.NodeID.String()
+		}
+		return found[i].root.TrashedAt.After(found[j].root.TrashedAt)
+	})
+	if len(found) > maxRoots {
+		found = found[:maxRoots]
+		// The batch limit was hit, so there may be more. The caller runs again rather than
+		// believing the bin is empty.
+		res.More = true
+	}
+
+	for _, c := range found {
+		nodes, bytes := t.purgeMemory(c.root.NodeID)
+		res.Nodes += nodes
+		res.Bytes += bytes
+		res.Roots++
+	}
+	return res, nil
 }
 
 func (t *memTx) ExpireVersions(ctx context.Context, retention time.Duration) (int, error) {

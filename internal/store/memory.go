@@ -76,7 +76,34 @@ type Memory struct {
 	otpAttempts           []OTPAttempt
 	shareUploadEvents     []memShareUploadEvent
 	sharePasswordAttempts []memPasswordAttempt
-	nextVersion           int
+	// mounts is the external-mount table (ADR-0014), keyed by mount id; mountByNode is
+	// the unique index on node_id, so both lookups the request path makes are O(1).
+	mounts      map[uuid.UUID]*Mount
+	mountByNode map[uuid.UUID]uuid.UUID
+	// loginFlows holds pending Nextcloud login-flow-v2 authorisations (ADR-0015), keyed
+	// by id. They are short-lived rows, deleted by the poll that consumes them.
+	loginFlows map[uuid.UUID]*memLoginFlow
+	// The social substrate (core-scope §4, §5, §6). All four are keyed by NODE ID where they name
+	// a node, never by path, so a rename cannot move a star or a discussion onto another file.
+	//
+	// favorites is keyed by (user, node) because a favorite is per USER: two people sharing a
+	// folder star independently, which a node flag could not express.
+	favorites map[[2]uuid.UUID]time.Time
+	// tags holds both system tags (OwnerID nil) and per-account tags.
+	tags []*Tag
+	// nodeTags is keyed by (node, tag) — the primary key of the SQL table.
+	nodeTags map[[2]uuid.UUID]memNodeTag
+	// comments is the discussion table. Soft-deleted rows stay: the thread has to remain readable,
+	// and "a comment was deleted" is a moderation fact worth keeping.
+	comments []*Comment
+	// nextCommentSeq is the in-memory equivalent of the comments.seq identity column.
+	//
+	// It is a counter rather than a timestamp for a reason measured on this platform: two
+	// consecutive time.Now() calls return the SAME value, so several comments posted in a row would
+	// share created_at and the "oldest first" ordering would fall back to a random UUID — putting a
+	// reply above the message it answers.
+	nextCommentSeq int64
+	nextVersion    int
 	// broken simulates an unreachable backend, for tests of failure handling.
 	broken *brokenFlag
 	now    func() time.Time
@@ -107,6 +134,14 @@ type memNode struct {
 	versions []Version
 }
 
+// memLoginFlow adds the two token digests to the exported row. They are lookup keys,
+// never data the caller reads.
+type memLoginFlow struct {
+	flow      LoginFlow
+	pollHash  [32]byte
+	loginHash [32]byte
+}
+
 // NewMemory returns an empty metadata store.
 func NewMemory() *Memory {
 	m := &Memory{
@@ -131,6 +166,11 @@ func NewMemory() *Memory {
 		otpAttempts:           nil,
 		shareUploadEvents:     nil,
 		sharePasswordAttempts: nil,
+		mounts:                map[uuid.UUID]*Mount{},
+		mountByNode:           map[uuid.UUID]uuid.UUID{},
+		loginFlows:            map[uuid.UUID]*memLoginFlow{},
+		favorites:             map[[2]uuid.UUID]time.Time{},
+		nodeTags:              map[[2]uuid.UUID]memNodeTag{},
 		now:                   time.Now,
 		journal:               consistency.NewMemoryJournal(),
 		revisions:             make(map[uuid.UUID]consistency.Revision),
@@ -221,6 +261,9 @@ func (m *Memory) WithTx(ctx context.Context, fn func(ctx context.Context, tx Tx)
 	m.sessions = work.sessions
 	m.appPasswords = work.appPasswords
 	m.locks = work.locks
+	m.mounts = work.mounts
+	m.mountByNode = work.mountByNode
+	m.loginFlows = work.loginFlows
 	m.deadProps = work.deadProps
 	m.shares = work.shares
 	m.blobIDs = work.blobIDs
@@ -229,6 +272,14 @@ func (m *Memory) WithTx(ctx context.Context, fn func(ctx context.Context, tx Tx)
 	m.acl = work.acl
 	m.groups = work.groups
 	m.ops = work.ops
+	// The social substrate travels with the commit for the same reason every other map does: a
+	// field added to snapshot() and forgotten here is written into a workspace that is thrown away,
+	// and the write reports success while changing nothing.
+	m.favorites = work.favorites
+	m.tags = work.tags
+	m.nodeTags = work.nodeTags
+	m.comments = work.comments
+	m.nextCommentSeq = work.nextCommentSeq
 	m.groupMembers = work.groupMembers
 	m.otpAttempts = work.otpAttempts
 	m.shareUploadEvents = work.shareUploadEvents
@@ -246,6 +297,29 @@ func (m *Memory) WithTx(ctx context.Context, fn func(ctx context.Context, tx Tx)
 	m.nextVersion = work.nextVersion
 	m.journal = work.journal
 	return nil
+}
+
+// cloneComment copies a comment record, including the pointer fields a shallow copy would leave
+// aliased to the committed row.
+func cloneComment(c *Comment) *Comment {
+	cp := *c
+	if c.ParentID != nil {
+		parent := *c.ParentID
+		cp.ParentID = &parent
+	}
+	if c.EditedAt != nil {
+		at := *c.EditedAt
+		cp.EditedAt = &at
+	}
+	if c.DeletedAt != nil {
+		at := *c.DeletedAt
+		cp.DeletedAt = &at
+	}
+	if c.DeletedBy != nil {
+		by := *c.DeletedBy
+		cp.DeletedBy = &by
+	}
+	return &cp
 }
 
 // cloneTrashBytes copies the retained-usage counter.
@@ -320,7 +394,45 @@ func (m *Memory) snapshot() *Memory {
 		jobs:                  append([]queuedJob(nil), m.jobs...),
 		nextVersion:           m.nextVersion,
 		ops:                   make(map[uuid.UUID]Op, len(m.ops)),
+		mounts:                make(map[uuid.UUID]*Mount, len(m.mounts)),
+		mountByNode:           make(map[uuid.UUID]uuid.UUID, len(m.mountByNode)),
+		loginFlows:            make(map[uuid.UUID]*memLoginFlow, len(m.loginFlows)),
+		favorites:             make(map[[2]uuid.UUID]time.Time, len(m.favorites)),
+		nodeTags:              make(map[[2]uuid.UUID]memNodeTag, len(m.nodeTags)),
+		nextCommentSeq:        m.nextCommentSeq,
 		now:                   m.now,
+	}
+	for k, v := range m.favorites {
+		work.favorites[k] = v
+	}
+	for k, v := range m.nodeTags {
+		work.nodeTags[k] = v
+	}
+	// Tags and comments are cloned, not shared: a rename mutates the tag record and a soft delete
+	// mutates the comment, and a transaction that rolls back must not have changed the committed
+	// row.
+	for _, t := range m.tags {
+		cp := *t
+		if t.OwnerID != nil {
+			owner := *t.OwnerID
+			cp.OwnerID = &owner
+		}
+		work.tags = append(work.tags, &cp)
+	}
+	for _, c := range m.comments {
+		work.comments = append(work.comments, cloneComment(c))
+	}
+	for k, v := range m.mounts {
+		work.mounts[k] = v
+	}
+	for k, v := range m.mountByNode {
+		work.mountByNode[k] = v
+	}
+	// Login flows are cloned, not shared: the approval mutates the record, and a
+	// transaction that rolls back must not have changed the committed row.
+	for k, v := range m.loginFlows {
+		cp := *v
+		work.loginFlows[k] = &cp
 	}
 	for k, v := range m.ops {
 		work.ops[k] = v
@@ -532,10 +644,14 @@ func (t *memTx) CreateFile(ctx context.Context, n NewFile) (Node, error) {
 	parent := n.ParentID
 	blobID := n.BlobID
 	now := t.m.now()
+	modified := now
+	if n.ModifiedAt != nil {
+		modified = *n.ModifiedAt
+	}
 	node := Node{
 		ID: newID(), ParentID: &parent, OwnerID: n.OwnerID, OwnerGroupID: n.OwnerGroupID,
 		Name: n.Name, Kind: KindFile, Size: n.Size, Mime: n.Mime, ETag: n.ETag,
-		BlobID: &blobID, CreatedAt: now, ModifiedAt: now, RetainUntil: n.RetainUntil,
+		BlobID: &blobID, CreatedAt: now, ModifiedAt: modified, RetainUntil: n.RetainUntil,
 	}
 	t.m.nodes[node.ID] = &memNode{node: node, blob: n.BlobHash}
 	t.attach(n.ParentID, node)
@@ -589,7 +705,11 @@ func (t *memTx) UpdateFile(ctx context.Context, u UpdateFile) (Node, error) {
 	rec.node.Mime = u.Mime
 	rec.node.ETag = u.ETag
 	rec.node.BlobID = &blobID
-	rec.node.ModifiedAt = t.m.now()
+	if u.ModifiedAt != nil {
+		rec.node.ModifiedAt = *u.ModifiedAt
+	} else {
+		rec.node.ModifiedAt = t.m.now()
+	}
 	rec.blob = u.BlobHash
 	t.m.usage[rec.node.OwnerID] += delta
 	return rec.node, nil
@@ -612,7 +732,7 @@ func (t *memTx) WriteFile(ctx context.Context, w WriteFile) (Node, bool, error) 
 			NodeID: existing.ID, Size: w.Size, Mime: w.Mime, ETag: w.ETag,
 			BlobID: w.BlobID, BlobHash: w.BlobHash,
 			KeepVersion: w.KeepVersion, MaxVersions: w.MaxVersions,
-			By: w.By,
+			By: w.By, ModifiedAt: w.ModifiedAt,
 		})
 		if uerr != nil {
 			return Node{}, false, uerr
@@ -773,11 +893,16 @@ func (t *memTx) trashRecursive(id uuid.UUID, depth int) error {
 	return nil
 }
 
-// Trashed lists trashed nodes that are the roots of their deleted subtree.
+// Trashed lists trashed nodes that are the roots of their deleted subtree, as far as THIS
+// owner is concerned.
 //
-// The parent check mirrors the PostgreSQL query: an item the user deleted is trashed
-// while its parent is not, whereas a child that was deleted along with its folder
-// has a trashed parent and must not appear as a separate entry.
+// The parent check mirrors the PostgreSQL query: an item the user deleted is trashed while its
+// parent is not (or its trashed parent belongs to a different account), whereas a child that
+// was deleted along with its own owner's folder has a trashed parent of the same owner and
+// must not appear as a separate entry. The ownership clause is what keeps account deletion
+// from stranding other users' files: a foreign file binned with a deleted account's folder has
+// a trashed parent it can never be reached through, and the listing is the only place its
+// owner can still find it.
 func (t *memTx) Trashed(ctx context.Context, ownerID uuid.UUID, limit int) ([]Node, error) {
 	return t.TrashedAfter(ctx, ownerID, "", limit)
 }
@@ -812,9 +937,12 @@ func (t *memTx) TrashedAfter(ctx context.Context, ownerID uuid.UUID, cursor stri
 		if n.OwnerID != ownerID || n.TrashedAt == nil {
 			continue
 		}
-		// Skip descendants of a trashed ancestor.
+		// Skip descendants of a trashed ancestor of the SAME owner: those are children that
+		// went along with their own subtree, and the subtree root is their listing entry. A
+		// trashed ancestor under a DIFFERENT owner is not that — the file was binned with
+		// someone else's folder, and this listing is where its owner must find it.
 		if n.ParentID != nil {
-			if parent, ok := t.m.nodes[*n.ParentID]; ok && parent.node.TrashedAt != nil {
+			if parent, ok := t.m.nodes[*n.ParentID]; ok && parent.node.TrashedAt != nil && parent.node.OwnerID == n.OwnerID {
 				continue
 			}
 		}
@@ -1178,6 +1306,18 @@ func (m *Memory) Usage(ctx context.Context, ownerID uuid.UUID) (int64, error) {
 	return m.usage[ownerID], nil
 }
 
+// TrashUsage returns the owner's retained (trash) usage.
+//
+// The retained half of §4.3's accounting is otherwise invisible to the conformance suite on
+// this backend: PostgreSQL's tests can read users.trash_bytes, and a mixed-owner subtree
+// case that asserted only the logical quota would pass here while the retained counters
+// drifted. This is the same read the SQL side gets, for the same purpose.
+func (m *Memory) TrashUsage(owner uuid.UUID) int64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.trashBytes[owner]
+}
+
 // SetQuota sets the byte limit for an owner. Zero or negative means unlimited.
 //
 // It serialises with TRANSACTIONS, not merely with other mutations.
@@ -1501,25 +1641,24 @@ func (t *memTx) DeleteSetting(ctx context.Context, key string) error {
 // TrashCapped moves a node to the trash, refusing when retained usage would exceed the cap.
 func (t *memTx) TrashCapped(ctx context.Context, id uuid.UUID, maxRetainedBytes int64) error {
 	if maxRetainedBytes > 0 {
-		var released int64
+		// The cap bounds each ACCOUNT's retained usage, and the subtree can be mixed-owner
+		// (a shared folder where writers own their files). Charging the whole subtree against
+		// the root's owner alone refuses deletes that fit and moves bytes between accounts
+		// that are not each other's, so the check runs per owner — the same shape as the
+		// PostgreSQL UPDATE's WHERE clause.
+		perOwner := map[uuid.UUID]int64{}
 		for _, nid := range t.collectSubtree(id) {
 			if rec, ok := t.m.nodes[nid]; ok && rec.node.TrashedAt == nil {
-				released += rec.node.Size
+				perOwner[rec.node.OwnerID] += rec.node.Size
 			}
 		}
-		if t.m.trashBytes[id2owner(t, id)]+released > maxRetainedBytes {
-			return ErrTrashFull
+		for owner, released := range perOwner {
+			if t.m.trashBytes[owner]+released > maxRetainedBytes {
+				return ErrTrashFull
+			}
 		}
 	}
 	return t.Trash(ctx, id)
-}
-
-// id2owner returns the owner of a node.
-func id2owner(t *memTx, id uuid.UUID) uuid.UUID {
-	if rec, ok := t.m.nodes[id]; ok {
-		return rec.node.OwnerID
-	}
-	return uuid.Nil
 }
 
 // TrimRetainedVersions drops the oldest version rows until each account's history fits capBytes.

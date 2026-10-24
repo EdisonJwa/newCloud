@@ -157,6 +157,10 @@ func (t *memTx) UpsertIdPUser(ctx context.Context, in UpsertUser) (User, error) 
 		if in.DisplayName != "" {
 			byIdentity.DisplayName = in.DisplayName
 		}
+		// Mirrors the PostgreSQL UPDATE's `is_breakglass = is_breakglass OR $n`: a
+		// break-glass login through any branch must leave the row carrying the flag
+		// the revalidation exemption reads.
+		byIdentity.IsBreakglass = byIdentity.IsBreakglass || in.Issuer == BreakglassIssuer
 		// Role is intentionally not written here: ApplyIdPRole owns it, because
 		// only it can also revoke the credentials a demotion invalidates. Writing
 		// it in both places made the change invisible to the reconciler.
@@ -194,6 +198,7 @@ func (t *memTx) UpsertIdPUser(ctx context.Context, in UpsertUser) (User, error) 
 		now := t.m.now()
 		byName.IdPConfirmedAt = &now
 		byName.UpdatedAt = now
+		byName.IsBreakglass = byName.IsBreakglass || in.Issuer == BreakglassIssuer
 		return *byName, nil
 	}
 
@@ -217,7 +222,10 @@ func (t *memTx) UpsertIdPUser(ctx context.Context, in UpsertUser) (User, error) 
 		ID: newID(), Username: username, Email: in.Email, DisplayName: in.DisplayName,
 		Role: orDefault(in.Role, "guest"), Status: orDefault(in.Status, StatusActive),
 		IdPIssuer: in.Issuer, IdPSubject: in.Subject,
-		CreatedAt: now, UpdatedAt: now,
+		// Born with the flag, like the PostgreSQL column: a break-glass row is created
+		// by its own issuer and the revalidation exemption reads exactly this field.
+		IsBreakglass: in.Issuer == BreakglassIssuer,
+		CreatedAt:    now, UpdatedAt: now,
 	}
 	// Mirrors the PostgreSQL column default (10 GiB) when no explicit quota is supplied, so the
 	// two backends agree about a freshly provisioned account even though only one of them has a

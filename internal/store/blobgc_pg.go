@@ -19,20 +19,28 @@ type BlobRef struct {
 // observed consistently; the query itself only reads.
 //
 // Three conditions must all hold: refcount is zero (nothing points at the bytes),
-// collect_after has passed (the grace period is over), and no version row still
+// the grace period has passed, and no version row still
 // names the blob. The version check is belt-and-braces against a refcount that
 // drifted: a version is a live reference to content, and collecting bytes a
 // historical version needs would turn "restore an old version" into a permanent
 // error for that file.
+//
+// The clock being checked is COALESCE(collect_after, created_at + grace). A row that
+// dropped its last reference carries collect_after, set at the moment the count reached
+// zero. A row that was NEVER referenced has none — BlobIDFor creates it before the node
+// that will reference it exists, and a publish that fails in between (quota 507, If-Match
+// 412, a name fold 409) leaves refcount 0 and collect_after NULL forever, immune to the
+// collector. Ageing those orphans by the row's own creation, with the same grace the
+// caller passes for dropped references, is what makes them collectable at all; the grace
+// is what keeps the sweep from racing the upload that is about to reference the row.
 func (t *pgTx) CollectableBlobs(ctx context.Context, grace time.Duration) ([]BlobRef, error) {
 	const q = `SELECT b.id, b.size FROM blobs b
 		WHERE b.refcount = 0
-		  AND b.collect_after IS NOT NULL
-		  AND b.collect_after <= now()
+		  AND COALESCE(b.collect_after, b.created_at + $1::interval) <= now()
 		  AND NOT EXISTS (SELECT 1 FROM versions v WHERE v.blob_id = b.id)
 		  AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.blob_id = b.id)
 		LIMIT 1000`
-	rows, err := t.tx.Query(ctx, q)
+	rows, err := t.tx.Query(ctx, q, intervalOf(grace))
 	if err != nil {
 		return nil, translate(err)
 	}
@@ -83,5 +91,11 @@ func (t *memTx) CollectableBlobs(ctx context.Context, grace time.Duration) ([]Bl
 }
 
 func (t *memTx) DeleteBlob(ctx context.Context, id uuid.UUID) error {
-	return nil
+	// The memory store keeps no blob rows — only a content-address-to-id map, with no
+	// refcount, size or creation time — so there is no row to delete and nothing to check
+	// "still referenced" against, which is the guard the PostgreSQL version refuses to skip.
+	// It used to return nil, making this the one call in the GC pair that lied on this
+	// backend: a sweep would count bytes reclaimed that no backend ever dropped. Like
+	// CollectableBlobs above, it reports the gap instead of pretending success.
+	return errNotImplemented
 }
