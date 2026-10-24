@@ -45,6 +45,10 @@ type Node struct {
 	// RetainUntil is when this node is purged, set at delivery time from the share that
 	// accepted it (SHARE-05 保留期限). Nil means no retention was in force.
 	RetainUntil *time.Time
+	// OwnerGroupID names the group that owns this node, when it is a group space rather than a
+	// personal one. The column was stored and scanned away for a while: writes set it and reads
+	// dropped it, so nothing could ever report a space.
+	OwnerGroupID *uuid.UUID
 }
 
 // IsDir reports whether the node is a directory.
@@ -215,6 +219,12 @@ type Tx interface {
 	// the newest entry; the cursor comes from FormatTrashCursor, which the store owns because the
 	// ordering it has to match lives here.
 	TrashedAfter(ctx context.Context, ownerID uuid.UUID, cursor string, limit int) ([]Node, error)
+	// SpacesFor lists the group-owned roots this account can see.
+	//
+	// A space is a node whose owner_group_id names a group the caller belongs to. Membership is the
+	// whole test: the space exists for the group, not for whoever happened to create it, and a
+	// member who joins later sees it without anybody granting anything.
+	SpacesFor(ctx context.Context, userID uuid.UUID) ([]Node, error)
 
 	// Versions lists kept versions of a file, newest first.
 	Versions(ctx context.Context, nodeID uuid.UUID, limit int) ([]Version, error)

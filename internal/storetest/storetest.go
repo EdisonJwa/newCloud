@@ -234,6 +234,70 @@ func Run(t *testing.T, factory Factory, opts Options) {
 	// A paged listing must return every row exactly once. Trashing several nodes in the same instant
 	// gives them identical timestamps, so a cursor that orders by time alone either repeats a row at
 	// the page boundary or loses one — and the failure is invisible on page one.
+	// A space belongs to the group, so joining the group is what makes it visible. The column that
+	// says so was written and then scanned away for a long time: nothing could report a space.
+	t.Run("SpacesAreVisibleToMembersAndNobodyElse", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		memberUser, merr := upsertUser(s, store.UpsertUser{
+			Issuer: "https://idp.test", Subject: "space-member",
+			Username: "space-member", Email: "space-member@example.test", Role: "user",
+		})
+		if merr != nil {
+			t.Fatalf("create member: %v", merr)
+		}
+		member := memberUser.ID
+
+		var groupID uuid.UUID
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			g, gerr := tx.CreateGroup(ctx, store.Group{Name: "team-" + member.String()[:8]})
+			groupID = g.ID
+			if gerr != nil {
+				return gerr
+			}
+			return tx.AddGroupMember(ctx, g.ID, member, "viewer")
+		}); err != nil {
+			t.Fatalf("create group: %v", err)
+		}
+
+		var space store.Node
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			n, cerr := tx.CreateDir(ctx, store.NewNode{
+				OwnerID: owner, ParentID: r.ID, Name: "team-space", OwnerGroupID: &groupID,
+			})
+			space = n
+			return cerr
+		}); err != nil {
+			t.Fatalf("create space: %v", err)
+		}
+		if space.OwnerGroupID == nil || *space.OwnerGroupID != groupID {
+			t.Fatalf("the space did not record its owning group: %+v", space.OwnerGroupID)
+		}
+
+		read := func(uid uuid.UUID) []store.Node {
+			var got []store.Node
+			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				list, lerr := tx.SpacesFor(ctx, uid)
+				got = list
+				return lerr
+			}); err != nil {
+				t.Fatalf("SpacesFor: %v", err)
+			}
+			return got
+		}
+
+		if list := read(member); len(list) != 1 || list[0].ID != space.ID {
+			t.Fatalf("the member sees %d space(s), want the one its group owns", len(list))
+		}
+		if list := read(owner); len(list) != 0 {
+			t.Fatalf("the creator is not a member of the group, so it must not see the space "+
+				"through membership; got %d", len(list))
+		}
+		if list := read(uuid.New()); len(list) != 0 {
+			t.Fatalf("an unrelated account sees %d space(s)", len(list))
+		}
+	})
+
 	t.Run("TrashPagesDoNotRepeatOrSkipRows", func(t *testing.T) {
 		s, owner := factory(t)
 		r := rootOf(t, s, owner)

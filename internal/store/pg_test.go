@@ -42,7 +42,7 @@ func TestPGConformance(t *testing.T) {
 		// across subtests. Without this the Groups ordering case sees rows from an
 		// earlier subtest and reports "5 groups, want 2" — a test-isolation failure,
 		// not a store failure. Clear the dependent rows first.
-		if _, err := pool.Exec(context.Background(), `DELETE FROM group_members; DELETE FROM groups`); err != nil {
+		if _, err := pool.Exec(context.Background(), `UPDATE nodes SET owner_group_id = NULL WHERE owner_group_id IS NOT NULL; DELETE FROM group_members; DELETE FROM groups`); err != nil {
 			t.Fatalf("clear groups: %v", err)
 		}
 		owner := newUser(t, pool)

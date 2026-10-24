@@ -125,3 +125,31 @@ func (t *pgTx) GroupByID(ctx context.Context, id uuid.UUID) (Group, error) {
 	const q = `SELECT ` + groupColumns + ` FROM groups WHERE id = $1`
 	return scanGroup(t.tx.QueryRow(ctx, q, id))
 }
+
+// SpacesFor lists the group-owned roots the account can see.
+//
+// The join is on group_members, not on a grant: a space belongs to the group as a whole, so joining
+// the group is what makes it appear. That is the difference between a space and a folder shared
+// with a group — the folder is somebody's and was shared, the space is the group's.
+func (t *pgTx) SpacesFor(ctx context.Context, userID uuid.UUID) ([]Node, error) {
+	const q = `SELECT ` + nodeColumns + ` FROM nodes
+		WHERE owner_group_id IS NOT NULL
+		  AND trashed_at IS NULL
+		  AND owner_group_id IN (SELECT group_id FROM group_members WHERE user_id = $1)
+		ORDER BY name`
+	rows, err := t.tx.Query(ctx, q, userID)
+	if err != nil {
+		return nil, translate(err)
+	}
+	defer rows.Close()
+
+	var out []Node
+	for rows.Next() {
+		n, serr := scanNode(rows)
+		if serr != nil {
+			return nil, serr
+		}
+		out = append(out, n)
+	}
+	return out, translate(rows.Err())
+}

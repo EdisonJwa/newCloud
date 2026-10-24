@@ -507,7 +507,7 @@ func (t *memTx) CreateDir(ctx context.Context, n NewNode) (Node, error) {
 	parent := n.ParentID
 	now := t.m.now()
 	node := Node{
-		ID: newID(), ParentID: &parent, OwnerID: n.OwnerID,
+		ID: newID(), ParentID: &parent, OwnerID: n.OwnerID, OwnerGroupID: n.OwnerGroupID,
 		Name: n.Name, Kind: KindDir, CreatedAt: now, ModifiedAt: now,
 	}
 	t.m.nodes[node.ID] = &memNode{node: node}
@@ -526,7 +526,7 @@ func (t *memTx) CreateFile(ctx context.Context, n NewFile) (Node, error) {
 	blobID := n.BlobID
 	now := t.m.now()
 	node := Node{
-		ID: newID(), ParentID: &parent, OwnerID: n.OwnerID,
+		ID: newID(), ParentID: &parent, OwnerID: n.OwnerID, OwnerGroupID: n.OwnerGroupID,
 		Name: n.Name, Kind: KindFile, Size: n.Size, Mime: n.Mime, ETag: n.ETag,
 		BlobID: &blobID, CreatedAt: now, ModifiedAt: now, RetainUntil: n.RetainUntil,
 	}

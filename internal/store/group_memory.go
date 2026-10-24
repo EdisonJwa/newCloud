@@ -118,3 +118,21 @@ func (t *memTx) GroupByID(ctx context.Context, id uuid.UUID) (Group, error) {
 	}
 	return Group{}, ErrNotFound
 }
+
+// SpacesFor lists the group-owned roots the account can see, matching the SQL join on membership.
+func (t *memTx) SpacesFor(ctx context.Context, userID uuid.UUID) ([]Node, error) {
+	groups := t.groupsOf(userID)
+	var out []Node
+	for _, rec := range t.m.nodes {
+		n := rec.node
+		if n.OwnerGroupID == nil || n.TrashedAt != nil {
+			continue
+		}
+		if !groups[*n.OwnerGroupID] {
+			continue
+		}
+		out = append(out, n)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}

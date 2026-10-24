@@ -173,7 +173,7 @@ func nodeColumnsQualified(alias string) string {
 func scanNode(row pgx.Row) (Node, error) {
 	var n Node
 	var kind string
-	err := row.Scan(&n.ID, &n.ParentID, &n.OwnerID, new(*uuid.UUID), &n.Name, &kind,
+	err := row.Scan(&n.ID, &n.ParentID, &n.OwnerID, &n.OwnerGroupID, &n.Name, &kind,
 		&n.Size, &n.Mime, &n.ETag, &n.BlobID, &n.CreatedAt, &n.ModifiedAt, &n.TrashedAt,
 		&n.RetainUntil)
 	if err != nil {
