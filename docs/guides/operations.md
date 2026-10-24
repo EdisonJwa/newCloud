@@ -108,6 +108,28 @@ GET /api/audit?format=json
 A normal user's export covers that user's own actions plus anonymized events about their data
 (anonymous downloads, rejected recipient attempts). Only an administrator can export the full log.
 
+### Building a release
+
+```sh
+make release VERSION=v1.2.3
+```
+
+Produces, in `dist/`:
+
+- one binary per platform (`linux`, `darwin`, `windows` × `amd64`, `arm64`), cross-compiled with
+  `CGO_ENABLED=0` and trimmed paths, each stamped with `VERSION` so `newcloud --version` answers
+  "which build is this" without trusting a label;
+- `SHA256SUMS` covering every artifact including the SBOM;
+- `sbom.cdx.json` — a CycloneDX inventory of **every module the binary imports**, not the module
+  graph: the distinction matters, because the graph also contains this repository's lint plugins and
+  a security review that scans them raises findings against code that is never shipped.
+
+Pushing a tag matching `v*` runs the same `make release` in CI, verifies the stamped version on the
+built binary, verifies the SBOM names the binary's dependencies, and publishes the artifacts with the
+release. `make sbom` alone regenerates just the inventory.
+
+Omit `VERSION` and it defaults to `git describe --tags --always --dirty`, so a build from a modified
+tree says so.
 ### Verifying a build before deploying it
 
 Everything else in this repository tests packages through Go interfaces. One test builds the binary

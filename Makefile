@@ -1,4 +1,4 @@
-.PHONY: test test-race build web webcheck api apicheck lint fmt clean race vuln check devidp e2e uicheck dropcheck example-config
+.PHONY: test test-race build web webcheck api apicheck lint fmt clean race vuln check devidp e2e uicheck dropcheck example-config sbom release
 
 GO ?= go
 
@@ -82,3 +82,40 @@ check: lint example-config webcheck race
 
 clean:
 	rm -rf bin
+
+# --- release artifacts -------------------------------------------------------
+#
+# What a self-hosted deployment needs in order to answer "which build is this, and what is in it":
+# one binary per platform stamped with the version it came from, a checksum file, and an SBOM
+# naming every module the binary actually imports.
+#
+# The version defaults to `git describe`, so a build from a dirty tree says so. A release overrides
+# it: make release VERSION=v1.2.3
+DIST ?= dist
+PLATFORMS ?= linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64
+
+# The SBOM is generated from the module graph of ./cmd/newcloud, not from the whole module graph:
+# see tools/sbom for why a list that includes this repository's own lint plugins is the wrong answer
+# to "what is in the binary".
+sbom:
+	@mkdir -p $(DIST)
+	$(GO) run ./tools/sbom -version "$(VERSION)" -o "$(DIST)/sbom.cdx.json"
+	@echo "wrote $(DIST)/sbom.cdx.json"
+
+# Cross-compiled with CGO_ENABLED=0: the whole binary is pure Go, so a release needs no per-platform
+# toolchain. -trimpath keeps the build path out of the binary, which is both a reproducibility and a
+# disclosure question.
+release:
+	@rm -rf $(DIST)
+	@mkdir -p $(DIST)
+	@set -e; for p in $(PLATFORMS); do \
+		os=$${p%/*}; arch=$${p#*/}; \
+		out="$(DIST)/newcloud-$(VERSION)-$$os-$$arch"; \
+		if [ "$$os" = "windows" ]; then out="$$out.exe"; fi; \
+		echo "  $$os/$$arch"; \
+		CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch $(GO) build -trimpath \
+			-ldflags '$(LDFLAGS)' -o "$$out" ./cmd/newcloud; \
+	done
+	@$(MAKE) --no-print-directory sbom
+	@cd $(DIST) && sha256sum * > SHA256SUMS
+	@echo "release artifacts in $(DIST)/ for $(VERSION)"

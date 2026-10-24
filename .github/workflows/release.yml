@@ -1,0 +1,51 @@
+name: release
+
+# Triggered by a tag so that what is published is exactly what was tagged. The version stamped into
+# the binaries comes from the tag itself, which is what lets an operator answer "which build is
+# running" without trusting a label someone typed.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The version is derived from the tag; a shallow clone has no tags to describe.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build, checksum and inventory
+        run: make release VERSION="${GITHUB_REF_NAME}"
+
+      - name: Verify the stamped version
+        # A build that does not report the tag it was published under is the failure this catches:
+        # the ldflags plumbing is silent when it breaks, and the binary still runs.
+        run: |
+          ./dist/newcloud-"${GITHUB_REF_NAME}"-linux-amd64 --version | grep -F "${GITHUB_REF_NAME}"
+          ./dist/newcloud-"${GITHUB_REF_NAME}"-linux-amd64 version | grep -F "${GITHUB_REF_NAME}"
+
+      - name: Verify the SBOM names the binary's dependencies
+        run: |
+          test -s dist/sbom.cdx.json
+          grep -q '"bomFormat": "CycloneDX"' dist/sbom.cdx.json
+          # The binary always imports at least pgx; an SBOM without it is one that inventoried the
+          # wrong graph.
+          grep -q 'github.com/jackc/pgx' dist/sbom.cdx.json
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/newcloud-*
+            dist/SHA256SUMS
+            dist/sbom.cdx.json
+          generate_release_notes: true
