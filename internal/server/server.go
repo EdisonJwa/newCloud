@@ -244,6 +244,11 @@ func (s *Server) Handler() http.Handler {
 				r.Post("/content-ticket", s.handleContentTicket)
 				r.Post("/rename", s.handleRename)
 				r.Post("/move", s.handleMove)
+				// Copy and move in bulk, and one implementation for both: see transfer.go.
+				r.Post("/batch", s.handleBatch)
+				// A ZIP of the selection. It streams, and it is authenticated like any other read:
+				// taking a copy of many files is the same act as taking one.
+				r.Get("/zip", s.handleZip)
 				r.Delete("/", s.handleDelete)
 				r.Get("/trash", s.handleTrashList)
 				r.Post("/restore", s.handleRestore)
@@ -366,10 +371,11 @@ func (s *Server) Handler() http.Handler {
 	//
 	//   NOT CLAIMED: that no bytes at all leave this origin. Authenticated routes do serve a signed-in
 	//   user their own files: /api/files/download (attachment by default),
-	//   /api/shared/{id}/content, /api/files/version, /api/files/thumbnail, and WebDAV GET. Each is
-	//   session- or app-password-authenticated and re-checks the node's permissions on every request.
-	//   Sending them to the content origin is not possible without also handing the content origin
-	//   the ability to authenticate a session, which is the isolation the split exists to provide.
+	//   /api/shared/{id}/content, /api/files/version, /api/files/thumbnail, /api/files/zip, and WebDAV
+	//   GET. Each is session- or app-password-authenticated and re-checks the node's permissions on
+	//   every request. Sending them to the content origin is not possible without also handing the
+	//   content origin the ability to authenticate a session, which is the isolation the split exists
+	//   to provide.
 	//
 	//   The one route that can render bytes INLINE on this origin is /api/files/download?inline=1,
 	//   and it is a vetted exception rather than an oversight: it is opt-in per request, its type

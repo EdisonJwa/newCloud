@@ -39,13 +39,23 @@ const subtreeCheckLimit = 10_000
 // not proceed on the assumption that it would have been allowed.
 func (s *Server) checkSubtreePerm(r *http.Request, actor authz.Actor,
 	rootID uuid.UUID, perm authz.Perm) bool {
+	return s.checkSubtreePermCtx(r.Context(), actor, rootID, perm)
+}
+
+// checkSubtreePermCtx is the same answer for a caller that has only a context.
+//
+// The transfer helpers are reached both from a handler and from a batch loop that has already
+// flattened N requests into one; threading a *http.Request through them only to reach its context
+// would suggest the request were the input when the actor and the tree are.
+func (s *Server) checkSubtreePermCtx(ctx context.Context, actor authz.Actor,
+	rootID uuid.UUID, perm authz.Perm) bool {
 
 	var (
 		nodes    []store.Node
 		complete bool
 		err      error
 	)
-	walkErr := s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
+	walkErr := s.deps.Meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
 		nodes, complete, err = tx.Descendants(ctx, rootID, subtreeCheckLimit)
 		return err
 	})

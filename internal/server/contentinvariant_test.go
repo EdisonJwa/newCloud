@@ -60,6 +60,7 @@ var userByteRoutes = map[string]byteRouteClass{
 	"GET /api/files/download":      classVettedInline, // attachment by default; inline via ?inline=1
 	"GET /api/files/version":       classAuthenticated,
 	"GET /api/files/thumbnail":     classAuthenticated, // derived image, re-authorized per request
+	"GET /api/files/zip":           classAuthenticated, // streams many nodes; authorized per node
 	"GET /api/shared/{id}/content": classAuthenticated,
 	"GET /content/*":               classAnonymousContentOriginOnly,
 	"GET /s/{token}/download":      classShareGated,
