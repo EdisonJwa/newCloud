@@ -564,6 +564,25 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		Owner: actor.ID().String(), Path: rel,
 	})
 	if err != nil {
+		// "The row is there and you may read it, but its bytes are not where the metadata says" is
+		// storage damage, not a missing file. It used to reach the client as a bare 500 with an
+		// empty body and leave no trace in the log: the user cannot report anything useful and the
+		// operator cannot tell it apart from any other fault.
+		//
+		// The three states are different and answered differently on purpose:
+		//   404 — the file does not exist (Resolve failed earlier)
+		//   403 — the caller may not read it (Authorize failed earlier)
+		//   500 — the file exists, the caller may read it, and its bytes are gone
+		if errors.Is(err, layout.ErrNotFound) {
+			s.deps.Log.Error("content missing for an existing file: the metadata row says the "+
+				"bytes are on the storage backend and they are not",
+				"node", node.ID.String(), "name", node.Name, "path", rel,
+				"owner", actor.ID().String())
+			writeError(w, http.StatusInternalServerError, "content_missing",
+				"this file's metadata exists but its content is missing on the storage backend; "+
+					"it has been reported and an operator needs to check the storage")
+			return
+		}
 		s.writeStoreError(w, err)
 		return
 	}
