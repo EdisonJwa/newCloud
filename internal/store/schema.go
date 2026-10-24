@@ -84,6 +84,71 @@ func ApplySchema(ctx context.Context, pool *pgxpool.Pool) error {
 	return nil
 }
 
+// CheckSchema reports whether the database has every migration this binary embeds.
+//
+// It exists because `serve` used to apply no check at all: a binary deployed ahead of
+// its schema served traffic, answered /readyz, and then failed on the first request
+// that touched a new column — a 500 whose cause was three hops away from its symptom
+// (2026-10-24 review, H8). Refusing to serve with a message naming the missing
+// migrations turns that into a startup error an operator can act on before any user
+// sees it.
+//
+// The direction matters. A database BEHIND the binary is fatal (the code will query
+// columns that do not exist). A database AHEAD of the binary is a rollback in
+// progress: it is reported so the mismatch is visible, but it is not the check's job
+// to refuse — the older binary may well serve correctly, and refusing would make a
+// rollback impossible without a database restore.
+func CheckSchema(ctx context.Context, pool *pgxpool.Pool) (behind, ahead []string, err error) {
+	entries, err := migrations.FS.ReadDir(".")
+	if err != nil {
+		return nil, nil, fmt.Errorf("store: read migrations: %w", err)
+	}
+	embedded := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".sql") {
+			embedded = append(embedded, e.Name())
+		}
+	}
+	sort.Strings(embedded)
+
+	rows, qerr := pool.Query(ctx, `SELECT name FROM schema_migrations`)
+	if qerr != nil {
+		// The table itself may be missing, which means nothing has been applied. That
+		// is the "behind" case with every migration listed, not an error to hide.
+		return embedded, nil, nil
+	}
+	defer rows.Close()
+
+	applied := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if serr := rows.Scan(&name); serr != nil {
+			return nil, nil, fmt.Errorf("store: read applied migrations: %w", serr)
+		}
+		applied[name] = true
+	}
+	if rerr := rows.Err(); rerr != nil {
+		return nil, nil, fmt.Errorf("store: read applied migrations: %w", rerr)
+	}
+
+	for _, name := range embedded {
+		if !applied[name] {
+			behind = append(behind, name)
+		}
+	}
+	known := map[string]bool{}
+	for _, name := range embedded {
+		known[name] = true
+	}
+	for name := range applied {
+		if !known[name] {
+			ahead = append(ahead, name)
+		}
+	}
+	sort.Strings(ahead)
+	return behind, ahead, nil
+}
+
 // stripTxControl removes top-level BEGIN/COMMIT statements.
 //
 // The migration files are written to be runnable by psql directly, which needs

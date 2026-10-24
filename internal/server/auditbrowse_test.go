@@ -250,8 +250,13 @@ func TestAuditEventsFilterByAction(t *testing.T) {
 // Resolving a thumbnail by path can only ever find the caller's OWN files, so a folder somebody
 // shared through an ACL showed type badges where it could show pictures — the one content entry point
 // that ignored a grant that the download, listing and WebDAV paths all honoured. Addressing the node
-// by id fixes that, and the id is deliberately NOT a capability: the same PermRead check decides,
-// so a shared file has a preview exactly when the caller may read it.
+// by id fixes that, and the id is deliberately NOT a capability.
+//
+// The capability the preview requires is `download`, exactly like the content paths beside it:
+// a thumbnail is decoded pixels of the file, so a grant that withholds the bytes while allowing the
+// metadata must withhold the preview too. The middle assertion pins that half — before 2026-10-24
+// this route checked PermRead, and a read-without-download grantee received full renditions while
+// the download one screen over answered 404.
 func TestSharedFileHasAPreviewOnlyWithAGrant(t *testing.T) {
 	h := newHarness(t)
 	uploadWithType(t, h, "private-shot.png", "image/png", samplePNG(t))
@@ -283,12 +288,21 @@ func TestSharedFileHasAPreviewOnlyWithAGrant(t *testing.T) {
 			"be a capability.", code)
 	}
 
+	// Read WITHOUT download: metadata, not bytes. The preview is bytes, so it is
+	// withheld — the same answer the download route gives for this grant.
 	h.grantOn(t, node.ID, other.ID, store.PermRead, false)
+	if code := byID(); code != http.StatusNotFound {
+		t.Fatalf("a read-without-download grant produced a thumbnail (%d). A preview is "+
+			"decoded content; the grant that withholds the file must withhold it too.", code)
+	}
+
+	// Read AND download: the preview appears, exactly like every other content path.
+	h.grantOn(t, node.ID, other.ID, store.PermRead|store.PermDownload, false)
 
 	if code := byID(); code != http.StatusOK {
-		t.Fatalf("a file shared with read permission has no preview (%d). Every other entry point "+
-			"honours that grant; the thumbnail one must too, or the shared folder is a wall of type "+
-			"badges.", code)
+		t.Fatalf("a file shared with read+download permission has no preview (%d). Every other "+
+			"entry point honours that grant; the thumbnail one must too, or the shared folder is "+
+			"a wall of type badges.", code)
 	}
 }
 

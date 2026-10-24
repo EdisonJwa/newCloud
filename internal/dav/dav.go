@@ -369,9 +369,15 @@ func writeXMLError(w http.ResponseWriter, status int, condition string) {
 // Getting these wrong is user-visible: a quota failure reported as 500 makes
 // Windows show "unexpected error" instead of "the disk is full".
 func statusForError(err error) int {
+	var maxBytes *http.MaxBytesError
 	switch {
 	case err == nil:
 		return http.StatusOK
+	case errors.As(err, &maxBytes):
+		// A body that ran past limits.max_file_bytes mid-read. Chunked uploads
+		// declare no length, so this — not the ContentLength check — is the only
+		// thing standing between them and an unbounded write.
+		return http.StatusRequestEntityTooLarge
 	case errors.Is(err, store.ErrNotFound), errors.Is(err, authz.ErrNotFound), errors.Is(err, authz.ErrDenied):
 		// Deliberately 404 rather than 403 for denied: see resolvePath.
 		return http.StatusNotFound

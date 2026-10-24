@@ -215,6 +215,10 @@ func (w *Worker) Run(ctx context.Context) {
 	if err := w.anchorOnce(ctx); err != nil {
 		w.log.Error("audit anchoring failed", "error", err)
 	}
+	// The audit gauges are not part of anchoring: they must exist on a deployment with
+	// no anchor directory configured too, or the chain-stalled alert is dead by
+	// configuration rather than by threshold.
+	w.AuditHealth(ctx)
 
 	for {
 		select {
@@ -260,6 +264,11 @@ func (w *Worker) Run(ctx context.Context) {
 			if err := w.anchorOnce(ctx); err != nil {
 				w.log.Error("audit anchoring failed", "error", err)
 			}
+			// The anchor tick is hourly, which matches the head-age alert's own
+			// threshold (3600s): sampling more often would not page anyone sooner,
+			// and sampling less often would make the alert blind for most of the
+			// hour it claims to watch.
+			w.AuditHealth(ctx)
 		case <-jobs.C:
 			// Before claiming, release leases whose worker died mid-job. Claiming would
 			// recover them anyway — an expired lease is claimable — so this is not what makes

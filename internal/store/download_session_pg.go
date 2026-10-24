@@ -43,6 +43,18 @@ func (t *pgTx) AuthorizeDownload(ctx context.Context, s DownloadSession, reuseEx
 		s.ExpiresAt = t.now.Add(DownloadSessionTTL)
 	}
 
+	// The share row is locked first, so "is there a live session?" and "charge for a new
+	// one" happen under one lock.
+	//
+	// Without it the find below runs in two concurrent transactions that both see no
+	// session, both call IncrementDownload, and the loser's upsert lands on the winner's row:
+	// one download, two charges (2026-10-24 review, M16). The lock is per share, which is
+	// the granularity the cap itself is defined at, so it serialises exactly the requests
+	// that contend for the same allowance.
+	if _, err := t.tx.Exec(ctx, `SELECT 1 FROM shares WHERE id = $1 FOR UPDATE`, s.ShareID); err != nil {
+		return DownloadSession{}, false, translate(err)
+	}
+
 	const find = `SELECT id, share_id, node_id, grant_hash, etag, created_at, expires_at
 		FROM download_sessions
 		WHERE share_id = $1 AND node_id = $2 AND grant_hash = $3 AND expires_at > now()`

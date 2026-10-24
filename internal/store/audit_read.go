@@ -17,6 +17,7 @@ package store
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/EdisonJwa/newCloud/internal/audit"
 )
@@ -89,6 +90,16 @@ func (m *Memory) AuditCount(ctx context.Context) (int64, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return int64(len(m.audit)), nil
+}
+
+// AuditNewest returns the time of the newest entry, and whether one exists.
+func (m *Memory) AuditNewest(ctx context.Context) (time.Time, bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if len(m.auditTimes) == 0 {
+		return time.Time{}, false, nil
+	}
+	return m.auditTimes[len(m.auditTimes)-1], true, nil
 }
 
 // ChainCapable reports whether this backend maintains a real hash chain.

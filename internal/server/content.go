@@ -126,6 +126,28 @@ func (s *Server) handleContent(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rc.Close()
 
+	// Reads are audited here too.
+	//
+	// The JSON download route recorded file.read and this one did not, so the route the
+	// two-origin design exists for was the only way to read a file with no trace at all —
+	// a compliance gap rather than a vulnerability, but the one that makes the audit log
+	// answerable ("who read this") only for the paths nobody uses (2026-10-24 review, H11).
+	//
+	// Best effort, in its own transaction, exactly like the download route: the bytes are
+	// this request's job, and a bookkeeping failure must not turn a working download into an
+	// error the client cannot act on. The actor is the ticket's subject, because the content
+	// origin has no session — that is the point of it.
+	size := node.Size
+	_ = s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
+		return tx.Audit(ctx, store.AuditEntry{
+			ActorKind: "user", ActorUserID: &ownerID, ActorEmail: claims.Extra["email"],
+			ActorIP: clientIP(r), UserAgent: r.UserAgent(),
+			Action: "file.read", TargetKind: "node", TargetID: node.ID.String(),
+			Result: "ok", Bytes: &size,
+			Metadata: map[string]any{"name": node.Name, "via": "content_ticket"},
+		})
+	})
+
 	// Always inline=false: the content origin never renders, whatever the client asks for.
 	http.ServeContent(w, r, node.Name, node.ModifiedAt, rc)
 }
@@ -261,7 +283,10 @@ func (s *Server) handleContentTicket(w http.ResponseWriter, r *http.Request) {
 	tok, err := s.deps.Tickets.Mint(ticket.PurposeDownload, ticket.Claims{
 		Subject: actor.ID().String(),
 		Expiry:  time.Now().Add(ttl),
-		Extra:   map[string]string{"path": rel},
+		// The email rides along so the content origin can attribute the read in the audit
+		// log: it has no session, and a user id alone is not what an operator reads first.
+		// It is not a credential — the signature covers it, and nothing authorizes on it.
+		Extra: map[string]string{"path": rel, "email": actor.Email()},
 	})
 	if err != nil {
 		s.deps.Log.Error("mint content ticket", "error", err)

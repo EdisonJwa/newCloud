@@ -706,6 +706,64 @@ func Run(t *testing.T, factory Factory, opts Options) {
 				t.Fatalf("create-only on a taken name: want ErrPrecondition, got %v", err)
 			}
 		})
+
+		// A name that collides with an existing one after case/Unicode folding is a
+		// CONFLICT, not the same file.
+		//
+		// ChildByName folds so that a lookup for "README.md" finds "Readme.md". Reusing that
+		// answer to decide an UPDATE meant the write replaced the content of a file with a
+		// DIFFERENT name and then 404'd on the name the client asked to read, because the read
+		// path is case-exact. ADR-0004 §4 says this must be refused; the suite only tested
+		// CreateFile, where the unique index refused it for free (2026-10-24 review, C6).
+		t.Run("AFoldCollisionIsAConflictNotAnUpdate", func(t *testing.T) {
+			s, owner := factory(t)
+			r := rootOf(t, s, owner)
+			original := mkfile(t, s, owner, r.ID, "Readme.md", 5)
+
+			err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				_, _, werr := tx.WriteFile(ctx, store.WriteFile{
+					NewFile: store.NewFile{
+						OwnerID: owner, ParentID: r.ID, Name: "README.md",
+						Size: 9, ETag: "e-fold", BlobID: newBlobHook(t),
+					},
+				})
+				return werr
+			})
+			if !errors.Is(err, store.ErrConflict) {
+				t.Fatalf("a differently-cased name must be refused with ErrConflict, got %v", err)
+			}
+
+			// The original is untouched: same name, same size, same node.
+			var after store.Node
+			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				got, gerr := tx.Node(ctx, original.ID)
+				after = got
+				return gerr
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if after.Name != "Readme.md" || after.Size != original.Size {
+				t.Fatalf("the refused write changed the existing node: name=%q size=%d",
+					after.Name, after.Size)
+			}
+
+			// The same name, spelled identically, still updates in place.
+			err = s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				_, created, werr := tx.WriteFile(ctx, store.WriteFile{
+					NewFile: store.NewFile{
+						OwnerID: owner, ParentID: r.ID, Name: "Readme.md",
+						Size: 7, ETag: "e-same", BlobID: newBlobHook(t),
+					},
+				})
+				if werr == nil && created {
+					return errors.New("an identically-named write must update, not create")
+				}
+				return werr
+			})
+			if err != nil {
+				t.Fatalf("writing the same name must still update: %v", err)
+			}
+		})
 	})
 
 	// Download counting.
@@ -758,6 +816,72 @@ func Run(t *testing.T, factory Factory, opts Options) {
 			})
 			if got.DownloadCount != 1 {
 				t.Fatalf("six range requests are one download, count=%d", got.DownloadCount)
+			}
+		})
+
+		// A player that opens several connections at once is one download.
+		//
+		// The find-then-charge sequence ran in two transactions that both saw no session and
+		// both called IncrementDownload; the loser's upsert then landed on the winner's row, so
+		// the share was charged twice for one download (2026-10-24 review, M16). The fix is a
+		// row lock on the share, and this is the case that proves it: eight concurrent
+		// CONTINUATION requests (what a seeking player issues) starting from no session,
+		// exactly one charge.
+		//
+		// reuseExisting=false is deliberately not used here: eight plain GETs really are eight
+		// downloads by design ("a second full download is a second download"), so charging each
+		// is correct behaviour rather than the race.
+		t.Run("ConcurrentContinuationsChargeOnce", func(t *testing.T) {
+			s, owner := factory(t)
+			r := rootOf(t, s, owner)
+			file := mkfile(t, s, owner, r.ID, "movie.mp4", 10)
+			sh := newShare(t, s, owner, file.ID, 50)
+
+			const attempts = 8
+			var wg sync.WaitGroup
+			start := make(chan struct{})
+			charged := make([]bool, attempts)
+			errs := make([]error, attempts)
+			for i := 0; i < attempts; i++ {
+				wg.Add(1)
+				go func(i int) {
+					defer wg.Done()
+					grant := []byte("same-visitor")
+					<-start
+					errs[i] = s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+						_, did, aerr := tx.AuthorizeDownload(ctx, store.DownloadSession{
+							ShareID: sh.ID, NodeID: file.ID, GrantHash: grant, ETag: file.ETag,
+						}, true)
+						charged[i] = did
+						return aerr
+					})
+				}(i)
+			}
+			close(start)
+			wg.Wait()
+
+			charges := 0
+			for i, err := range errs {
+				if err != nil {
+					t.Fatalf("authorize %d: %v", i, err)
+				}
+				if charged[i] {
+					charges++
+				}
+			}
+			if charges != 1 {
+				t.Fatalf("%d of %d concurrent continuation requests were charged for one "+
+					"download, want 1", charges, attempts)
+			}
+
+			var got store.Share
+			_ = s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				found, err := tx.ShareByID(ctx, sh.ID)
+				got = found
+				return err
+			})
+			if got.DownloadCount != 1 {
+				t.Fatalf("download count is %d after one download, want 1", got.DownloadCount)
 			}
 		})
 
@@ -3478,6 +3602,44 @@ func retentionSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.
 		return n
 	}
 
+	t.Run("ExpiryMovesTheBytesFromTheQuotaToTheTrash", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+
+		past := time.Now().Add(-time.Hour)
+		mkDelivered(t, s, owner, r.ID, "delivered.bin", &past)
+
+		before := usageOf(t, s, owner)
+		if n := expire(s); n != 1 {
+			t.Fatalf("expired %d nodes, want 1", n)
+		}
+
+		// Trashing — by a user or by retention — moves bytes out of the logical quota and
+		// into retained usage. The previous implementation set trashed_at and stopped
+		// there, so the quota was never released and the later purge subtracted from a
+		// retained counter that had never been credited: a permanent leak, and the retained
+		// cap under-counting everything retention had expired (2026-10-24 review, H14).
+		afterExpire := usageOf(t, s, owner)
+		if afterExpire >= before {
+			t.Fatalf("logical quota is %d after expiry, was %d: the bytes were trashed but "+
+				"never released", afterExpire, before)
+		}
+
+		// The purge that follows must NOT release the quota a second time. This is the half
+		// the leak hid: a purge subtracting from an uncredited counter looks correct until
+		// somebody compares the totals.
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			_, perr := tx.PurgeTrash(ctx, 0)
+			return perr
+		}); err != nil {
+			t.Fatalf("purge: %v", err)
+		}
+		if afterPurge := usageOf(t, s, owner); afterPurge != afterExpire {
+			t.Fatalf("logical quota moved from %d to %d during the purge; purging a trashed "+
+				"node must not touch the logical quota again", afterExpire, afterPurge)
+		}
+	})
+
 	t.Run("OnlyPastDeadlinesAreTrashed", func(t *testing.T) {
 		s, owner := factory(t)
 		r := rootOf(t, s, owner)
@@ -4389,6 +4551,92 @@ func lockSuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid.UUID)
 		})
 		if !errors.Is(err, store.ErrConflict) {
 			t.Fatalf("a second lock on a locked node: want ErrConflict, got %v", err)
+		}
+	})
+
+	// The sequential case above passes even with a read-then-insert, because nothing else
+	// is running. The guarantee WebDAV needs is the concurrent one: two clients that each
+	// observe "no live lock" at the same instant must not both get a lock. That was the
+	// 2026-10-24 review's H3 — PostgreSQL granted two exclusive locks on one node while
+	// the in-memory backend (which serialises transactions) could not, so the shared suite
+	// was blind to it. Now the backend needs a unique index, not a careful WHERE clause.
+	t.Run("ConcurrentLocksOnOneNodeGrantExactlyOne", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		f := mkfile(t, s, owner, r.ID, "raced.txt", 10)
+
+		const attempts = 8
+		errs := make([]error, attempts)
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for i := 0; i < attempts; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				u, uerr := upsertUser(s, store.UpsertUser{
+					Issuer: "https://idp.test", Subject: "race-" + string(rune('a'+i)),
+					Username: "racer" + string(rune('a'+i)), Email: "racer@example.test",
+					Role: "user",
+				})
+				if uerr != nil {
+					errs[i] = uerr
+					return
+				}
+				<-start
+				errs[i] = s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+					return tx.CreateLock(ctx, store.Lock{
+						Token:  "tok-" + string(rune('a'+i)),
+						NodeID: f.ID, UserID: &u.ID, Depth: "0", TimeoutSec: 3600,
+						CreatedAt: time.Now(), ExpiresAt: future(time.Hour),
+					})
+				})
+			}(i)
+		}
+		close(start)
+		wg.Wait()
+
+		granted := 0
+		for _, err := range errs {
+			switch {
+			case err == nil:
+				granted++
+			case errors.Is(err, store.ErrConflict):
+				// the expected refusal
+			default:
+				t.Fatalf("unexpected error from a racing LOCK: %v", err)
+			}
+		}
+		if granted != 1 {
+			t.Fatalf("%d concurrent locks were granted on one node, want exactly 1", granted)
+		}
+	})
+
+	// An expired lock must not block a new one. With the unique index in place this is the
+	// case that would silently regress: the index is on node_id alone, so the create path
+	// has to clear the expired row itself rather than wait for the sweeper.
+	t.Run("AnExpiredLockDoesNotBlockANewOne", func(t *testing.T) {
+		s, owner := factory(t)
+		holder := otherUser(t, s, "lock-holder7")
+		r := rootOf(t, s, owner)
+		f := mkfile(t, s, owner, r.ID, "stale.txt", 10)
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.CreateLock(ctx, store.Lock{
+				Token: "stale", NodeID: f.ID, UserID: &holder,
+				Depth: "0", TimeoutSec: 3600, CreatedAt: time.Now(), ExpiresAt: future(-time.Minute),
+			})
+		}); err != nil {
+			t.Fatal(err)
+		}
+		drainExpired(t, s)
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.CreateLock(ctx, store.Lock{
+				Token: "fresh", NodeID: f.ID, UserID: &holder,
+				Depth: "0", TimeoutSec: 3600, CreatedAt: time.Now(), ExpiresAt: future(time.Hour),
+			})
+		}); err != nil {
+			t.Fatalf("a new lock must not be blocked by an expired one: %v", err)
 		}
 	})
 }
@@ -6700,6 +6948,49 @@ func storeQuerySuite(t *testing.T, factory func(t *testing.T) (store.Store, uuid
 		}
 	})
 
+	// AuditNewest is what publishes newcloud_audit_chain_head_age_seconds. It must report
+	// the newest event's own timestamp — a zero time, or an error on an empty chain, would
+	// either make the gauge lie or take the worker's audit-health step down with it.
+	t.Run("AuditNewestReportsTheNewestTimestampOrNothing", func(t *testing.T) {
+		s, owner := factory(t)
+		ctx := context.Background()
+
+		// An empty chain reports "there is nothing", not an error. (The chain may not be
+		// empty here — PostgreSQL is shared across cases — so only the error is asserted.)
+		if _, _, err := s.AuditNewest(ctx); err != nil {
+			t.Fatalf("AuditNewest: %v", err)
+		}
+
+		// An AUDITED write, not merely a node change: the memory backend only records
+		// entries that go through Tx.Audit, so a test that creates a file proves nothing
+		// about the audit log on that backend.
+		before := time.Now().Add(-time.Second)
+		if err := s.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+			return tx.Audit(ctx, store.AuditEntry{
+				ActorKind: "system", Action: "user.create",
+				TargetKind: "user", TargetID: "newest-probe", Result: "ok",
+			})
+		}); err != nil {
+			t.Fatalf("record an audit entry: %v", err)
+		}
+
+		ts, any, err := s.AuditNewest(ctx)
+		if err != nil {
+			t.Fatalf("AuditNewest: %v", err)
+		}
+		if !any {
+			t.Fatal("AuditNewest reported no event after an audited write")
+		}
+		if ts.Before(before) {
+			t.Fatalf("AuditNewest returned %v, before the write that created it; the gauge "+
+				"would report an age that has nothing to do with the newest event", ts)
+		}
+		if ts.After(time.Now().Add(time.Minute)) {
+			t.Fatalf("AuditNewest returned %v, in the future", ts)
+		}
+		_ = owner
+	})
+
 	// Resolver reflects the METADATA, which is the only contract both backends share.
 	//
 	// The first version of this case recorded a path through Resolver and read it back. It failed
@@ -7162,15 +7453,13 @@ func retainedCapSuite(t *testing.T, factory func(t *testing.T) (store.Store, uui
 			t.Fatalf("a delete that exceeds the retained cap returned %v, want ErrTrashFull", err)
 		}
 
-		// Nothing changed: the refused node is still live, and it is still counted against the
-		// logical quota. Only the first file's bytes moved.
+		// The refused node is still live, and it is still counted against the logical quota.
+		// Only the first file's bytes moved.
 		//
-		// The guarantee comes from the TRANSACTION, not from the check running first: a failed
-		// callback is rolled back, so an implementation that mutates before refusing is still
-		// correct. This assertion guards the other case — an implementation that mutates outside a
-		// transaction, or a backend that publishes partially on error. A mutation test that moved the
-		// check after the trash produced no failure for exactly that reason, and that is the honest
-		// reading: the ordering is not load-bearing, the atomicity is.
+		// The guarantee for the refused path comes from the TRANSACTION: a failed callback is
+		// rolled back, so an implementation that marks first and refuses after is still
+		// correct. The concurrent case below is the one that needs more than a transaction —
+		// it needs the decision and the charge to be one statement.
 		var live bool
 		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
 			n, gerr := tx.Node(ctx, second.ID)
@@ -7186,6 +7475,67 @@ func retainedCapSuite(t *testing.T, factory func(t *testing.T) (store.Store, uui
 		if got := usageOf(t, s, owner); got != 600 {
 			t.Fatalf("after one refused delete the logical quota is %d, want 600 (the node that "+
 				"was refused must still count)", got)
+		}
+	})
+
+	// The concurrent case is the one a transaction alone does not fix.
+	//
+	// Reading `trash_bytes`, comparing it to the cap, and then charging in a LATER statement
+	// is two decisions: under READ COMMITTED two deletes both read the pre-cap total and both
+	// conclude they fit. Eight racing deletes against a 1000-byte cap left the counter at 4800
+	// on PostgreSQL (2026-10-24 review, H15). The cap has to be the WHERE clause of the
+	// statement that charges.
+	t.Run("ConcurrentDeletesCannotOvershootTheCap", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+
+		const (
+			files = 8
+			size  = 600
+			cap_  = 1000 // room for exactly one of them
+		)
+		nodes := make([]store.Node, files)
+		for i := 0; i < files; i++ {
+			nodes[i] = mkfile(t, s, owner, r.ID, "cap-"+string(rune('a'+i))+".bin", size)
+		}
+
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		errs := make([]error, files)
+		for i := 0; i < files; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				<-start
+				errs[i] = s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+					return tx.TrashCapped(ctx, nodes[i].ID, cap_)
+				})
+			}(i)
+		}
+		close(start)
+		wg.Wait()
+
+		granted := 0
+		for _, err := range errs {
+			switch {
+			case err == nil:
+				granted++
+			case errors.Is(err, store.ErrTrashFull):
+				// the expected refusal
+			default:
+				t.Fatalf("unexpected error from a racing delete: %v", err)
+			}
+		}
+		if granted != 1 {
+			t.Fatalf("%d concurrent deletes were accepted against a %d-byte cap with %d-byte "+
+				"files, want exactly 1", granted, cap_, size)
+		}
+
+		// The logical quota is the observable half of the accounting: exactly one accepted
+		// delete moves one file's bytes out of it. If a second delete had slipped past the
+		// cap, used_bytes would be smaller than this.
+		if got, want := usageOf(t, s, owner), int64((files-granted)*size); got != want {
+			t.Fatalf("logical quota is %d after %d accepted deletes, want %d", got, granted, want)
 		}
 	})
 

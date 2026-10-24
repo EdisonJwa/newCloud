@@ -866,7 +866,10 @@ func TestShareRangeRequestsDoNotConsumeDownloads(t *testing.T) {
 	}
 
 	// Every subsequent seek and resume rides the session and must not cost anything.
-	ranges := []string{"bytes=0-1023", "bytes=8192-16383", "bytes=16384-", "bytes=0-"}
+	// The list deliberately contains no whole-entity range: `bytes=0-` names the
+	// COMPLETE file from the first byte, and a re-download of everything is a fresh
+	// download (see the assertion after the loop).
+	ranges := []string{"bytes=0-1023", "bytes=8192-16383", "bytes=16384-", "bytes=4096-8191"}
 	for _, rng := range ranges {
 		req, err := http.NewRequest(http.MethodGet, url, nil)
 		if err != nil {
@@ -883,6 +886,27 @@ func TestShareRangeRequestsDoNotConsumeDownloads(t *testing.T) {
 				"share's single download, which is the over-counting the download-session "+
 				"mechanism exists to prevent — a video seek would exhaust a limited share.", rng, r.StatusCode)
 		}
+	}
+
+	// A whole-entity range is a fresh download wearing a Range header, and it must be
+	// charged as one. This is the 2026-10-24 review's H9: `Range: bytes=0-` was
+	// treated as a continuation, so a visitor could re-fetch the COMPLETE file, for
+	// free, for the session's TTL after the limit was exhausted — which is exactly
+	// what the owner's max_downloads exists to prevent.
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Range", "bytes=0-")
+	r, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Body.Close()
+	if r.StatusCode != http.StatusNotFound {
+		t.Fatalf("whole-entity range on an exhausted share: want 404, got %d. `bytes=0-` "+
+			"serves every byte of the file; treating it as a continuation made the download "+
+			"limit decorative for the session's TTL.", r.StatusCode)
 	}
 
 	// And the limit is still real: a genuine second full download is refused.

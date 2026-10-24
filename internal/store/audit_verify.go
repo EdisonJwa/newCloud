@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/EdisonJwa/newCloud/internal/audit"
 )
@@ -99,6 +100,39 @@ func (s *PG) RecordAnchor(ctx context.Context, head []byte, destination string) 
 			destination = EXCLUDED.destination, published_at = now()`
 	_, err := s.pool.Exec(ctx, q, head, destination)
 	return translate(err)
+}
+
+// AuditCount returns how many events the chain holds.
+//
+// A count(*) over an append-only table is the honest number (the biggest id is not:
+// pruning removes rows). The worker samples it hourly, which is a cost a gauge can
+// afford and a per-request path cannot — which is why this is not called from
+// anywhere hot.
+func (s *PG) AuditCount(ctx context.Context) (int64, error) {
+	var n int64
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM audit.events`).Scan(&n); err != nil {
+		return 0, fmt.Errorf("store: count audit events: %w", translate(err))
+	}
+	return n, nil
+}
+
+// AuditNewest returns the time of the newest event, and whether one exists at all.
+//
+// The primary key makes this an index lookup rather than a scan, which is the
+// property the head-age gauge depends on: it is published on every anchor tick, and a
+// monitoring query that cost a table walk would be a monitoring query somebody
+// switched off. A pruned-empty table reports no rows honestly.
+func (s *PG) AuditNewest(ctx context.Context) (time.Time, bool, error) {
+	var ts time.Time
+	err := s.pool.QueryRow(ctx,
+		`SELECT ts FROM audit.events ORDER BY id DESC LIMIT 1`).Scan(&ts)
+	if err != nil {
+		if isNoRows(err) {
+			return time.Time{}, false, nil
+		}
+		return time.Time{}, false, fmt.Errorf("store: read newest audit event: %w", translate(err))
+	}
+	return ts, true, nil
 }
 
 func isNoRows(err error) bool {

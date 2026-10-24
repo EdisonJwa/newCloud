@@ -389,6 +389,19 @@ func (t *pgTx) WriteFile(ctx context.Context, w WriteFile) (Node, bool, error) {
 	existing, err := t.ChildByName(ctx, w.ParentID, w.Name)
 	switch {
 	case err == nil:
+		// A name that differs from the requested one only by case or Unicode normalisation
+		// is a CONFLICT, not the file the caller meant to write.
+		//
+		// ChildByName compares name_key so a lookup for "README.md" finds a node created as
+		// "Readme.md" — that is what makes name lookup case-robust. Reusing that answer for a
+		// content write was a silent overwrite of a differently-named file, followed by a 404
+		// on the name the client had actually asked for, because Resolve (the read path) is
+		// case-exact. ADR-0004 §4 says a second upload under a conflicting name must fail
+		// with ErrConflict, and the shared suite only exercised CreateFile, where the unique
+		// index already refused it (2026-10-24 review, C6).
+		if existing.Name != w.Name {
+			return Node{}, false, ErrConflict
+		}
 		if !w.Expect.Matches(existing.ETag, true) {
 			return Node{}, false, ErrPrecondition
 		}
@@ -576,8 +589,35 @@ func (t *pgTx) Move(ctx context.Context, id, newParent uuid.UUID) (Node, error) 
 }
 
 func (t *pgTx) Trash(ctx context.Context, id uuid.UUID) error {
-	// Sum the bytes BEFORE marking: the update changes what a second query would see, and the sum
-	// has to describe the subtree as it was when the user asked to delete it.
+	released, ownerID, err := t.subtreeUsage(ctx, id)
+	if err != nil {
+		return err
+	}
+	if err := t.markTrashed(ctx, id); err != nil {
+		return err
+	}
+	if released > 0 {
+		// §4.3: trashing moves the bytes from the logical quota to retained usage. Both counters
+		// are clamped so an accounting bug cannot produce a negative quota that silently grants
+		// storage.
+		if _, err := t.tx.Exec(ctx, `
+			UPDATE users
+			SET used_bytes = GREATEST(used_bytes - $2, 0),
+			    trash_bytes = trash_bytes + $2,
+			    updated_at = now()
+			WHERE id = $1`, ownerID, released); err != nil {
+			return translate(err)
+		}
+	}
+	return nil
+}
+
+// subtreeUsage sums the live bytes under a node and returns the owner.
+//
+// Summed BEFORE the rows are marked trashed: the mark changes what a second query would
+// see, and the number has to describe the subtree as it was when the user asked to delete
+// it.
+func (t *pgTx) subtreeUsage(ctx context.Context, id uuid.UUID) (int64, uuid.UUID, error) {
 	var released int64
 	var ownerID uuid.UUID
 	if err := t.tx.QueryRow(ctx, `
@@ -590,14 +630,18 @@ func (t *pgTx) Trash(ctx context.Context, id uuid.UUID) error {
 		SELECT COALESCE(sum(size),0), owner_id FROM subtree
 		GROUP BY owner_id`, id).Scan(&released, &ownerID); err != nil {
 		if isNoRows(err) {
-			return ErrNotFound
+			return 0, uuid.Nil, ErrNotFound
 		}
-		return translate(err)
+		return 0, uuid.Nil, translate(err)
 	}
+	return released, ownerID, nil
+}
 
-	// A single recursive UPDATE marks the whole subtree. Doing it client-side
-	// would take one round trip per level and could leave a partially trashed
-	// tree if the connection dropped mid-way.
+// markTrashed sets trashed_at on the whole subtree in one statement.
+//
+// Doing it client-side would take one round trip per level and could leave a partially
+// trashed tree if the connection dropped mid-way.
+func (t *pgTx) markTrashed(ctx context.Context, id uuid.UUID) error {
 	const q = `
 		WITH RECURSIVE subtree AS (
 		    SELECT id FROM nodes WHERE id = $1 AND trashed_at IS NULL
@@ -614,18 +658,6 @@ func (t *pgTx) Trash(ctx context.Context, id uuid.UUID) error {
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound
-	}
-	// §4.3: trashing moves the bytes from the logical quota to retained usage. Both counters are
-	// clamped so an accounting bug cannot produce a negative quota that silently grants storage.
-	if released > 0 {
-		if _, err := t.tx.Exec(ctx, `
-			UPDATE users
-			SET used_bytes = GREATEST(used_bytes - $2, 0),
-			    trash_bytes = trash_bytes + $2,
-			    updated_at = now()
-			WHERE id = $1`, ownerID, released); err != nil {
-			return translate(err)
-		}
 	}
 	return nil
 }
@@ -1170,35 +1202,48 @@ func (t *pgTx) DeleteSetting(ctx context.Context, key string) error {
 // Both the sum and the counter are read inside the caller's transaction, so the check sees a
 // consistent snapshot and two concurrent deletes cannot both fit into one slot.
 func (t *pgTx) TrashCapped(ctx context.Context, id uuid.UUID, maxRetainedBytes int64) error {
-	if maxRetainedBytes > 0 {
-		var (
-			released int64
-			ownerID  uuid.UUID
-		)
-		if err := t.tx.QueryRow(ctx, `
-			WITH RECURSIVE subtree AS (
-			    SELECT id, owner_id, size FROM nodes WHERE id = $1 AND trashed_at IS NULL
-			    UNION ALL
-			    SELECT n.id, n.owner_id, n.size FROM nodes n JOIN subtree s ON n.parent_id = s.id
-			    WHERE n.trashed_at IS NULL
-			)
-			SELECT COALESCE(sum(size),0), owner_id FROM subtree
-			GROUP BY owner_id`, id).Scan(&released, &ownerID); err != nil {
-			if isNoRows(err) {
-				return ErrNotFound
-			}
-			return translate(err)
-		}
-		var held int64
-		if err := t.tx.QueryRow(ctx, `SELECT trash_bytes FROM users WHERE id = $1`, ownerID).
-			Scan(&held); err != nil {
-			return translate(err)
-		}
-		if held+released > maxRetainedBytes {
-			return ErrTrashFull
-		}
+	if maxRetainedBytes <= 0 {
+		return t.Trash(ctx, id)
 	}
-	return t.Trash(ctx, id)
+
+	released, ownerID, err := t.subtreeUsage(ctx, id)
+	if err != nil {
+		return err
+	}
+	if err := t.markTrashed(ctx, id); err != nil {
+		return err
+	}
+
+	// The cap is enforced by the WHERE clause of the counter update, not by a read
+	// followed by a write.
+	//
+	// The previous shape read `trash_bytes`, compared it to the cap, and then let Trash
+	// add to it in a second statement. Under READ COMMITTED two concurrent deletes both
+	// read the same pre-cap total and both passed: eight racing deletes against a
+	// 1000-byte cap left trash_bytes at 4800 (2026-10-24 review, H15). Here the same
+	// UPDATE both decides and charges, so the row lock serialises the two.
+	//
+	// A zero row count means the cap would have been exceeded. Returning ErrTrashFull
+	// rolls the whole transaction back — including the mark above — so a refused delete
+	// leaves the tree exactly as it was.
+	tag, err := t.tx.Exec(ctx, `
+		UPDATE users
+		SET used_bytes = GREATEST(used_bytes - $2, 0),
+		    trash_bytes = trash_bytes + $2,
+		    updated_at = now()
+		WHERE id = $1 AND trash_bytes + $2 <= $3`, ownerID, released, maxRetainedBytes)
+	if err != nil {
+		return translate(err)
+	}
+	if tag.RowsAffected() == 0 {
+		if released == 0 {
+			// Nothing to charge and the row matched nothing: the owner row is missing,
+			// which is a different failure from a full bin.
+			return ErrNotFound
+		}
+		return ErrTrashFull
+	}
+	return nil
 }
 
 // TrimRetainedVersions drops the oldest version rows until each account's history fits capBytes.

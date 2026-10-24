@@ -101,6 +101,25 @@ func (s *Server) handleSharePage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A share whose grant stops at uploading must not list either.
+	//
+	// The listing names every entry, its size and its ETag — and the download route
+	// already refuses exactly this grant. Serving the inventory to a create-only
+	// visitor disclosed what the owner's permission split had withheld, which is the
+	// same class of leak as serving the bytes: metadata about content is content
+	// information (2026-10-24 review, H10). The response keeps the fields an
+	// uploader's landing page needs and hides the tree, exactly as HideContents does.
+	if !sh.CanRead() {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"kind":          string(sh.Kind),
+			"hide_contents": true,
+			"label":         sh.Label,
+			"can_upload":    sh.CanCreate(),
+			"can_read":      false,
+		})
+		return
+	}
+
 	// Listing a shared directory.
 	//
 	// The lookup error is handled rather than discarded. It was previously dropped with `_ =`,
@@ -288,10 +307,14 @@ func (s *Server) handleShareDownload(w http.ResponseWriter, r *http.Request) {
 	// grant, actorKind and actorEmail were resolved above, because for a capability-authenticated
 	// request they come from the capability rather than from cookies.
 	//
-	// A Range request continues a download already authorised; a plain GET is a
-	// fresh download and is charged as one. That is the distinction the owner's
-	// "max downloads" setting actually means.
-	continuation := r.Header.Get("Range") != ""
+	// A Range request is a continuation only when it asks for less than the whole
+	// entity. `Range: bytes=0-` names every byte from the start: it is a fresh
+	// download wearing a Range header, and treating it as a continuation let a
+	// visitor re-fetch the COMPLETE file, for free, for the session's TTL after a
+	// link's download limit had been exhausted (2026-10-24 review, H9). A seek or a
+	// resume names a non-zero start or a bounded window and rides the session the
+	// first request paid for.
+	continuation := isPartialRange(r.Header.Get("Range"), node.Size)
 	err = s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
 		_, charged, aerr := tx.AuthorizeDownload(ctx, store.DownloadSession{
 			ShareID:   sh.ID,
@@ -890,13 +913,17 @@ func (s *Server) shareRecipientEmail(r *http.Request, sh store.Share) string {
 // bookkeeping failure must not turn a 404 into a 500 the visitor can see. It is still recorded,
 // because "nobody knows this link was used" and "this link was used and refused" are different
 // states for the person who owns it.
+//
+// The path in the metadata is redacted for the same reason the access log's is: a refusal can carry
+// a perfectly valid token (a wrong password is a refusal), and the raw token in an audit row is a
+// capability stored in the one place that is supposed to outlive everything else.
 func (s *Server) auditShareRefusal(r *http.Request, action, actorKind string) {
 	ctx := store.WithAuthMethod(r.Context(), store.AuthShareLink)
 	err := s.deps.Meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
 		return tx.Audit(ctx, store.AuditEntry{
 			ActorKind: actorKind, ActorIP: clientIP(r), UserAgent: r.UserAgent(),
 			Action: action, TargetKind: "share", Result: "denied",
-			Metadata: map[string]any{"path": r.URL.Path},
+			Metadata: map[string]any{"path": redactLogPath(r.URL.Path)},
 		})
 	})
 	if err != nil {
@@ -925,4 +952,66 @@ func (s *Server) auditShareView(r *http.Request, sh store.Share) {
 	if err != nil {
 		s.deps.Log.Warn("could not audit a share view", "share", sh.ID.String(), "error", err)
 	}
+}
+
+// isPartialRange reports whether a Range header names less than the whole entity,
+// which is what makes a request a continuation of a download rather than a new one.
+//
+// The distinction exists because the download-session logic charges nothing for a
+// continuation — that is what keeps a video seek from consuming a limited link — but
+// "any Range header" was once the test, and `Range: bytes=0-` names the COMPLETE
+// entity from the first byte. Treating that as a continuation meant a visitor could
+// re-download the entire file, repeatedly, for the session's TTL after the share's
+// download limit was exhausted.
+//
+// Continuations (free): a non-zero start, a bounded window that ends before the last
+// byte, and suffix ranges shorter than the entity. Fresh downloads (charged): no
+// Range at all, `bytes=0-`, `bytes=0-(size-1)`, a suffix as long as the entity,
+// multi-range requests (conservatively — a player that asks for scattered windows is
+// doing something a single session should not be asked to cover), and anything
+// malformed (charge rather than guess).
+func isPartialRange(header string, size int64) bool {
+	if header == "" {
+		return false
+	}
+	spec, ok := strings.CutPrefix(header, "bytes=")
+	if !ok {
+		return false
+	}
+	spec = strings.TrimSpace(spec)
+	if spec == "" || strings.Contains(spec, ",") {
+		return false
+	}
+	first, last, found := strings.Cut(spec, "-")
+	if !found {
+		return false
+	}
+	first, last = strings.TrimSpace(first), strings.TrimSpace(last)
+
+	if first == "" {
+		// Suffix range: the last N bytes. It is a continuation only when it is
+		// genuinely shorter than the entity.
+		n, err := strconv.ParseInt(last, 10, 64)
+		if err != nil || n <= 0 {
+			return false
+		}
+		return n < size
+	}
+
+	start, err := strconv.ParseInt(first, 10, 64)
+	if err != nil || start < 0 {
+		return false
+	}
+	if start > 0 {
+		return true
+	}
+	// start == 0: the whole entity unless the window is bounded short of the end.
+	if last == "" {
+		return false
+	}
+	end, err := strconv.ParseInt(last, 10, 64)
+	if err != nil {
+		return false
+	}
+	return end >= 0 && end < size-1
 }

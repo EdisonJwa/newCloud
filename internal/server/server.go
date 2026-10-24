@@ -600,7 +600,13 @@ func (s *Server) requestLogger(next http.Handler) http.Handler {
 		next.ServeHTTP(ww, r)
 		s.deps.Log.Info("request",
 			"method", r.Method,
-			"path", r.URL.Path,
+			// The path is redacted, not the query: query strings were already kept out
+			// of the log, but a share token lives in the PATH (/s/{token}/download), and
+			// possessing that token is what authorises the download. The access log is
+			// the least-protected copy of anything a deployment ships — aggregated,
+			// greppable, widely readable — so an unredacted line was a working
+			// credential on every share view (2026-10-24 review, H5).
+			"path", redactLogPath(r.URL.Path),
 			"status", ww.Status(),
 			"bytes", ww.BytesWritten(),
 			"dur_ms", time.Since(start).Milliseconds(),
@@ -608,6 +614,27 @@ func (s *Server) requestLogger(next http.Handler) http.Handler {
 			"ip", r.RemoteAddr,
 		)
 	})
+}
+
+// redactLogPath replaces the token segment of a share URL with a fixed marker.
+//
+// The marker is fixed rather than length-preserving: correlating log lines with a
+// share is what the audit log is for (it records the share id, which is not a
+// capability), and a length-preserving redaction would leak the token's shape on
+// every line. Paths that are not share URLs pass through unchanged.
+func redactLogPath(p string) string {
+	const prefix = "/s/"
+	if !strings.HasPrefix(p, prefix) {
+		return p
+	}
+	rest := p[len(prefix):]
+	tail := ""
+	if i := strings.IndexByte(rest, '/'); i >= 0 {
+		tail = rest[i:]
+	} else if rest == "" {
+		return p
+	}
+	return prefix + "***" + tail
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {

@@ -12,23 +12,33 @@ import (
 // PostgreSQL lock implementation.
 
 func (t *pgTx) CreateLock(ctx context.Context, l Lock) error {
-	// A conditional insert: the WHERE clause makes "is there a conflicting lock"
-	// and "take the lock" one atomic step. Reading then inserting would let two
-	// clients both observe "no lock" and both proceed.
+	// One live lock per node, decided by the unique index (migrations/0017).
 	//
-	// Expired locks do not block, so a client that crashed mid-edit cannot lock a
-	// file out forever.
+	// The previous statement was `INSERT ... WHERE NOT EXISTS (SELECT ... FROM
+	// lock_tokens WHERE node_id = $2 ...)`, which reads as atomic and is not: under
+	// READ COMMITTED two concurrent transactions each see no committed live row and
+	// both insert, so PostgreSQL could grant two exclusive locks on one node while the
+	// in-memory backend — which serialises transactions — could not. A unique index is
+	// the only construct that makes the answer the same for both.
+	//
+	// Expired rows are cleared for this node first, because the index is on node_id
+	// alone (`expires_at > now()` is not immutable and cannot be a partial predicate).
+	// The sweeper still removes every other node's expired locks on its own cadence.
+	if _, err := t.tx.Exec(ctx,
+		`DELETE FROM lock_tokens WHERE node_id = $1 AND expires_at <= now()`, l.NodeID); err != nil {
+		return translate(err)
+	}
+
 	const q = `INSERT INTO lock_tokens (token, node_id, user_id, owner_xml, depth, timeout_sec, expires_at)
-		SELECT $1, $2, $3, $4, $5, $6, $7
-		WHERE NOT EXISTS (
-		    SELECT 1 FROM lock_tokens
-		    WHERE node_id = $2 AND expires_at > now()
-		)`
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (node_id) DO NOTHING`
 	tag, err := t.tx.Exec(ctx, q, l.Token, l.NodeID, l.UserID, l.OwnerXML, l.Depth, l.TimeoutSec, l.ExpiresAt)
 	if err != nil {
 		return translate(err)
 	}
 	if tag.RowsAffected() == 0 {
+		// Somebody else holds the node. A conflict is the honest answer, not a lock
+		// the database quietly refused to record.
 		return ErrConflict
 	}
 	return nil

@@ -139,6 +139,24 @@ func (t *memTx) ExpireRetained(ctx context.Context) (int, error) {
 		rec.node.TrashedAt = &ts
 		rec.node.ModifiedAt = now
 		t.m.nodes[id] = rec
+
+		// Trashing moves the bytes out of the logical quota and into retained usage,
+		// whoever caused it. Skipping this left the quota permanently charged for bytes
+		// the purge later removed from an uncredited retained counter — the same leak the
+		// PostgreSQL backend had (2026-10-24 review, H14). Both backends do it, or the
+		// shared suite would prove nothing about the pair.
+		if rec.node.Size > 0 {
+			owner := rec.node.OwnerID
+			if t.m.usage[owner] >= rec.node.Size {
+				t.m.usage[owner] -= rec.node.Size
+			} else {
+				t.m.usage[owner] = 0
+			}
+			if t.m.trashBytes == nil {
+				t.m.trashBytes = map[uuid.UUID]int64{}
+			}
+			t.m.trashBytes[owner] += rec.node.Size
+		}
 		n++
 	}
 	return n, nil

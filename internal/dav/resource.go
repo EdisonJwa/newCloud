@@ -303,22 +303,41 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request, a authz.Acto
 		return
 	}
 
-	// If-None-Match: * is the "create, or fail" conditional a second tab needs so it cannot
-	// clobber a file that appeared while it was editing.
-	if r.Header.Get("If-None-Match") == "*" && existing != nil {
-		w.WriteHeader(http.StatusPreconditionFailed)
-		return
-	}
-
+	// The declared length is refused cheaply. A chunked body declares nothing
+	// (ContentLength is -1), so the same limit is enforced on the read itself below —
+	// without that second half, `Transfer-Encoding: chunked` was an unlimited write.
 	if r.ContentLength > h.cfg.Limits.MaxFileBytes {
 		writeXMLError(w, http.StatusRequestEntityTooLarge, "")
 		return
 	}
 
+	// Preconditions are decided BEFORE a single byte is written.
+	//
+	// The content store on the tree layout publishes to the live path, so deciding
+	// after writing destroyed the old bytes whenever the decision was "no": a stale
+	// If-Match answered 412 with the previous content already gone, and metadata that
+	// still described bytes that no longer existed. Deciding first means a refusal
+	// leaves the resource exactly as it was. The store re-evaluates the same
+	// precondition inside the UPDATE (UpdateFile's Expect), so a writer that commits
+	// between this check and the write still fails safely with 412 — this fast path
+	// exists so a doomed upload never reaches the content store at all.
+	expect, ok := h.putPrecondition(r, existing)
+	if !ok {
+		w.WriteHeader(http.StatusPreconditionFailed)
+		return
+	}
+
 	owner := a.ID().String()
+	// The cap on the read, for bodies that never declared a length. MaxBytesReader
+	// aborts the copy at the limit, and Put reports the failure; the tree store's
+	// stage-then-rename means the previous content is untouched.
+	body := io.Reader(r.Body)
+	if h.cfg.Limits.MaxFileBytes > 0 {
+		body = http.MaxBytesReader(w, r.Body, h.cfg.Limits.MaxFileBytes)
+	}
 	res, err := h.content.Put(ctx, layout.Node{
 		Owner: owner, Path: rel, IsDir: false,
-	}, r.Body, r.ContentLength)
+	}, body, r.ContentLength)
 	if err != nil {
 		// Logged before mapping to a status: the client only sees a code, and a
 		// storage failure that is invisible in the log is indistinguishable from a
@@ -337,15 +356,16 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request, a authz.Acto
 
 	// The existence check happened above, before the lock rule needed its answer.
 	if existing != nil {
-		if !h.checkIfMatch(r, existing.ETag) {
-			w.WriteHeader(http.StatusPreconditionFailed)
-			return
-		}
 		err = h.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
 			_, uerr := tx.UpdateFile(ctx, store.UpdateFile{
 				NodeID: existing.ID, Size: res.Size, Mime: mime, ETag: etag,
 				BlobID:   h.blobIDFor(ctx, res.Hash, res.Size),
 				BlobHash: res.Hash,
+				// Expect re-evaluates the request's conditional inside the UPDATE,
+				// under the row lock: a writer that committed between the handler's
+				// check above and this statement fails here with ErrPrecondition
+				// instead of silently discarding the other client's work.
+				Expect: expect,
 				// Keep a version only when the content actually changed: the
 				// client may retry an upload, and duplicating identical versions
 				// fills the history with noise.
@@ -407,7 +427,91 @@ func (h *Handler) checkIfMatch(r *http.Request, etag string) bool {
 	if im == "" {
 		return true
 	}
-	return etagMatches(im, etag)
+	// Strong comparison: If-Match is defined to never match a weak tag, whichever
+	// method carries it. The weak list form stays available to If-None-Match paths
+	// via etagMatches.
+	return strongEtagMatches(im, etag)
+}
+
+// putPrecondition translates a PUT's conditional headers into the store's Precondition
+// and evaluates it against the resource's current state. ok=false means the request is
+// refused with 412 and nothing — bytes or metadata — has been changed.
+//
+// The rules (RFC 7232, as they apply to a state-changing request):
+//
+//   - If-Match is evaluated with the STRONG comparison: a weak tag never matches (§2.1),
+//     "*" matches any current entity, and on a resource that does not exist the
+//     condition fails outright (§3.1).
+//   - If-None-Match is evaluated with the weak comparison, and on PUT a match is a
+//     refusal (§3.2) — this is how a client says "only create what I do not already
+//     see", including with "*".
+//   - When both headers are present both must hold.
+//
+// The returned Precondition carries the SAME decision into the store so that
+// UpdateFile re-evaluates it inside the UPDATE under the row lock. A list-valued or
+// wildcard header is normalised to the matched entity-tag for that purpose: the
+// store compares one exact value, and this function has already established which
+// value that is.
+func (h *Handler) putPrecondition(r *http.Request, existing *store.Node) (*store.Precondition, bool) {
+	im := strings.TrimSpace(r.Header.Get("If-Match"))
+	inm := strings.TrimSpace(r.Header.Get("If-None-Match"))
+	if im == "" && inm == "" {
+		return nil, true
+	}
+
+	exists := existing != nil
+	var etag string
+	if exists {
+		etag = existing.ETag
+	}
+
+	expect := &store.Precondition{}
+
+	if im != "" {
+		if !exists {
+			// If-Match on a resource that does not exist: the condition fails. This
+			// used to fall through to the create path and answer 201, which told a
+			// client its guard had passed when it had not been evaluated at all.
+			return nil, false
+		}
+		if !strongEtagMatches(im, etag) {
+			return nil, false
+		}
+		if im != "*" {
+			expect.IfMatch = etag
+		} else {
+			expect.IfMatch = "*"
+		}
+	}
+
+	if inm != "" {
+		// Weak comparison: a weak spelling of the current tag counts as a match.
+		if exists && (inm == "*" || etagMatches(inm, etag)) {
+			return nil, false
+		}
+		// Hand the store the same must-not-be condition. On the create path the
+		// unique (parent, name) index is what enforces it atomically.
+		expect.IfNoneMatch = inm
+	}
+
+	return expect, true
+}
+
+// strongEtagMatches evaluates an If-Match list with the strong comparison: a member
+// matches when it is "*" or is exactly the current entity-tag, and a weakly-tagged
+// member never matches (RFC 7232 §2.1). If-Match is the one header where accepting a
+// weak tag would let a client overwrite content it only weakly validated.
+func strongEtagMatches(header, etag string) bool {
+	for _, part := range strings.Split(header, ",") {
+		part = strings.TrimSpace(part)
+		if strings.HasPrefix(part, "W/") {
+			continue
+		}
+		if part == "*" || part == etag {
+			return true
+		}
+	}
+	return false
 }
 
 // blobIDFor maps a content address to the blobs row id, registering it on first

@@ -633,6 +633,13 @@ type Store interface {
 	AuditRows(ctx context.Context, afterID int64, limit int) ([]audit.Event, error)
 	AuditHead(ctx context.Context) ([]byte, error)
 
+	// AuditCount and AuditNewest are the cheap health end of the log: how many
+	// events there are, and when the newest one landed. They exist so monitoring
+	// can publish the chain's length and head age without walking it — the head-age
+	// gauge was once fed a literal zero, which made the alert on it decorative.
+	AuditCount(ctx context.Context) (int64, error)
+	AuditNewest(ctx context.Context) (time.Time, bool, error)
+
 	// AllRoots returns every user's namespace root. Whole-deployment operations (the restore
 	// drill) need it; per-request code should not.
 	AllRoots(ctx context.Context) ([]Node, error)

@@ -67,12 +67,6 @@ func (w *Worker) publishCheckpoint(ctx context.Context, day time.Time) error {
 	if err != nil {
 		return err
 	}
-	if w.metrics != nil {
-		// The head's age is the signal that matters operationally: a chain whose newest
-		// event is days old means nothing is being written, which is either an idle
-		// deployment or a broken audit path.
-		w.metrics.SetAudit(count, 0)
-	}
 
 	// Publishing the *current* head for *yesterday's* date is slightly too inclusive:
 	// it covers everything up to now, not up to midnight. That is the safe direction —
@@ -182,6 +176,46 @@ func (w *Worker) EnableAnchoring(dir string, src auditverify.RowSource) error {
 	w.anchor = a
 	w.chain = auditverify.NewStoreChain(src)
 	return nil
+}
+
+// AuditHealth publishes the audit gauges: how many events the chain holds, and how
+// old the newest one is.
+//
+// Both were previously written only inside publishCheckpoint — once a day, only when
+// anchoring was configured — and the head age was passed as a literal 0. The
+// `audit chain stalled` alert therefore compared a constant: it could never fire, on
+// any deployment, ever (2026-10-24 review, H6). This runs on every anchor tick
+// regardless of anchoring, because a broken audit path is most likely to be noticed
+// exactly when the anchoring machinery around it is also unconfigured or wedged.
+//
+// The age is computed from the newest event's own timestamp, so an idle deployment
+// reports a growing age. That is honest — the gauge cannot distinguish "nobody wrote
+// anything" from "writes are failing" — and the alert's runbook says so; what the
+// gauge must never do is claim, unasked and forever, that the chain is fresh.
+//
+// Exposed (like AnchorNow) so the admin surface and the tests can force the step
+// rather than waiting for the ticker.
+func (w *Worker) AuditHealth(ctx context.Context) {
+	if w.metrics == nil {
+		return
+	}
+	count, cerr := w.meta.AuditCount(ctx)
+	if cerr != nil {
+		w.log.Error("could not count audit events", "error", cerr)
+		return
+	}
+	newest, any, nerr := w.meta.AuditNewest(ctx)
+	if nerr != nil {
+		w.log.Error("could not read the newest audit event", "error", nerr)
+		return
+	}
+	age := time.Duration(0)
+	if any {
+		if age = time.Since(newest); age < 0 {
+			age = 0 // a clock step must not publish a negative age
+		}
+	}
+	w.metrics.SetAudit(count, age)
 }
 
 // AnchorNow publishes the pending checkpoint immediately.

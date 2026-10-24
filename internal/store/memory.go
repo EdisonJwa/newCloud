@@ -589,6 +589,11 @@ func (t *memTx) WriteFile(ctx context.Context, w WriteFile) (Node, bool, error) 
 	existing, err := t.ChildByName(ctx, w.ParentID, w.Name)
 	switch {
 	case err == nil:
+		// A fold-collision is a conflict, not an update: see the PostgreSQL twin for the
+		// reasoning. Both backends must agree, or the shared suite proves nothing.
+		if existing.Name != w.Name {
+			return Node{}, false, ErrConflict
+		}
 		if !w.Expect.Matches(existing.ETag, true) {
 			return Node{}, false, ErrPrecondition
 		}
@@ -1259,6 +1264,25 @@ var txLockTimeout = 10 * time.Second
 
 // SetTxLockTimeoutForTest shortens the wait so a test can observe the failure without stalling.
 func (m *Memory) SetTxLockTimeoutForTest(d time.Duration) { m.txLockTimeout = d }
+
+// BackdateNewestAudit moves the newest audit event's timestamp into the past.
+//
+// The chain-head-age gauge answers "how long since anything was written", and the
+// interesting state is "written, but hours ago" — a stalled audit path. Reaching it
+// honestly would mean waiting, so the seam moves the stamp instead of the clock,
+// exactly as BackdateIdPConfirmation does for the revalidation window.
+//
+// Test-only, and deliberately narrow: it moves one timestamp rather than the store's
+// clock, so the test can age the audit trail without ageing leases, sessions or jobs.
+func (m *Memory) BackdateNewestAudit(at time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.auditTimes) == 0 {
+		return ErrNotFound
+	}
+	m.auditTimes[len(m.auditTimes)-1] = at
+	return nil
+}
 
 // BackdateIdPConfirmation moves an account's IdP confirmation timestamp into the past.
 //

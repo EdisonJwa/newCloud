@@ -83,6 +83,18 @@ func TestAlertRulesNameOnlyMetricsThatExist(t *testing.T) {
 	if len(namesInRules) == 0 {
 		t.Fatal("no metric names found in the rules")
 	}
+	// Metrics that are deliberately NOT published by this process.
+	//
+	// The guard's premise is "a rule on a metric the server never publishes is decorative".
+	// That premise is right for everything the server measures, and wrong for a series a
+	// sibling process owns: the backup runs from cron and publishes through node_exporter's
+	// textfile collector, so the application cannot and should not emit it. Each exception
+	// names where the series comes from — an exception without a source is how this guard
+	// would rot into a rubber stamp.
+	externallyPublished := map[string]string{
+		"newcloud_backup_last_success_timestamp_seconds": "deploy/backup/backup-all.sh, via node_exporter's textfile collector",
+		"newcloud_backup_last_drill_timestamp_seconds":   "the restore drill, via node_exporter's textfile collector",
+	}
 	var unknown []string
 	seen := map[string]bool{}
 	for _, name := range namesInRules {
@@ -90,6 +102,9 @@ func TestAlertRulesNameOnlyMetricsThatExist(t *testing.T) {
 			continue
 		}
 		seen[name] = true
+		if _, external := externallyPublished[name]; external {
+			continue
+		}
 		if !strings.Contains(exposition, name+"{") && !strings.Contains(exposition, name+" ") {
 			unknown = append(unknown, name)
 		}

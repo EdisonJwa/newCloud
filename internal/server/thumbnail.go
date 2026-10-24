@@ -59,13 +59,22 @@ func (s *Server) handleThumbnail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The same capability a download requires. A thumbnail is content.
+	// The same capability a download requires. A thumbnail is content — decoded,
+	// downscaled pixels of the file — so a grant that withholds `download` while
+	// allowing `read` must withhold the preview too: serving it would be a way to
+	// read the picture without the right to fetch the picture.
+	//
+	// This check once said PermRead, which made the permission split unenforceable
+	// through this route: every other content path (download, shared content, the
+	// content origin, ZIP) required PermDownload, and a grantee holding
+	// read-without-download received full 320-pixel renditions here while the
+	// download beside it answered 404 (2026-10-24 review, M1).
 	cap, err := s.deps.Authz.Authorize(actor, node.ID)
 	if err != nil {
 		s.writeStoreError(w, err)
 		return
 	}
-	if !cap.Can(authz.PermRead) {
+	if !cap.Can(authz.PermDownload) {
 		writeError(w, http.StatusNotFound, "not_found", "no such file")
 		return
 	}

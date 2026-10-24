@@ -245,24 +245,64 @@ var _ = pgx.ErrNoRows
 // subtree is not taken: retention is stamped per delivered file, and a delivered directory is not
 // a case this schema creates.
 func (t *pgTx) ExpireRetained(ctx context.Context) (int, error) {
-	const q = `UPDATE nodes
-		SET trashed_at = now(), modified_at = now()
+	// The eligible roots are read first, then each is accounted and marked. The previous
+	// version was one UPDATE that set trashed_at and nothing else: the bytes stayed in
+	// used_bytes, and the later purge — which subtracts from trash_bytes — removed bytes
+	// from a counter that was never credited. The result was a permanent quota leak that
+	// survived the purge, plus a retained counter that under-counted (2026-10-24 review,
+	// H14).
+	//
+	// The accounting is the same as Trash's because it has to be: "trashed" means the bytes
+	// moved from the logical quota to retained usage, whoever caused the transition.
+	const eligible = `SELECT id FROM nodes
 		WHERE retain_until IS NOT NULL
 		  AND retain_until <= now()
-		  AND trashed_at IS NULL
-		RETURNING id`
-	rows, err := t.tx.Query(ctx, q)
+		  AND trashed_at IS NULL`
+	rows, err := t.tx.Query(ctx, eligible)
 	if err != nil {
 		return 0, translate(err)
 	}
-	defer rows.Close()
-
-	n := 0
+	var roots []uuid.UUID
 	for rows.Next() {
-		n++
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, translate(err)
+		}
+		roots = append(roots, id)
 	}
+	rows.Close()
 	if err := rows.Err(); err != nil {
 		return 0, translate(err)
 	}
-	return n, nil
+
+	for _, id := range roots {
+		// Summed while the subtree is still live; after the mark it reads as zero.
+		released, ownerID, uerr := t.subtreeUsage(ctx, id)
+		if uerr != nil {
+			// A node that vanished between the SELECT and here is not an error: the caller's
+			// transaction is a snapshot of sorts, and another expiry pass may have taken it.
+			if errors.Is(uerr, ErrNotFound) {
+				continue
+			}
+			return 0, uerr
+		}
+		if merr := t.markTrashed(ctx, id); merr != nil {
+			if errors.Is(merr, ErrNotFound) {
+				continue
+			}
+			return 0, merr
+		}
+		if released > 0 {
+			if _, qerr := t.tx.Exec(ctx, `
+				UPDATE users
+				SET used_bytes = GREATEST(used_bytes - $2, 0),
+				    trash_bytes = trash_bytes + $2,
+				    updated_at = now()
+				WHERE id = $1`, ownerID, released); qerr != nil {
+				return 0, translate(qerr)
+			}
+		}
+	}
+	return len(roots), nil
 }
