@@ -34,7 +34,23 @@ type Config struct {
 	Limits  LimitsConfig  `yaml:"limits"`
 	Audit   AuditConfig   `yaml:"audit"`
 	Mail    MailConfig    `yaml:"mail"`
+	Mounts  MountsConfig  `yaml:"mounts"`
+	Search  SearchConfig  `yaml:"search"`
+
+	// warnings collects the non-fatal findings Validate produces (a legal but
+	// discouraged configuration, such as an http:// public URL). They are reported by
+	// the serving process at startup, which is the one moment an operator is looking at
+	// configuration; Validate itself cannot print, because it also runs from commands
+	// whose output is machine-read.
+	warnings []string
 }
+
+// Warnings returns the non-fatal findings from the last Validate, in the order found.
+//
+// Empty for a configuration that raised nothing. It is a method rather than part of the
+// error so a legal configuration still loads: a warning must never become a reason a
+// deployment cannot start.
+func (c *Config) Warnings() []string { return c.warnings }
 
 // MailConfig configures the transport for share recipient verification codes.
 //
@@ -298,6 +314,20 @@ type LimitsConfig struct {
 	// in the request-serving process after the timeout has been returned to the client, which is
 	// the one resource a hostile upload can take without ever completing a request.
 	ThumbnailIsolation string `yaml:"thumbnail_isolation"`
+
+	// CommentRatePerHour bounds how many comments one account may post in a rolling hour
+	// (core-scope §6).
+	//
+	// The anonymous-abuse lesson from the share OTP endpoint applies to every user-writable append
+	// surface: a table anybody can write to without a bound is a table somebody will fill. A rate
+	// rather than a count because the failure is a BURST, and a total cap would either be too low
+	// for a normal year or too high to stop a spam run.
+	//
+	// 60 is a generous ceiling for a human (a comment a minute for an hour) and far below what a
+	// script needs. Zero or negative disables the limit, which an operator might do on a small
+	// trusted deployment — the startup log does not warn about it, because unlike a security
+	// control it is a policy about noise rather than about access.
+	CommentRatePerHour int `yaml:"comment_rate_per_hour"`
 }
 
 // VersionRetention is how long an old version is kept. Zero means forever.
@@ -414,6 +444,108 @@ type AuditConfig struct {
 	ArchiveDir string `yaml:"archive_dir"`
 }
 
+// MountsConfig governs external storage mounts (ADR-0014): SMB/SFTP/FTP/WebDAV-backed folders
+// that are browsed in place, never copied.
+//
+// The whole section is disabled by default, because a mount is a credential the server spends
+// on the operator's behalf: enabling it is the decision to let the file service talk to hosts
+// it did not choose itself.
+type MountsConfig struct {
+	// Enabled turns on the mount surface: the /api/mounts routes and the virtual resolution
+	// below mount points. Disabled, existing mounts resolve as ordinary (empty) folders and
+	// the routes answer 503 — the data behind them was never local, so there is nothing to
+	// migrate off.
+	Enabled bool `yaml:"enabled"`
+	// SecretFile is the hex-encoded 32-byte key that encrypts mount credentials at rest
+	// (AES-256-GCM). Required when Enabled: mount credentials are live secrets to external
+	// systems, and storing them in plaintext in the metadata store would make every future
+	// database leak a credential leak too.
+	SecretFile string `yaml:"secret_file"`
+	// AllowUserMounts lets any signed-in user create mounts in their own tree. Off by default:
+	// creating a mount is an operator action, because it points the server at a host of the
+	// creator's choosing (ADR-0014, security posture).
+	AllowUserMounts bool `yaml:"allow_user_mounts"`
+	// DenyPrivateAddresses refuses user-created mounts whose endpoint resolves to loopback,
+	// link-local or private address space — the SSRF guard for the user-mount mode. Admin
+	// mounts are exempt: an administrator already controls the process.
+	DenyPrivateAddresses bool `yaml:"deny_private_addresses"`
+	// TimeoutSec bounds every dial and per-operation round trip to a mount. Slow remote
+	// storage must degrade into 502s, not hold request goroutines.
+	TimeoutSec int `yaml:"timeout_seconds"`
+	// MaxListEntries caps one directory listing fetched from a mount. The store's listings
+	// page; a remote listing arrives whole, so the cap is the honest alternative — refuse
+	// with "too many entries" rather than silently truncating, which would look like an
+	// empty bottom half of the folder.
+	MaxListEntries int `yaml:"max_list_entries"`
+	// MaxFileBytes caps a single write into a mount. Local writes have limits.max_file_bytes;
+	// external writes must have their own, because they consume a request goroutine and a
+	// remote handle for the whole transfer. Zero means "use limits.max_file_bytes".
+	MaxFileBytes int64 `yaml:"max_file_bytes"`
+	// AllowedSchemes is the dial allowlist. Default: the schemes with a provider compiled in
+	// today. An operator can narrow it; widening it to "smb" changes nothing until an SMB
+	// provider exists (the dial refuses with a clear error rather than 500ing).
+	AllowedSchemes []string `yaml:"allowed_schemes"`
+}
+
+// DefaultMountSchemes are the schemes a provider exists for out of the box (ADR-0014).
+var DefaultMountSchemes = []string{"webdav", "ftp", "sftp"}
+
+// SearchConfig governs the OPTIONAL content-search engine (core-scope §7.2, ADR-0016).
+//
+// The default is `none`, and that is a decision rather than an omission: a deployment without
+// Elasticsearch still has working name-and-filter search, and the response says `mode: name` so a
+// user is never told a document does not exist when the truth is that nothing looked inside it.
+// The single-binary principle is preserved by making the engine optional, not by pretending
+// full-text search does not exist.
+type SearchConfig struct {
+	// Engine is "none" or "elasticsearch".
+	Engine string `yaml:"engine"`
+	// Elasticsearch is the cluster configuration. Validated only when Engine says so: a
+	// deployment that turned the engine off must not fail to start because a URL it does not use
+	// is malformed.
+	Elasticsearch ElasticsearchConfig `yaml:"elasticsearch"`
+	// ContentTypes is the set of document types whose TEXT is extracted and indexed (§7.2 v1:
+	// text, markdown, pdf).
+	//
+	// Office extraction is deliberately out: it needs an extractor service, and promising it
+	// without one is worse than not offering it. A file whose type is not here is still indexed by
+	// its METADATA, so it stays findable by name, kind, tag and date.
+	ContentTypes []string `yaml:"content_types"`
+	// IndexBytes is the largest body the indexer reads (limits.search_index_bytes). A document
+	// above it is indexed without content: the metadata still answers "what is this file", and
+	// reading a two-gigabyte PDF during a sweep is not worth it.
+	IndexBytes int64 `yaml:"index_bytes"`
+}
+
+// ElasticsearchConfig is the cluster connection (search.elasticsearch.*).
+type ElasticsearchConfig struct {
+	// URLs is the cluster's HTTP endpoints, tried in order.
+	URLs []string `yaml:"urls"`
+	// Username and Password authenticate. PasswordFile is preferred in a container: a mounted
+	// secret never appears in `docker inspect`.
+	Username     string `yaml:"username"`
+	Password     string `yaml:"password"`
+	PasswordFile string `yaml:"password_file"`
+	// IndexPrefix namespaces this deployment's index so two deployments can share a cluster.
+	IndexPrefix string `yaml:"index_prefix"`
+	// InsecureSkipVerify is for a self-signed certificate on a private network. It removes the
+	// only protection against an active attacker on that path, so startup logs it.
+	InsecureSkipVerify bool `yaml:"insecure_skip_verify"`
+	// TimeoutSeconds bounds every engine request. A search that hangs is a page that hangs.
+	TimeoutSeconds int `yaml:"timeout_seconds"`
+}
+
+// SearchEnabled reports whether a content-search engine is configured.
+func (c *Config) SearchEnabled() bool { return c.Search.Engine == "elasticsearch" }
+
+// SearchTimeout is the per-request bound for the engine.
+func (e ElasticsearchConfig) Timeout() time.Duration {
+	if e.TimeoutSeconds <= 0 {
+		return 5 * time.Second
+	}
+	return time.Duration(e.TimeoutSeconds) * time.Second
+}
+
 // Default returns the safe baseline. Everything that can be wrong by omission
 // is set here rather than left to zero values.
 func Default() Config {
@@ -440,8 +572,34 @@ func Default() Config {
 			UploadChunkBytes:      256 << 20, // 256 MiB
 			// Decode in a child process by default (§6.3, WC-GAP-004).
 			ThumbnailIsolation: ThumbnailIsolationProcess,
+			// A comment a minute, on average, over an hour. See LimitsConfig.CommentRatePerHour.
+			CommentRatePerHour: 60,
 		},
 		Audit: AuditConfig{RetentionDays: 365},
+		Mounts: MountsConfig{
+			// Private-address refusal is the safe default for the day user mounts are
+			// turned on; it is only reachable then, but a default that must be remembered
+			// to be safe is a default that will be forgotten.
+			DenyPrivateAddresses: true,
+			TimeoutSec:           30,
+			MaxListEntries:       5_000,
+			AllowedSchemes:       DefaultMountSchemes,
+		},
+		Search: SearchConfig{
+			// "none" is the default: optional means off unless an operator decides otherwise, and
+			// name+filter search works without it.
+			Engine: "none",
+			// §7.2 names exactly these three. Office extraction needs an extractor service and is
+			// a separate decision, not a silent gap.
+			ContentTypes: []string{"text", "markdown", "pdf"},
+			// 10 MiB of extracted text is far more than any document whose body is worth searching,
+			// and small enough that a sweep cannot read a whole archive in one pass.
+			IndexBytes: 10 << 20,
+			Elasticsearch: ElasticsearchConfig{
+				IndexPrefix:    "newcloud",
+				TimeoutSeconds: 5,
+			},
+		},
 	}
 }
 
@@ -485,6 +643,18 @@ func Load(path string) (Config, error) {
 		cfg.Mail.Password = strings.TrimSpace(string(secret))
 	}
 
+	// The search engine's credential, on the same rule as mail: read only when the engine is
+	// actually enabled, because an example configuration that names a secret path must not make a
+	// deployment fail to start when the engine is off.
+	if cfg.SearchEnabled() && cfg.Search.Elasticsearch.Password == "" &&
+		cfg.Search.Elasticsearch.PasswordFile != "" {
+		secret, err := os.ReadFile(cfg.Search.Elasticsearch.PasswordFile)
+		if err != nil {
+			return cfg, fmt.Errorf("read search.elasticsearch.password_file: %w", err)
+		}
+		cfg.Search.Elasticsearch.Password = strings.TrimSpace(string(secret))
+	}
+
 	if err := cfg.Validate(); err != nil {
 		return cfg, err
 	}
@@ -526,6 +696,11 @@ func invalid(format string, args ...any) error {
 
 // Validate rejects configurations that are structurally unsafe.
 func (c *Config) Validate() error {
+	// Fresh findings per run: Validate can be called more than once (Load does, and tests
+	// call it directly), and a warning that survived from a previous pass would be
+	// reported for a configuration that no longer has the problem.
+	c.warnings = nil
+
 	if c.Server.PublicURL == "" {
 		return invalid("server.public_url is required (used for share links and OIDC redirect)")
 	}
@@ -543,6 +718,24 @@ func (c *Config) Validate() error {
 	uc, err := url.Parse(c.Server.UserContentURL)
 	if err != nil || uc.Scheme == "" || uc.Host == "" {
 		return invalid("server.usercontent_url must be an absolute URL, got %q", c.Server.UserContentURL)
+	}
+
+	// The scheme has to be one the browser actually treats as a secure context or plain web
+	// origin. Anything else (a typo like "https:/cloud", or an invented scheme) parses as an
+	// absolute URL above and passes, and the deployment only notices when a redirect or a
+	// share link is built from it.
+	//
+	// Plain http is legal — dev deployments and air-gapped LANs — but it is a decision, so
+	// it is reported as a warning rather than passed in silence (see Warnings).
+	for name, u := range map[string]*url.URL{"server.public_url": pub, "server.usercontent_url": uc} {
+		switch strings.ToLower(u.Scheme) {
+		case "http":
+			c.warnings = append(c.warnings, name+" uses plain http: share links, OIDC redirects and "+
+				"session cookies will not be encrypted. Acceptable for development only")
+		case "https":
+		default:
+			return invalid("%s must use http or https, got scheme %q", name, u.Scheme)
+		}
 	}
 	if sameOrigin(pub, uc) {
 		return invalid("server.usercontent_url must differ from public_url in scheme, host or port (got the same origin)")
@@ -602,9 +795,32 @@ func (c *Config) Validate() error {
 	if !contains(c.Auth.Scopes, "groups") {
 		return invalid("auth.scopes must include \"groups\": Pocket ID only releases group membership when the scope is requested")
 	}
+	// openid and email are the two scopes the login itself depends on, not merely
+	// enriches: without openid the provider issues no ID token, so the OAuth callback
+	// has nothing to verify and LOGIN CANNOT WORK AT ALL; without email there is no
+	// verified address, so account provisioning cannot name the person and share
+	// invitations by email have no recipient. A deployment that starts without them
+	// looks healthy until the first sign-in fails, which is the wrong time to learn it.
+	for _, need := range []struct{ scope, why string }{
+		{"openid", "without it the provider issues no ID token and login cannot work"},
+		{"email", "without it no account has a verified address and provisioning cannot complete"},
+	} {
+		if !contains(c.Auth.Scopes, need.scope) {
+			return invalid("auth.scopes must include %q: %s", need.scope, need.why)
+		}
+	}
 
 	if len([]byte(c.Auth.SessionSecret)) < 32 {
 		return invalid("auth.session_secret must be at least 32 bytes")
+	}
+
+	// The session lifetime was the one duration nothing checked. Zero reaches
+	// Sessions.Mint as a zero expiry: the ticket is minted already expired, so the login
+	// appears to succeed and the very next request is refused — a failure that looks like
+	// a broken IdP rather than a misconfigured duration.
+	if c.Auth.SessionTTL <= 0 {
+		return invalid("auth.session_ttl must be positive (how long a browser session lives), got %s",
+			c.Auth.SessionTTL)
 	}
 
 	// An unknown isolation mode is rejected rather than defaulted. Defaulting would be safe (any
@@ -622,6 +838,67 @@ func (c *Config) Validate() error {
 		case RoleAdmin, RoleUser, RoleGuest:
 		default:
 			return invalid("auth.group_role_map[%q]: unknown role %q", name, role)
+		}
+	}
+
+	// The search engine (§7.2). Validated here for the same reason mail is: a key that is accepted,
+	// documented and silently ignored is the failure mode the configuration ratchet exists to stop,
+	// and an engine that is configured but unreachable must be a startup ERROR rather than a
+	// deployment that quietly never has content search.
+	switch strings.ToLower(strings.TrimSpace(c.Search.Engine)) {
+	case "", "none":
+		c.Search.Engine = "none"
+	case "elasticsearch":
+		c.Search.Engine = "elasticsearch"
+		if len(c.Search.Elasticsearch.URLs) == 0 {
+			return invalid("search.engine=elasticsearch requires search.elasticsearch.urls")
+		}
+		for _, raw := range c.Search.Elasticsearch.URLs {
+			u, err := url.Parse(strings.TrimSpace(raw))
+			if err != nil || u.Scheme == "" || u.Host == "" {
+				return invalid("search.elasticsearch.urls: %q is not an absolute URL", raw)
+			}
+			if u.Scheme != "http" && u.Scheme != "https" {
+				return invalid("search.elasticsearch.urls: %q must be http or https", raw)
+			}
+			// An engine reached over plain HTTP on a public address hands the credentials and the
+			// document bodies to anyone on the path. On a private network, which is where most
+			// single-host deployments put it, that is a normal choice; saying so is not.
+			if u.Scheme == "http" && !isLoopbackHost(u.Hostname()) {
+				c.warnings = append(c.warnings, fmt.Sprintf(
+					"search.elasticsearch.urls[%q] uses plain http; document text and the engine "+
+						"credential travel unencrypted", raw))
+			}
+		}
+		if c.Search.Elasticsearch.InsecureSkipVerify {
+			c.warnings = append(c.warnings, "search.elasticsearch.insecure_skip_verify is set: the "+
+				"engine's TLS certificate is not verified, so an active attacker on that path can "+
+				"read the indexed document text")
+		}
+		// The index prefix becomes part of a URL path and an index name; Elasticsearch restricts
+		// it to lowercase, digits and a few separators, and a prefix with a slash would address a
+		// different endpoint entirely.
+		prefix := strings.TrimSpace(c.Search.Elasticsearch.IndexPrefix)
+		if prefix == "" {
+			c.Search.Elasticsearch.IndexPrefix = "newcloud"
+		} else if !validIndexPrefix(prefix) {
+			return invalid("search.elasticsearch.index_prefix must be lowercase letters, digits, "+
+				"- or _, got %q", prefix)
+		}
+	}
+
+	if c.Search.IndexBytes < 0 {
+		return invalid("search.index_bytes must not be negative, got %d", c.Search.IndexBytes)
+	}
+	for _, ct := range c.Search.ContentTypes {
+		switch strings.ToLower(strings.TrimSpace(ct)) {
+		case "", "text", "markdown", "pdf":
+		default:
+			// Refused rather than ignored: an operator who added "docx" would otherwise believe
+			// Office documents were searchable, which is the "silently worse than promised"
+			// outcome §7.2 names.
+			return invalid("search.content_types: %q has no extractor in this build; supported "+
+				"types are text, markdown and pdf", ct)
 		}
 	}
 
@@ -657,6 +934,24 @@ func (c *Config) Validate() error {
 	}
 	if c.Limits.MaxProfindChildren <= 0 {
 		return invalid("limits.max_propfind_children must be positive")
+	}
+
+	if c.Mounts.Enabled {
+		if c.Mounts.SecretFile == "" {
+			return invalid("mounts.enabled=true requires mounts.secret_file (the key that encrypts mount credentials)")
+		}
+		if c.Mounts.TimeoutSec < 5 || c.Mounts.TimeoutSec > 300 {
+			return invalid("mounts.timeout_seconds must be between 5 and 300")
+		}
+		if c.Mounts.MaxListEntries <= 0 {
+			return invalid("mounts.max_list_entries must be positive")
+		}
+		if c.Mounts.MaxFileBytes < 0 {
+			return invalid("mounts.max_file_bytes must not be negative")
+		}
+		if len(c.Mounts.AllowedSchemes) == 0 {
+			return invalid("mounts.allowed_schemes must name at least one scheme (the default is webdav, ftp, sftp)")
+		}
 	}
 
 	switch c.Storage.Backend {
@@ -704,7 +999,11 @@ func (c *Config) Validate() error {
 		if c.Mail.From == "" {
 			return invalid("mail.from is required when mail.enabled is true")
 		}
-		if c.Mail.Port < 0 || c.Mail.Port > 65535 {
+		// `<= 0`, not `< 0`: the message below has always said "between 1 and 65535",
+		// and a zero port slipped past it. The transport happens to assume 587 for a
+		// zero port, which is a silent guess about a production relay — exactly the
+		// kind of half-configured value this block exists to name.
+		if c.Mail.Port <= 0 || c.Mail.Port > 65535 {
 			return invalid("mail.port must be between 1 and 65535, got %d", c.Mail.Port)
 		}
 		if c.Mail.ImplicitTLS && c.Mail.StartTLS {
@@ -750,6 +1049,41 @@ func canonicalHost(u *url.URL) string {
 		}
 	}
 	return host + ":" + port
+}
+
+// isLoopbackHost reports whether a URL host names this machine.
+//
+// Used by the search-engine warning: plain HTTP to localhost is a normal single-host choice, and
+// plain HTTP to a public address is credentials and document text on the wire.
+func isLoopbackHost(host string) bool {
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
+// validIndexPrefix reports whether a string is a legal Elasticsearch index-name prefix.
+//
+// The name ends up in a URL path, so a prefix containing "/" or "?" would address a different
+// endpoint than the one intended. Elasticsearch itself forbids uppercase, so accepting it here
+// would produce a startup that succeeds and an index that never exists.
+func validIndexPrefix(s string) bool {
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= '0' && r <= '9':
+		case r == '-' || r == '_' || r == '.':
+		default:
+			return false
+		}
+	}
+	return s != "" && s != "." && s != ".."
 }
 
 func contains(xs []string, want string) bool {
