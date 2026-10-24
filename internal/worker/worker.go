@@ -93,6 +93,9 @@ type Worker struct {
 	// passCap overrides passTimeout when non-zero. Set only by tests, which cannot wait
 	// thirty minutes to watch a hung pass be cut off.
 	passCap time.Duration
+	// recoveryGrace overrides the recovery pass's grace period. Set only by tests, which cannot
+	// wait a minute for every case.
+	recoveryGrace time.Duration
 
 	// metrics is optional; nil means nothing is recorded.
 	metrics *metrics.Registry
@@ -125,6 +128,7 @@ func (w *Worker) WithMetrics(r *metrics.Registry) *Worker {
 func New(meta store.Store, log *slog.Logger) *Worker {
 	w := &Worker{
 		meta:          meta,
+		recoveryGrace: recoveryGrace,
 		log:           log,
 		lockInterval:  time.Minute,
 		sweepInterval: 6 * time.Hour,
@@ -285,6 +289,21 @@ func (w *Worker) duties() []duty {
 			}
 			if n > 0 {
 				w.log.Debug("processed jobs", "count", n)
+			}
+			return nil
+		}},
+		// Operation recovery reads the journal that the delete path writes. An open row means a
+		// process stopped between recording intent and finishing, so the pass either resolves it from
+		// the node's own state or escalates it — it never guesses, and it never deletes content.
+		{name: "op-recovery", interval: w.purgeInterval, run: func(ctx context.Context) error {
+			resolved, escalated, err := w.RecoverOperations(ctx)
+			if err != nil {
+				return fmt.Errorf("recover operations: %w", err)
+			}
+			if escalated > 0 {
+				w.log.Warn("operations need an operator", "count", escalated, "resolved", resolved)
+			} else if resolved > 0 {
+				w.log.Info("recovered unfinished operations", "count", resolved)
 			}
 			return nil
 		}},
