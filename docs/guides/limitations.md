@@ -195,18 +195,24 @@ tests that fail without the fix; the row says what changed, not just that someth
 | The backup manifest recorded the literal `restic:latest`, the dump was only checked for a readable TOC, and nothing alerted on a stale backup. | The manifest records the real snapshot id (which survives `forget --prune`), the dump must contain the application's tables, and `newcloud_backup_last_success_timestamp_seconds` drives a stale-backup alert (opt in with `BACKUP_METRICS_FILE`). |
 | A lock on a collection did not fence anything: COPY could add a member to a Depth: 0-locked folder, MOVE could remove one, and DELETE of a folder returned 204 with a locked file inside it. A failed COPY's rollback also trashed a file that had been locked and reported as success. | COPY/MOVE consult the destination's collection (Depth: 0 for a new member, Depth: infinity for an existing one), MOVE also consults the source's, and DELETE checks every live lock in the subtree with one recursive query (`LocksInSubtree`). A holder proceeds by submitting its token; everyone else gets `423`. The rollback skips a node that gained a live lock, the same way it already skipped one that gained a dead property. |
 | A COPY to a new name published its bytes at the destination **before** creating the metadata row, so a concurrent `PUT` that won that name had its bytes replaced by a copy that then failed to publish — the winner's success revoked with no error addressed to it. | Where the content address is the path (the `tree` layout) the copy stages beside the destination and installs the bytes only after the row commits; a lost race removes the stage and reports a failure, and a publish that fails after the commit trashes the row rather than leaving a file that answers 500 forever. The `blob` layout writes directly, because there the path is a metadata mapping and a losing copy can only leave an orphan blob. |
+| A DELETE resolved the node and trashed it in a later transaction, so a `PUT` that updated that row in between was trashed with it and the writer's success vanished. | The trash is conditional on the row still matching the resolved ETag (`TrashCappedExpect`, evaluated inside the statement that trashes, not by a separate read). A writer that committed first now wins and the DELETE answers `412`. |
 | A full `go test ./...` with `TEST_DATABASE_URL` set was racy: the PostgreSQL suites share one database and reset its schemas, so parallel packages dropped each other's tables. | CI and the Makefile run `-p 1`. |
 
 Two things this table does **not** claim: the ADR-0013 staging machinery is still not wired into the
 DAV request path (COPY/MOVE/`tree`-layout crash windows remain as described above), and no real desktop
 WebDAV client has been run against this build.
 
-One consequence is worth naming because it is a real race rather than a crash window: a **DELETE is not
-yet fenced against a concurrent writer**. The handler resolves the node, then trashes it by id in a later
-transaction; a `PUT` that updated that row in between is trashed with it, and the writer's success
-disappears. The fix is a precondition on the trash statement itself (the shape `UpdateFile.Expect`
-already has), which is an interface change still to be made;
-`internal/dav/phase0_red_test.go` keeps the reproduction.
+The remaining four probes are one design gap, not four bugs: on the `tree` layout the content address
+**is** the path, so a physical move cannot be made atomic with the metadata commit without the
+operation ledger ADR-0013 designs (a delete that relocates content to a trash area, and reads that do
+not depend on the live path). Until that lands, `internal/dav/phase0_red_test.go` keeps all four
+reproductions, and `TEST_DATABASE_URL`-free runs of `go test ./...` do not execute them — they carry a
+`phase0red` build tag.
+
+DELETE's *resolve-to-trash* window is closed: the trash is conditional on the row still matching what
+the handler resolved (`TrashCappedExpect`), the same arbitration `UpdateFile.Expect` gives a write. What
+that does not cover is the case the probe models, where a physical move has already happened outside the
+metadata's knowledge — that is the ledger's job.
 
 ## Where the evidence lives
 

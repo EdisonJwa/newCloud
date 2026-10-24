@@ -274,6 +274,18 @@ type Tx interface {
 	// content somebody else holds a lock on.
 	LocksInSubtree(ctx context.Context, rootID uuid.UUID) ([]Lock, error)
 
+	// TrashCappedExpect moves a node to the trash only if it still matches expect.
+	//
+	// The precondition is what makes DELETE safe against a concurrent writer. A handler
+	// resolves the node, then trashes it in a later transaction; a PUT that updates that
+	// row in between is trashed with it, and the writer's success disappears from the
+	// namespace with no error addressed to it. Checking in the handler has the same
+	// read-then-write shape — the decision has to be in the statement that changes the
+	// row, exactly like UpdateFile.Expect.
+	//
+	// A nil expect is unconditional, which is what TrashCapped means.
+	TrashCappedExpect(ctx context.Context, id uuid.UUID, maxRetainedBytes int64, expect *Precondition) error
+
 	// WebDAV dead properties. Windows Explorer and macOS Finder store per-file
 	// metadata here and misbehave when it does not survive a reconnect.
 	SetDeadProp(ctx context.Context, nodeID uuid.UUID, space, name, value string) error

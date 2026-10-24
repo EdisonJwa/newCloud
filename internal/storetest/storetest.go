@@ -7601,6 +7601,55 @@ func retainedCapSuite(t *testing.T, factory func(t *testing.T) (store.Store, uui
 		}
 	})
 
+	// A conditional trash is what lets DELETE refuse because the file changed after the
+	// handler resolved it. The precondition has to be evaluated inside the statement that
+	// trashes: a separate read would let a writer commit in between and then be trashed with
+	// the row it had just updated (2026-10-24 review, G1).
+	t.Run("TrashCappedExpectRefusesWhenTheRowMovedOn", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		f := mkfile(t, s, owner, r.ID, "fenced.txt", 10)
+
+		// A stale expectation is refused, and nothing is trashed.
+		err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.TrashCappedExpect(ctx, f.ID, 0,
+				&store.Precondition{IfMatch: `"not-the-current-etag"`})
+		})
+		if !errors.Is(err, store.ErrPrecondition) {
+			t.Fatalf("stale precondition on trash: want ErrPrecondition, got %v", err)
+		}
+		var live bool
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			n, gerr := tx.Node(ctx, f.ID)
+			live = gerr == nil && n.TrashedAt == nil
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if !live {
+			t.Fatal("the refused trash trashed the node anyway")
+		}
+
+		// The current expectation is accepted, with the cap and the accounting intact.
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.TrashCappedExpect(ctx, f.ID, 0, &store.Precondition{IfMatch: f.ETag})
+		}); err != nil {
+			t.Fatalf("matching precondition: %v", err)
+		}
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			n, gerr := tx.NodeIncludingTrashed(ctx, f.ID)
+			if gerr != nil {
+				return gerr
+			}
+			if n.TrashedAt == nil {
+				t.Error("the accepted trash did not trash the node")
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	})
+
 	t.Run("ZeroMeansUnlimited", func(t *testing.T) {
 		s, owner := factory(t)
 		r := rootOf(t, s, owner)

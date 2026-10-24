@@ -706,6 +706,27 @@ func (t *memTx) Trash(ctx context.Context, id uuid.UUID) error {
 	return t.trashRecursive(id, 0)
 }
 
+// TrashCappedExpect is TrashCapped with a precondition on the node's current state.
+//
+// The memory backend serialises transactions, so evaluating the precondition here is
+// already atomic with the write — the same reason its lock and quota checks never needed
+// the database's predicate tricks. The requirement is that it AGREES with PostgreSQL, which
+// is what the shared conformance suite tests.
+func (t *memTx) TrashCappedExpect(ctx context.Context, id uuid.UUID, maxRetainedBytes int64,
+	expect *Precondition) error {
+	rec, ok := t.m.nodes[id]
+	if !ok {
+		return ErrNotFound
+	}
+	if rec.node.TrashedAt != nil {
+		return ErrNotFound
+	}
+	if !expect.Matches(rec.node.ETag, true) {
+		return ErrPrecondition
+	}
+	return t.TrashCapped(ctx, id, maxRetainedBytes)
+}
+
 // trashRecursive marks the subtree. The depth guard turns a corrupted parent
 // chain into an error instead of a stack overflow.
 func (t *memTx) trashRecursive(id uuid.UUID, depth int) error {

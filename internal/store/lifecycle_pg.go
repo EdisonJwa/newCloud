@@ -287,7 +287,7 @@ func (t *pgTx) ExpireRetained(ctx context.Context) (int, error) {
 			}
 			return 0, uerr
 		}
-		if merr := t.markTrashed(ctx, id); merr != nil {
+		if merr := t.markTrashed(ctx, id, nil); merr != nil {
 			if errors.Is(merr, ErrNotFound) {
 				continue
 			}

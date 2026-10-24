@@ -596,7 +596,23 @@ func (h *Handler) handleDelete(w http.ResponseWriter, r *http.Request, a authz.A
 	}
 
 	err = h.meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
-		if terr := tx.TrashCapped(ctx, node.ID, h.trashCap(ctx)); terr != nil {
+		// The trash is conditional on the node still being what this request resolved.
+		//
+		// A DELETE resolves the node, checks its lock and its ACL, then trashes it in this
+		// transaction. A PUT that updated the row in between would be trashed along with it:
+		// the writer was told 201/204 and its file vanishes from the namespace with no error
+		// addressed to it (2026-10-24 review, G1). The precondition is evaluated inside the
+		// statement that trashes, so a writer that committed first wins and this DELETE
+		// answers 412 — the same arbitration a stale If-Match gets.
+		//
+		// Directories carry no strong validator, so the expectation is only applied to files;
+		// a concurrent write inside a directory is still a membership change that the lock
+		// rules cover.
+		var expect *store.Precondition
+		if !node.IsDir() && node.ETag != "" {
+			expect = &store.Precondition{IfMatch: node.ETag}
+		}
+		if terr := tx.TrashCappedExpect(ctx, node.ID, h.trashCap(ctx), expect); terr != nil {
 			return terr
 		}
 		return tx.Audit(ctx, store.AuditEntry{

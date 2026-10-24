@@ -593,7 +593,7 @@ func (t *pgTx) Trash(ctx context.Context, id uuid.UUID) error {
 	if err != nil {
 		return err
 	}
-	if err := t.markTrashed(ctx, id); err != nil {
+	if err := t.markTrashed(ctx, id, nil); err != nil {
 		return err
 	}
 	if released > 0 {
@@ -641,7 +641,11 @@ func (t *pgTx) subtreeUsage(ctx context.Context, id uuid.UUID) (int64, uuid.UUID
 //
 // Doing it client-side would take one round trip per level and could leave a partially
 // trashed tree if the connection dropped mid-way.
-func (t *pgTx) markTrashed(ctx context.Context, id uuid.UUID) error {
+//
+// expect (nil = unconditional) is evaluated INSIDE the statement that trashes. Under READ
+// COMMITTED a separate read would let a concurrent writer commit between the read and the
+// write, and the writer's row would then be trashed by a request that never saw it.
+func (t *pgTx) markTrashed(ctx context.Context, id uuid.UUID, expect *Precondition) error {
 	const q = `
 		WITH RECURSIVE subtree AS (
 		    SELECT id FROM nodes WHERE id = $1 AND trashed_at IS NULL
@@ -651,12 +655,28 @@ func (t *pgTx) markTrashed(ctx context.Context, id uuid.UUID) error {
 		)
 		UPDATE nodes
 		SET trashed_at = now(), trashed_from = parent_id
-		WHERE id IN (SELECT id FROM subtree)`
-	tag, err := t.tx.Exec(ctx, q, id)
+		WHERE id IN (SELECT id FROM subtree)
+		  AND ($2 = '' OR (SELECT etag FROM nodes WHERE id = $1) = $2)`
+	etag := ""
+	if expect != nil {
+		etag = expect.IfMatch
+	}
+	tag, err := t.tx.Exec(ctx, q, id, etag)
 	if err != nil {
 		return translate(err)
 	}
 	if tag.RowsAffected() == 0 {
+		// Two causes, and they are different answers: the node changed under us (412, the
+		// caller's If-Match no longer describes it), or it is gone (404).
+		if expect != nil && etag != "" {
+			if _, gerr := t.Node(ctx, id); gerr == nil {
+				return ErrPrecondition
+			} else if errors.Is(gerr, ErrNotFound) {
+				return ErrNotFound
+			} else {
+				return gerr
+			}
+		}
 		return ErrNotFound
 	}
 	return nil
@@ -1202,15 +1222,45 @@ func (t *pgTx) DeleteSetting(ctx context.Context, key string) error {
 // Both the sum and the counter are read inside the caller's transaction, so the check sees a
 // consistent snapshot and two concurrent deletes cannot both fit into one slot.
 func (t *pgTx) TrashCapped(ctx context.Context, id uuid.UUID, maxRetainedBytes int64) error {
+	return t.TrashCappedExpect(ctx, id, maxRetainedBytes, nil)
+}
+
+// TrashCappedExpect is TrashCapped with a precondition on the node's current state.
+//
+// The precondition is evaluated in the UPDATE that trashes (see markTrashed), which is what
+// lets a DELETE refuse because a concurrent PUT changed the file after the handler resolved
+// it — instead of trashing that writer's successful update along with the row it belonged to.
+func (t *pgTx) TrashCappedExpect(ctx context.Context, id uuid.UUID, maxRetainedBytes int64,
+	expect *Precondition) error {
 	if maxRetainedBytes <= 0 {
-		return t.Trash(ctx, id)
+		if expect == nil {
+			return t.Trash(ctx, id)
+		}
+		released, ownerID, err := t.subtreeUsage(ctx, id)
+		if err != nil {
+			return err
+		}
+		if err := t.markTrashed(ctx, id, expect); err != nil {
+			return err
+		}
+		if released > 0 {
+			if _, qerr := t.tx.Exec(ctx, `
+				UPDATE users
+				SET used_bytes = GREATEST(used_bytes - $2, 0),
+				    trash_bytes = trash_bytes + $2,
+				    updated_at = now()
+				WHERE id = $1`, ownerID, released); qerr != nil {
+				return translate(qerr)
+			}
+		}
+		return nil
 	}
 
 	released, ownerID, err := t.subtreeUsage(ctx, id)
 	if err != nil {
 		return err
 	}
-	if err := t.markTrashed(ctx, id); err != nil {
+	if err := t.markTrashed(ctx, id, expect); err != nil {
 		return err
 	}
 
