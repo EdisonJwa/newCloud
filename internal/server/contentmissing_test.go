@@ -79,9 +79,9 @@ func TestContentMissingIsCounted(t *testing.T) {
 		d.Metrics = reg
 		d.Content = missingOpenContent{ContentStore: d.Content}
 	})
-	h.uploadFile(t, "ghost2.txt", "bytes")
+	h.uploadFile(t, "ghost2.png", "bytes")
 
-	first := h.do(http.MethodGet, "/api/files/download?path=ghost2.txt", nil, nil)
+	first := h.do(http.MethodGet, "/api/files/download?path=ghost2.png", nil, nil)
 	first.Body.Close()
 	if first.StatusCode != http.StatusInternalServerError {
 		t.Fatalf("setup: expected the missing-content answer, got %d", first.StatusCode)
@@ -89,11 +89,15 @@ func TestContentMissingIsCounted(t *testing.T) {
 	// The thumbnail route reports the same condition but does NOT reach this counter — measured, not
 	// assumed: it answers 500 content_missing and counts nothing. The download path is the one the
 	// alert depends on, and limitations.md records the gap rather than implying coverage.
-	second := h.do(http.MethodGet, "/api/files/thumbnail?path=ghost2.txt", nil, nil)
+	second := h.do(http.MethodGet, "/api/files/thumbnail?path=ghost2.png", nil, nil)
 	second.Body.Close()
 
-	if got := reg.ContentMissing(); got != 1 {
-		t.Fatalf("the download of a file with missing content counted %d, want 1: the alert on "+
-			"this condition would be dead by configuration", got)
+	// Both routes count. The first version of this test used a .txt name and measured one: the
+	// thumbnail route rejects a non-image BEFORE it opens content, so the second request never
+	// reached the counter. That was a fixture mistake, not a gap in the code — and worth a comment,
+	// because it is the kind of thing that gets written down as a product limitation.
+	if got := reg.ContentMissing(); got != 2 {
+		t.Fatalf("two routes served a missing-content file but the counter recorded %d: the alert "+
+			"on this condition would be partly blind", got)
 	}
 }
