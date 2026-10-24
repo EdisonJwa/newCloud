@@ -28,7 +28,14 @@ type lockRequest struct {
 	Type struct {
 		Write *struct{} `xml:"write"`
 	} `xml:"locktype"`
-	OwnerRaw string `xml:"owner"`
+	// Owner keeps the owner element's inner XML, kept raw because the common form is a nested
+	// <D:href>, which a plain string field would silently empty (encoding/xml only accumulates
+	// direct character data into a tagged string; and ",innerxml" cannot share a tag with an
+	// element name, hence the wrapper). It is echoed inside the lock response and lockdiscovery,
+	// always through xmlEscape ??client-supplied markup must never re-enter a response as markup.
+	Owner struct {
+		Inner string `xml:",innerxml"`
+	} `xml:"owner"`
 }
 
 // handleLock creates or refreshes a lock.
@@ -54,7 +61,13 @@ func (h *Handler) handleLock(w http.ResponseWriter, r *http.Request, a authz.Act
 	if depth == "" {
 		depth = "infinity"
 	}
-	if depth != "0" && depth != "infinity" {
+	// Depth tokens compare case-insensitively (RFC 4918 §9.10.3 spells it "Infinity"); the
+	// stored lock keeps the canonical lowercase spelling so every depth comparison downstream
+	// sees one form (2026-10-25 review).
+	switch strings.ToLower(depth) {
+	case "0", "infinity":
+		depth = strings.ToLower(depth)
+	default:
 		writeXMLError(w, http.StatusBadRequest, "invalid-depth")
 		return
 	}
@@ -75,12 +88,17 @@ func (h *Handler) handleLock(w http.ResponseWriter, r *http.Request, a authz.Act
 		}
 		// A refresh reports the depth the lock already has: the Depth header on a refresh does
 		// not change it (RFC 4918 §9.10.2), so echoing the request's default would tell the
-		// client something untrue about the lock it holds.
+		// client something untrue about the lock it holds. The lock row is read once and also
+		// supplies the owner the lock was created with.
 		heldDepth := "infinity"
-		if l, ok := h.activeLock(ctx, node.ID); ok && l.Depth != "" {
-			heldDepth = l.Depth
+		heldOwner := ""
+		if l, ok := h.activeLock(ctx, node.ID); ok {
+			if l.Depth != "" {
+				heldDepth = l.Depth
+			}
+			heldOwner = l.OwnerXML
 		}
-		h.writeLockResponse(w, http.StatusOK, tok, node, expires, heldDepth)
+		h.writeLockResponse(w, http.StatusOK, tok, heldOwner, lockRootHref(r), expires, heldDepth)
 		return
 	}
 
@@ -93,7 +111,7 @@ func (h *Handler) handleLock(w http.ResponseWriter, r *http.Request, a authz.Act
 	// A shared-lock request is REFUSED rather than silently downgraded to exclusive.
 	//
 	// The struct models both scopes and the handler never branched on it, so a client asking for
-	// <shared> received 200 with an <exclusive/> activelock — which RFC 4918 §6.1 does not allow a
+	// <shared> received 200 with an <exclusive/> activelock ??which RFC 4918 §6.1 does not allow a
 	// server to substitute. A careful client reads the response scope and notices; a careless one
 	// believes it holds a shared lock and discovers otherwise when a second member of the same
 	// document group is refused with 423.
@@ -114,12 +132,23 @@ func (h *Handler) handleLock(w http.ResponseWriter, r *http.Request, a authz.Act
 		return
 	}
 
+	// A Depth: infinity lock on an ancestor covers every resource below it, including one
+	// nobody has locked directly (RFC 4918 §7.4/§9.10.3): granting a second exclusive write
+	// lock under it hands two clients the same bytes. Only the node's own lock was checked
+	// above, so the walk starts at the parent. The holder may still proceed by submitting its
+	// own token ??lockAncestorsInfinityOnly applies the same submitted-token rule every other
+	// write does (2026-10-25 review).
+	if node.ParentID != nil && h.lockAncestorsInfinityOnly(ctx, a, *node.ParentID, r.Header.Get("If")) {
+		writeXMLError(w, http.StatusLocked, "no-conflicting-lock")
+		return
+	}
+
 	token := newLockToken()
 	expires := h.now().Add(timeout)
 	err = h.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
 		if lerr := tx.CreateLock(ctx, store.Lock{
 			Token: token, NodeID: node.ID, UserID: a.Ptr(),
-			OwnerXML: req.OwnerRaw, Depth: depth,
+			OwnerXML: req.Owner.Inner, Depth: depth,
 			TimeoutSec: int(timeout.Seconds()), ExpiresAt: expires,
 		}); lerr != nil {
 			return lerr
@@ -136,7 +165,7 @@ func (h *Handler) handleLock(w http.ResponseWriter, r *http.Request, a authz.Act
 		return
 	}
 
-	h.writeLockResponse(w, http.StatusOK, token, node, expires, depth)
+	h.writeLockResponse(w, http.StatusOK, token, req.Owner.Inner, lockRootHref(r), expires, depth)
 }
 
 // handleUnlock removes a lock.
@@ -208,12 +237,22 @@ func (h *Handler) writeUnsupportedLockScope(w http.ResponseWriter) {
 //
 // The depth reported is the one the client asked for. It used to be the literal "infinity",
 // so a client that locked a collection with Depth: 0 was told it had locked the whole
-// subtree — and a client that trusts the response then skips re-locking its children
+// subtree ??and a client that trusts the response then skips re-locking its children
 // (2026-10-24 review).
-func (h *Handler) writeLockResponse(w http.ResponseWriter, status int, token string,
-	n store.Node, expires time.Time, depth string) {
+//
+// The owner the client submitted is echoed back and the lockroot names the locked resource:
+// §14.1/§14.2 make both part of an activelock, and Office reads them to show "locked by" and
+// to match the lock to the URL it edited. Omitting the owner reduced a co-authoring lock to
+// an anonymous refusal (2026-10-25 review). The owner content is the client's own ??it is
+// escaped, never replayed as markup.
+func (h *Handler) writeLockResponse(w http.ResponseWriter, status int, token, ownerXML, lockroot string,
+	expires time.Time, depth string) {
 	if depth == "" {
 		depth = "infinity"
+	}
+	owner := ""
+	if strings.TrimSpace(ownerXML) != "" {
+		owner = "<D:owner>" + xmlEscape(ownerXML) + "</D:owner>"
 	}
 	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 	w.Header().Set("Lock-Token", "<"+token+">")
@@ -223,18 +262,33 @@ func (h *Handler) writeLockResponse(w http.ResponseWriter, status int, token str
 	if secs < 0 {
 		secs = 0
 	}
-	// The depth is the one the client asked for. It used to be the literal "infinity", so a
-	// client that locked a collection with Depth: 0 was told it had locked the whole subtree
-	// — and clients that trust the response then skip re-locking children (2026-10-24 review).
+	// The element order follows §14.2's activelock sequence: locktype, lockscope, depth,
+	// owner?, timeout?, locktoken?, lockroot. The depth is the one the client asked for; it
+	// used to be the literal "infinity", so a client that locked a collection with Depth: 0
+	// was told it had locked the whole subtree ??and clients that trust the response then skip
+	// re-locking children (2026-10-24 review).
 	_, _ = fmt.Fprintf(w, `<?xml version="1.0" encoding="utf-8"?>
 <D:prop xmlns:D="DAV:"><D:lockdiscovery><D:activelock>
 <D:locktype><D:write/></D:locktype>
 <D:lockscope><D:exclusive/></D:lockscope>
 <D:depth>%s</D:depth>
+%s
 <D:timeout>Second-%d</D:timeout>
 <D:locktoken><D:href>%s</D:href></D:locktoken>
+<D:lockroot><D:href>%s</D:href></D:lockroot>
 </D:activelock></D:lockdiscovery></D:prop>`,
-		xmlEscape(depth), secs, xmlEscape(token))
+		xmlEscape(depth), owner, secs, xmlEscape(token), xmlEscape(lockroot))
+}
+
+// lockRootHref is the URL of the resource a LOCK addressed, used for <D:lockroot>.
+//
+// It is the request's own path — the same shape PROPFIND's hrefs use — so a client
+// comparing the lockroot against the address it edited matches on the path. Nextcloud
+// clients reject a listing whose hrefs do not start with the request path, so the two
+// surfaces must agree on the form (ADR-0015). EscapedPath keeps whatever encoding the
+// client sent.
+func lockRootHref(r *http.Request) string {
+	return r.URL.EscapedPath()
 }
 
 // requestedTimeout parses the client's Timeout header.
@@ -269,17 +323,20 @@ func (h *Handler) requestedTimeout(r *http.Request) time.Duration {
 	return def
 }
 
-// lockTokenFromIf extracts a token from an If header.
+// lockTokenFromIf extracts a lock token from an If header.
 //
-// The header is a small grammar; the only form that matters here is the
-// "(<opaquelocktoken:...>)" wrapper clients send on refresh.
+// The header's grammar allows tagged lists ??"If: <url> (<opaquelocktoken:...>)" ??so the FIRST
+// <...> substring is often the resource URL, not a token; returning it made every refresh sent
+// with a tagged If answer 412 (2026-10-25 review). Every <...> substring is collected and only
+// the ones carrying a lock-token scheme are considered, which is the same filter
+// internal/server/locks.go's submittedLockToken applies.
 func lockTokenFromIf(ifHeader string) string {
-	start := strings.Index(ifHeader, "<")
-	end := strings.Index(ifHeader, ">")
-	if start < 0 || end <= start+1 {
-		return ""
+	for _, tok := range submittedTokens(ifHeader) {
+		if strings.HasPrefix(tok, "opaquelocktoken:") || strings.HasPrefix(tok, "urn:") {
+			return tok
+		}
 	}
-	return ifHeader[start+1 : end]
+	return ""
 }
 
 // submittedTokens returns every lock token named in the request's If header.
@@ -313,8 +370,7 @@ func submittedTokens(ifHeader string) []string {
 //
 // It is the one place that answers "is this write allowed past the lock", called
 // from every mutating method. Before this existed, locks were enforced only in the
-// LOCK handler itself: a client could take a lock, and then any other writer —
-// including the same client through a different entry point — would overwrite the
+// LOCK handler itself: a client could take a lock, and then any other writer ??// including the same client through a different entry point ??would overwrite the
 // file without ever being told the resource was locked. That is precisely the
 // silent-corruption case RFC 4918 §6 exists to prevent.
 func (h *Handler) lockBlocks(ctx context.Context, a authz.Actor, nodeID [16]byte, ifHeader string) bool {
@@ -366,7 +422,7 @@ func (h *Handler) lockAncestors(ctx context.Context, a authz.Actor, parentID [16
 // lockAncestorsInfinityOnly is the same walk, restricted to Depth: infinity locks.
 //
 // The distinction is RFC 4918 §7.4 and it is not cosmetic. A Depth: 0 lock on a collection
-// protects the collection's *membership* — you may not add or remove children — but it says
+// protects the collection's *membership* ??you may not add or remove children ??but it says
 // nothing about the content of an existing child. A Depth: infinity lock covers the whole
 // subtree, content included.
 //
@@ -380,7 +436,7 @@ func (h *Handler) lockAncestors(ctx context.Context, a authz.Actor, parentID [16
 //     exactly the right it protects.
 //
 // Before this split one function answered both, so Depth was ignored entirely and a Depth: 0
-// lock behaved like Depth: infinity on the ancestor path — over-blocking, and silently, because
+// lock behaved like Depth: infinity on the ancestor path ??over-blocking, and silently, because
 // the client gets 423 with no indication that its own Depth: 0 lock is the cause.
 func (h *Handler) lockAncestorsInfinityOnly(ctx context.Context, a authz.Actor, parentID [16]byte,
 	ifHeader string) bool {

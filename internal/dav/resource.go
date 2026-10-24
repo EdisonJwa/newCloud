@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"path"
 	"strconv"
@@ -14,7 +15,6 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/EdisonJwa/newCloud/internal/authz"
-	"github.com/EdisonJwa/newCloud/internal/blob"
 	"github.com/EdisonJwa/newCloud/internal/dircommit"
 	"github.com/EdisonJwa/newCloud/internal/storage/layout"
 	"github.com/EdisonJwa/newCloud/internal/store"
@@ -255,12 +255,20 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request, a authz.Acto
 	ctx := r.Context()
 
 	// The parent must exist and be writable; PUT does not create directories.
-	_, rel, serr := h.splitPath(r.URL.Path)
+	ownerSeg, rel, serr := h.splitPath(r.URL.Path)
 	if serr != nil {
 		// splitPath refuses a swap's staging name, and PUT used to discard that error and fall
 		// through to 409. Writing to a staging name would corrupt a swap another request is in
 		// the middle of, so the refusal has to be honoured here (2026-10-24 review, M4).
 		writeXMLError(w, statusForError(serr), "")
+		return
+	}
+	// A URL that names another account's namespace is refused before anything is written.
+	// The bytes would land in the caller's own tree (the store never sees the URL), so
+	// without this a client could upload "to /remote.php/dav/files/someone/" and be told it
+	// worked.
+	if ownerSeg != "" && ownerSeg != a.Username() {
+		writeXMLError(w, http.StatusNotFound, "")
 		return
 	}
 	if rel == "" {
@@ -290,6 +298,24 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request, a authz.Acto
 		}
 		return nil
 	})
+
+	// A name that differs from the found sibling only by case or Unicode folding is a
+	// CONFLICT, not the file the caller meant to write.
+	//
+	// ChildByName compares the folded name_key, so a PUT for "readme.md" finds a node created
+	// as "README.md" — that is what makes name lookup case-robust. Reusing that answer for a
+	// content write updated the OTHER file's row while publishing bytes under the path the
+	// client asked for: the response was 204, the original's content was replaced, and a GET
+	// of the requested name then answered 404 because Resolve (the read path) is case-exact.
+	// The store's WriteFile guard (pg.go / memory.go) refuses exactly this, and ADR-0004 §4
+	// says a second write under a conflicting name must fail; the handler now does the same,
+	// before any lock check or byte is touched, so the folded sibling is untouched and
+	// everything downstream (locks, putPrecondition) only ever sees the exact-name node
+	// (2026-10-25 review).
+	if existing != nil && existing.Name != name {
+		writeXMLError(w, http.StatusConflict, "name-conflict")
+		return
+	}
 
 	// Locks (§5.3, RFC 4918 §7.4). Which ancestor rule applies depends on whether this PUT adds
 	// a name or replaces content:
@@ -333,6 +359,16 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request, a authz.Acto
 	if !ok {
 		w.WriteHeader(http.StatusPreconditionFailed)
 		return
+	}
+
+	// Nextcloud clients send the file's modification time as X-OC-Mtime and expect
+	// "X-OC-MTime: accepted" in reply. Without it the server stamps its own clock on every
+	// upload, and the sync client then sees a remote mtime it never recorded and downloads
+	// its own file back. An unparseable value is ignored rather than refused: the upload is
+	// still valid, it just keeps the server's clock, and the missing header says so.
+	clientMtime, mtimeAccepted := parseOCMtime(r.Header.Get("X-OC-Mtime"))
+	if mtimeAccepted {
+		w.Header().Set("X-OC-MTime", "accepted")
 	}
 
 	owner := a.ID().String()
@@ -381,6 +417,8 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request, a authz.Acto
 				MaxVersions: h.maxVersions(),
 				// §8.1 操作者引用: a WebDAV PUT names the account that made the version.
 				By: a.Ptr(),
+				// X-OC-Mtime, when the client sent one.
+				ModifiedAt: clientMtime,
 			})
 			if uerr != nil {
 				return uerr
@@ -399,6 +437,7 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request, a authz.Acto
 				OwnerID: a.ID(), ParentID: parentNode.ID, Name: name,
 				Size: res.Size, Mime: mime, ETag: etag,
 				BlobID: h.blobIDFor(ctx, res.Hash, res.Size), BlobHash: res.Hash,
+				ModifiedAt: clientMtime,
 			})
 			if cerr != nil {
 				return cerr
@@ -428,6 +467,29 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request, a authz.Acto
 		return
 	}
 	w.WriteHeader(http.StatusCreated)
+}
+
+// parseOCMtime reads the Nextcloud X-OC-Mtime request header.
+//
+// The value is Unix seconds; some clients send a fractional part, so a float is accepted
+// and truncated. A value outside the range a filesystem can represent is ignored, which
+// leaves the server's clock in place and omits the "accepted" reply — the contract the
+// client checks, so it can tell the difference between "stored" and "ignored".
+func parseOCMtime(v string) (*time.Time, bool) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return nil, false
+	}
+	n, err := strconv.ParseFloat(v, 64)
+	if err != nil || math.IsNaN(n) || math.IsInf(n, 0) {
+		return nil, false
+	}
+	// 253402300799 is 9999-12-31T23:59:59Z, the largest timestamp HTTP dates represent.
+	if n < 0 || n > 253402300799 {
+		return nil, false
+	}
+	t := time.Unix(int64(n), 0).UTC()
+	return &t, true
 }
 
 func (h *Handler) checkIfMatch(r *http.Request, etag string) bool {
@@ -666,7 +728,22 @@ func (h *Handler) handleMkcol(w http.ResponseWriter, r *http.Request, a authz.Ac
 		return
 	}
 
-	_, rel, _ := h.splitPath(r.URL.Path)
+	ownerSeg, rel, serr := h.splitPath(r.URL.Path)
+	if serr != nil {
+		// The refusal is a real answer about the NAME (an unsafe path, or a swap's reserved
+		// staging segment), and discarding it made an unsafe MKCOL fall into the 405 branch
+		// below — telling the client the method was wrong when the name was. PUT honours the
+		// same error (2026-10-25 review).
+		writeXMLError(w, statusForError(serr), "")
+		return
+	}
+	// Same namespace rule as PUT: MKCOL resolves its PARENT from the caller's tree, so a
+	// URL naming another account would create the folder under the caller while reporting
+	// success against somebody else's name.
+	if ownerSeg != "" && ownerSeg != a.Username() {
+		writeXMLError(w, http.StatusNotFound, "")
+		return
+	}
 	if rel == "" {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
@@ -735,5 +812,3 @@ func (h *Handler) handleMkcol(w http.ResponseWriter, r *http.Request, a authz.Ac
 }
 
 var errUnsupported = errors.New("dav: unsupported")
-
-var _ = blob.Hash{}

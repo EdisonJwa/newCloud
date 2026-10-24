@@ -80,6 +80,20 @@ func (h *Handler) handleProppatch(w http.ResponseWriter, r *http.Request, a auth
 		return
 	}
 
+	// A dead-property write is a content-level change on an existing resource, so it is fenced
+	// exactly the way PUT fences an update: a lock on the target itself blocks it, and only a
+	// Depth: infinity ancestor reaches it (a Depth: 0 lock protects the parent's membership,
+	// not this node's properties — RFC 4918 §7.4). PROPPATCH used to check PermWrite alone, so
+	// a client could rewrite the properties of a file another client held a lock on, which is
+	// the concurrent-edit case the lock exists to prevent (2026-10-25 review).
+	if !h.requireUnlocked(w, r.Context(), a, node.ID, r.Header.Get("If")) {
+		return
+	}
+	if node.ParentID != nil && h.lockAncestorsInfinityOnly(r.Context(), a, *node.ParentID, r.Header.Get("If")) {
+		writeXMLError(w, http.StatusLocked, "lock-token-submitted")
+		return
+	}
+
 	props, err := parseProppatchBody(r.Body)
 	if err != nil {
 		writeXMLError(w, http.StatusBadRequest, "")
@@ -200,7 +214,31 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request, a authz
 			return
 		}
 		if !ok {
-			writeXMLError(w, http.StatusLocked, "")
+			// 403 with a named condition, not 423 with an empty body. The tree was enumerable
+			// and the walk found a node the actor's grant does not cover, which is a permission
+			// answer; 423 told the client a lock existed when none did, and an empty body gave
+			// it nothing to distinguish the two. The root-denied case above stays 404 on
+			// purpose: the enumeration-oracle policy (resolvePath) hides a refused ROOT behind
+			// a miss, and by the time this walk runs the root has already been resolved for the
+			// client, so the inner refusal reveals nothing the operation's shape has not —
+			// which the old empty 423 leaked in the same way (2026-10-25 review).
+			writeXMLError(w, http.StatusForbidden, "forbidden-by-permission")
+			return
+		}
+	}
+
+	// COPY honours Depth (RFC 4918 §9.8.3): the default is infinity, and Depth: 0 copies a
+	// collection WITHOUT its children. MOVE is always depth-infinity per §9.9.3, so the header
+	// is not consulted there. The flag threads through copyNode/copyResolved — the only place
+	// the recursion is driven — and leaves the swap/rollback core untouched.
+	shallowCopy := false
+	if !move {
+		switch strings.ToLower(r.Header.Get("Depth")) {
+		case "", "infinity":
+		case "0":
+			shallowCopy = true
+		default:
+			writeXMLError(w, http.StatusBadRequest, "invalid-depth")
 			return
 		}
 	}
@@ -376,13 +414,21 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request, a authz
 	// effects at all.
 	var copyPlan *treewalk.Tree
 	if !move && src.IsDir() {
-		plan, perr := treewalk.Resolve(ctx, h.meta, src, srcRel, copyWalkBudget())
-		if perr != nil {
-			h.logf("copy refused: cannot prove the source subtree complete path=%q err=%v", srcRel, perr)
-			writeXMLError(w, statusForCopyWalkError(perr), "")
-			return
+		if shallowCopy {
+			// A shallow copy never reads the children, so the completeness walk is not merely
+			// unnecessary — it would refuse a huge tree for a copy that touches none of it.
+			// The plan is the root alone; copyResolved's shallow guard keeps the children
+			// uncopied even if a full plan were handed in.
+			copyPlan = &treewalk.Tree{Node: src, Rel: srcRel}
+		} else {
+			plan, perr := treewalk.Resolve(ctx, h.meta, src, srcRel, copyWalkBudget())
+			if perr != nil {
+				h.logf("copy refused: cannot prove the source subtree complete path=%q err=%v", srcRel, perr)
+				writeXMLError(w, statusForCopyWalkError(perr), "")
+				return
+			}
+			copyPlan = plan
 		}
-		copyPlan = plan
 	}
 
 	if existing != nil {
@@ -407,7 +453,7 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request, a authz
 			// A COPY over an existing destination does NOT trash it (NC-RR-005): the copy is staged
 			// under a reserved sibling name and swapped in only once it has fully succeeded.
 			if !disableCopyOverwritePreserveForTest {
-				if cerr := h.copyOverExisting(w, r, a, src, copyPlan, dstParent, dstName, *existing, destPath); cerr != nil {
+				if cerr := h.copyOverExisting(w, r, a, src, copyPlan, dstParent, dstName, *existing, destPath, shallowCopy); cerr != nil {
 					writeXMLError(w, statusForError(cerr), "")
 				}
 				return
@@ -459,7 +505,7 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request, a authz
 		// operation's already-successful node and trashing "whatever has that name" would
 		// revoke a success the client was told about (R8-DAV-001).
 		var createdIDs []createdNode
-		err := h.copyNode(ctx, a, src, copyPlan, dstParent, dstName, dstRel,
+		err := h.copyNode(ctx, a, src, copyPlan, dstParent, dstName, dstRel, shallowCopy,
 			r.WithContext(withCopyWasOverwrite(r.Context(), existing != nil)), &createdIDs)
 		// WC-GAP-009: a failed directory COPY must not leave a half-populated destination that
 		// LOOKS complete.
@@ -649,14 +695,17 @@ type createdNode struct {
 // A directory is copied from plan, the completeness-proven tree the caller resolved BEFORE the
 // destination (or its staging name) existed. plan may be nil only for a file source; a directory
 // without a plan is a programming error rather than a reason to fall back to a truncated walk.
+//
+// shallow is COPY's Depth: 0 (RFC 4918 §9.8.3): the destination collection is created with no
+// children. It is meaningless for a file source.
 func (h *Handler) copyNode(ctx context.Context, a authz.Actor, src store.Node, plan *treewalk.Tree,
-	dstParent store.Node, dstName, dstRel string, r *http.Request, created *[]createdNode) error {
+	dstParent store.Node, dstName, dstRel string, shallow bool, r *http.Request, created *[]createdNode) error {
 
 	if src.IsDir() {
 		if plan == nil {
 			return errors.New("dav: a directory copy was given no resolved tree")
 		}
-		return h.copyResolved(ctx, a, plan, dstParent.ID, dstName, dstRel, r, created)
+		return h.copyResolved(ctx, a, plan, dstParent.ID, dstName, dstRel, shallow, r, created)
 	}
 
 	// Files: copy the bytes (the blob layout deduplicates them, the tree layout
@@ -761,7 +810,7 @@ func (h *Handler) copyNode(ctx context.Context, a authz.Actor, src store.Node, p
 // guarantees a depth the recursion can handle and a node count the caller already budgeted for, so
 // there is no cycle to guard against here — Resolve refused anything it could not prove.
 func (h *Handler) copyResolved(ctx context.Context, a authz.Actor, tn *treewalk.Tree,
-	dstParentID uuid.UUID, dstName, dstRel string, r *http.Request, created *[]createdNode) error {
+	dstParentID uuid.UUID, dstName, dstRel string, shallow bool, r *http.Request, created *[]createdNode) error {
 
 	var newDir store.Node
 	// The physical directory exists before the node does. Ignoring the Mkdir result here was
@@ -797,11 +846,20 @@ func (h *Handler) copyResolved(ctx context.Context, a authz.Actor, tn *treewalk.
 		})
 	}
 
+	// Depth: 0: the collection itself is the whole copy. Its children are neither read nor
+	// recreated (RFC 4918 §9.8.3) — the guard is here so the recursion cannot start even if a
+	// full plan were handed in.
+	if shallow {
+		return nil
+	}
+
 	for _, child := range tn.Children {
 		childDstRel := path.Join(dstRel, child.Node.Name)
 
 		if child.Node.IsDir() {
-			if err := h.copyResolved(ctx, a, child, newDir.ID, child.Node.Name, childDstRel, r, created); err != nil {
+			// shallow is already answered above — this loop only runs on a full copy, and a
+			// nested collection is copied whole relative to its parent.
+			if err := h.copyResolved(ctx, a, child, newDir.ID, child.Node.Name, childDstRel, false, r, created); err != nil {
 				return err
 			}
 			continue
@@ -922,7 +980,7 @@ func subtreeSourcePerm(move bool) authz.Perm {
 // detectable cases at startup; docs/guides/limitations.md states the window.
 func (h *Handler) copyOverExisting(w http.ResponseWriter, r *http.Request, a authz.Actor,
 	src store.Node, plan *treewalk.Tree, dstParent store.Node, dstName string,
-	existing store.Node, destPath string) error {
+	existing store.Node, destPath string, shallow bool) error {
 
 	ctx := r.Context()
 
@@ -944,7 +1002,7 @@ func (h *Handler) copyOverExisting(w http.ResponseWriter, r *http.Request, a aut
 			// copyNode is reused rather than reimplemented, so the same resolved tree, audit entries
 			// and error handling apply exactly as they do on the non-overwrite path.
 			if cerr := h.copyNode(ctx, a, src, plan, dstParent, stagedName,
-				path.Join(parentRel, stagedName),
+				path.Join(parentRel, stagedName), shallow,
 				r.WithContext(withCopyWasOverwrite(ctx, false)), nil); cerr != nil {
 				return store.Node{}, cerr
 			}
@@ -1204,9 +1262,14 @@ func copyWasOverwrite(ctx context.Context) bool {
 
 // resolveDestination resolves a Destination header to its parent and name.
 func (h *Handler) resolveDestination(ctx context.Context, a authz.Actor, destPath string) (authz.Cap, store.Node, string, error) {
-	_, rel, err := h.splitPath(destPath)
+	owner, rel, err := h.splitPath(destPath)
 	if err != nil {
 		return authz.Cap{}, store.Node{}, "", authz.ErrDenied
+	}
+	// Same rule as resolvePath: a Destination that names a different account's namespace
+	// cannot target the caller's own tree under that label.
+	if owner != "" && owner != a.Username() {
+		return authz.Cap{}, store.Node{}, "", store.ErrNotFound
 	}
 	parentRel, name := splitParent(rel)
 	if name == "" {

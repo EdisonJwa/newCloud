@@ -2,7 +2,6 @@ package dav
 
 import (
 	"encoding/xml"
-	"errors"
 	"io"
 	"net/url"
 	"strings"
@@ -102,5 +101,3 @@ func destinationHostMatches(dest, publicURL string) bool {
 	}
 	return strings.EqualFold(u.Host, pub.Host)
 }
-
-var _ = errors.New

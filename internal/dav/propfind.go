@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -55,8 +54,11 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request, a authz
 	if depth == "" {
 		depth = "1" // RFC default for PROPFIND; clients rely on it
 	}
-	switch depth {
+	// Depth tokens compare case-insensitively (RFC 4918 §9.1 spells it "Infinity"); the
+	// rest of the handler keeps the canonical lowercase form (2026-10-25 review).
+	switch strings.ToLower(depth) {
 	case "0", "1", "infinity":
+		depth = strings.ToLower(depth)
 	default:
 		writeXMLError(w, http.StatusBadRequest, "invalid-depth")
 		return
@@ -69,9 +71,22 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request, a authz
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
-	w.Header().Set("DAV", daClasses(h.cfg))
-	w.WriteHeader(http.StatusMultiStatus)
+	// Children are read BEFORE the response starts, and the dead properties of the whole
+	// listing are read in ONE query.
+	//
+	// The Nextcloud clients request about twenty non-DAV properties on every entry, so the
+	// old per-entry lookup opened a transaction per child: a 500-entry folder was 500 round
+	// trips before the client saw a complete response. Reading first also lets a listing
+	// failure be an error response rather than a half-written multistatus.
+	var children []store.Node
+	if depth == "1" && node.IsDir() {
+		list, err := h.listChildren(r.Context(), node)
+		if err != nil {
+			writeXMLError(w, statusForError(err), "")
+			return
+		}
+		children = list
+	}
 
 	// One query for every live lock at or below the address, indexed by node.
 	//
@@ -95,6 +110,26 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request, a authz
 		h.logf("propfind: could not read locks for %q: %v", r.URL.Path, lerr)
 	}
 
+	// The same trick for dead properties: only when the request could ask for one, and once
+	// for the whole listing.
+	deadByNode := map[uuid.UUID][]store.DeadProp{}
+	if h.propfindWantsDead(req) {
+		ids := make([]uuid.UUID, 0, len(children)+1)
+		ids = append(ids, node.ID)
+		for _, c := range children {
+			ids = append(ids, c.ID)
+		}
+		if props, derr := h.deadPropsOfMany(r.Context(), ids); derr == nil {
+			deadByNode = props
+		} else {
+			h.logf("propfind: dead properties unavailable for %q: %v", r.URL.Path, derr)
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	w.Header().Set("DAV", daClasses(h.cfg))
+	w.WriteHeader(http.StatusMultiStatus)
+
 	bw := bufio.NewWriterSize(w, 32<<10)
 	defer bw.Flush()
 
@@ -102,26 +137,16 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request, a authz
 	_, _ = bw.WriteString(`<D:multistatus xmlns:D="DAV:" xmlns:oc="http://owncloud.org/ns" xmlns:nc="http://nextcloud.org/ns">` + "\n")
 
 	writeEntry := func(n store.Node, href string, isRoot bool) {
-		h.writePropEntry(r.Context(), bw, req, n, href, cap, isRoot, locks)
+		h.writePropEntry(bw, req, n, href, cap, isRoot, locks, deadByNode[n.ID])
 	}
 
-	href := resourceHref(h, r, node)
+	href := resourceHref(r, node)
 	writeEntry(node, href, true)
 
-	if depth == "1" && node.IsDir() {
-		children, err := h.listChildren(r.Context(), node)
-		if err != nil {
-			// Headers are already sent, so the only honest signal left is a
-			// response-status entry for the parent.
-			h.writeStatusEntry(bw, href, statusForError(err))
-			_, _ = bw.WriteString("</D:multistatus>\n")
-			return
-		}
-		for _, c := range children {
-			// Trim before joining: href ends with "/" for a collection, and joining it directly
-			// produced "/root//name" — an href the server itself answers 404 for.
-			writeEntry(c, strings.TrimSuffix(href, "/")+"/"+escapeHrefSegment(c.Name), false)
-		}
+	for _, c := range children {
+		// Trim before joining: href ends with "/" for a collection, and joining it directly
+		// produced "/root//name" — an href the server itself answers 404 for.
+		writeEntry(c, strings.TrimSuffix(href, "/")+"/"+escapeHrefSegment(c.Name), false)
 	}
 
 	_, _ = bw.WriteString("</D:multistatus>\n")
@@ -147,8 +172,13 @@ func (h *Handler) listChildren(ctx context.Context, dir store.Node) ([]store.Nod
 // The oc:/nc: ones are included because several third-party clients (rclone,
 // some mobile apps) look for them even against a non-Nextcloud server; they cost
 // little and avoid a support ticket.
-func (h *Handler) writePropEntry(ctx context.Context, w io.Writer, req propfindRequest, n store.Node,
-	href string, cap authz.Cap, isRoot bool, locks map[uuid.UUID][]store.Lock) {
+//
+// dead is this entry's dead properties, fetched in one query for the whole listing before
+// the response started (see deadPropsOfMany). It used to be fetched here, per entry, which
+// turned a large listing into one transaction per child.
+func (h *Handler) writePropEntry(w io.Writer, req propfindRequest, n store.Node,
+	href string, cap authz.Cap, isRoot bool, locks map[uuid.UUID][]store.Lock,
+	dead []store.DeadProp) {
 
 	// A blank displayname is for the NAMESPACE ROOT, which genuinely has no name. Using the
 	// "is this the addressee" flag for it blanked the name of whatever was asked about, so a
@@ -256,7 +286,7 @@ func (h *Handler) writePropEntry(ctx context.Context, w io.Writer, req propfindR
 	if req.AllProp || hasProp(req.Props, "DAV:", "lockdiscovery") {
 		b.WriteString("<D:lockdiscovery>")
 		for _, l := range locks[n.ID] {
-			b.WriteString(activeLockXML(l))
+			b.WriteString(activeLockXML(l, href))
 		}
 		b.WriteString("</D:lockdiscovery>")
 	}
@@ -266,14 +296,8 @@ func (h *Handler) writePropEntry(ctx context.Context, w io.Writer, req propfindR
 	// The store has kept them (Windows Explorer and macOS Finder write per-file metadata there
 	// and misbehave when it does not survive a reconnect), but PROPFIND never returned one, so
 	// a client that set a property and re-read it saw nothing and concluded the server had
-	// ignored it. Fetched only when the request could care — the query is per entry, and a
-	// plain live-property listing must not pay for it.
-	var dead []store.DeadProp
-	if h.propfindWantsDead(req) {
-		if props, derr := h.deadPropsOf(ctx, n.ID); derr == nil {
-			dead = props
-		}
-	}
+	// ignored it. They are fetched in one batch by the caller, only when the request could
+	// care; a plain live-property listing pays nothing.
 	for _, p := range dead {
 		b.WriteString("<")
 		b.WriteString(xmlEscape(p.Name))
@@ -329,10 +353,15 @@ func (h *Handler) propIsEmitted(p propName, dead []store.DeadProp) bool {
 	}
 	switch p.Name {
 	case "resourcetype", "displayname", "getcontentlength", "getcontenttype", "getetag",
-		"getlastmodified", "creationdate", "supportedlock", "lockdiscovery",
-		"quota-used-bytes", "quota-available-bytes":
+		"getlastmodified", "creationdate", "supportedlock", "lockdiscovery":
 		return true
 	}
+	// quota-used-bytes / quota-available-bytes are deliberately NOT claimed: quota() is still
+	// a stub, so the emitter never writes them, and claiming them made a requested quota
+	// property disappear from the response entirely instead of being answered in the 404
+	// propstat, which is the RFC-correct answer until quota reporting is wired. Wiring it
+	// needs per-owner usage plus a configured quota-byte figure (Store.Usage / SetQuota), at
+	// which point both names come back here (2026-10-25 review).
 	return false
 }
 
@@ -349,11 +378,11 @@ func (h *Handler) propfindWantsDead(req propfindRequest) bool {
 	return false
 }
 
-// deadPropsOf reads a node's dead properties.
-func (h *Handler) deadPropsOf(ctx context.Context, nodeID uuid.UUID) ([]store.DeadProp, error) {
-	var out []store.DeadProp
+// deadPropsOfMany reads the dead properties of several nodes in one query, for a listing.
+func (h *Handler) deadPropsOfMany(ctx context.Context, nodeIDs []uuid.UUID) (map[uuid.UUID][]store.DeadProp, error) {
+	var out map[uuid.UUID][]store.DeadProp
 	err := h.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
-		props, err := tx.DeadProps(ctx, nodeID)
+		props, err := tx.DeadPropsFor(ctx, nodeIDs)
 		out = props
 		return err
 	})
@@ -361,20 +390,32 @@ func (h *Handler) deadPropsOf(ctx context.Context, nodeID uuid.UUID) ([]store.De
 }
 
 // activeLockXML renders one <D:activelock> for lockdiscovery.
-func activeLockXML(l store.Lock) string {
+//
+// href is the entry's own URL and becomes the lockroot: §14.2 makes lockroot part of an
+// activelock, and a client matches the lock to the resource it edited by comparing it. The
+// lock's submitted owner is echoed too — escaped, never replayed as markup — which is how a
+// co-authoring client shows "locked by" (2026-10-25 review).
+func activeLockXML(l store.Lock, href string) string {
 	scope := "<D:exclusive/>"
 	depth := l.Depth
 	if depth == "" {
 		depth = "infinity"
 	}
+	owner := ""
+	if strings.TrimSpace(l.OwnerXML) != "" {
+		owner = "<D:owner>" + xmlEscape(l.OwnerXML) + "</D:owner>"
+	}
 	secs := int(time.Until(l.ExpiresAt).Seconds())
 	if secs < 0 {
 		secs = 0
 	}
+	// Element order follows §14.2's activelock sequence: locktype, lockscope, depth, owner?,
+	// timeout?, locktoken?, lockroot.
 	return fmt.Sprintf("<D:activelock><D:locktype><D:write/></D:locktype>"+
-		"<D:lockscope>%s</D:lockscope><D:depth>%s</D:depth>"+
-		"<D:timeout>Second-%d</D:timeout><D:locktoken><D:href>%s</D:href></D:locktoken>",
-		scope, xmlEscape(depth), secs, xmlEscape(l.Token))
+		"<D:lockscope>%s</D:lockscope><D:depth>%s</D:depth>%s"+
+		"<D:timeout>Second-%d</D:timeout><D:locktoken><D:href>%s</D:href></D:locktoken>"+
+		"<D:lockroot><D:href>%s</D:href></D:lockroot>",
+		scope, xmlEscape(depth), owner, secs, xmlEscape(l.Token), xmlEscape(href))
 }
 
 // emptyPropXML renders a property element with no value, for the 404 propstat.
@@ -393,11 +434,6 @@ func (h *Handler) quota(userID [16]byte) (used, total int64) {
 	// The id is a UUID; the store takes one directly. This indirection keeps the
 	// call site free of type conversions.
 	return 0, 0
-}
-
-func (h *Handler) writeStatusEntry(w io.Writer, href string, status int) {
-	_, _ = fmt.Fprintf(w, "<D:response><D:href>%s</D:href><D:status>HTTP/1.1 %d %s</D:status></D:response>\n",
-		xmlEscape(href), status, http.StatusText(status))
 }
 
 // hasProp reports whether the client asked for a specific property.
@@ -454,23 +490,19 @@ func parsePropfindBody(r io.Reader) (propfindRequest, error) {
 
 // resourceHref builds the URL a client should use for a node.
 //
-// The owner segment is the username, which is what the client typed, so hrefs
-// round-trip through the client's own path handling.
-// resourceHref is the URL of the resource a PROPFIND addresses.
+// It is an ABSOLUTE PATH, not a full URL, and that is load-bearing for the Nextcloud
+// clients: their discovery parser compares every href with the request URL's path
+// (`QUrl::path()` of what they asked for) and drops the response as invalid when an href
+// does not start with it. Nextcloud itself answers with paths for the same reason. A path
+// is also the more robust answer behind a reverse proxy, where the public URL and the Host
+// the client used can differ.
 //
-// It used to return the caller's collection root for everything: every entry described a node but
-// named the collection it lived in, so a PROPFIND on a file answered 207 with the FILE's size and
-// etag attached to the FOLDER's href. A client following that href builds a folder with a file's
-// content-length, and every child came back as "/root//name" because the same function always
-// ended with a slash. The doubled path is not merely ugly: the server answers 404 for it, so the
-// href it published was an address it would not serve.
-//
-// The addressee's href is the URL the client actually used. Reconstructing it from the node would
-// have to re-derive the path, and the node does not reliably know it — the request already does.
-// EscapedPath keeps whatever encoding the client sent, so a name with a space stays addressable.
-func resourceHref(h *Handler, r *http.Request, n store.Node) string {
-	base := strings.TrimSuffix(h.cfg.Server.PublicURL, "/")
-	href := base + r.URL.EscapedPath()
+// The addressee's href is the path the client actually used, in the encoding it sent it.
+// Reconstructing it from the node would have to re-derive the path, and the node does not
+// reliably know it — the request already does. EscapedPath keeps whatever encoding the
+// client used, so a name with a space stays addressable.
+func resourceHref(r *http.Request, n store.Node) string {
+	href := r.URL.EscapedPath()
 	// Collections conventionally end with a slash; the request may omit it.
 	if n.IsDir() && !strings.HasSuffix(href, "/") {
 		href += "/"
@@ -495,6 +527,3 @@ func xmlEscape(s string) string {
 	_ = xml.EscapeText(&b, []byte(s))
 	return b.String()
 }
-
-var _ = path.Join
-var _ = time.Now
