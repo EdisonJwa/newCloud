@@ -838,8 +838,20 @@ func (s *Server) handleTrashList(w http.ResponseWriter, r *http.Request) {
 	actor, _ := actorFrom(r.Context())
 
 	var nodes []store.Node
+	// One extra row answers "is there more?" without a second query.
+	//
+	// The trash has no cursor, so a client that hits this cap cannot page further — but it can at
+	// least tell a full page from a complete one. Before this, a trash larger than the cap was
+	// reported as if it were the whole thing, and a client offering "restore all" would silently
+	// restore a subset (2026-10-24 review, M8).
+	limit := s.deps.Config.Limits.MaxProfindChildren
+	truncated := false
 	err := s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
-		list, lerr := tx.Trashed(ctx, actor.ID(), s.deps.Config.Limits.MaxProfindChildren)
+		list, lerr := tx.Trashed(ctx, actor.ID(), limit+1)
+		if len(list) > limit {
+			truncated = true
+			list = list[:limit]
+		}
 		nodes = list
 		return lerr
 	})
@@ -866,7 +878,13 @@ func (s *Server) handleTrashList(w http.ResponseWriter, r *http.Request) {
 		out = append(out, item)
 	}
 
-	body := map[string]any{"items": out}
+	body := map[string]any{
+		"items": out,
+		// True when the cap was reached and there are more entries the caller cannot see yet.
+		// There is no cursor for the trash, so this is the only warning a client gets: without it
+		// the page reads as the complete trash.
+		"truncated": truncated,
+	}
 	// The window itself, so a client can explain the deadline without hardcoding a number that
 	// the operator may have changed.
 	if retention > 0 {
