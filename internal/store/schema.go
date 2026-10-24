@@ -12,18 +12,52 @@ import (
 	"github.com/EdisonJwa/newCloud/migrations"
 )
 
+// MigrationLockID is the advisory-lock key that serialises migration runs.
+//
+// `pg_advisory_lock` takes a bigint chosen by the application; this one is the ASCII of
+// "newcloud-migrate" folded into a number, so two different tools cannot collide by
+// accident.
+const MigrationLockID int64 = 0x6e65_7763_6c6f_7564 // "newcloud" in ASCII
+
 // ApplySchema runs the embedded migrations in order.
 //
 // They are idempotent at the file level only (each migration is written to be
 // re-runnable where practical), so the applied set is tracked in a table rather
 // than relying on that: a half-applied migration that "succeeds again" silently is
 // worse than a loud failure.
+//
+// The whole run holds a PostgreSQL advisory lock on ONE connection, because two
+// concurrent `newcloud migrate` runs — a rolling deploy, or a compose restart while cron
+// is running it — otherwise both read "not applied" for the same file and both apply it.
+// The loser then fails on a duplicate object, and the failure lands on whichever process
+// was later, which is not the one an operator is watching (2026-10-24 review, M11). The
+// lock is released when the session ends even if the process is killed.
 func ApplySchema(ctx context.Context, pool *pgxpool.Pool) error {
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("store: acquire a connection for migrations: %w", err)
+	}
+	defer conn.Release()
+
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, MigrationLockID); err != nil {
+		return fmt.Errorf("store: take the migration lock: %w", err)
+	}
+	defer func() {
+		// Best effort: the session releases the lock on close anyway, and a failure here must
+		// not mask the migration's own error. The connection is about to go back to the pool
+		// with the lock still held if this fails, so it is unlocked on a fresh background
+		// context that a cancelled request cannot abort.
+		if _, uerr := conn.Exec(context.Background(),
+			`SELECT pg_advisory_unlock($1)`, MigrationLockID); uerr != nil {
+			_ = conn.Conn().Close(context.Background())
+		}
+	}()
+
 	const tracking = `CREATE TABLE IF NOT EXISTS schema_migrations (
 		name       text PRIMARY KEY,
 		applied_at timestamptz NOT NULL DEFAULT now()
 	)`
-	if _, err := pool.Exec(ctx, tracking); err != nil {
+	if _, err := conn.Exec(ctx, tracking); err != nil {
 		return fmt.Errorf("store: create migration table: %w", err)
 	}
 
@@ -41,7 +75,7 @@ func ApplySchema(ctx context.Context, pool *pgxpool.Pool) error {
 
 	for _, name := range names {
 		var applied bool
-		err := pool.QueryRow(ctx,
+		err := conn.QueryRow(ctx,
 			`SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE name = $1)`, name).Scan(&applied)
 		if err != nil {
 			return fmt.Errorf("store: check migration %s: %w", name, err)
@@ -62,7 +96,7 @@ func ApplySchema(ctx context.Context, pool *pgxpool.Pool) error {
 
 		// One transaction per migration: a failure leaves the schema at the
 		// previous version instead of half-way through.
-		tx, err := pool.Begin(ctx)
+		tx, err := conn.Begin(ctx)
 		if err != nil {
 			return err
 		}

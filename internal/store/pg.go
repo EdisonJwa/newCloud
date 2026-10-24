@@ -127,7 +127,20 @@ func translate(err error) error {
 		case "23505": // unique_violation
 			return fmt.Errorf("%w: %s", ErrConflict, pgErr.ConstraintName)
 		case "23503": // foreign_key_violation
-			return fmt.Errorf("%w: %s", ErrNotFound, pgErr.ConstraintName)
+			// A missing PARENT is a 404: the caller named a collection that is gone, and
+			// "there is no such directory" is the honest answer.
+			//
+			// Every other foreign key is a fault, not an absence. A node whose blob_id
+			// points at no blobs row means the metadata references content that does not
+			// exist — the opposite of "not found" — and answering 404 would send an
+			// operator looking at the client while the storage is damaged. The project's
+			// own failure-behaviour table promises this: "Blob missing but row present →
+			// error, never 404" (2026-10-24 review, M18).
+			if strings.Contains(pgErr.ConstraintName, "parent") {
+				return fmt.Errorf("%w: %s", ErrNotFound, pgErr.ConstraintName)
+			}
+			return fmt.Errorf("store: referential integrity violated (%s): %w",
+				pgErr.ConstraintName, err)
 		case "23514": // check_violation
 			if strings.Contains(pgErr.ConstraintName, "name") {
 				return fmt.Errorf("%w: %s", ErrInvalidName, pgErr.ConstraintName)
