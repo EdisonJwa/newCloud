@@ -182,9 +182,12 @@ func TestEveryTickerHasASelectCase(t *testing.T) {
 	for _, m := range regexp.MustCompile(`(\w+)\s*:?=\s*time\.NewTicker\(`).FindAllStringSubmatch(src, -1) {
 		declared[m[1]] = true
 	}
-	if len(declared) < 5 {
-		t.Fatalf("found only %d tickers, which is far fewer than expected — the parse is probably "+
-			"broken and this check is not testing anything", len(declared))
+	// The floor is one, not five: since the duties moved to per-goroutine loops there is
+	// exactly one ticker left in production code, and it lives in `loop`. A higher floor here
+	// would fail for the right code, which is how a ratchet starts getting deleted instead of
+	// fixed.
+	if len(declared) == 0 {
+		t.Fatal("found no tickers at all — the parse is broken and this check is testing nothing")
 	}
 
 	// A ticker assigned to the blank identifier can never be received from at all. Named

@@ -12,6 +12,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
+	"sync"
 	"time"
 
 	"github.com/EdisonJwa/newCloud/internal/audit"
@@ -88,6 +90,10 @@ type Worker struct {
 	// step is idempotent so extra runs cost one directory listing.
 	anchorInterval time.Duration
 
+	// passCap overrides passTimeout when non-zero. Set only by tests, which cannot wait
+	// thirty minutes to watch a hung pass be cut off.
+	passCap time.Duration
+
 	// metrics is optional; nil means nothing is recorded.
 	metrics *metrics.Registry
 }
@@ -160,157 +166,273 @@ func (w *Worker) WithRetention(versions, trash time.Duration) *Worker {
 	return w
 }
 
-// Run blocks until the context is cancelled.
+// duty is one periodic task: its own timer, its own goroutine, its own failure boundary.
 //
-// Each ticker runs independently: a slow blob sweep must not delay lock expiry,
-// because a stale lock blocks a user's edits immediately while an unreferenced
-// blob costs only disk.
-func (w *Worker) Run(ctx context.Context) {
-	locks := time.NewTicker(w.lockInterval)
-	defer locks.Stop()
-	sweeps := time.NewTicker(w.sweepInterval)
-	defer sweeps.Stop()
-	purges := time.NewTicker(w.purgeInterval)
-	defer purges.Stop()
-	retention := time.NewTicker(w.purgeInterval)
-	defer retention.Stop()
-	ratePrune := time.NewTicker(w.purgeInterval)
-	defer ratePrune.Stop()
-	jobs := time.NewTicker(w.jobInterval)
-	defer jobs.Stop()
-	anchors := time.NewTicker(w.anchorInterval)
-	defer anchors.Stop()
-	// Archiving health changes slowly but its consequences are severe: a broken archive_command
-	// leaves pg_wal growing until the disk fills. Sampled on the sweep cadence.
-	walSample := time.NewTicker(w.sweepInterval)
-	defer walSample.Stop()
-	// The scrub is the only check that reads live content back. It runs on the sweep cadence
-	// because a corrupted blob is a storage problem, not a latency one.
+// The previous shape was a single select loop with one case per timer, which had three
+// problems that only show up in production (2026-10-24 review, M12):
+//
+//   - The duties were serialised despite the comment claiming they were not. A blob sweep
+//     over a large store blocks the loop for minutes, and lock expiry — the one duty whose
+//     lateness a user feels immediately, as "the file is locked by nobody" — waits behind it.
+//   - A panic anywhere took the process down. One corrupt row in a purge ended the whole
+//     server, including the HTTP listener, because the worker runs in the same process.
+//   - Nothing bounded a pass, so a query blocked on a lock stalled every other duty with no
+//     signal beyond "the worker log stopped".
+type duty struct {
+	name     string
+	interval time.Duration
+	// run does one pass and must respect ctx cancellation.
+	run func(ctx context.Context) error
+}
+
+// passTimeout is the ceiling on a single pass, independent of its interval.
+//
+// A duty that hangs holds whatever it touched until the process is restarted, and no part of
+// this package can tell "slow" from "stuck". Cutting the pass off bounds the damage; every
+// duty is idempotent, so a pass that was cut short simply runs again on the next tick.
+const passTimeout = 30 * time.Minute
+
+// passTimeoutOr is the bound for one pass, with a test override.
+func (w *Worker) passTimeoutOr() time.Duration {
+	if w.passCap > 0 {
+		return w.passCap
+	}
+	return passTimeout
+}
+
+// duties returns every periodic task, in the order they are logged at startup.
+func (w *Worker) duties() []duty {
 	scrubEvery := w.scrubInterval
 	if scrubEvery <= 0 {
 		scrubEvery = w.sweepInterval
 	}
-	scrubs := time.NewTicker(scrubEvery)
-	defer scrubs.Stop()
-	// Partial uploads are reclaimed on the purge cadence: they are invisible to every listing and
-	// cost storage until removed, but they are not urgent, so there is no reason for a faster tick.
-	uploadCleanup := time.NewTicker(w.purgeInterval)
-	defer uploadCleanup.Stop()
+	return []duty{
+		// Lock expiry runs on the shortest interval because it is the only duty whose lateness
+		// a user feels directly: a lock nobody holds blocks every write to that file (RFC 4918
+		// §6.1), and the client that took it is already gone.
+		{name: "locks", interval: w.lockInterval, run: func(ctx context.Context) error {
+			n, err := w.ExpireLocks(ctx)
+			if err != nil {
+				return fmt.Errorf("expire locks: %w", err)
+			}
+			if n > 0 {
+				w.log.Info("expired locks", "count", n)
+			}
+			n, err = w.ExpireDownloadSessions(ctx)
+			if err != nil {
+				return fmt.Errorf("expire download sessions: %w", err)
+			}
+			if n > 0 {
+				w.log.Info("expired download sessions", "count", n)
+			}
+			return nil
+		}},
+		// The collector is the only thing that reclaims disk, so both its successes and its
+		// failures are published: a run that deletes nothing is normal, a run that errors means
+		// space is held that should have been freed. Recording only successes would make the
+		// error counter permanently zero and the alert on it dead.
+		{name: "blob-sweep", interval: w.sweepInterval, run: func(ctx context.Context) error {
+			n, err := w.SweepBlobs(ctx)
+			if w.metrics != nil {
+				w.metrics.ObserveBlobGC(n, err != nil)
+			}
+			if err != nil {
+				return fmt.Errorf("blob sweep: %w", err)
+			}
+			if n > 0 {
+				w.log.Info("collected orphaned blobs", "count", n)
+			}
+			return nil
+		}},
+		// A broken archiver does not surface anywhere else: the database keeps serving and the
+		// only visible symptom is pg_wal growing until the disk fills.
+		{name: "wal-archive", interval: w.sweepInterval, run: func(ctx context.Context) error {
+			w.sampleWALArchive(ctx)
+			return nil
+		}},
+		// The anchor tick is hourly, matching the head-age alert's own threshold: sampling more
+		// often would not page anyone sooner, and sampling less would leave the alert blind for
+		// most of the hour it claims to watch.
+		{name: "audit-anchor", interval: w.anchorInterval, run: func(ctx context.Context) error {
+			err := w.anchorOnce(ctx)
+			// The audit gauges are not part of anchoring: they must exist on a deployment with
+			// no anchor directory configured too, or the chain-stalled alert is dead by
+			// configuration rather than by threshold.
+			w.AuditHealth(ctx)
+			if err != nil {
+				return fmt.Errorf("audit anchoring: %w", err)
+			}
+			return nil
+		}},
+		// Integrity: read a sample of live blobs and compare to their addresses. Distinct from
+		// the sweep, which reclaims UNREFERENCED content — this looks for content that is
+		// referenced and WRONG, which the sweep cannot see by construction.
+		{name: "audit-scrub", interval: scrubEvery, run: func(ctx context.Context) error {
+			w.runScrub(ctx)
+			return nil
+		}},
+		{name: "jobs", interval: w.jobInterval, run: func(ctx context.Context) error {
+			// Before claiming, release leases whose worker died mid-job. Claiming would recover
+			// them anyway — an expired lease is claimable — so this is not what makes recovery
+			// work. It is the only place that can REPORT it, which is the difference between
+			// "the queue is busy" and "the queue is being lost".
+			w.reapExpiredJobLeases(ctx)
+			// A failure here is logged and the pass ends: the queue is durable, so a transient
+			// database error means the work waits rather than being lost.
+			n, err := w.ProcessJobs(ctx)
+			if err != nil {
+				return fmt.Errorf("job processing: %w", err)
+			}
+			if n > 0 {
+				w.log.Debug("processed jobs", "count", n)
+			}
+			return nil
+		}},
+		{name: "rate-limit-prune", interval: w.purgeInterval, run: func(ctx context.Context) error {
+			w.pruneRateLimitRows(ctx)
+			return nil
+		}},
+		// Share retention (SHARE-05 保留期限). Separate from PurgeTrash: this moves expired
+		// deliveries to the trash, and the trash window still applies before anything is
+		// destroyed.
+		{name: "share-retention", interval: w.purgeInterval, run: func(ctx context.Context) error {
+			w.expireRetained(ctx)
+			return nil
+		}},
+		// Partial uploads are invisible to every listing and cost storage until removed, but
+		// they are not urgent, so there is no reason for a faster tick.
+		{name: "upload-cleanup", interval: w.purgeInterval, run: func(ctx context.Context) error {
+			w.abortStaleUploads(ctx)
+			return nil
+		}},
+		{name: "purge", interval: w.purgeInterval, run: func(ctx context.Context) error {
+			var firstErr error
+			keep := func(err error) {
+				if err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
+			if res, err := w.PurgeTrash(ctx); err != nil {
+				keep(fmt.Errorf("trash purge: %w", err))
+			} else if res.Roots > 0 {
+				w.log.Info("purged expired trash",
+					"roots", res.Roots, "nodes", res.Nodes, "bytes", res.Bytes)
+			}
+			if n, err := w.ExpireVersions(ctx); err != nil {
+				keep(fmt.Errorf("version expiry: %w", err))
+			} else if n > 0 {
+				w.log.Info("expired old versions", "count", n)
+			}
+			// The byte cap runs after the age expiry: expiring by age first means the trim
+			// usually has nothing to do, and the two policies never fight over the same row.
+			if _, err := w.TrimVersionHistory(ctx); err != nil {
+				keep(fmt.Errorf("version history trim: %w", err))
+			}
+			return firstErr
+		}},
+	}
+}
 
+// Run blocks until the context is cancelled, then waits for in-flight passes to finish.
+//
+// Each duty runs in its own goroutine, so a slow blob sweep cannot delay lock expiry. The
+// wait at the end is what makes shutdown joined: returning while a purge was still writing
+// would kill it half-way through a transaction that the next start has to reason about.
+func (w *Worker) Run(ctx context.Context) {
 	w.log.Info("worker started",
 		"lock_interval", w.lockInterval, "sweep_interval", w.sweepInterval,
 		"purge_interval", w.purgeInterval,
 		"version_retention", w.versionRetention, "trash_retention", w.trashRetention)
 
 	if w.trashRetention <= 0 && w.versionRetention <= 0 {
-		// Say so loudly. "Retention is configured" and "retention does nothing"
-		// look identical from outside, and an operator who believes the second is
-		// the first discovers it when the disk fills.
+		// Say so loudly. "Retention is configured" and "retention does nothing" look identical
+		// from outside, and an operator who believes the second is the first discovers it when
+		// the disk fills.
 		w.log.Warn("no data retention is configured: trash and versions are kept forever",
 			"hint", "set limits.trash_retention_days and limits.version_retention_days")
 	}
 
-	// One pass at startup: a process that restarts more often than the interval would
-	// otherwise never anchor at all.
+	// One pass at startup: a process that restarts more often than the interval would otherwise
+	// never anchor at all.
 	if err := w.anchorOnce(ctx); err != nil {
 		w.log.Error("audit anchoring failed", "error", err)
 	}
-	// The audit gauges are not part of anchoring: they must exist on a deployment with
-	// no anchor directory configured too, or the chain-stalled alert is dead by
-	// configuration rather than by threshold.
 	w.AuditHealth(ctx)
 
+	w.runDuties(ctx, w.duties())
+}
+
+// runDuties starts one goroutine per duty and waits for all of them at shutdown.
+//
+// Split out from Run so a test can drive the real machinery — goroutines, the join, the
+// panic boundary — with a task it controls, instead of needing a store to make the real
+// duties do anything.
+func (w *Worker) runDuties(ctx context.Context, duties []duty) {
+	var wg sync.WaitGroup
+	for _, d := range duties {
+		if d.interval <= 0 {
+			// A zero interval means "not configured", not "as fast as possible".
+			continue
+		}
+		wg.Add(1)
+		go func(d duty) {
+			defer wg.Done()
+			w.loop(ctx, d)
+		}(d)
+	}
+
+	<-ctx.Done()
+	w.log.Info("worker stopping; waiting for in-flight passes")
+	wg.Wait()
+	w.log.Info("worker stopped")
+}
+
+// loop runs one duty until the context is cancelled.
+func (w *Worker) loop(ctx context.Context, d duty) {
+	t := time.NewTicker(d.interval)
+	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			w.log.Info("worker stopping")
 			return
-		case <-locks.C:
-			if n, err := w.ExpireLocks(ctx); err != nil {
-				w.log.Error("expire locks failed", "error", err)
-			} else if n > 0 {
-				w.log.Info("expired locks", "count", n)
-			}
-			if n, err := w.ExpireDownloadSessions(ctx); err != nil {
-				w.log.Error("expire download sessions failed", "error", err)
-			} else if n > 0 {
-				w.log.Info("expired download sessions", "count", n)
-			}
-		case <-scrubs.C:
-			// Integrity: read a sample of live blobs and compare to their addresses. Distinct
-			// from the sweep, which reclaims UNREFERENCED content — this looks for content that
-			// is referenced and WRONG, which the sweep cannot see by construction.
-			w.runScrub(ctx)
-		case <-sweeps.C:
-			n, err := w.SweepBlobs(ctx)
-			// The collector is the only thing that reclaims disk, so both its successes and its
-			// failures are worth publishing: a run that deletes nothing is normal, a run that
-			// errors means space is being held that should have been freed. Recording only
-			// successes would make the error counter permanently zero and the alert on it dead.
-			if w.metrics != nil {
-				w.metrics.ObserveBlobGC(n, err != nil)
-			}
-			if err != nil {
-				w.log.Error("blob sweep failed", "error", err)
-			} else if n > 0 {
-				w.log.Info("collected orphaned blobs", "count", n)
-			}
-		case <-walSample.C:
-			// A broken archiver does not surface anywhere else: the database keeps serving, the
-			// application keeps writing, and the only visible symptom is pg_wal growing until the
-			// disk fills. Sampling on its own timer is what turns that into an alert.
-			w.sampleWALArchive(ctx)
-		case <-anchors.C:
-			if err := w.anchorOnce(ctx); err != nil {
-				w.log.Error("audit anchoring failed", "error", err)
-			}
-			// The anchor tick is hourly, which matches the head-age alert's own
-			// threshold (3600s): sampling more often would not page anyone sooner,
-			// and sampling less often would make the alert blind for most of the
-			// hour it claims to watch.
-			w.AuditHealth(ctx)
-		case <-jobs.C:
-			// Before claiming, release leases whose worker died mid-job. Claiming would
-			// recover them anyway — an expired lease is claimable — so this is not what makes
-			// recovery work. It is the only place that can REPORT it: ReapExpiredLeases existed,
-			// was implemented on both backends and was called by no production path, so a
-			// deployment whose workers were dying mid-job had no signal at all. A rising count is
-			// the difference between "the queue is busy" and "the queue is being lost".
-			w.reapExpiredJobLeases(ctx)
-			// A failure here is logged and the loop continues: the queue is durable, so
-			// a transient database error means the work waits rather than being lost.
-			if n, err := w.ProcessJobs(ctx); err != nil {
-				w.log.Error("job processing failed", "error", err)
-			} else if n > 0 {
-				w.log.Debug("processed jobs", "count", n)
-			}
-		case <-ratePrune.C:
-			w.pruneRateLimitRows(ctx)
-		case <-retention.C:
-			// Share retention (SHARE-05 保留期限). Separate from PurgeTrash: this moves
-			// expired deliveries to the trash, and the trash window still applies before
-			// anything is destroyed.
-			w.expireRetained(ctx)
-		case <-uploadCleanup.C:
-			w.abortStaleUploads(ctx)
-		case <-purges.C:
-			if res, err := w.PurgeTrash(ctx); err != nil {
-				w.log.Error("trash purge failed", "error", err)
-			} else if res.Roots > 0 {
-				w.log.Info("purged expired trash",
-					"roots", res.Roots, "nodes", res.Nodes, "bytes", res.Bytes)
-			}
-			if n, err := w.ExpireVersions(ctx); err != nil {
-				w.log.Error("version expiry failed", "error", err)
-			} else if n > 0 {
-				w.log.Info("expired old versions", "count", n)
-			}
-			// The byte cap runs after the age expiry: expiring by age first means the trim usually
-			// has nothing to do, and the two policies never fight over the same row.
-			if _, err := w.TrimVersionHistory(ctx); err != nil {
-				w.log.Error("version history trim failed", "error", err)
-			}
+		case <-t.C:
+			w.pass(ctx, d)
 		}
+	}
+}
+
+// pass runs one iteration with a timeout and a panic boundary.
+//
+// The recover is the reason a single corrupt row can no longer take the process down: the
+// worker shares the process with the HTTP listener, so an unrecovered panic in a purge is an
+// outage for every user, not just a lost maintenance cycle.
+func (w *Worker) pass(ctx context.Context, d duty) {
+	if ctx.Err() != nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			w.log.Error("worker pass panicked; the process stays up and the pass is skipped",
+				"duty", d.name, "panic", r, "stack", string(debug.Stack()))
+		}
+	}()
+
+	limit := w.passTimeoutOr()
+	passCtx, cancel := context.WithTimeout(ctx, limit)
+	defer cancel()
+
+	if err := d.run(passCtx); err != nil {
+		// A cancelled pass is shutdown, not failure: the duty was interrupted on purpose and
+		// its next tick will see the same state.
+		if ctx.Err() != nil {
+			return
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			w.log.Error("worker pass exceeded its timeout; it will be retried",
+				"duty", d.name, "timeout", limit)
+			return
+		}
+		w.log.Error("worker pass failed", "duty", d.name, "error", err)
 	}
 }
 
