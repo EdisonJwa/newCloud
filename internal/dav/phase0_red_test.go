@@ -258,3 +258,74 @@ func TestPhase0BackfillMovesNewLiveBytes(t *testing.T) {
 			"The backfill moved a path a newer live node owns (G1/D3).", got.Code, got.Body.String())
 	}
 }
+
+// phase0MoveHook runs a competing request at the moment a delete starts moving content.
+//
+// Before the move, not after: the window this reproduces is "the delete decided, the writer
+// committed, and the delete's content move has not happened yet". Firing afterwards models a
+// different race — the writer arriving once the bytes are already gone — which is not the hazard.
+type phase0MoveHook struct {
+	layout.ContentStore
+	armed bool
+	fired bool
+	run   func()
+}
+
+func (c *phase0MoveHook) Move(ctx context.Context, src, dst layout.Node) error {
+	if c.armed {
+		c.armed = false
+		c.fired = true
+		c.run()
+	}
+	return c.ContentStore.Move(ctx, src, dst)
+}
+
+// TestPhase0ADeleteDoesNotMoveAConcurrentWritersBytes reproduces the remaining G1 window through
+// the real delete path rather than a simulated one.
+//
+// A DELETE resolves the node, then moves its content out of the live path, then switches the
+// namespace. A writer that commits between the resolution and the move has its bytes AT the live
+// path when the move runs — and the move is keyed on that path, so it takes the writer's bytes to
+// the reserved name. The delete then refuses (the row's validator no longer matches), which is
+// correct and useless: the refusal protects the metadata while the content has already walked.
+//
+// This is the same hazard the older reproduction describes with an explicit content move, reached
+// here by the code the product actually runs. It cannot be closed by ordering: whichever of the
+// two steps goes first, the other can be interleaved. It needs the operation journal (ADR-0013),
+// which records the intent before any byte moves so recovery can tell the writer's bytes from the
+// ones being retired.
+func TestPhase0ADeleteDoesNotMoveAConcurrentWritersBytes(t *testing.T) {
+	e := newTreeEnv(t)
+	if rec := e.do(t, http.MethodPut, e.davPath("raced.txt"),
+		strings.NewReader("the file being deleted"), nil); rec.Code != http.StatusCreated {
+		t.Fatalf("seed: %d", rec.Code)
+	}
+
+	hook := &phase0MoveHook{ContentStore: e.h.content}
+	var writerCode int
+	hook.run = func() {
+		writerCode = e.do(t, http.MethodPut, e.davPath("raced.txt"),
+			strings.NewReader("the writer's bytes"), nil).Code
+	}
+	e.h.content = hook
+	hook.armed = true
+
+	del := e.do(t, http.MethodDelete, e.davPath("raced.txt"), nil, nil)
+	if !hook.fired {
+		t.Fatal("the concurrent write was never injected; the test would prove nothing")
+	}
+	if writerCode != http.StatusCreated && writerCode != http.StatusNoContent {
+		t.Fatalf("the concurrent PUT was refused (%d); the interleaving did not happen", writerCode)
+	}
+	// The delete may succeed or be refused — either is acceptable. What is not acceptable is a
+	// successful write whose bytes are no longer readable.
+	if del.Code != http.StatusNoContent && del.Code != http.StatusPreconditionFailed {
+		t.Fatalf("DELETE = %d, want 204 or 412", del.Code)
+	}
+	got := e.do(t, http.MethodGet, e.davPath("raced.txt"), nil, nil)
+	if got.Code != http.StatusOK || got.Body.String() != "the writer's bytes" {
+		t.Fatalf("after a successful PUT during a delete, GET = %d %q, want 200 with the writer's "+
+			"bytes. The delete's content move took a path that no longer held its own file (G1).",
+			got.Code, got.Body.String())
+	}
+}
