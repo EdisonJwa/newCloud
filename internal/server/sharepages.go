@@ -41,6 +41,13 @@ const sharePageTimeout = time.Hour
 // browser showed raw JSON, because the shell is only served as the router's fallback for
 // paths no handler claims ??and this path is claimed.
 func (s *Server) handleSharePage(w http.ResponseWriter, r *http.Request) {
+	// A share URL is a capability in the path, and anything on the open web that links to it will
+	// be crawled unless told not to be: noindex keeps a public share out of search results, where
+	// the token would otherwise outlive the decision to share. Set here rather than in the global
+	// securityHeaders middleware, because the header describes THIS resource — the API and the
+	// shell both answer from this handler, and both carry it.
+	w.Header().Set("X-Robots-Tag", "noindex")
+
 	// A browser navigation sends Accept: text/html; fetch() and API clients do not.
 	if wantsHTML(r) {
 		s.serveAppShell(w, r)
@@ -439,6 +446,18 @@ func (s *Server) handleShareUpload(w http.ResponseWriter, r *http.Request) {
 	name := path.Base(header.Filename)
 	if name == "" || name == "." || name == "/" {
 		writeError(w, http.StatusBadRequest, "invalid_name", "the file needs a name")
+		return
+	}
+	// The store's own segment validator, before ANY storage write.
+	//
+	// ".." passes the three-way check above (path.Base keeps it), and every delivery step below —
+	// Content.Put, RecordUpload, CreateFile — costs the share something: an upload counts against
+	// the share's allowance the moment RecordUpload commits, and on the tree layout the Put
+	// publishes at the assembled path. A name the store would refuse at CreateFile must be
+	// refused before any of that happens, so a malformed delivery burns neither the counters nor
+	// the bytes.
+	if verr := layout.ValidateSegment(name); verr != nil {
+		writeError(w, http.StatusBadRequest, "invalid_name", "the file needs a usable name")
 		return
 	}
 

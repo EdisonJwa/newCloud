@@ -29,6 +29,8 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/EdisonJwa/newCloud/internal/config"
 	"github.com/EdisonJwa/newCloud/internal/password"
@@ -41,6 +43,88 @@ import (
 // timestamps behave like everything else's, and so an operator can see it in the user
 // list and disable it.
 const breakglassUsername = "breakglass"
+
+// failureThrottle is the in-process brute-force cap for one credential path.
+//
+// The server is single-process by design, so a mutex-protected map is a complete
+// limiter here the way it would not be for the share endpoints (which a second
+// replica would silently multiply). The shape and the numbers are the share-password
+// throttle's on purpose: same window, same allowance, so the two credential paths
+// cannot drift into one of them being the weak one.
+type failureThrottle struct {
+	mu    sync.Mutex
+	fails map[string][]time.Time
+}
+
+// newFailureThrottle builds an empty limiter.
+func newFailureThrottle() *failureThrottle {
+	return &failureThrottle{fails: map[string][]time.Time{}}
+}
+
+// allow reports whether this source may attempt the credential now.
+//
+// Eviction is lazy and whole-map: every check drops every entry older than the
+// window, so the map holds only sources that failed recently and an idle deployment's
+// limiter is empty. That is what keeps it from growing without bound.
+func (l *failureThrottle) allow(key string, now time.Time) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.evict(now)
+	return len(l.fails[key]) < store.PasswordMaxAttempts
+}
+
+// recordFailure counts one rejected credential for this source.
+func (l *failureThrottle) recordFailure(key string, now time.Time) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.fails[key] = append(l.fails[key], now)
+}
+
+// reset clears a source's count, after a successful authentication.
+//
+// A success proves the credential was presented correctly; the failures before it
+// were almost certainly the same person mistyping, and leaving them counted would
+// lock the operator out of the recovery path mid-incident.
+func (l *failureThrottle) reset(key string, now time.Time) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.evict(now)
+	delete(l.fails, key)
+}
+
+// evict drops every failure older than the window, across all sources.
+//
+// A failure counts through the whole window and stops counting only once it is
+// strictly older than it: the boundary instant itself is still inside the window.
+func (l *failureThrottle) evict(now time.Time) {
+	for key, times := range l.fails {
+		kept := times[:0]
+		for _, at := range times {
+			if now.Sub(at) <= store.PasswordWindow {
+				kept = append(kept, at)
+			}
+		}
+		if len(kept) == 0 {
+			delete(l.fails, key)
+			continue
+		}
+		l.fails[key] = kept
+	}
+}
+
+// breakglassFails is the process-wide cap on break-glass password guessing.
+var breakglassFails = newFailureThrottle()
+
+// ResetBreakglassThrottleForTest clears the in-process failure counters.
+//
+// Exported because the throttle deliberately outlives one request, which means it
+// also outlives one test: without a reset, one test's wrong passwords would leak
+// into the next test's allowance and failures would depend on file order.
+func ResetBreakglassThrottleForTest() {
+	breakglassFails.mu.Lock()
+	breakglassFails.fails = map[string][]time.Time{}
+	breakglassFails.mu.Unlock()
+}
 
 // handleBreakglassLogin authenticates the local administrator.
 //
@@ -86,10 +170,24 @@ func (s *Server) handleBreakglassLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Brute-force cap, checked BEFORE the KDF: the sixth attempt inside the window is
+	// refused without running Argon2, so a guess flood costs the attacker their own
+	// request time rather than the server's. Keyed on the peer address — the same
+	// RemoteAddr the CIDR check uses, deliberately not a forwarded header.
+	ip := clientIP(r)
+	now := time.Now()
+	if !breakglassFails.allow(ip, now) {
+		s.auditBreakglass(r, body.Username, "throttled")
+		writeError(w, http.StatusTooManyRequests, "rate_limited",
+			"too many failed attempts; try again later")
+		return
+	}
+
 	ok, err := s.verifyBreakglassPassword(body.Password)
 	if err != nil {
 		// A malformed or unreadable hash file is an operator error, and it must be
 		// loud: silently refusing every login would look like a wrong password.
+		// It is not a guess, so it does not consume the throttle.
 		s.deps.Log.Error("break-glass hash could not be read; local login is unavailable",
 			"file", cfg.LocalAdmin.PasswordFile, "error", err)
 		s.auditBreakglass(r, body.Username, "hash_unreadable")
@@ -98,10 +196,14 @@ func (s *Server) handleBreakglassLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !ok {
+		breakglassFails.recordFailure(ip, now)
 		s.auditBreakglass(r, body.Username, "bad_password")
 		writeError(w, http.StatusUnauthorized, "login_failed", "invalid credentials")
 		return
 	}
+	// A correct password ends the guessing: whatever came before it was almost
+	// certainly the operator mistyping their own recovery credential.
+	breakglassFails.reset(ip, now)
 
 	// Provision or find the account and start the session.
 	var user store.User
@@ -111,8 +213,9 @@ func (s *Server) handleBreakglassLogin(w http.ResponseWriter, r *http.Request) {
 			QuotaBytes: s.initialQuota(ctx),
 			// The issuer string marks this identity as local rather than IdP-backed.
 			// It shares the unique (issuer, subject) key with everything else, so a
-			// real IdP subject can never collide with it.
-			Issuer:      "local://breakglass",
+			// real IdP subject can never collide with it. The store recognises this
+			// issuer and writes is_breakglass with the row.
+			Issuer:      store.BreakglassIssuer,
 			Subject:     breakglassUsername,
 			Username:    breakglassUsername,
 			Email:       "",
@@ -137,6 +240,18 @@ func (s *Server) handleBreakglassLogin(w http.ResponseWriter, r *http.Request) {
 		s.deps.Log.Error("break-glass provisioning failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal", "could not start a session")
 		return
+	}
+
+	// Stamp the row itself as break-glass. The revalidation exemption reads
+	// users.is_breakglass — a column nothing used to write, which made the exemption
+	// dead code and the break-glass session subject to an IdP confirmation window it
+	// can never satisfy (it has no IdP to confirm against). It is its own small
+	// transaction because the provisioning transaction has already committed; if this
+	// fails the next break-glass login sets the flag, which is the next time anything
+	// reads it.
+	if merr := store.MarkBreakglassUser(r.Context(), s.deps.Meta, user.ID); merr != nil {
+		s.deps.Log.Warn("break-glass row could not be flagged; revalidation exemption may not apply",
+			"user", user.ID.String(), "error", merr)
 	}
 
 	// §3.3 requires "使用后告警" — an alert after use. An audit row cannot be alerted on from a

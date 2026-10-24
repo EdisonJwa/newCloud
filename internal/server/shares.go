@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -174,9 +175,33 @@ func (s *Server) handleShareCreate(w http.ResponseWriter, r *http.Request) {
 		kind = store.ShareLink
 	}
 	switch kind {
-	case store.ShareLink, store.ShareEmail, store.ShareRequest:
+	case store.ShareLink, store.ShareRequest:
+	case store.ShareEmail:
+		// An email share exists to mail verification codes. Without a transport every recipient
+		// request would fail at the delivery step — previously AFTER the share was created, so the
+		// owner held a link that could never work and did not know it until a recipient tried.
+		// Refusing at creation turns the misconfiguration into one clear error at the moment it
+		// can still be fixed.
+		if s.deps.Mailer == nil {
+			writeError(w, http.StatusServiceUnavailable, "mail_unavailable",
+				"email shares need a configured mail transport; this deployment has none")
+			return
+		}
 	default:
 		writeError(w, http.StatusBadRequest, "invalid_kind", "kind must be link, email or request")
+		return
+	}
+
+	// An upload-accepting share must target a DIRECTORY.
+	//
+	// A request share is create-only by definition, and any kind can be made upload-accepting by
+	// asking for the `create` permission; pointed at a FILE, the upload route then filed every
+	// delivery UNDER the file as its parent — a node whose ParentID named a non-directory, which
+	// no listing could reach and the quota counted anyway. Download-only links on files are the
+	// normal case and stay exactly as they are.
+	if !node.IsDir() && (kind == store.ShareRequest || slices.Contains(body.Permissions, "create")) {
+		writeError(w, http.StatusBadRequest, "invalid_target",
+			"a share that accepts uploads must target a folder")
 		return
 	}
 

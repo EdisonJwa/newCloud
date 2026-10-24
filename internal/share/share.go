@@ -42,6 +42,19 @@ type Service struct {
 	// argonParams are deliberately tunable so tests can use cheap settings while
 	// production pays for real ones.
 	argonParams ArgonParams
+	// argonGate bounds how many Argon2 evaluations this service may run at once.
+	//
+	// A verification allocates the full hash memory (64 MiB with production
+	// parameters), so an attacker who can fire password guesses concurrently is not
+	// merely burning CPU but allocating: a few hundred parallel guesses would request
+	// tens of gibibytes before the first of them finished. The channel is the
+	// queue: attempts beyond the cap wait, they are not refused — the throttle above
+	// is what refuses, and this only paces the work that remains.
+	argonGate chan struct{}
+	// compareHash is the KDF entry point, indirected for the same reason `now` is:
+	// the property "at most cap verifications run concurrently" is cheapest to
+	// observe by substituting a fake that counts, rather than by timing a real KDF.
+	compareHash func(secret string, stored []byte, p ArgonParams) bool
 }
 
 // ArgonParams configures password hashing.
@@ -57,9 +70,24 @@ func DefaultArgon() ArgonParams { return password.Default() }
 // TestArgon are intentionally weak parameters for fast tests.
 func TestArgon() ArgonParams { return password.Test() }
 
+// maxArgonVerifications is how many Argon2 evaluations may run concurrently.
+//
+// Package constant rather than a limits key on purpose: the right number follows from
+// the hash memory the deployment is willing to multiply (8 × 64 MiB ≈ half a gibibyte
+// peak), not from a limit an operator would tune per deployment. At production cost a
+// verification takes tens of milliseconds, so queuing behind the cap costs a burst of
+// visitors fractions of a second.
+const maxArgonVerifications = 8
+
 // New builds the service.
 func New(meta store.Store, params ArgonParams) *Service {
-	return &Service{meta: meta, now: time.Now, argonParams: params}
+	return &Service{
+		meta:        meta,
+		now:         time.Now,
+		argonParams: params,
+		argonGate:   make(chan struct{}, maxArgonVerifications),
+		compareHash: password.Verify,
+	}
 }
 
 // NewShare describes a share to create.
@@ -311,38 +339,56 @@ func (s *Service) gate(sh store.Share) error {
 }
 
 // VerifyPassword checks a presented password in constant time at the KDF level.
+//
+// The count read FAILS CLOSED.
+//
+// The previous version discarded the count's error, leaving `failures` at zero so the comparison was
+// false and the attempt proceeded. A storage fault therefore disabled the attempt cap
+// completely — and the worse the fault, the longer the window in which guessing was free.
+// Fail-open is the wrong direction for a control that exists to bound guessing: if the server
+// cannot tell whether the cap is reached, it must not assume it is not.
+//
+// The error is returned rather than translated into a wrong-password refusal, so a client does
+// not get told "wrong password" when the truth is "cannot tell", and so the operator sees a
+// fault instead of a suspicious burst of failures.
 func (s *Service) VerifyPassword(ctx context.Context, sh store.Share, password string) error {
 	if !sh.NeedsPassword() {
 		return nil
 	}
 
-	// Throttle BEFORE comparing the hash (SHARE-02 尝试上限).
+	// Throttle BEFORE comparing the hash (SHARE-02 尝试上限), and record the attempt
+	// INSIDE THE SAME transaction that reads the count.
 	//
-	// Checking the limit first is what makes it hold under parallel guessing: a caller that
-	// counted only after a failure would leave a window in which concurrent attempts all observed
-	// "under the limit". Recording the attempt first, then refusing when the window is full, means
-	// the sixth guess in fifteen minutes is refused regardless of whether it would have been right.
+	// Recording BEFORE the hash comparison is what makes the cap hold under parallel guessing: a
+	// caller that recorded only failures after the fact would leave a window in which concurrent
+	// attempts all observed "under the limit". Here the attempt is recorded optimistically as a
+	// failure, before the KDF runs, and a comparison that succeeds records its success afterwards.
+	// Counting and recording in one transaction is what closes the read-then-record gap on the
+	// in-memory backend entirely, and shrinks it to a single statement's width on PostgreSQL.
 	//
-	// The count read FAILS CLOSED.
-	//
-	// The previous version discarded this error, leaving `failures` at zero so the comparison was
-	// false and the attempt proceeded. A storage fault therefore disabled the attempt cap
-	// completely — and the worse the fault, the longer the window in which guessing was free.
-	// Fail-open is the wrong direction for a control that exists to bound guessing: if the server
-	// cannot tell whether the cap is reached, it must not assume it is not.
-	//
-	// The error is returned rather than translated into a wrong-password refusal, so a client does
-	// not get told "wrong password" when the truth is "cannot tell", and so the operator sees a
-	// fault instead of a suspicious burst of failures.
-	var failures int
+	// The cost of the optimistic row is deliberate and bounded: a SUCCESSFUL verification
+	// leaves one counted failure behind, so roughly five verifications inside the window will
+	// trip the cap. A share password is verified once per visitor per two-hour page session,
+	// so a link that trips the cap through successes alone is one whose traffic pattern is
+	// indistinguishable from a guessing burst — the same answer either way is the point of a
+	// rolling cap, and the window expires.
+	var throttled bool
 	if cerr := s.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
 		n, nerr := tx.PasswordFailureCount(ctx, sh.ID, store.PasswordWindow)
-		failures = n
-		return nerr
+		if nerr != nil {
+			return nerr
+		}
+		if n >= store.PasswordMaxAttempts {
+			throttled = true
+			return nil
+		}
+		// Optimistic failure: a crash between this write and the comparison must not
+		// silently refund an attempt.
+		return tx.RecordPasswordAttempt(ctx, sh.ID, "", false)
 	}); cerr != nil {
 		return cerr
 	}
-	if failures >= store.PasswordMaxAttempts {
+	if throttled {
 		_ = s.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
 			return tx.Audit(ctx, store.AuditEntry{
 				ActorKind: "anonymous", Action: "share.password.verify.throttled",
@@ -352,23 +398,35 @@ func (s *Service) VerifyPassword(ctx context.Context, sh store.Share, password s
 		return store.ErrSharePasswordThrottled
 	}
 
-	ok := s.checkPassword(password, sh.PasswordHash)
-	_ = s.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
-		return tx.RecordPasswordAttempt(ctx, sh.ID, "", ok)
-	})
+	// The KDF runs under the process-wide gate, so a burst of parallel guesses paces
+	// its own memory allocation instead of multiplying it.
+	ok := func() bool {
+		if s.argonGate != nil {
+			s.argonGate <- struct{}{}
+			defer func() { <-s.argonGate }()
+		}
+		return s.compareHash(password, sh.PasswordHash, s.argonParams)
+	}()
 
-	if !ok {
-		// Failure is audited: a burst of these on one share is how brute forcing
-		// looks, and it is the only signal the owner has.
+	if ok {
+		// Correct the optimistic failure with the success row. The counted failure
+		// from the optimistic write stands — see the comment above for why that is
+		// the accepted cost of a cap that holds under parallel guessing.
 		_ = s.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
-			return tx.Audit(ctx, store.AuditEntry{
-				ActorKind: "anonymous", Action: "share.password.verify.failure",
-				TargetKind: "share", TargetID: sh.ID.String(), Result: "denied",
-			})
+			return tx.RecordPasswordAttempt(ctx, sh.ID, "", true)
 		})
-		return store.ErrSharePassword
+		return nil
 	}
-	return nil
+
+	// Failure is audited: a burst of these on one share is how brute forcing
+	// looks, and it is the only signal the owner has.
+	_ = s.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		return tx.Audit(ctx, store.AuditEntry{
+			ActorKind: "anonymous", Action: "share.password.verify.failure",
+			TargetKind: "share", TargetID: sh.ID.String(), Result: "denied",
+		})
+	})
+	return store.ErrSharePassword
 }
 
 // RecordDownload was removed.
@@ -510,6 +568,11 @@ func (s *Service) HashPassword(secret string) ([]byte, error) {
 	return password.Hash(secret, s.argonParams)
 }
 
+// checkPassword verifies a secret against a stored hash.
+//
+// Kept for callers that verify outside the throttle path; VerifyPassword routes through
+// compareHash under the argonGate instead, because the cap must pace exactly the
+// evaluations a visitor triggers.
 func (s *Service) checkPassword(secret string, stored []byte) bool {
 	return password.Verify(secret, stored, s.argonParams)
 }

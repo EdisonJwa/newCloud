@@ -75,10 +75,16 @@ func (s *Server) handleShareVerify(w http.ResponseWriter, r *http.Request) {
 
 // handleShareRecipientRequest sends a verification code to an invited address.
 //
-// It always answers 202 with no detail. Whether an address was invited, already
+// It answers 202 with no detail about the ADDRESS. Whether an address was invited, already
 // verified, or never heard of must not be observable here: this endpoint accepts
-// unauthenticated input of arbitrary addresses, so any distinction turns it into a way
-// to test whether a given person was invited to a given share.
+// unauthenticated input of arbitrary addresses, so any per-address distinction turns it into a
+// way to test whether a given person was invited to a given share.
+//
+// What it must NOT claim is delivery that cannot happen. With no mail transport configured the
+// first version generated a code, logged a warning nobody at the browser could see, and answered
+// `sent: true` — the recipient sat at "check your inbox" forever, and the owner believed the
+// link worked. That is a 503: the request is well-formed, the deployment is missing a dependency,
+// and retrying after the operator configures delivery will succeed.
 func (s *Server) handleShareRecipientRequest(w http.ResponseWriter, r *http.Request) {
 	token := chiURLParam(r, "token")
 
@@ -98,6 +104,13 @@ func (s *Server) handleShareRecipientRequest(w http.ResponseWriter, r *http.Requ
 		// Not an email share: telling the caller is harmless and saves a confusing
 		// "check your inbox" for a link that never sends anything.
 		writeError(w, http.StatusBadRequest, "not_email_share", "this link does not use email verification")
+		return
+	}
+	// Checked before the code is generated, so a broken deployment never mints codes it cannot
+	// deliver (each one is a live credential sitting in the database).
+	if s.deps.Mailer == nil {
+		writeError(w, http.StatusServiceUnavailable, "mail_unavailable",
+			"no mail transport is configured, so a verification code cannot be delivered")
 		return
 	}
 

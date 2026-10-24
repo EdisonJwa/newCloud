@@ -2,6 +2,9 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"errors"
 	"net/http"
 	"strings"
@@ -56,7 +59,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	// Next is restricted to same-site paths: an open redirect after login is a
 	// phishing primitive.
 	next := r.URL.Query().Get("next")
-	if !strings.HasPrefix(next, "/") || strings.HasPrefix(next, "//") {
+	if !isSameSitePath(next) {
 		next = "/"
 	}
 	http.SetCookie(w, &http.Cookie{
@@ -95,7 +98,10 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	stateCookieVal, err := r.Cookie(stateCookie)
-	if err != nil || stateCookieVal.Value != state[0] {
+	// Constant time, like the nonce comparison below: the state is not secret once
+	// it has been used, but the comparison is free and the habit should not depend
+	// on remembering which cookie values are worth the care.
+	if err != nil || subtle.ConstantTimeCompare([]byte(stateCookieVal.Value), []byte(state[0])) != 1 {
 		writeError(w, http.StatusBadRequest, "bad_state", "state mismatch")
 		return
 	}
@@ -150,6 +156,15 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 	// The existence check is a separate read because the policy's answer depends on
 	// whether this identity is new, and an existing account must never be re-evaluated:
 	// approval is a one-time event.
+	//
+	// The same transaction also decides whether this login would CLAIM a pre-provisioned
+	// account by username (the store's byName fallback). That claim is only allowed when the
+	// IdP's address is verified and matches the account's stored email exactly; the check
+	// lives here, before the upsert, so the refusal is the same identity_conflict the store
+	// itself answers — and so the in-memory backend (tests, pre-database wiring) enforces
+	// the identical rule, not only PostgreSQL.
+	storeEmail := effectiveLoginEmail(claims.Email, claims.EmailVerified)
+	claimRefused := false
 	existing := false
 	if err := s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
 		_, uerr := tx.UserByIdPSubject(ctx, s.deps.Config.Auth.Issuer, claims.Subject)
@@ -158,7 +173,8 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 			return nil
 		}
 		if uerr == store.ErrNotFound {
-			return nil
+			// New identity. If a username-claim is on the table, it must be earned.
+			return s.checkClaimEligibility(ctx, tx, claims, storeEmail, &claimRefused)
 		}
 		return uerr
 	}); err != nil {
@@ -167,7 +183,19 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	decision := s.decideJIT(existing, claims.Email)
+	if claimRefused {
+		// Same answer the store gives for a subject mismatch: the address cannot be
+		// attached to that account, and the attempt is on the audit trail.
+		s.deps.Log.Warn("login refused: identity conflict",
+			"email", claims.Email, "subject", claims.Subject)
+		s.auditLoginFailure(r, claims.Email, "identity_conflict")
+		writeError(w, http.StatusForbidden, "identity_conflict",
+			"this email address is already associated with another account; "+
+				"an administrator must resolve it")
+		return
+	}
+
+	decision := s.decideJIT(existing, claims.Email, claims.EmailVerified)
 	if !decision.Allowed() {
 		s.auditLoginFailure(r, claims.Email, "provisioning_denied")
 		s.deps.Log.Warn("login refused by provisioning policy",
@@ -186,10 +214,15 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 	var roleChange store.RoleChange
 	err = s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
 		u, uerr := tx.UpsertIdPUser(ctx, store.UpsertUser{
-			Issuer:      s.deps.Config.Auth.Issuer,
-			Subject:     claims.Subject,
-			Username:    sanitiseUsername(claims.Username, claims.Email, claims.Subject),
-			Email:       claims.Email,
+			Issuer:  s.deps.Config.Auth.Issuer,
+			Subject: claims.Subject,
+			// storeEmail is empty when the IdP marked the address unverified, so an
+			// explicitly unverified address can neither claim an account by email,
+			// collide with the UNIQUE email column, nor be copied onto an existing
+			// row. It falls back to the subject-based identity (ID-01: (iss, sub) is
+			// the key; email is never the key).
+			Username:    sanitiseUsername(claims.Username, storeEmail, claims.Subject),
+			Email:       storeEmail,
 			DisplayName: claims.Name,
 			Role:        string(role),
 			QuotaBytes:  s.initialQuota(ctx),
@@ -361,7 +394,7 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	next := "/"
-	if c, err := r.Cookie("__Host-wc_next"); err == nil && strings.HasPrefix(c.Value, "/") && !strings.HasPrefix(c.Value, "//") {
+	if c, err := r.Cookie("__Host-wc_next"); err == nil && isSameSitePath(c.Value) {
 		next = c.Value
 	}
 	http.Redirect(w, r, next, http.StatusFound)
@@ -452,6 +485,86 @@ func (s *Server) auditLoginFailure(r *http.Request, email, reason string) {
 	})
 }
 
+// isSameSitePath reports whether a post-login redirect target stays on this origin.
+//
+// The historical check refused anything not starting with "/" and anything starting
+// with "//". That misses "/\evil.com": browsers normalise a backslash to a slash
+// before resolving, so the URL after the second character is parsed as an authority
+// and the login lands on an attacker's host. The rule is deliberately stricter than
+// the minimum — ANY backslash disqualifies the target, and so does a second
+// character of "/" or "\" — because a same-origin redirect has no legitimate use for
+// either, and a lenient parse of ambiguous input is exactly how the last one slipped
+// through.
+func isSameSitePath(p string) bool {
+	if !strings.HasPrefix(p, "/") {
+		return false
+	}
+	if strings.HasPrefix(p, "//") {
+		return false
+	}
+	if len(p) > 1 && (p[1] == '/' || p[1] == '\\') {
+		return false
+	}
+	return !strings.ContainsRune(p, '\\')
+}
+
+// effectiveLoginEmail returns the address this login may store, match against
+// accounts, and satisfy policy with.
+//
+// The IdP's email_verified claim is parsed as a pointer: nil means the IdP did not
+// send the claim at all, and those deployments keep the historical behaviour — the
+// address is used as before (ID-01 never makes email the account key, so the trust
+// placed in it is bounded). An EXPLICIT false is different: the IdP has said the
+// address was not proven, so acting on it would let whoever controls the claim
+// (not the mailbox) bind a victim's address to their own identity. Such an address
+// is treated as absent everywhere an email would confer something: the JIT domain
+// allow-list, the UNIQUE email column, and the pre-provisioned-account claim.
+func effectiveLoginEmail(email string, verified *bool) string {
+	if verified != nil && !*verified {
+		return ""
+	}
+	return email
+}
+
+// checkClaimEligibility refuses a login that would otherwise CLAIM a pre-provisioned
+// account it has not earned (ID-01, ID-09).
+//
+// The store's byName fallback lets a first-time identity adopt the account whose
+// username matches, which is how an administrator pre-creates accounts. The defect:
+// whichever identity first produced the same sanitiseUsername output claimed the row,
+// verified address or not. The rule now: the claim is allowed only when the IdP
+// asserted an address that is not explicitly unverified (effectiveLoginEmail blanks
+// those) AND it matches the account's stored address case-insensitively. A
+// username-only collision refuses with the same identity_conflict answer the store
+// uses for a subject mismatch, and the caller writes the login-failure audit row.
+//
+// This mirrors the rule lookupIdPUser enforces inside the store. It is duplicated at
+// this layer on purpose: the check must run BEFORE the upsert (so nothing is bound
+// and the refusal is observable in the audit trail), and the in-memory backend must
+// behave exactly like PostgreSQL — "works in tests, differs in production" is the
+// divergence this codebase refuses to ship.
+func (s *Server) checkClaimEligibility(ctx context.Context, tx store.Tx,
+	claims *auth.Claims, storeEmail string, refused *bool) error {
+
+	candidate := sanitiseUsername(claims.Username, storeEmail, claims.Subject)
+	u, err := tx.UserByUsername(ctx, candidate)
+	if err != nil {
+		// No such account: nothing to claim, the login provisions normally.
+		return nil
+	}
+	if u.IdPIssuer != "" || u.IdPSubject != "" {
+		// Already bound: the store's own subject-mismatch handling answers this.
+		return nil
+	}
+	if storeEmail != "" && strings.EqualFold(u.Email, storeEmail) {
+		// The identity presents the account's own verified address: the claim is the
+		// documented path and proceeds.
+		return nil
+	}
+	*refused = true
+	return nil
+}
+
 // sanitiseUsername produces a namespace segment from IdP data.
 //
 // It falls back through username → email local part → subject hash, because the
@@ -467,7 +580,23 @@ func sanitiseUsername(username, email, subject string) string {
 	}
 	if candidate == "" {
 		// A short, stable, collision-resistant fallback derived from the subject.
-		candidate = "u" + strings.ReplaceAll(subject, "-", "")[:12]
+		//
+		// The dash-stripped subject is clamped, not sliced: an IdP is free to send a
+		// sub shorter than the 12 bytes the old expression assumed, and a slice past
+		// the end panics — turning that identity's every login into a 500, forever.
+		trimmed := strings.ReplaceAll(subject, "-", "")
+		if len(trimmed) > 12 {
+			trimmed = trimmed[:12]
+		}
+		if trimmed == "" {
+			// Empty or all-dashes subject: there is nothing to truncate, so derive
+			// the segment from a hash instead. Deterministic, so the same identity
+			// keeps the same namespace across logins.
+			sum := sha256.Sum256([]byte(subject))
+			candidate = "u" + hex.EncodeToString(sum[:])[:12]
+		} else {
+			candidate = "u" + trimmed
+		}
 	}
 
 	var b strings.Builder

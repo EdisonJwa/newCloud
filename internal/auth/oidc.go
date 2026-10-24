@@ -76,13 +76,19 @@ func NewProvider(ctx context.Context, cfg config.Config) (*Provider, error) {
 // key. preferred_username and email can be edited in the IdP and are therefore
 // display data, not identity.
 type Claims struct {
-	Subject   string
-	Username  string
-	Email     string
-	Name      string
-	Groups    []string
-	IssuedAt  time.Time
-	ExpiresAt time.Time
+	Subject  string
+	Username string
+	Email    string
+	// EmailVerified is the IdP's email_verified claim. Pointer on purpose: nil means
+	// the IdP did not send the claim, true means it vouched for the address, and
+	// false means it explicitly did NOT — a distinction a plain bool collapses, and
+	// the callers (JIT allow-list, account binding) must be able to treat the third
+	// case as "no usable address" rather than as either of the other two.
+	EmailVerified *bool
+	Name          string
+	Groups        []string
+	IssuedAt      time.Time
+	ExpiresAt     time.Time
 }
 
 // AuthCodeURL returns the redirect target and sets the state and PKCE verifier
@@ -151,7 +157,7 @@ func (p *Provider) Exchange(ctx context.Context, code, verifier, expectedNonce s
 	var claims struct {
 		PreferredUsername string   `json:"preferred_username"`
 		Email             string   `json:"email"`
-		EmailVerified     bool     `json:"email_verified"`
+		EmailVerified     *bool    `json:"email_verified"`
 		Name              string   `json:"name"`
 		Groups            []string `json:"groups"`
 	}
@@ -160,13 +166,14 @@ func (p *Provider) Exchange(ctx context.Context, code, verifier, expectedNonce s
 	}
 
 	return &Claims{
-		Subject:   idToken.Subject,
-		Username:  claims.PreferredUsername,
-		Email:     claims.Email,
-		Name:      claims.Name,
-		Groups:    claims.Groups,
-		IssuedAt:  idToken.IssuedAt,
-		ExpiresAt: idToken.Expiry,
+		Subject:       idToken.Subject,
+		Username:      claims.PreferredUsername,
+		Email:         claims.Email,
+		EmailVerified: claims.EmailVerified,
+		Name:          claims.Name,
+		Groups:        claims.Groups,
+		IssuedAt:      idToken.IssuedAt,
+		ExpiresAt:     idToken.Expiry,
 	}, nil
 }
 

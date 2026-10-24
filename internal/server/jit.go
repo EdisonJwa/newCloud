@@ -47,12 +47,18 @@ func (d jitDecision) Allowed() bool { return d.Existing || d.Provision }
 // It is a pure function of the config and the claims so it can be tested directly: the
 // interesting cases are all "what happens to this identity", not "what does the HTTP
 // handler do with it".
-func (s *Server) decideJIT(existing bool, email string) jitDecision {
+//
+// emailVerified is the IdP's email_verified claim; nil means the IdP did not send one.
+// An explicitly UNVERIFIED address does not satisfy the domain allow-list: the claim
+// "this address belongs to the permitted tenant" is exactly the thing the IdP declined
+// to vouch for. It is treated as absent here — an IdP that omits the claim keeps the
+// historical behaviour, and a deployment with no allow-list is unaffected either way.
+func (s *Server) decideJIT(existing bool, email string, emailVerified *bool) jitDecision {
 	cfg := s.deps.Config.Auth.JIT
 
 	// Domain gate first: it applies even to a first-time account in any mode, and it is
 	// cheaper to reason about than the mode interaction.
-	if !emailDomainAllowed(email, cfg.AllowedDomains) {
+	if !emailDomainAllowed(effectiveLoginEmail(email, emailVerified), cfg.AllowedDomains) {
 		return jitDecision{
 			Existing: existing,
 			Refusal:  "email domain is not permitted for this deployment",

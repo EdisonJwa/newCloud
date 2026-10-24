@@ -39,6 +39,15 @@ var (
 	ErrNotRecipient = errors.New("share: not a recipient of this share")
 	// ErrAlreadyVerified: the address has already proven ownership.
 	ErrAlreadyVerified = errors.New("share: recipient already verified")
+	// ErrRecipientCodeRateLimited: the address has been sent the maximum number of
+	// codes inside the window.
+	//
+	// Exported and distinct from ErrNotRecipient on purpose: issuing codes sends
+	// email, and the handler that wires this error should answer 429 (as it already
+	// does for a throttled share password) rather than the opaque refusal a
+	// non-recipient gets. The distinction is safe for the same reason the password
+	// throttle's is — the caller only reached it by naming a share that exists.
+	ErrRecipientCodeRateLimited = errors.New("share: too many verification codes requested")
 )
 
 // SetTicketIssuer gives the service the ability to mint and verify recipient codes.
@@ -61,29 +70,60 @@ func RequiresRecipient(sh store.Share) bool {
 // already says so. Matching case-sensitively would reject a legitimate visitor for a
 // reason they cannot see.
 func (s *Service) ResolveRecipient(ctx context.Context, sh store.Share, email string) (store.ShareRecipient, error) {
+	rec, err := s.resolveRecipientQuiet(ctx, sh, email)
+	if err != nil {
+		if errors.Is(err, ErrNotRecipient) {
+			s.auditDenied(ctx, sh, email, recDeniedReason(rec))
+		}
+		return store.ShareRecipient{}, err
+	}
+	return rec, nil
+}
+
+// resolveRecipientQuiet answers the invitation check without writing anything.
+//
+// ResolveRecipient is its audible wrapper: same verdict, plus the denial audit row.
+// The split exists for the rate-limited path, which must still answer the question
+// ("was this address invited?") while the row the answer used to cost is exactly what
+// the limit exists to stop.
+func (s *Service) resolveRecipientQuiet(ctx context.Context, sh store.Share, email string) (store.ShareRecipient, error) {
 	email, err := normaliseEmail(email)
 	if err != nil {
 		return store.ShareRecipient{}, ErrNotRecipient
 	}
 
 	var found store.ShareRecipient
+	var missing bool
 	err = s.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
 		r, rerr := tx.RecipientFor(ctx, sh.ID, email)
+		if errors.Is(rerr, store.ErrNotFound) {
+			missing = true
+			return nil
+		}
+		if rerr != nil {
+			return rerr
+		}
 		found = r
-		return rerr
+		return nil
 	})
 	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			s.auditDenied(ctx, sh, email, "not_invited")
-			return store.ShareRecipient{}, ErrNotRecipient
-		}
 		return store.ShareRecipient{}, err
 	}
-	if found.RevokedAt != nil {
-		s.auditDenied(ctx, sh, email, "revoked")
+	if missing {
 		return store.ShareRecipient{}, ErrNotRecipient
 	}
+	if found.RevokedAt != nil {
+		return found, ErrNotRecipient
+	}
 	return found, nil
+}
+
+// recDeniedReason names why an address was refused, for the denial audit row.
+func recDeniedReason(rec store.ShareRecipient) string {
+	if rec.RevokedAt != nil {
+		return "revoked"
+	}
+	return "not_invited"
 }
 
 // IssueRecipientCode creates a one-time verification code for an invited address.
@@ -96,18 +136,40 @@ func (s *Service) ResolveRecipient(ctx context.Context, sh store.Share, email st
 // SHARE-03: knowing the link is not being the recipient. The code is bound to the address the owner
 // invited, sent to it, and checked against it, so forwarding the URL does not turn a stranger into the
 // invitee — and VerifyRecipientCode counts failures per (share, address), not per link.
+//
+// Issuance itself is rate limited per (share, address) (SHARE-02, mail-bomb half): each code is an
+// outbound email the visitor triggers, so an unbounded requester could turn this endpoint into a
+// spam cannon pointed at the invitee — or at the audit log, which the invited/denied rows below are
+// part of. When the limit is in force the typed error
+// share.ErrRecipientCodeRateLimited is returned and NOTHING downstream runs: no ticket, no email,
+// no audit row. The check lives here rather than in the handler because the handler must learn
+// nothing a wrong address does not already tell it.
 func (s *Service) IssueRecipientCode(ctx context.Context, sh store.Share, email string) (string, error) {
 	if s.tickets == nil {
 		return "", errors.New("share: email verification is not configured")
 	}
 
-	rec, err := s.ResolveRecipient(ctx, sh, email)
+	email, err := normaliseEmail(email)
 	if err != nil {
+		return "", ErrNotRecipient
+	}
+
+	// The rate gate comes first, before the invitation check: both the invited audit
+	// row and the denied audit row inside ResolveRecipient are things a requester can
+	// trigger, so both are bounded by the same (share, address) allowance.
+	//
+	// When the allowance is gone the answers stay typed — a stranger's probe still reads
+	// "not invited", so the gate does not become an invited-or-not oracle — but nothing
+	// is minted and nothing is written: the codes and the rows were the abuse channel,
+	// and a limit that kept spending them would only meter it.
+	if err := s.limitRecipientCodeIssue(ctx, sh, email); err != nil {
+		if _, qerr := s.resolveRecipientQuiet(ctx, sh, email); qerr != nil {
+			return "", qerr
+		}
 		return "", err
 	}
-	// ResolveRecipient already validated the address; normalise it again only to get
-	// the canonical form used in the code's claims.
-	email, err = normaliseEmail(email)
+
+	rec, err := s.ResolveRecipient(ctx, sh, email)
 	if err != nil {
 		return "", err
 	}
@@ -132,20 +194,64 @@ func (s *Service) IssueRecipientCode(ctx context.Context, sh store.Share, email 
 	return code, nil
 }
 
+// limitRecipientCodeIssue applies the per-(share, address) issuance rate limit.
+//
+// The store method is an atomic count-and-record: when there is room it records this
+// issuance and returns nil; when the window is full it returns
+// store.ErrRecipientCodeRateLimited without recording. The surface is narrower than
+// the share-rate one because the caller needs exactly one question answered, and
+// stores that predate it (only wrapped test stores) skip the limit rather than fail —
+// the OTP guess throttle on the verification side still bounds abuse there.
+func (s *Service) limitRecipientCodeIssue(ctx context.Context, sh store.Share, email string) error {
+	var limited error
+	err := s.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		rl, ok := tx.(store.RecipientCodeRateTx)
+		if !ok {
+			return nil
+		}
+		if err := rl.AllowRecipientCodeIssue(ctx, sh.ID, email,
+			store.RecipientCodeMaxIssuance, store.RecipientCodeWindow); err != nil {
+			limited = err
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if limited != nil {
+		return ErrRecipientCodeRateLimited
+	}
+	return nil
+}
+
 // VerifyRecipientCode exchanges a code for a verified recipient.
 //
 // The code is checked against both the share and the address. A code minted for
 // alice@example.com must not work for bob@example.com on the same share, or any invited
 // person could let in anyone by forwarding their code.
 //
-// Three guarantees, each of which was missing before SHARE-02 was addressed:
+// Guarantees, and their current shape (revisited 2026-10-25):
 //
-//	single use     the recipient row is marked consumed, so a code works once even if
-//	               its whole TTL has not elapsed and even if it leaked;
+//	bound          the code works only for its share and its address — the property
+//	               SHARE-03 needs. What makes a visitor "the recipient" is possession
+//	               of the address's mailbox, and every code is delivered there.
+//	re-issuable    a recipient whose access grant has expired (the 2h page cookie) can
+//	               verify again with a freshly issued code. The first version refused
+//	               any verification once the address's row was consumed, so the second
+//	               code an owner's page helpfully emailed could never work and the
+//	               recipient was locked out until an administrator intervened.
 //	throttled      failures are counted per (share, address) inside a rolling window,
 //	               so online guessing is bounded regardless of source address;
 //	no oracle      a throttled attempt is indistinguishable from a wrong code, because
 //	               telling them apart confirms both the share and the invitation.
+//
+// The consumed_at record is kept, but as metadata and as the serialization point for
+// two simultaneous submissions of the same code — not as a lifetime lock. Because the
+// ticket is stateless, a replay of the SAME code within its TTL is no longer refused
+// by this function; the bound that matters is unchanged (a replayed code still grants
+// only what the address's mailbox already proved, and only until the code's TTL), and
+// the freshly-issued code a legitimate re-verification needs is exactly as trustworthy
+// as the first one.
 func (s *Service) VerifyRecipientCode(ctx context.Context, sh store.Share, email, code string) error {
 	if s.tickets == nil {
 		return errors.New("share: email verification is not configured")
@@ -207,25 +313,35 @@ func (s *Service) VerifyRecipientCode(ctx context.Context, sh store.Share, email
 	}
 
 	// The address must still be on the list: it may have been revoked after the code
-	// was sent, and a code is not a durable capability.
-	rec, err := s.ResolveRecipient(ctx, sh, email)
-	if err != nil {
+	// was sent, and a code is not a durable capability. Liveness is the only question
+	// left here — consumed_at is metadata, not a refusal condition any more.
+	if _, err := s.ResolveRecipient(ctx, sh, email); err != nil {
 		record(false, "recipient_withdrawn")
 		return err
 	}
-	if rec.ConsumedAt != nil {
-		record(false, "already_used")
-		s.auditDenied(ctx, sh, email, "already_used")
-		return ErrNotRecipient
-	}
 
 	return s.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
-		// Consuming and verifying happen in one transaction, and consumption is a
-		// conditional UPDATE, so two concurrent submissions of the same code cannot
-		// both succeed.
+		// Consumption stays a conditional UPDATE, so two concurrent submissions of the
+		// same code still serialise: exactly one of them consumes, the other observes
+		// ErrCodeConsumed. With re-verification allowed, "already consumed" no longer
+		// means "refuse" — it means either a legitimate re-verification (a second code
+		// for an address whose first was spent) or the losing half of that race. Both
+		// proceed; the row's liveness was re-checked above, and once more below.
 		if cerr := tx.ConsumeRecipientCode(ctx, sh.ID, email); cerr != nil {
-			return ErrNotRecipient
+			if !errors.Is(cerr, store.ErrCodeConsumed) {
+				// The row vanished (withdrawn concurrently): refuse.
+				return ErrNotRecipient
+			}
+			live, lerr := tx.RecipientFor(ctx, sh.ID, email)
+			if lerr != nil || live.RevokedAt != nil {
+				// Consumed because the invitation was withdrawn between the check
+				// above and now: refuse, the same answer a revoked recipient gets.
+				return ErrNotRecipient
+			}
 		}
+		// Idempotent by design: MarkRecipientVerified keeps the FIRST verified_at, so a
+		// re-verification records that the address proved itself again without
+		// rewriting when it did so the first time.
 		if merr := tx.MarkRecipientVerified(ctx, sh.ID, email); merr != nil {
 			return merr
 		}

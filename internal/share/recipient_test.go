@@ -264,9 +264,17 @@ func TestExpiredCodeRejected(t *testing.T) {
 	}
 }
 
-// TestCodeIsSingleUse covers SHARE-02's replay half: a leaked code must not keep
-// working for the rest of its TTL.
-func TestCodeIsSingleUse(t *testing.T) {
+// TestConsumptionIsRecordedButNotALifetimeLock reflects the 2026-10-25 semantics
+// change. The old version of this test pinned "a one-time code must not verify
+// twice", and that refusal was exactly what locked a recipient out forever after
+// their first session: the consumed check rejected every later code, including the
+// fresh one the page emails when the recipient's access grant expires. Consumption
+// is still recorded — as metadata and as the serialization point for two
+// simultaneous submissions — but a fresh, valid, unexpired code verifies again
+// (pinned by TestARecipientCanVerifyAgainAfterTheirAccessExpires in
+// recipient_reissue_test.go). What is gone is single-use-per-lifetime; what remains
+// is the address binding, which the address-binding tests cover.
+func TestConsumptionIsRecordedButNotALifetimeLock(t *testing.T) {
 	svc, sh, _, _ := recipientFixture(t)
 	ctx := context.Background()
 
@@ -277,8 +285,17 @@ func TestCodeIsSingleUse(t *testing.T) {
 	if err := svc.VerifyRecipientCode(ctx, sh, "alice@example.test", code); err != nil {
 		t.Fatalf("first use must succeed: %v", err)
 	}
-	if err := svc.VerifyRecipientCode(ctx, sh, "alice@example.test", code); err == nil {
-		t.Fatal("a one-time code must not verify twice")
+	rec, err := svc.ResolveRecipient(ctx, sh, "alice@example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.ConsumedAt == nil {
+		t.Fatal("the use must still be recorded as consumed")
+	}
+	// A replay of the same code within its TTL grants only what the address already
+	// proved; it must not error the recipient out of their own share.
+	if err := svc.VerifyRecipientCode(ctx, sh, "alice@example.test", code); err != nil {
+		t.Fatalf("a spent code must not lock the address out: %v", err)
 	}
 }
 
