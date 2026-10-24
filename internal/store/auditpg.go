@@ -66,6 +66,21 @@ func (chainWriter) Append(ctx context.Context, tx Tx, e AuditEntry) error {
 		return fmt.Errorf("store: read audit chain head: %w", translate(err))
 	}
 
+	// The request id comes from the caller when it set one explicitly, and from the context
+	// otherwise. The context fallback is what makes every existing call site carry it without each
+	// one having to remember: the server puts the id there once per request.
+	//
+	// Resolved BEFORE the event is sealed, because version 2 hashes both of these fields: sealing
+	// first would hash one set of values and store another (2026-10-24 review, M6).
+	requestID := e.RequestID
+	if requestID == "" {
+		requestID = RequestIDFromContext(ctx)
+	}
+	authMethod := e.AuthMethod
+	if authMethod == "" {
+		authMethod = AuthMethodFromContext(ctx)
+	}
+
 	ev := audit.Event{
 		Time:       ptx.now,
 		ActorKind:  audit.ActorKind(orDefault(e.ActorKind, "system")),
@@ -80,34 +95,27 @@ func (chainWriter) Append(ctx context.Context, tx Tx, e AuditEntry) error {
 		Bytes:      e.Bytes,
 		Metadata:   e.Metadata,
 		PrevHash:   prev,
+		// Version 2 covers the request id and the auth method. Every row written from here on is
+		// sealed under it; rows written before carry 1 from the column default.
+		HashVersion: 2,
+		RequestID:   requestID,
+		AuthMethod:  authMethod,
 	}
 	ev.ActorUserID = e.ActorUserID
 	if err := ev.Seal(); err != nil {
 		return err
 	}
 
-	// The request id comes from the caller when it set one explicitly, and from the context
-	// otherwise. The context fallback is what makes every existing call site carry it without each
-	// one having to remember: the server puts the id there once per request.
-	requestID := e.RequestID
-	if requestID == "" {
-		requestID = RequestIDFromContext(ctx)
-	}
-	authMethod := e.AuthMethod
-	if authMethod == "" {
-		authMethod = AuthMethodFromContext(ctx)
-	}
-
 	const q = `INSERT INTO audit.events
 		(ts, actor_kind, actor_user_id, actor_email, actor_ip, user_agent,
 		 action, target_kind, target_id, share_id, result, bytes, metadata, prev_hash, hash, request_id,
-		 auth_method)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`
+		 auth_method, hash_version)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`
 	_, err = ptx.Exec(ctx, q,
 		ev.Time, string(ev.ActorKind), ev.ActorUserID, nullifyEmpty(ev.ActorEmail),
 		nullifyEmpty(ev.ActorIP), ev.UserAgent, string(ev.Action), string(ev.TargetKind),
 		ev.TargetID, ev.ShareID, string(ev.Result), ev.Bytes,
-		jsonOrEmpty(ev.Metadata), ev.PrevHash, ev.Hash, requestID, authMethod)
+		jsonOrEmpty(ev.Metadata), ev.PrevHash, ev.Hash, requestID, authMethod, ev.HashVersion)
 	if err != nil {
 		return fmt.Errorf("store: append audit: %w", translate(err))
 	}
