@@ -26,6 +26,7 @@ import (
 
 	"github.com/EdisonJwa/newCloud/internal/authz"
 	"github.com/EdisonJwa/newCloud/internal/store"
+	"github.com/EdisonJwa/newCloud/internal/swap"
 )
 
 // seedOverwriteTree builds src/ with four 1 KiB files and dst/ with one file that must survive.
@@ -332,17 +333,17 @@ func TestTheOverwritePreservationIsLoadBearing(t *testing.T) {
 
 // TestAnOverwriteOfALongNonASCIIFileKeepsUtf8Valid is a guard on the intermediate name itself.
 //
-// reservedName truncates the destination name to keep the intermediate inside the 255-byte limit the
-// store enforces. A byte-offset truncation can split a multi-byte character, and the resulting name
-// is not just ugly: layout.ValidateSegment rejects invalid UTF-8, so the NAME fails validation and
-// the overwrite fails with "invalid name" for a file whose only crime was a long non-ASCII name.
+// The swap package truncates the destination name to keep the intermediate inside the 255-byte limit
+// the store enforces. A byte-offset truncation can split a multi-byte character, and the resulting
+// name is not just ugly: layout.ValidateSegment rejects invalid UTF-8, so the NAME fails validation
+// and the overwrite fails with "invalid name" for a file whose only crime was a long non-ASCII name.
 func TestAnOverwriteOfALongNonASCIIFileKeepsUtf8Valid(t *testing.T) {
 	e := newEnv(t)
 
-	for _, n := range []string{"staged", "replaced"} {
-		name := reservedName(n, strings.Repeat("文", 80))
+	for _, makeName := range []func(string) string{swap.StagedName, swap.BackupName} {
+		name := makeName(strings.Repeat("文", 80))
 		if !utf8.ValidString(name) {
-			t.Fatalf("reservedName(%q, <long non-ASCII>) produced invalid UTF-8: %q", n, name)
+			t.Fatalf("a reserved name for a long non-ASCII destination produced invalid UTF-8: %q", name)
 		}
 	}
 

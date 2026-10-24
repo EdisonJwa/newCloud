@@ -15,6 +15,7 @@ import (
 
 	"github.com/EdisonJwa/newCloud/internal/authz"
 	"github.com/EdisonJwa/newCloud/internal/blob"
+	"github.com/EdisonJwa/newCloud/internal/dircommit"
 	"github.com/EdisonJwa/newCloud/internal/storage/layout"
 	"github.com/EdisonJwa/newCloud/internal/store"
 )
@@ -532,28 +533,32 @@ func (h *Handler) handleMkcol(w http.ResponseWriter, r *http.Request, a authz.Ac
 		return
 	}
 
-	err = h.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
-		node, cerr := tx.CreateDir(ctx, store.NewNode{
-			OwnerID: a.ID(), ParentID: parentNode.ID, Name: name,
+	// The content store is written before the metadata row, and a failure from either is
+	// reported instead of being ignored (NC-R6-001). Creating the node first and then
+	// discarding the Mkdir error made a collection appear in the listing and the audit log
+	// while the tree layout had no directory on disk.
+	err = dircommit.Create(ctx, h.content,
+		layout.Node{Owner: a.ID().String(), Path: rel, IsDir: true},
+		func(ctx context.Context) error {
+			return h.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+				node, cerr := tx.CreateDir(ctx, store.NewNode{
+					OwnerID: a.ID(), ParentID: parentNode.ID, Name: name,
+				})
+				if cerr != nil {
+					return cerr
+				}
+				return tx.Audit(ctx, store.AuditEntry{
+					ActorKind: "user", ActorUserID: a.Ptr(),
+					ActorEmail: a.Email(), ActorIP: clientIP(r), UserAgent: r.UserAgent(),
+					Action: "file.write", TargetKind: "node", TargetID: node.ID.String(),
+					Result: "ok", Metadata: map[string]any{"name": name, "created": true, "kind": "dir"},
+				})
+			})
 		})
-		if cerr != nil {
-			return cerr
-		}
-		return tx.Audit(ctx, store.AuditEntry{
-			ActorKind: "user", ActorUserID: a.Ptr(),
-			ActorEmail: a.Email(), ActorIP: clientIP(r), UserAgent: r.UserAgent(),
-			Action: "file.write", TargetKind: "node", TargetID: node.ID.String(),
-			Result: "ok", Metadata: map[string]any{"name": name, "created": true, "kind": "dir"},
-		})
-	})
 	if err != nil {
 		writeXMLError(w, statusForError(err), "")
 		return
 	}
-
-	// The tree layout needs the directory on disk too; blob layout has nothing to
-	// create. Asking the store keeps both correct without branching here.
-	_ = h.content.Mkdir(ctx, layout.Node{Owner: a.ID().String(), Path: rel, IsDir: true})
 
 	w.WriteHeader(http.StatusCreated)
 }

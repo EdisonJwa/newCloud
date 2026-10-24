@@ -17,6 +17,7 @@ import (
 
 	"github.com/EdisonJwa/newCloud/internal/authz"
 	"github.com/EdisonJwa/newCloud/internal/blob"
+	"github.com/EdisonJwa/newCloud/internal/dircommit"
 	"github.com/EdisonJwa/newCloud/internal/storage/layout"
 	"github.com/EdisonJwa/newCloud/internal/store"
 )
@@ -213,6 +214,11 @@ func (s *Server) handleMkdir(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	parent := parentNodes[len(parentNodes)-1]
+	// Canonical content path of the parent, from the resolved identity rather than the request text:
+	// "path" arrives in the listing's own "/docs/new" form, and a path-backed store refuses the
+	// absolute spelling. The new name is validated by the store like any other name.
+	parentRel = relOfChain(parentNodes)
+	newRel := path.Join(parentRel, name)
 
 	cap, err := s.deps.Authz.Authorize(actor, parent.ID)
 	if err != nil {
@@ -236,33 +242,35 @@ func (s *Server) handleMkdir(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var created store.Node
-	err = s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
-		n, cerr := tx.CreateDir(ctx, store.NewNode{
-			OwnerID: actor.ID(), ParentID: parent.ID, Name: name,
+	// The directory is created in the content store before its metadata row, and neither
+	// failure is ignored (NC-R6-001). The old order committed the node and the "ok" audit
+	// row, then discarded a failed Mkdir: the tree layout answered 201 with a directory that
+	// did not exist on disk.
+	err = dircommit.Create(r.Context(), s.deps.Content,
+		layout.Node{Owner: actor.ID().String(), Path: newRel, IsDir: true},
+		func(ctx context.Context) error {
+			return s.deps.Meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+				n, cerr := tx.CreateDir(ctx, store.NewNode{
+					OwnerID: actor.ID(), ParentID: parent.ID, Name: name,
+				})
+				if cerr != nil {
+					return cerr
+				}
+				created = n
+				return tx.Audit(ctx, store.AuditEntry{
+					ActorKind: "user", ActorUserID: actor.Ptr(), ActorEmail: actor.Email(),
+					ActorIP: clientIP(r), UserAgent: r.UserAgent(),
+					Action: "file.write", TargetKind: "node", TargetID: n.ID.String(),
+					Result: "ok", Metadata: map[string]any{"name": name, "kind": "dir"},
+				})
+			})
 		})
-		if cerr != nil {
-			return cerr
-		}
-		created = n
-		return tx.Audit(ctx, store.AuditEntry{
-			ActorKind: "user", ActorUserID: actor.Ptr(), ActorEmail: actor.Email(),
-			ActorIP: clientIP(r), UserAgent: r.UserAgent(),
-			Action: "file.write", TargetKind: "node", TargetID: n.ID.String(),
-			Result: "ok", Metadata: map[string]any{"name": name, "kind": "dir"},
-		})
-	})
 	if err != nil {
 		s.writeStoreError(w, err)
 		return
 	}
 
-	// The tree layout needs the directory on disk; blob layout has nothing to
-	// create. Asking the store keeps both correct without branching here.
-	_ = s.deps.Content.Mkdir(r.Context(), layout.Node{
-		Owner: actor.ID().String(), Path: body.Path, IsDir: true,
-	})
-
-	writeJSON(w, http.StatusCreated, toFileJSON(created, body.Path))
+	writeJSON(w, http.StatusCreated, toFileJSON(created, newRel))
 }
 
 // Two sentinel errors so writableParent can say why without choosing a status code. The

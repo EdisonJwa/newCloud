@@ -393,6 +393,11 @@ func statusForError(err error) int {
 	case errors.Is(err, store.ErrInvalidName), errors.Is(err, layout.ErrInvalidNode),
 		errors.Is(err, layout.ErrUnsafePath):
 		return http.StatusBadRequest
+	case errors.Is(err, store.ErrAuditUnavailable):
+		// Fail-closed (T-16): the write was refused because it could not be recorded, and nothing
+		// changed. 503 says "retry when the recorder is back"; 500 would send an operator looking at
+		// the data, which is intact. The JSON API answers the same way.
+		return http.StatusServiceUnavailable
 	default:
 		return http.StatusInternalServerError
 	}
