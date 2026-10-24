@@ -61,6 +61,9 @@ var drillTables = []string{
 	// than by anyone noticing: a group-to-role mapping and the record of names the name_key
 	// migration had to rename. Both must survive a restore, and neither was being checked.
 	"name_conflict_renames",
+	// ADR-0013 Phase 1: the operation journal, durable content references and the
+	// singleton lease are part of a consistent restore, not transient cache.
+	"operations", "content_refs", "consistency_lease",
 }
 
 // drillAuditTables are the partitioned audit tables, counted via their parent.

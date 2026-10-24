@@ -38,6 +38,8 @@ import (
 	"github.com/EdisonJwa/newCloud/internal/blob/local"
 	s3blob "github.com/EdisonJwa/newCloud/internal/blob/s3"
 	"github.com/EdisonJwa/newCloud/internal/config"
+	"github.com/EdisonJwa/newCloud/internal/consistency"
+	"github.com/EdisonJwa/newCloud/internal/lease"
 	"github.com/EdisonJwa/newCloud/internal/mail"
 	"github.com/EdisonJwa/newCloud/internal/metrics"
 	"github.com/EdisonJwa/newCloud/internal/password"
@@ -432,12 +434,21 @@ func serve() error {
 	}
 	defer closeMeta()
 
+	runtimeLease, releaseRuntime, err := acquireRuntimeProtection(ctx, cfg, meta, stop, log)
+	if err != nil {
+		return err
+	}
+	defer releaseRuntime()
+
 	// Open the content store and run its startup self-checks before accepting a
 	// single request. Discovering a split filesystem at 3am while a 100 GiB upload
 	// is mid-flight is not an option.
 	content, blobStore, err := openStorage(cfg, meta, log)
 	if err != nil {
 		return fmt.Errorf("startup self-check failed: %w", err)
+	}
+	if err := recoverBeforeServing(ctx, meta, content, log); err != nil {
+		return err
 	}
 
 	tickets, err := ticket.NewIssuer([]byte(cfg.Auth.SessionSecret))
@@ -579,6 +590,15 @@ func serve() error {
 	srv, err := server.New(deps)
 	if err != nil {
 		return err
+	}
+	if runtimeLease != nil {
+		// The lease watcher installed before the server only cancels the context.
+		// Once the server exists, losing the lease must also make /readyz fail
+		// immediately, not merely start a graceful shutdown.
+		lease.FailStop(ctx, *runtimeLease, func() {
+			srv.SetNotReady()
+			stop()
+		})
 	}
 
 	// Maintenance runs in-process. The sweep is outbox-style and idempotent, so
@@ -761,6 +781,45 @@ func serve() error {
 
 // openMetadata builds the metadata store: PostgreSQL when configured, otherwise
 // in-memory with a loud warning.
+// acquireRuntimeProtection enforces ADR-0013 A1 before the server opens a
+// listener: a Tree process takes the OS root lock, and a PostgreSQL-backed
+// process takes the singleton lease. Lease loss cancels stop, which is the
+// signal context that drives shutdown; the process must not keep serving writes.
+func acquireRuntimeProtection(ctx context.Context, cfg config.Config, meta storepkg.Store, stop func(), log *slog.Logger) (*lease.Lease, func(), error) {
+	var closers []func()
+	cleanup := func() {
+		for i := len(closers) - 1; i >= 0; i-- {
+			closers[i]()
+		}
+	}
+
+	if cfg.Storage.Layout == config.LayoutTree {
+		lock, err := lease.LockTree(cfg.Storage.Local.Root)
+		if err != nil {
+			return nil, nil, fmt.Errorf("tree singleton lock: %w", err)
+		}
+		closers = append(closers, func() { _ = lock.Close() })
+		log.Info("tree root locked for this process", "root", cfg.Storage.Local.Root)
+	}
+
+	if pg, ok := meta.(*storepkg.PG); ok {
+		manager := lease.NewPG(pg.Pool(), 0x4e430013)
+		runtimeLease, err := manager.Acquire(ctx, uuid.New())
+		if err != nil {
+			cleanup()
+			return nil, nil, fmt.Errorf("singleton lease: %w", err)
+		}
+		closers = append(closers, runtimeLease.Close)
+		lease.FailStop(ctx, runtimeLease, stop)
+		log.Info("singleton lease acquired", "epoch", runtimeLease.Epoch)
+		return &runtimeLease, cleanup, nil
+	} else {
+		log.Warn("metadata store has no PostgreSQL singleton lease; " +
+			"this is a development-only single-process mode")
+	}
+	return nil, cleanup, nil
+}
+
 func openMetadata(ctx context.Context, log *slog.Logger) (storepkg.Store, func(), error) {
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
@@ -833,10 +892,44 @@ func openS3Storage(cfg config.Config, meta storepkg.Store, log *slog.Logger) (la
 	if err != nil {
 		return nil, nil, err
 	}
+	adapter = adapter.WithPublisher(meta)
 	// Uploads stage on local disk even when the bytes land in a bucket: the hash is needed
 	// before the object can be named.
 	adapter = adapter.WithSpoolDir(cfg.Storage.Local.Root)
 	return adapter, store, nil
+}
+
+// recoverBeforeServing applies the safe recovery rules before the listener is
+// opened. A NEEDS_OPERATOR operation is a persistent startup blocker, not a log
+// line: serving would expose a namespace whose physical state was interrupted.
+func recoverBeforeServing(ctx context.Context, meta storepkg.Store, content layout.ContentStore, log *slog.Logger) error {
+	j, ok := meta.(consistency.Journal)
+	if !ok {
+		return nil
+	}
+	var staging consistency.StagingStore
+	if s, ok := content.(consistency.StagingStore); ok {
+		staging = s
+	}
+	results, err := consistency.Recover(ctx, j, staging, 1000)
+	if err != nil {
+		return fmt.Errorf("startup recovery failed: %w", err)
+	}
+	for _, r := range results {
+		if r.Action == consistency.RecoveryNeedsOperator {
+			log.Error("operation needs operator before serving",
+				"operation", r.Operation.ID, "state", r.Operation.State,
+				"staged_root", r.Operation.StagedRoot)
+		}
+	}
+	blocked, err := consistency.HasUnresolved(ctx, j, 1)
+	if err != nil {
+		return fmt.Errorf("startup recovery check failed: %w", err)
+	}
+	if blocked {
+		return fmt.Errorf("startup refused: unresolved PUBLISHING operation requires an operator")
+	}
+	return nil
 }
 
 // openStorage builds the content store for the configured backend and layout.
@@ -864,6 +957,9 @@ func openStorage(cfg config.Config, meta storepkg.Store, log *slog.Logger) (layo
 		s, err := tree.New(cfg.Storage.Local.Root)
 		if err != nil {
 			return nil, nil, err
+		}
+		if err := s.ProbeNoReplace(); err != nil {
+			return nil, nil, fmt.Errorf("tree no-replace probe failed on %q: %w", cfg.Storage.Local.Root, err)
 		}
 		caps := s.Capabilities()
 		log.Info("storage ready",
@@ -904,6 +1000,7 @@ func openStorage(cfg config.Config, meta storepkg.Store, log *slog.Logger) (layo
 	if err != nil {
 		return nil, nil, err
 	}
+	adapter = adapter.WithPublisher(meta)
 	return adapter.WithSpoolDir(filepath.Join(cfg.Storage.Local.Root, "tmp")), ls, nil
 }
 

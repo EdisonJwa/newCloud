@@ -419,6 +419,11 @@ func (s *Server) Handler() http.Handler {
 	return r
 }
 
+// SetNotReady makes /readyz fail immediately. The runtime lease-loss watcher
+// calls this before cancelling the process context, so an orchestrator stops
+// routing to the instance during the shutdown window.
+func (s *Server) SetNotReady() { s.ready.Store(false) }
+
 // Routes enumerates every registered method and path pattern.
 //
 // Added so a coverage test can enumerate the real route table instead of a hand-maintained copy of
