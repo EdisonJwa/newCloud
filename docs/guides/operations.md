@@ -108,6 +108,25 @@ GET /api/audit?format=json
 A normal user's export covers that user's own actions plus anonymized events about their data
 (anonymous downloads, rejected recipient attempts). Only an administrator can export the full log.
 
+### Verifying a build before deploying it
+
+Everything else in this repository tests packages through Go interfaces. One test builds the binary
+an operator deploys and runs it:
+
+```sh
+TEST_DATABASE_URL=postgres://... go test ./cmd/newcloud -run TestTheShippedBinaryMigrates
+```
+
+It compiles `cmd/newcloud`, checks `--version` needs no database or config file, runs `migrate`
+twice against a real PostgreSQL and requires both runs to succeed, asserts the schema is complete
+afterwards, and requires an incomplete configuration to be refused with a message naming the
+problem. It skips without `TEST_DATABASE_URL`, like the other PostgreSQL tests.
+
+Worth knowing why it exists and what it deliberately does not do: it was written after a manual
+smoke test reported healthy endpoints while a **stale server from an earlier session** was answering
+on the port being probed, so the green result proved nothing about the binary under test. The test
+therefore asserts only things a leftover process cannot fake — exit codes and the state of the
+database — and leaves endpoint probing to the deployment's own health checks.
 ### Retention: pruning the log
 
 The audit table is append-only and grows monotonically, so retention is an explicit operator action
