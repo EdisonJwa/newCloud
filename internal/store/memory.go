@@ -32,6 +32,8 @@ import (
 // It is NOT a cache: each Memory instance is the only copy of its data, which is
 // exactly why it must not be shared between processes.
 type Memory struct {
+	// ops is the operation journal, keyed by operation id.
+	ops map[uuid.UUID]Op
 	// mu guards the committed state; txMu orders transactions so two of them
 	// cannot publish conflicting copies.
 	mu   sync.RWMutex
@@ -226,6 +228,7 @@ func (m *Memory) WithTx(ctx context.Context, fn func(ctx context.Context, tx Tx)
 	m.downloads = work.downloads
 	m.acl = work.acl
 	m.groups = work.groups
+	m.ops = work.ops
 	m.groupMembers = work.groupMembers
 	m.otpAttempts = work.otpAttempts
 	m.shareUploadEvents = work.shareUploadEvents
@@ -316,7 +319,11 @@ func (m *Memory) snapshot() *Memory {
 		auditTimes:            append([]time.Time(nil), m.auditTimes...),
 		jobs:                  append([]queuedJob(nil), m.jobs...),
 		nextVersion:           m.nextVersion,
+		ops:                   make(map[uuid.UUID]Op, len(m.ops)),
 		now:                   m.now,
+	}
+	for k, v := range m.ops {
+		work.ops[k] = v
 	}
 	for k, v := range m.nodes {
 		cp := *v

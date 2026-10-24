@@ -225,6 +225,13 @@ type Tx interface {
 	// whole test: the space exists for the group, not for whoever happened to create it, and a
 	// member who joins later sees it without anybody granting anything.
 	SpacesFor(ctx context.Context, userID uuid.UUID) ([]Node, error)
+	// The operation journal (ADR-0013 4.1). The table is migration 0016; these are the transitions
+	// that make it usable, so a crash between moving bytes and committing metadata can be repaired
+	// rather than guessed at.
+	StartOp(ctx context.Context, op Op) (Op, error)
+	AdvanceOp(ctx context.Context, id uuid.UUID, from, to string) error
+	OpByID(ctx context.Context, id uuid.UUID) (Op, error)
+	OpenOps(ctx context.Context, limit int) ([]Op, error)
 
 	// Versions lists kept versions of a file, newest first.
 	Versions(ctx context.Context, nodeID uuid.UUID, limit int) ([]Version, error)

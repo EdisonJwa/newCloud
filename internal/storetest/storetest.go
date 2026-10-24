@@ -239,6 +239,92 @@ func Run(t *testing.T, factory Factory, opts Options) {
 	// Deleting a group must not delete its members' space, and must not be blocked by it. The
 	// schema decides both (memberships cascade, owner_group_id goes NULL), so what this pins is that
 	// the two backends agree about the result an operator actually sees.
+	// The journal is only worth having if a second pass cannot silently finish an operation the first
+	// one is still working on, so the transition guard is the point, not the storage.
+	t.Run("TheOpJournalRecordsIntentAndRefusesStaleTransitions", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		f := mkfile(t, s, owner, r.ID, "journaled.txt", 4)
+
+		var op store.Op
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			got, serr := tx.StartOp(ctx, store.Op{
+				Kind: "delete", OwnerID: owner, StagedRoot: &f.ID,
+			})
+			op = got
+			return serr
+		}); err != nil {
+			t.Fatalf("StartOp: %v", err)
+		}
+		if op.State != store.OpIntent {
+			t.Fatalf("a started operation is in state %q, want INTENT: the row has to exist before "+
+				"anything is touched, or a crash leaves no trace of what was being done", op.State)
+		}
+		if op.ID == uuid.Nil {
+			t.Fatal("StartOp returned no id, so nothing can later refer to the operation")
+		}
+		if op.StagedRoot == nil || *op.StagedRoot != f.ID {
+			t.Fatalf("the staged root did not round-trip: %+v", op.StagedRoot)
+		}
+
+		var open []store.Op
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			list, lerr := tx.OpenOps(ctx, 10)
+			open = list
+			return lerr
+		}); err != nil {
+			t.Fatalf("OpenOps: %v", err)
+		}
+		found := false
+		for _, o := range open {
+			if o.ID == op.ID {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("an operation in INTENT is not listed as open; recovery would never see it")
+		}
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.AdvanceOp(ctx, op.ID, store.OpIntent, store.OpPublishing)
+		}); err != nil {
+			t.Fatalf("INTENT -> PUBLISHING: %v", err)
+		}
+
+		// The row has left INTENT, so a second pass must not be able to move it as if it had not.
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.AdvanceOp(ctx, op.ID, store.OpIntent, store.OpCommitted)
+		}); !errors.Is(err, store.ErrPrecondition) {
+			t.Fatalf("advancing from a state the operation has left returned %v, want a precondition "+
+				"error: two passes must not both think they finished it", err)
+		}
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.AdvanceOp(ctx, op.ID, store.OpPublishing, store.OpCommitted)
+		}); err != nil {
+			t.Fatalf("PUBLISHING -> COMMITTED: %v", err)
+		}
+
+		// A committed operation is no longer recovery's business.
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			got, oerr := tx.OpByID(ctx, op.ID)
+			if oerr != nil {
+				return oerr
+			}
+			if got.State != store.OpCommitted {
+				t.Errorf("state is %q after commit", got.State)
+			}
+			list, lerr := tx.OpenOps(ctx, 10)
+			for _, o := range list {
+				if o.ID == op.ID {
+					t.Errorf("a committed operation is still listed as open")
+				}
+			}
+			return lerr
+		}); err != nil {
+			t.Fatalf("after commit: %v", err)
+		}
+	})
 	t.Run("DeletingAGroupFreesItsSpacesWithoutDeletingThem", func(t *testing.T) {
 		s, owner := factory(t)
 		r := rootOf(t, s, owner)
