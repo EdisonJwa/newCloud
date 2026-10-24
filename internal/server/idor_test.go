@@ -446,6 +446,8 @@ func TestIDORTableCoversEveryIdRoute(t *testing.T) {
 			"gets the same 404 as for an id that does not exist",
 		"GET /api/nodes/{id}/children": "covered by the same test as GET /api/nodes/{id}; the " +
 			"listing goes through the identical Authorize check before it reads a child",
+		"DELETE /api/admin/groups/{id}": "covered by TestAdminCanDeleteAGroup in spacesadmin_test.go, " +
+			"which checks the admin gate, the 404 for an absent group and the refusal for a non-admin",
 		"DELETE /api/admin/groups/{id}/members/{userID}": "admin-only; the member-add case above " +
 			"proves the gate rejects a non-admin, and the removal runs behind the same check",
 	}

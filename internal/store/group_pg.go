@@ -153,3 +153,19 @@ func (t *pgTx) SpacesFor(ctx context.Context, userID uuid.UUID) ([]Node, error) 
 	}
 	return out, translate(rows.Err())
 }
+
+// DeleteGroup removes a group.
+//
+// The schema does the rest, and each part is deliberate: group_members cascades so memberships
+// cannot outlive the group, and nodes.owner_group_id is ON DELETE SET NULL so a space becomes an
+// ordinary folder instead of blocking the delete or being destroyed with it (migration 0020).
+func (t *pgTx) DeleteGroup(ctx context.Context, id uuid.UUID) error {
+	tag, err := t.tx.Exec(ctx, `DELETE FROM groups WHERE id = $1`, id)
+	if err != nil {
+		return translate(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}

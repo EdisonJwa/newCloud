@@ -236,6 +236,83 @@ func Run(t *testing.T, factory Factory, opts Options) {
 	// the page boundary or loses one — and the failure is invisible on page one.
 	// A space belongs to the group, so joining the group is what makes it visible. The column that
 	// says so was written and then scanned away for a long time: nothing could report a space.
+	// Deleting a group must not delete its members' space, and must not be blocked by it. The
+	// schema decides both (memberships cascade, owner_group_id goes NULL), so what this pins is that
+	// the two backends agree about the result an operator actually sees.
+	t.Run("DeletingAGroupFreesItsSpacesWithoutDeletingThem", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		memberUser, merr := upsertUser(s, store.UpsertUser{
+			Issuer: "https://idp.test", Subject: "space-orphan",
+			Username: "space-orphan", Email: "space-orphan@example.test", Role: "user",
+		})
+		if merr != nil {
+			t.Fatalf("create member: %v", merr)
+		}
+
+		var groupID uuid.UUID
+		var spaceID uuid.UUID
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			g, gerr := tx.CreateGroup(ctx, store.Group{Name: "doomed-" + memberUser.ID.String()[:8]})
+			if gerr != nil {
+				return gerr
+			}
+			groupID = g.ID
+			if aerr := tx.AddGroupMember(ctx, g.ID, memberUser.ID, "viewer"); aerr != nil {
+				return aerr
+			}
+			n, cerr := tx.CreateDir(ctx, store.NewNode{
+				OwnerID: owner, ParentID: r.ID, Name: "team-space", OwnerGroupID: &groupID,
+			})
+			spaceID = n.ID
+			return cerr
+		}); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.DeleteGroup(ctx, groupID)
+		}); err != nil {
+			t.Fatalf("deleting the group failed: %v. A space must not make its group undeletable.", err)
+		}
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			if _, gerr := tx.GroupByID(ctx, groupID); !errors.Is(gerr, store.ErrNotFound) {
+				t.Errorf("the group still resolves after deletion: %v", gerr)
+			}
+			// The member's membership is gone with it.
+			if members, merr := tx.GroupsForUser(ctx, memberUser.ID); merr == nil {
+				for _, g := range members {
+					if g.ID == groupID {
+						t.Error("the membership outlived the group")
+					}
+				}
+			}
+			n, nerr := tx.Node(ctx, spaceID)
+			if nerr != nil {
+				t.Fatalf("the space's node did not survive its group: %v", nerr)
+			}
+			if n.OwnerGroupID != nil {
+				t.Error("the node still names a group that no longer exists")
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		// And it is no longer listed as anybody's space.
+		var spaces []store.Node
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			list, lerr := tx.SpacesFor(ctx, memberUser.ID)
+			spaces = list
+			return lerr
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if len(spaces) != 0 {
+			t.Fatalf("the member still sees %d space(s) after the group was deleted", len(spaces))
+		}
+	})
 	t.Run("SpacesAreVisibleToMembersAndNobodyElse", func(t *testing.T) {
 		s, owner := factory(t)
 		r := rootOf(t, s, owner)

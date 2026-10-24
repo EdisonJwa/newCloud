@@ -40,6 +40,10 @@ type GroupTx interface {
 	// AddGroupMember adds an account to a group, idempotently.
 	AddGroupMember(ctx context.Context, groupID, userID uuid.UUID, role string) error
 	// RemoveGroupMember removes an account from a group.
+	// DeleteGroup removes a group. Memberships go with it and nodes that named it as owner keep
+	// their content but stop being group spaces (ON DELETE SET NULL), so deleting a group never
+	// deletes files.
+	DeleteGroup(ctx context.Context, id uuid.UUID) error
 	RemoveGroupMember(ctx context.Context, groupID, userID uuid.UUID) error
 	// GroupsForUser lists the groups an account belongs to.
 	GroupsForUser(ctx context.Context, userID uuid.UUID) ([]Group, error)

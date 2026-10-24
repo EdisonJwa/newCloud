@@ -136,3 +136,36 @@ func (t *memTx) SpacesFor(ctx context.Context, userID uuid.UUID) ([]Node, error)
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
 }
+
+// DeleteGroup removes a group, its memberships, and the group ownership of any space it owned.
+//
+// The SQL version delegates the last two to the schema (CASCADE and SET NULL); this one has to be
+// told, and the shared conformance suite is what keeps the two answers the same.
+func (t *memTx) DeleteGroup(ctx context.Context, id uuid.UUID) error {
+	idx := -1
+	for i := range t.m.groups {
+		if t.m.groups[i].ID == id {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return ErrNotFound
+	}
+	t.m.groups = append(t.m.groups[:idx], t.m.groups[idx+1:]...)
+
+	kept := t.m.groupMembers[:0]
+	for _, m := range t.m.groupMembers {
+		if m.GroupID != id {
+			kept = append(kept, m)
+		}
+	}
+	t.m.groupMembers = kept
+
+	for _, rec := range t.m.nodes {
+		if rec.node.OwnerGroupID != nil && *rec.node.OwnerGroupID == id {
+			rec.node.OwnerGroupID = nil
+		}
+	}
+	return nil
+}

@@ -300,6 +300,7 @@ func (s *Server) Handler() http.Handler {
 				r.Post("/", s.handleAdminCreateGroup)
 				r.Post("/{id}/members", s.handleAdminAddGroupMember)
 				r.Delete("/{id}/members/{userID}", s.handleAdminRemoveGroupMember)
+				r.Delete("/{id}", s.handleAdminDeleteGroup)
 			})
 			r.Route("/admin/users", func(r chi.Router) {
 				r.Get("/", s.handleAdminUsers)

@@ -298,3 +298,32 @@ func (s *Server) handleAdminRemoveGroupMember(w http.ResponseWriter, r *http.Req
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
+
+// handleAdminDeleteGroup removes a group.
+//
+// What happens to the group's spaces is decided by the schema, not here: memberships cascade and
+// nodes that named the group as owner keep their content while losing the group (migration 0020).
+// The handler's job is only to say whether the group existed.
+func (s *Server) handleAdminDeleteGroup(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requireAdmin(w, r); !ok {
+		return
+	}
+	groupID, err := uuid.Parse(chiURLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusNotFound, "not_found", "no such group")
+		return
+	}
+
+	err = s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
+		return tx.DeleteGroup(ctx, groupID)
+	})
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", "no such group")
+			return
+		}
+		s.writeStoreError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}

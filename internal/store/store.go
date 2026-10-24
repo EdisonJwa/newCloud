@@ -447,6 +447,10 @@ type Tx interface {
 	GroupByID(ctx context.Context, id uuid.UUID) (Group, error)
 	CreateGroup(ctx context.Context, g Group) (Group, error)
 	GroupByName(ctx context.Context, name string) (Group, error)
+	// DeleteGroup removes a group. Memberships go with it and nodes that named it as owner keep
+	// their content but stop being group spaces (ON DELETE SET NULL), so deleting a group never
+	// deletes files.
+	DeleteGroup(ctx context.Context, id uuid.UUID) error
 	AddGroupMember(ctx context.Context, groupID, userID uuid.UUID, role string) error
 	RemoveGroupMember(ctx context.Context, groupID, userID uuid.UUID) error
 	GroupsForUser(ctx context.Context, userID uuid.UUID) ([]Group, error)
