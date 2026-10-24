@@ -290,6 +290,28 @@ table accumulated across subtests. The PG factory now clears it; both versions p
 5. `git diff --check`, build, vet, normal tests, race tests pass on the Phase 1 commit.
 6. Separate implementation review approves the Phase 1R entry.
 
+### 6b. What the four remaining phase-0 reproductions actually require
+
+Measured after the delete relocation landed (`swap.Retire`, 2026-10-25), because that change looked
+like it might close more than one of them and did not. Four of the seven now pass. The other three
+are grouped here by what would have to exist, so a later round does not repeat the guess that they
+are one small fix away.
+
+| Reproduction | What it simulates | What closing it requires |
+|---|---|---|
+| `TestPhase0ReaderNeverSeesTheReplacementWindow` | A physical move of a node's content, with the metadata untouched, and a reader arriving in between | The read path must not derive a content location from `parent + name`. Either the location is recorded per node (indirection) or reads are fenced against the writer that moves it. A lock alone does not help: the reproduction performs the move outside any operation, so no writer holds anything to fence against. |
+| `TestPhase0LegacyWriterBypassesDeleteFence` | A writer that does not join the fence, landing in the window between a delete's content move and its metadata rename | The operation journal. The window is real — `swap.Retire` moves content, then renames metadata, then trashes, and a writer arriving between the first two steps still updates the OLD node, which the trash then takes with it. A fence cannot stop a writer that does not take one; what catches it is recording the intent before the move so recovery can tell "this writer's bytes are the live ones" from "these are the ones being retired". |
+| `TestPhase0BackfillMovesNewLiveBytes` | A maintenance process moving bytes that a live node now owns | The same indirection as the first row. It is also the least urgent of the three: no code in this tree performs that move. |
+
+Two of the three are therefore the read-side half of the ADR (§ "OpenLive"), and the third is the
+journal half. Neither is a defect in a path this deployment serves today: both describe what becomes
+possible once content has an identity separate from its path, which is the point of the ADR and not a
+bug in the path-addressed layout.
+
+The delete relocation is worth separating from them, because it is the one that was a real defect and
+is now fixed: a deleted file used to keep occupying its path until the retention sweep, which blocked
+no-replace publish on this layout and left the retained copy addressable at a name that no longer
+existed. That is `TestPhase0DeleteReleasesTheTreeLivePath`, and it passes.
 ### 6a. First slice, in the order it has to happen
 
 Written down after the 2026-10-24 review's M4 (2026-10-25): the artefact-name leak and
