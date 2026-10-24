@@ -68,6 +68,20 @@ export function ShareLanding({ token }: { token: string }) {
   const needsPassword = landing.requires_password;
   const needsEmail = landing.requires_email;
 
+  // The payload differs by state, so a drop box's counters are absent on a plain link. Defaulting
+  // them once keeps the arithmetic below from guarding at every site.
+  const uploadCount = landing.upload_count ?? 0;
+  const maxUploads = landing.max_uploads ?? 0;
+
+  // root_kind decides which primary action is honest.
+  //
+  // A shared DIRECTORY has no bytes of its own: `GET /s/{token}/download` answers 400
+  // `is_directory` for it, and a child is fetched with `?name=`. Rendering one Download button for
+  // both kinds therefore gave every folder share a primary action that was guaranteed to fail —
+  // and a shared folder is the common case. When a payload omits root_kind (an older server), a
+  // non-empty child list still identifies a directory.
+  const isFolder = landing.root_kind ? landing.root_kind === "dir" : (landing.children?.length ?? 0) > 0;
+
   return (
     <div className="landing">
       <div className="landcard">
@@ -181,11 +195,11 @@ export function ShareLanding({ token }: { token: string }) {
                   }}
                 />
               </label>
-              {landing.max_uploads ? (
+              {maxUploads > 0 ? (
                 <p className="hintline">
                   {t("share.slots", {
-                    left: Math.max(0, landing.max_uploads - landing.upload_count - uploaded.length),
-                    max: landing.max_uploads,
+                    left: Math.max(0, maxUploads - uploadCount - uploaded.length),
+                    max: maxUploads,
                   })}
                 </p>
               ) : null}
@@ -201,23 +215,43 @@ export function ShareLanding({ token }: { token: string }) {
               ) : null}
             </>
           ) : landing.can_read ? (
-            <>
+            isFolder ? (
+              <>
+                <p className="hintline">{t("share.folderHint")}</p>
+                {landing.children && landing.children.length > 0 ? (
+                  <div className="filelist-simple">
+                    {landing.children.map((child) => (
+                      <div className="li" key={child.id}>
+                        <Icon name={child.kind === "dir" ? "files" : "doc"} size={12} />
+                        <span className="n">{child.name}</span>
+                        <span className="s">{child.kind === "dir" ? t("share.folder") : fmt.size(child.size)}</span>
+                        {/* Only files carry bytes. A nested folder is listed so the recipient can
+                            see the shape of what was shared, but it is not an action: this route
+                            serves a child FILE by name, and offering a link that 400s would
+                            reintroduce the defect this branch exists to fix. */}
+                        {child.kind === "dir" ? null : (
+                          <a
+                            className="btn sm"
+                            href={shareDownloadURL(token, child.name)}
+                            aria-label={t("share.downloadNamed", { name: child.name })}
+                          >
+                            <Icon name="download" size={12} />
+                            {t("share.download")}
+                          </a>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="hintline">{t("share.folderEmpty")}</p>
+                )}
+              </>
+            ) : (
               <a className="btn primary" href={shareDownloadURL(token)}>
                 <Icon name="download" size={13} />
                 {t("share.download")}
               </a>
-              {landing.children && landing.children.length > 0 ? (
-                <div className="filelist-simple">
-                  {landing.children.map((child) => (
-                    <div className="li" key={child.id}>
-                      <Icon name={child.kind === "dir" ? "files" : "doc"} size={12} />
-                      <span className="n">{child.name}</span>
-                      <span className="s">{child.kind === "dir" ? "—" : fmt.size(child.size)}</span>
-                    </div>
-                  ))}
-                </div>
-              ) : null}
-            </>
+            )
           ) : (
             <p className="hintline">{t("share.cannotRead")}</p>
           )}

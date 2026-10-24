@@ -393,3 +393,80 @@ func TestAuditExportExcludesOtherOwnersEvents(t *testing.T) {
 		}
 	}
 }
+
+// TestShareCreateAcceptsThePayloadTheDialogSends is the create-dialog half of the email-share feature.
+//
+// The feature existed end to end — the handler accepted `kind: "email"` with `recipients`, the page
+// demanded verification, the mailer sent codes — and nothing in the browser could produce one: the
+// create dialog's type selector offered only link and drop box, and its request type was a
+// hand-written copy of the schema that had no `recipients` field. That is why the gap survived
+// testing: every Go test built its own payload with curl-shaped JSON, so the one caller that could
+// not send it was the one nobody exercised.
+//
+// This asserts the exact body ShareDialog now submits. It is here rather than in the TypeScript
+// because the contract is the server's: a wrong field name typechecks fine against a spec that
+// agrees with itself and fails only when a real handler decodes it.
+func TestShareCreateAcceptsThePayloadTheDialogSends(t *testing.T) {
+	h := newHarness(t)
+	h.uploadFile(t, "offer.txt", "terms")
+
+	payload := map[string]any{
+		"path":               "offer.txt",
+		"kind":               "email",
+		"recipients":         []string{"buyer@example.test", "counsel@example.test"},
+		"expires_in_seconds": 3600,
+	}
+
+	resp := h.do(http.MethodPost, "/api/shares/", jsonBody(t, payload),
+		map[string]string{"Content-Type": "application/json"})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("the dialog's create request was refused: %d %s", resp.StatusCode, readBody(resp))
+	}
+	created := decode(t, resp)
+
+	// The confirmation panel reads the recipients back, so they have to be in the response.
+	sh, _ := created["share"].(map[string]any)
+	got, _ := sh["recipients"].([]any)
+	if len(got) != 2 {
+		t.Fatalf("recipients = %v, want the two the dialog sent", sh["recipients"])
+	}
+
+	// And the payload produced a share that is actually restricted, not merely labelled "email":
+	// the landing page asks for an address before it shows anything.
+	token, _ := created["token"].(string)
+	page := h.do(http.MethodGet, "/s/"+token, nil, map[string]string{"Accept": "application/json"})
+	info := decode(t, page)
+	if info["requires_email"] != true {
+		t.Fatalf("a share created with kind=email does not require verification: %v", info)
+	}
+	if _, leaked := info["children"]; leaked {
+		t.Fatal("the unverified landing page listed children")
+	}
+}
+
+// TestShareCreateRefusesAMalformedRecipient pins the server rule the dialog's shape check mirrors.
+//
+// The two checks are deliberately not identical — the server uses net/mail and is the authority, the
+// client only refuses the obvious typo before a round trip — but a client that let a broken address
+// through must produce a clear 400 rather than a share that silently invites nobody.
+func TestShareCreateRefusesAMalformedRecipient(t *testing.T) {
+	h := newHarness(t)
+	h.uploadFile(t, "doc.txt", "content")
+
+	resp := h.do(http.MethodPost, "/api/shares/",
+		jsonBody(t, map[string]any{
+			"path":       "doc.txt",
+			"kind":       "email",
+			"recipients": []string{"not-an-address"},
+		}),
+		map[string]string{"Content-Type": "application/json"})
+	body := readBody(resp)
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("a malformed recipient answered %d (%s); want 400 so the dialog can say which "+
+			"address is wrong", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, "invalid_recipient") {
+		t.Fatalf("the refusal did not name the cause: %s", body)
+	}
+}

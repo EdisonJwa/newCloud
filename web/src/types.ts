@@ -24,11 +24,16 @@ export type VersionsResponse = Schemas["VersionsResponse"];
 export type ShareKind = Schemas["ShareKind"];
 export type Share = Schemas["Share"];
 export type ShareCreated = Schemas["ShareCreated"];
+export type CreateShareRequest = Schemas["CreateShareRequest"];
 export type AuditEvent = Schemas["AuditEvent"];
 export type AuditPage = Schemas["AuditPage"];
 export type AppPassword = Schemas["AppPassword"];
 export type ShareLanding = Schemas["ShareLanding"];
+export type BatchRequest = Schemas["BatchRequest"];
+export type BatchResponse = Schemas["BatchResponse"];
+export type BatchResult = Schemas["BatchResult"];
 export type ACLGrant = Schemas["ACLGrant"];
+export type SharedNode = Schemas["SharedNode"];
 // The listing wrapper is inline in openapi.yaml (path, permissions, grants) rather than a named
 // schema, so it is written here from the generated path type instead of hand-modelled: the
 // document still decides the shape, and a change there breaks this rather than drifting quietly.
@@ -38,3 +43,6 @@ export type ACLListing = {
   grants: ACLGrant[];
 };
 export type AdminUser = Schemas["AdminUser"];
+export type Group = Schemas["Group"];
+export type GroupMember = Schemas["GroupMember"];
+export type AdminSetting = Schemas["AdminSetting"];

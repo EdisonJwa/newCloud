@@ -16,14 +16,20 @@
 import createClient from "openapi-fetch";
 import type { paths } from "./api-types";
 import type {
+  AdminSetting,
   AppPassword,
   AuditPage,
+  BatchRequest,
+  BatchResponse,
+  CreateShareRequest,
   FileNode,
+  Group,
   Listing,
   Me,
   Share,
   ShareCreated,
   ShareLanding,
+  SharedNode,
   VersionsResponse,
 } from "./types";
 
@@ -118,13 +124,24 @@ export const api = {
   trash: () => call<{ items: FileNode[] }>(client.GET("/api/files/trash")),
   versions: (path: string) =>
     call<VersionsResponse>(client.GET("/api/files/versions", { params: { query: { path } } })),
+  // The server answers with the restored node (200), not 204: the caller can use it to refresh the
+  // row it is showing, and the spec had said 204 — a contract the client and the server disagreed
+  // about, found by the fourth independent review.
   restoreVersion: (path: string, version: number) =>
-    call<void>(client.POST("/api/files/restore-version", { body: { path, version } })),
+    call<FileNode>(client.POST("/api/files/restore-version", { body: { path, version } })),
   restore: (id: string) => call<void>(client.POST("/api/files/restore", { body: { id } })),
   mkdir: (path: string) => call<void>(client.POST("/api/files/mkdir", { body: { path } })),
   rename: (path: string, name: string) =>
     call<void>(client.POST("/api/files/rename", { body: { path, name } })),
   remove: (path: string) => call<void>(client.DELETE("/api/files/", { params: { query: { path } } })),
+
+  // Copy and move, one item or many, through one endpoint.
+  //
+  // The response is per item because a multi-file transfer is routinely partial, and a single status
+  // code cannot say which of five files moved. With exactly one item the server answers that item's
+  // own status instead, so a single-file copy fails the way every other call fails — which is why
+  // `target_exists` can arrive as an APIError or as a result row.
+  batch: (body: BatchRequest) => call<BatchResponse>(client.POST("/api/files/batch", { body })),
 
   // Resumable uploads. Like the single-request upload, the chunk body is raw bytes, so these
   // three go through fetch rather than the generated client; the JSON in and out is still
@@ -194,16 +211,23 @@ export const api = {
   },
 
   shares: () => call<{ items: Share[] }>(client.GET("/api/shares/")),
-  createShare: (body: {
-    path: string;
-    kind: string;
-    password?: string;
-    expires_in_seconds?: number;
-    max_downloads?: number;
-    max_uploads?: number;
-  }) => call<ShareCreated>(client.POST("/api/shares/", { body: body as never })),
+  // The body type is the schema, not a hand-written copy of it. It used to be a copy, and the copy
+  // drifted from the handler: `kind: "email"` with `recipients` was accepted by the server and
+  // unrepresentable here, so the create dialog could not offer an email share at all.
+  createShare: (body: CreateShareRequest) => call<ShareCreated>(client.POST("/api/shares/", { body })),
   revokeShare: (id: string) =>
     call<void>(client.DELETE("/api/shares/{id}", { params: { path: { id } } })),
+
+  // "Shared with me" — the other direction of sharing.
+  //
+  // These nodes are addressed by ID, not by path: their paths live in the owner's namespace, and
+  // every path-based route resolves inside the caller's own tree. Without these two calls the ACL
+  // API could create a grant that no browser could ever act on, which is exactly the state this
+  // section exists to end. The listing carries the authorizer's CURRENT capability, so a revoked
+  // grant disappears rather than going stale.
+  sharedWithMe: () => call<{ items: SharedNode[] }>(client.GET("/api/shared")),
+  sharedNode: (id: string) =>
+    call<SharedNode>(client.GET("/api/shared/{id}", { params: { path: { id } } })),
 
   audit: (params: { offset?: number; actions?: string; result?: string; since?: string }) =>
     call<AuditPage>(client.GET("/api/audit/events", { params: { query: params } })),
@@ -225,6 +249,37 @@ export const api = {
       params: { path: { id } },
       body: { status } as never,
     })),
+  // Quotas are an administrative control (§4), so changing one is an administrative act with its
+  // own audit event rather than a side effect of something else.
+  setUserQuota: (id: string, bytes: number) =>
+    call<{ id: string; quota: number; used_bytes: number }>(
+      client.POST("/api/admin/users/{id}/quota", { params: { path: { id } }, body: { bytes } }),
+    ),
+
+  // Groups. Membership is what a group ACL resolves against, so an admin who cannot see or edit it
+  // cannot use group sharing at all.
+  adminGroups: () => call<{ groups: Group[] }>(client.GET("/api/admin/groups")),
+  createGroup: (body: { name: string; display_name?: string }) =>
+    call<Group>(client.POST("/api/admin/groups", { body })),
+  addGroupMember: (id: string, body: { username?: string; user_id?: string; role?: string }) =>
+    call<Group>(client.POST("/api/admin/groups/{id}/members", { params: { path: { id } }, body: body as never })),
+  removeGroupMember: (id: string, userID: string) =>
+    call<void>(client.DELETE("/api/admin/groups/{id}/members/{userID}", {
+      params: { path: { id, userID } },
+    })),
+
+  // Runtime settings: the limits an administrator can change without a restart. Each row reports
+  // its source so "the override is still on" is visible rather than inferred from a value that does
+  // not match the file.
+  adminSettings: () => call<{ settings: AdminSetting[] }>(client.GET("/api/admin/settings")),
+  setAdminSetting: (key: string, value: number) =>
+    call<{ key: string; value: number }>(
+      client.PUT("/api/admin/settings/{key}", { params: { path: { key } }, body: value }),
+    ),
+  resetAdminSetting: (key: string) =>
+    call<{ key: string; configured: number }>(
+      client.DELETE("/api/admin/settings/{key}", { params: { path: { key } } }),
+    ),
 
   // Resource ACL (§4.1 layer 2). Grants are per node, so every call names a path.
   //
@@ -249,6 +304,21 @@ export const inlineURL = (path: string): string =>
 
 export const thumbnailURL = (path: string): string =>
   `/api/files/thumbnail?path=${encodeURIComponent(path)}`;
+
+// A ZIP of the selection. A plain link rather than a fetch: the browser handles the download, the
+// response can be gigabytes, and the server streams it, so there is nothing to buffer here.
+export const zipURL = (paths: string[]): string => {
+  const query = new URLSearchParams();
+  for (const p of paths) query.append("path", p);
+  return `/api/files/zip?${query.toString()}`;
+};
+
+// A node somebody else owns, addressed by id.
+//
+// The `download` permission is enforced per request; a plain link is the right shape because the
+// browser handles the response, and the route is authenticated, so the session cookie does the work.
+export const sharedContentURL = (id: string): string =>
+  `/api/shared/${encodeURIComponent(id)}/content`;
 
 // A share's download URL.
 //

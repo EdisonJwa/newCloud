@@ -251,7 +251,21 @@ paths:
                 path: { type: string }
                 version: { type: integer }
       responses:
-        "204": { description: restored }
+        # The handler returns the restored node so a client can use the response to update the row it
+        # is showing. It used to be documented as 204 No Content, which is not what the server sends
+        # (fourth independent review, 2026-10-23, item 6.2).
+        "200":
+          description: The restored node
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FileNode" }
+        # The tree layout keeps bytes at the path and overwrites them, so a superseded version's
+        # content is not retained; restoring one would report a change it cannot make.
+        "409":
+          description: This layout keeps no restorable version content (code no_version_content).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /api/files/restore:
     post:
@@ -298,6 +312,88 @@ paths:
                 name: { type: string }
       responses:
         "204": { description: renamed }
+
+  /api/files/move:
+    post:
+      summary: Rename and/or reparent one node
+      description: |
+        The single-item primitive: a move is a rename plus a reparent, and the two ends are checked
+        independently — `delete`-class authority on the source, `create`/`overwrite` on the
+        destination.
+
+        The file manager routes every transfer, single or multiple, through `/api/files/batch` so
+        that one code path covers both. This route stays because it is the shape scripts and the
+        existing tests use, and because a single operation deserves an unambiguous endpoint.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/MoveRequest" }
+      responses:
+        "200":
+          description: the moved node
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FileNode" }
+        "404": { $ref: "#/components/responses/NotFoundResult" }
+        "409": { description: something with that name already exists at the destination }
+
+  /api/files/batch:
+    post:
+      summary: Copy or move one or many nodes
+      description: |
+        One request for a multi-file selection, because partial failure has to be reportable: the
+        answer is a list with one result per item, in the order they were sent.
+
+        With a SINGLE item, a failure answers that item's own status (409 `target_exists`, 404
+        `not_found`, …) exactly like the dedicated routes. With two or more the response is 200 and
+        the caller inspects `results`, because "three moved, two did not" is the ordinary case and
+        no single status code can describe it.
+
+        `overwrite` defaults to false and answers 409 `target_exists` rather than replacing:
+        "replace it?" is a question, and an overwrite nobody confirmed is a deletion. A retry with
+        `overwrite: true` replaces, sending the previous node to the trash.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BatchRequest" }
+      responses:
+        "200":
+          description: per-item outcomes
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BatchResponse" }
+        "400": { description: invalid op, empty selection, or too many items }
+        "404": { $ref: "#/components/responses/NotFoundResult" }
+        "409": { description: a single-item request whose destination already exists }
+
+  /api/files/zip:
+    get:
+      summary: Download a ZIP of the selection
+      description: |
+        Streams the archive as it is produced — nothing is staged to a temporary file and nothing is
+        assembled in memory, so a download the client abandons stops costing work immediately.
+
+        Every node is authorized BEFORE the first byte is written. Once the archive headers are on
+        the wire there is no way to answer 404, and a refusal discovered mid-stream could only
+        produce a truncated archive, which every extraction tool reports as corrupt rather than as
+        "you may not download that".
+      parameters:
+        - name: path
+          in: query
+          required: true
+          description: Repeat once per selected node.
+          style: form
+          explode: true
+          schema: { type: array, items: { type: string } }
+      responses:
+        "200":
+          description: the archive
+          content:
+            application/zip:
+              schema: { type: string, format: binary }
+        "404": { $ref: "#/components/responses/NotFoundResult" }
 
   /api/files/upload:
     post:
@@ -432,6 +528,198 @@ paths:
                   app_passwords_revoked: { type: integer }
         "400": { description: unknown status }
         "404": { $ref: "#/components/responses/NotFoundResult" }
+
+  /api/admin/groups:
+    get:
+      summary: List groups and the accounts in them
+      description: |
+        Administrator only; a non-admin gets 404, not 403, so the surface is invisible rather than
+        merely forbidden.
+
+        This exists because creation and membership were write-only: an operator could make a group
+        and put somebody in it, and had no way to find out what existed. Group ACLs are only usable
+        if the group can be discovered in the first place.
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [groups]
+                properties:
+                  groups:
+                    type: array
+                    items: { $ref: "#/components/schemas/Group" }
+        "404": { $ref: "#/components/responses/NotFoundResult" }
+    post:
+      summary: Create a group, or return the existing one of that name
+      description: |
+        Idempotent by name, matching the store: group membership arrives from the IdP on every
+        login, so a non-idempotent create would fail the second time a known group signed in —
+        which is every sign-in.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+                display_name: { type: string }
+      responses:
+        "201":
+          description: created, or already existed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Group" }
+
+  /api/admin/groups/{id}/members:
+    post:
+      summary: Put an account into a group, or change its role
+      description: |
+        Named by username or id. The response is the whole group, in the same shape the listing
+        uses — one concept, one shape.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                username: { type: string }
+                user_id: { type: string, format: uuid }
+                role: { type: string, enum: [viewer, editor, manager] }
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Group" }
+        "404": { $ref: "#/components/responses/NotFoundResult" }
+
+  /api/admin/groups/{id}/members/{userID}:
+    delete:
+      summary: Take an account out of a group
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - name: userID
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "204": { description: removed }
+        "404": { $ref: "#/components/responses/NotFoundResult" }
+
+  /api/admin/users/{id}/quota:
+    post:
+      summary: Change one account's byte quota
+      description: |
+        Quotas are applied at provisioning and were otherwise unchangeable: an operator whose user
+        hit the limit could edit the database or tell the user to delete files, and the second is
+        not a policy.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [bytes]
+              properties:
+                bytes: { type: integer, minimum: 0, description: Zero means unlimited. }
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, quota, used_bytes]
+                properties:
+                  id: { type: string }
+                  quota: { type: integer }
+                  used_bytes: { type: integer }
+        "404": { $ref: "#/components/responses/NotFoundResult" }
+
+  /api/admin/settings:
+    get:
+      summary: List the runtime settings and where each value comes from
+      description: |
+        The limits an administrator can change without a restart. Each entry reports its effective
+        value and whether that value is the configured default or an override, because "why is the
+        limit 4 MiB when the file says 8" is the question this screen exists to answer.
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [settings]
+                properties:
+                  settings:
+                    type: array
+                    items: { $ref: "#/components/schemas/AdminSetting" }
+        "404": { $ref: "#/components/responses/NotFoundResult" }
+
+  /api/admin/settings/{key}:
+    put:
+      summary: Override one runtime setting
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: integer }
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [key, value]
+                properties:
+                  key: { type: string }
+                  value: { type: integer }
+        "400": { description: unknown key, or a value outside its allowed range }
+    delete:
+      summary: Remove an override, restoring the configured value
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: reset
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [key, configured]
+                properties:
+                  key: { type: string }
+                  configured: { type: integer }
+        "400": { description: unknown key }
 
   /api/acl/:
     get:
@@ -634,28 +922,7 @@ paths:
         required: true
         content:
           application/json:
-            schema:
-              type: object
-              required: [path, kind]
-              properties:
-                path: { type: string }
-                kind: { $ref: "#/components/schemas/ShareKind" }
-                password: { type: string }
-                expires_in_seconds: { type: integer }
-                max_downloads: { type: integer }
-                max_uploads: { type: integer }
-                # Per-share upload limits. They are enforced on the upload path, so
-                # a drop box that cannot set them cannot be limited at all.
-                max_bytes_per_file: { type: integer }
-                allowed_mime:
-                  type: array
-                  items: { type: string }
-                permissions:
-                  type: array
-                  items: { type: string }
-                recipients:
-                  type: array
-                  items: { type: string }
+            schema: { $ref: "#/components/schemas/CreateShareRequest" }
       responses:
         "201":
           description: created
@@ -834,6 +1101,55 @@ components:
         offset: { type: integer }
         chunk_size: { type: integer, description: The size the server suggests for each chunk. }
 
+    MoveRequest:
+      type: object
+      required: [from, to]
+      properties:
+        from: { type: string, description: Existing path inside the caller's own namespace. }
+        to: { type: string, description: Destination path, including the name it should have. }
+
+    BatchItem:
+      type: object
+      required: [from, to]
+      properties:
+        from: { type: string }
+        to: { type: string }
+
+    BatchRequest:
+      type: object
+      required: [op, items]
+      properties:
+        op: { type: string, enum: [copy, move] }
+        overwrite:
+          type: boolean
+          description: Replace an existing destination instead of refusing it.
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/BatchItem" }
+
+    BatchResult:
+      type: object
+      required: [from, to, ok]
+      properties:
+        from: { type: string }
+        to: { type: string }
+        ok: { type: boolean }
+        # target_exists is the one the client acts on: it is the signal to ask "replace it?".
+        code: { type: string, description: "Machine-readable cause, e.g. target_exists or not_found." }
+        error: { type: string }
+
+    BatchResponse:
+      type: object
+      required: [op, results, moved, failed, complete]
+      properties:
+        op: { type: string }
+        results:
+          type: array
+          items: { $ref: "#/components/schemas/BatchResult" }
+        moved: { type: integer, description: Items that succeeded. }
+        failed: { type: integer }
+        complete: { type: boolean, description: True when every item succeeded. }
+
     UploadConflict:
       type: object
       required: [error, offset]
@@ -877,6 +1193,40 @@ components:
         is_breakglass: { type: boolean }
         created_at: { type: string }
 
+    Group:
+      type: object
+      required: [id, name, members]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        display_name: { type: string }
+        members:
+          type: array
+          items: { $ref: "#/components/schemas/GroupMember" }
+
+    GroupMember:
+      type: object
+      required: [id, username, role]
+      properties:
+        id: { type: string, format: uuid }
+        username: { type: string }
+        email: { type: string }
+        # Stored for display; authorization uses the ACL grants, not this field.
+        role: { type: string }
+
+    AdminSetting:
+      type: object
+      required: [key, value, configured, source]
+      properties:
+        key: { type: string }
+        # Every runtime setting is a byte or count limit, so the value is always an integer.
+        value: { type: integer }
+        configured: { type: integer, description: The value from the configuration file. }
+        source:
+          type: string
+          enum: [config, override]
+          description: Whether the effective value is the default or an administrative override.
+
     ACLGrant:
       type: object
       required: [id, subject_kind, subject, permissions, inherit, created_at]
@@ -914,6 +1264,7 @@ components:
           nullable: true
           items:
             type: object
+            required: [id, name, kind]
             properties:
               id: { type: string, format: uuid }
               name: { type: string }
@@ -930,10 +1281,15 @@ components:
 
     VersionsResponse:
       type: object
-      required: [path, versions, cheap_versions]
+      required: [path, versions, cheap_versions, version_content_available]
       properties:
         path: { type: string }
+        # Whether keeping a version is cheap (differences) or expensive (a copy) — a cost signal.
         cheap_versions: { type: boolean }
+        # Whether the rows below can be RESTORED. The tree layout records version rows but retains no
+        # content for them, so the list is a history of changes and the Restore action would fail
+        # with 409 every time. The UI must hide the action when this is false (fourth review, 6.1).
+        version_content_available: { type: boolean }
         versions:
           type: array
           items: { $ref: "#/components/schemas/Version" }
@@ -941,6 +1297,48 @@ components:
     ShareKind:
       type: string
       enum: [link, email, request]
+
+    # The body of POST /api/shares/.
+    #
+    # Named rather than inline so the client's dialog is typed against the same shape the handler
+    # decodes. An inline object in a path is just as generated, but it cannot be named at a call
+    # site, and the create dialog grew a hand-written copy of it once already — which is how the
+    # email-recipient fields came to be accepted by the server and untypeable in the client.
+    CreateShareRequest:
+      type: object
+      required: [path, kind]
+      properties:
+        path: { type: string }
+        kind: { $ref: "#/components/schemas/ShareKind" }
+        label: { type: string }
+        password: { type: string }
+        expires_in_seconds: { type: integer }
+        max_downloads: { type: integer }
+        max_uploads: { type: integer }
+        # Per-share upload limits. They are enforced on the upload path, so a drop box
+        # that cannot set them cannot be limited at all.
+        max_bytes_per_file: { type: integer }
+        max_total_bytes: { type: integer }
+        retention_seconds: { type: integer }
+        max_upload_rate: { type: integer }
+        upload_rate_window_seconds: { type: integer }
+        allowed_mime:
+          type: array
+          items: { type: string }
+        permissions:
+          type: array
+          items: { type: string }
+        # kind "email" restricts access to these addresses: one of them must prove ownership with
+        # a mailed code before the link opens. An email share with no recipients fails closed — the
+        # server treats the kind alone as the requirement — so the dialog must collect at least one.
+        recipients:
+          type: array
+          items: { type: string }
+        # Accepted but not trusted: the server forces it on for request shares.
+        hide_contents: { type: boolean }
+        # Share a node the caller did not address by path inside their OWN namespace — the way a
+        # grantee exercises a `share` grant on somebody else's file.
+        node_id: { type: string, format: uuid }
 
     Share:
       type: object
@@ -1022,8 +1420,12 @@ components:
         revoked: { type: boolean }
 
     ShareLanding:
+      # This payload has several shapes by design: the access gate answers with what is still
+      # missing, a drop box answers with its rules and no listing, and an opened link answers with
+      # the node. Nothing is `required` beyond `kind`, because a client that insists on a field the
+      # gate does not send yet would have to invent it.
       type: object
-      required: [kind, can_read, requires_password, requires_email, upload_count]
+      required: [kind]
       properties:
         kind: { $ref: "#/components/schemas/ShareKind" }
         label: { type: string }
@@ -1031,8 +1433,25 @@ components:
         requires_password: { type: boolean }
         requires_email: { type: boolean }
         expires_at: { type: string }
+        # root_kind says whether the shared node is the file itself or a directory of files.
+        #
+        # It is what tells the landing page which primary action is honest: a directory has no
+        # bytes of its own, so `GET /s/{token}/download` answers 400 is_directory for it. The page
+        # rendered a Download button for both until this field existed, and for a shared folder
+        # that button was guaranteed to fail.
+        root_name: { type: string }
+        root_kind: { type: string, enum: [file, dir] }
+        hide_contents: { type: boolean }
+        can_upload: { type: boolean }
         max_uploads: { type: integer }
         upload_count: { type: integer }
+        # A drop box's rules, shown to the recipient before they upload rather than after a refusal.
+        max_bytes_per_file: { type: integer }
+        allowed_mime:
+          type: array
+          items: { type: string }
+        # Direct children of a shared directory. Each entry is downloadable by name:
+        # `GET /s/{token}/download?name=<name>`.
         children:
           type: array
           items: { $ref: "#/components/schemas/FileNode" }

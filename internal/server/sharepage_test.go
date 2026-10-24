@@ -9,7 +9,9 @@ package server_test
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -233,4 +235,75 @@ func TestDisabledOwnerSuspendsTheirShareLinks(t *testing.T) {
 	if code := h.do(http.MethodGet, "/s/"+token+"/download", nil, nil).StatusCode; code != http.StatusOK {
 		t.Fatalf("the link did not come back after re-enabling the account: %d", code)
 	}
+}
+
+// TestShareLandingSaysWhetherTheRootIsAFileOrADirectory is the contract the landing page branches on.
+//
+// The page rendered one Download button for every readable share, pointing at
+// /s/{token}/download. For a shared DIRECTORY that URL answers 400 is_directory by design, so the
+// single primary action on exactly the shares people send most often was a guaranteed failure: the
+// visitor clicked the only button and got an error. The fix is a download link per child, and it
+// depends on the server saying that the root is a directory — root_kind.
+//
+// Without this test, dropping root_kind from the payload would restore the broken button silently,
+// because the page falls back to "show the root download" when the field is absent.
+func TestShareLandingSaysWhetherTheRootIsAFileOrADirectory(t *testing.T) {
+	h := newHarness(t)
+
+	t.Run("a file share names the file", func(t *testing.T) {
+		h.uploadFile(t, "solo.txt", "one file")
+		token, _ := createShare(t, h, `{"path":"solo.txt","kind":"link"}`)
+
+		resp := h.do(http.MethodGet, "/s/"+token, nil, map[string]string{"Accept": "application/json"})
+		landing := decode(t, resp)
+		if landing["root_kind"] != "file" {
+			t.Fatalf("root_kind = %v, want \"file\"", landing["root_kind"])
+		}
+		if landing["root_name"] != "solo.txt" {
+			t.Fatalf("root_name = %v, want \"solo.txt\"", landing["root_name"])
+		}
+	})
+
+	t.Run("a directory share lists downloadable children", func(t *testing.T) {
+		h.mkdir(t, "box")
+		body := multipartBody(t, "box", "note.txt", "a shared child")
+		if rec := h.do(http.MethodPost, "/api/files/upload", body,
+			map[string]string{"Content-Type": "multipart/form-data; boundary=" + body.Boundary()}); rec.StatusCode != http.StatusCreated {
+			t.Fatalf("seed child: %d %s", rec.StatusCode, readBody(rec))
+		}
+		token, _ := createShare(t, h, `{"path":"box","kind":"link"}`)
+
+		resp := h.do(http.MethodGet, "/s/"+token, nil, map[string]string{"Accept": "application/json"})
+		landing := decode(t, resp)
+		if landing["root_kind"] != "dir" {
+			t.Fatalf("root_kind = %v, want \"dir\" — this is the field the page uses to avoid "+
+				"offering a download that returns 400", landing["root_kind"])
+		}
+		children, _ := landing["children"].([]any)
+		if len(children) != 1 {
+			t.Fatalf("want 1 child, got %d", len(children))
+		}
+		child, _ := children[0].(map[string]any)
+		if child["name"] != "note.txt" || child["kind"] != "file" {
+			t.Fatalf("child = %v, want the file note.txt", child)
+		}
+
+		// The two URLs the page now produces behave as the page assumes: the directory root has no
+		// bytes of its own, and the named child does.
+		root := h.do(http.MethodGet, "/s/"+token+"/download", nil, nil)
+		root.Body.Close()
+		if root.StatusCode != http.StatusBadRequest {
+			t.Fatalf("the directory root answered %d; the page hides this action BECAUSE it is "+
+				"not a download, so the status is part of the contract", root.StatusCode)
+		}
+		childResp := h.do(http.MethodGet, "/s/"+token+"/download?name="+url.QueryEscape("note.txt"), nil, nil)
+		defer childResp.Body.Close()
+		if childResp.StatusCode != http.StatusOK {
+			t.Fatalf("the named child answered %d", childResp.StatusCode)
+		}
+		got, _ := io.ReadAll(childResp.Body)
+		if string(got) != "a shared child" {
+			t.Fatalf("child bytes = %q", got)
+		}
+	})
 }

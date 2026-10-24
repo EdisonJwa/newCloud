@@ -19,10 +19,17 @@ import {
   type DragEvent,
   type KeyboardEvent,
 } from "react";
-import { api, APIError, downloadURL, inlineURL, thumbnailURL } from "../api";
+import { api, APIError, downloadURL, inlineURL, thumbnailURL, zipURL } from "../api";
 import { useI18n } from "../i18n";
 import { DeniedState, EmptyState, ErrorState, FileGlyph, Icon, Skeleton, useToast } from "../ui";
-import { DeleteDialog, NewFolderDialog, RenameDialog, ShareDialog } from "../components/Dialogs";
+import {
+  DeleteDialog,
+  NewFolderDialog,
+  RenameDialog,
+  ShareDialog,
+  TransferDialog,
+  type TransferOp,
+} from "../components/Dialogs";
 import { Viewer } from "../components/Viewer";
 import type { FileNode, Share, Version } from "../types";
 
@@ -74,6 +81,93 @@ function readSort(): Sort {
     }
   }
   return { key: "name", dir: "asc" };
+}
+
+/* ---------- unfinished uploads ---------- */
+
+/**
+ * A chunked upload that has not finished yet.
+ *
+ * The server's half of a resumable upload already survives a refresh: the staged bytes and the
+ * accepted offset live in the upload manager, not in the page. The BROWSER's half was a local
+ * variable holding the session id, so closing the tab or reloading dropped the only reference to
+ * work the server still had on disk. "Resumable" was then true of the protocol and false of the
+ * product — the bytes were unreachable, and the session sat there until it expired.
+ *
+ * These records are that missing half. They are a HINT, never authority: every chunk response
+ * carries the offset the server actually holds, and a session it no longer has answers 404, which
+ * is treated as "upload it again" rather than as a retry.
+ */
+interface PendingUpload {
+  /** The server's upload session id. */
+  id: string;
+  dir: string;
+  name: string;
+  size: number;
+  /** The File's lastModified, so a resumed upload cannot be fed a different file of the same name. */
+  lastModified: number;
+  /** Where we believe we stopped. The server's answer overrides it on the first chunk. */
+  offset: number;
+  /** The chunk size this session was started with, so a configured limit is not exceeded on resume. */
+  chunk: number;
+  updatedAt: number;
+}
+
+const PENDING_KEY = "wc.pendingUploads";
+
+/** A week: long enough to come back to, short enough that the list cannot accumulate forever. */
+const PENDING_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** readPending returns the recorded sessions, dropping anything malformed or stale.
+ *
+ * Parsed field by field rather than cast: this is localStorage, which any other tab, any browser
+ * extension and any earlier version of this code can write to.
+ */
+function readPending(): PendingUpload[] {
+  try {
+    const raw = localStorage.getItem(PENDING_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    const cutoff = Date.now() - PENDING_MAX_AGE_MS;
+    return parsed.filter((item): item is PendingUpload => {
+      if (typeof item !== "object" || item === null) return false;
+      const r = item as Partial<PendingUpload>;
+      return (
+        typeof r.id === "string" &&
+        typeof r.dir === "string" &&
+        typeof r.name === "string" &&
+        typeof r.size === "number" &&
+        typeof r.lastModified === "number" &&
+        typeof r.offset === "number" &&
+        typeof r.chunk === "number" &&
+        typeof r.updatedAt === "number" &&
+        r.updatedAt >= cutoff
+      );
+    });
+  } catch {
+    // Unreadable storage is not a reason to fail the view; it just means nothing can be resumed.
+    return [];
+  }
+}
+
+function writePending(list: PendingUpload[]): void {
+  try {
+    if (list.length === 0) localStorage.removeItem(PENDING_KEY);
+    else localStorage.setItem(PENDING_KEY, JSON.stringify(list));
+  } catch {
+    /* private mode: resume across reloads is simply unavailable, uploads still work */
+  }
+}
+
+/** rememberPending inserts or replaces one record by session id. */
+function rememberPending(rec: PendingUpload): void {
+  writePending([...readPending().filter((r) => r.id !== rec.id), rec]);
+}
+
+/** forgetPending drops a record that is finished, aborted or no longer known to the server. */
+function forgetPending(id: string): void {
+  writePending(readPending().filter((r) => r.id !== id));
 }
 
 // arrange filters and orders one column.
@@ -133,6 +227,7 @@ export function Files({ initialPath = "", reloadKey, onPathChange }: Props) {
     | { kind: "rename"; entry: FileNode }
     | { kind: "delete"; entries: FileNode[] }
     | { kind: "share"; entry: FileNode }
+    | { kind: "transfer"; op: TransferOp; entries: FileNode[] }
     | null
   >(null);
   const [upload, setUpload] = useState<{
@@ -142,10 +237,16 @@ export function Files({ initialPath = "", reloadKey, onPathChange }: Props) {
     bytesTotal: number;
   } | null>(null);
   const [dragging, setDragging] = useState(false);
+  // Unfinished uploads recorded by a previous page load. Read once on mount: a session that was
+  // interrupted in another tab is the same session, and the list is cheap to re-read after any
+  // upload activity.
+  const [pending, setPending] = useState<PendingUpload[]>(() => readPending());
+  const [resuming, setResuming] = useState(false);
 
   const colRefs = useRef<Array<HTMLDivElement | null>>([]);
   const wantFocus = useRef(false);
   const fileInput = useRef<HTMLInputElement>(null);
+  const resumeInput = useRef<HTMLInputElement>(null);
   const dragDepth = useRef(0);
 
   const deepest = dirs[dirs.length - 1] ?? "";
@@ -331,6 +432,7 @@ export function Files({ initialPath = "", reloadKey, onPathChange }: Props) {
       }
       setUpload(null);
       reload();
+      setPending(readPending());
       if (failed === 0) {
         toast.info(t("toast.uploaded", { n: done }));
       } else {
@@ -348,6 +450,65 @@ export function Files({ initialPath = "", reloadKey, onPathChange }: Props) {
     const files = Array.from(e.dataTransfer.files ?? []);
     if (files.length) void uploadFiles(files);
   };
+
+  /* ---------- resuming interrupted uploads ---------- */
+
+  // resumePicked continues whichever recorded sessions the picked files belong to.
+  //
+  // The picker is the only way back to the bytes: the browser cannot persist a File, so "resume
+  // after closing the tab" necessarily means "pick the same file again". Matching is by
+  // name+size+lastModified, and a file that matches nothing is reported rather than uploaded from
+  // scratch — starting a second upload of the same name would shadow the bytes already staged.
+  const resumePicked = useCallback(
+    async (files: File[]) => {
+      if (files.length === 0) return;
+      setResuming(true);
+      let resumed = 0;
+      try {
+        for (const file of files) {
+          const rec = readPending().find(
+            (r) => r.name === file.name && r.size === file.size && r.lastModified === file.lastModified,
+          );
+          if (!rec) {
+            toast.error(t("uploads.noMatch", { name: file.name }));
+            continue;
+          }
+          try {
+            await resumeUpload(rec, file, () => {});
+            resumed += 1;
+          } catch (err) {
+            toast.error(
+              err instanceof APIError && err.code === "file_changed"
+                ? t("uploads.fileChanged", { name: file.name })
+                : t("uploads.resumeFailed", { name: file.name }),
+            );
+          }
+        }
+      } finally {
+        setPending(readPending());
+        setResuming(false);
+        // A resumed upload may have published a file, so the listing is stale either way.
+        setListings({});
+        setErrors({});
+      }
+      if (resumed > 0) toast.info(t("uploads.resumed", { n: resumed }));
+    },
+    [t, toast],
+  );
+
+  // discardPending abandons every recorded session and releases its staged bytes.
+  //
+  // Aborting is the deliberate version of what the upload loop used to do automatically: throw the
+  // staging away. Here it is the person's decision, and it is the only way to stop a dead session
+  // from occupying one of the account's upload slots.
+  const discardPending = useCallback(async () => {
+    for (const rec of readPending()) {
+      await api.abortUpload(rec.id);
+    }
+    writePending([]);
+    setPending([]);
+    toast.info(t("uploads.discarded"));
+  }, [t, toast]);
 
   /* ---------- keyboard ---------- */
 
@@ -467,9 +628,60 @@ export function Files({ initialPath = "", reloadKey, onPathChange }: Props) {
             ) : null}
           </span>
         ) : null}
+        {pending.length > 0 ? (
+          <div className="resume-bar" role="status">
+            <Icon name="upload" size={12} />
+            <span className="mono">{t("uploads.pending", { n: pending.length })}</span>
+            {/* The picker is how the browser gets the bytes back. It is one control rather
+                than a row per session: the person has the file, not the session id. */}
+            <button
+              type="button"
+              className="btn sm"
+              disabled={resuming}
+              onClick={() => resumeInput.current?.click()}
+            >
+              {resuming ? t("uploads.resuming") : t("uploads.resume")}
+            </button>
+            <button
+              type="button"
+              className="btn sm ghost"
+              disabled={resuming}
+              onClick={() => void discardPending()}
+            >
+              {t("uploads.discard")}
+            </button>
+          </div>
+        ) : null}
         {picked.length > 1 ? (
           <div className="selection-bar" role="status">
             <span className="mono">{t("files.selected", { n: picked.length })}</span>
+            <button
+              type="button"
+              className="btn sm"
+              onClick={() => setDialog({ kind: "transfer", op: "copy", entries: pickedEntries })}
+            >
+              <Icon name="copy" size={12} />
+              {t("transfer.copy")}
+            </button>
+            <button
+              type="button"
+              className="btn sm"
+              onClick={() => setDialog({ kind: "transfer", op: "move", entries: pickedEntries })}
+            >
+              <Icon name="move" size={12} />
+              {t("transfer.move")}
+            </button>
+            {/* A plain link, not a fetch: the archive is streamed and the browser owns the
+                download, its progress and its cancel. */}
+            <a
+              className="btn sm"
+              href={zipURL(pickedEntries.map((e) => e.path))}
+              download
+              aria-label={t("transfer.zip")}
+            >
+              <Icon name="download" size={12} />
+              {t("transfer.zip")}
+            </a>
             <button
               type="button"
               className="btn sm danger"
@@ -719,6 +931,7 @@ export function Files({ initialPath = "", reloadKey, onPathChange }: Props) {
               onRename={() => setDialog({ kind: "rename", entry: sel.entry })}
               onDelete={() => setDialog({ kind: "delete", entries: [sel.entry] })}
               onShare={() => setDialog({ kind: "share", entry: sel.entry })}
+              onTransfer={(op) => setDialog({ kind: "transfer", op, entries: [sel.entry] })}
               onRefresh={reload}
             />
           ) : null}
@@ -743,6 +956,20 @@ export function Files({ initialPath = "", reloadKey, onPathChange }: Props) {
           const files = Array.from(e.target.files ?? []);
           e.target.value = "";
           void uploadFiles(files);
+        }}
+      />
+
+      {/* The same control for a resume. Separate from the upload input so that picking a file to
+          resume can never start a new upload: the two paths must not be one mis-click apart. */}
+      <input
+        ref={resumeInput}
+        type="file"
+        multiple
+        hidden
+        onChange={(e) => {
+          const files = Array.from(e.target.files ?? []);
+          e.target.value = "";
+          void resumePicked(files);
         }}
       />
 
@@ -774,6 +1001,19 @@ export function Files({ initialPath = "", reloadKey, onPathChange }: Props) {
       {dialog?.kind === "share" ? (
         <ShareDialog entry={dialog.entry} onClose={() => setDialog(null)} />
       ) : null}
+      {dialog?.kind === "transfer" ? (
+        <TransferDialog
+          op={dialog.op}
+          entries={dialog.entries}
+          startDir={deepest}
+          onClose={() => setDialog(null)}
+          onDone={() => {
+            setSel(null);
+            setPicked([]);
+            reload();
+          }}
+        />
+      ) : null}
     </>
   );
 }
@@ -784,6 +1024,9 @@ export function Files({ initialPath = "", reloadKey, onPathChange }: Props) {
  * A dropped connection on a 20 GiB file used to mean starting over. Now the retry loop resumes
  * from whatever offset the server reports, and a 409 is not a failure but the answer to "where
  * was I" — which is why a failed chunk is retried unchanged rather than with a guessed offset.
+ *
+ * The session is recorded in localStorage before the first byte, so the resumability survives the
+ * page rather than only the connection: see PendingUpload.
  */
 async function uploadOne(
   dir: string,
@@ -797,24 +1040,60 @@ async function uploadOne(
   }
 
   const session = await api.startUpload(dir, file.name, file.size);
-  const chunk = session.chunk_size > 0 ? session.chunk_size : CHUNK_THRESHOLD;
-  let offset = session.offset;
+  const rec: PendingUpload = {
+    id: session.id,
+    dir,
+    name: file.name,
+    size: file.size,
+    lastModified: file.lastModified,
+    offset: session.offset,
+    chunk: session.chunk_size > 0 ? session.chunk_size : CHUNK_THRESHOLD,
+    updatedAt: Date.now(),
+  };
+  rememberPending(rec);
+  await pumpChunks(rec, file, onProgress);
+}
+
+/**
+ * pumpChunks sends the bytes from rec.offset to the end and publishes the file.
+ *
+ * Shared by a fresh upload and a resume because they are the same operation from different
+ * starting offsets — and because the retry rule has to be identical in both: a failed chunk is
+ * retried unchanged, and a 409 is the server telling us where it actually is.
+ */
+async function pumpChunks(
+  rec: PendingUpload,
+  file: File,
+  onProgress: (sent: number) => void,
+): Promise<void> {
+  const chunk = rec.chunk > 0 ? rec.chunk : CHUNK_THRESHOLD;
+  let offset = rec.offset;
   let attempt = 0;
 
   while (offset < file.size) {
     const start = offset;
     const end = Math.min(start + chunk, file.size) - 1;
     try {
-      const result = await api.putChunk(session.id, start, end, file.size, file.slice(start, end + 1));
+      const result = await api.putChunk(rec.id, start, end, file.size, file.slice(start, end + 1));
       offset = result.offset;
+      // Recorded per chunk: a reload halfway through a large file should resume near the failure
+      // rather than at the beginning.
+      rememberPending({ ...rec, offset, updatedAt: Date.now() });
       onProgress(offset);
       attempt = 0;
     } catch (err) {
+      if (err instanceof APIError && err.status === 404) {
+        // The server no longer holds this session — it expired, or staging was cleaned up. The
+        // record is dead, and keeping it would offer the person a resume that can never work.
+        forgetPending(rec.id);
+        throw err;
+      }
       attempt += 1;
       if (attempt > MAX_CHUNK_ATTEMPTS) {
-        // Give up cleanly: leaving the session open would keep occupying a slot until it
-        // expires.
-        await api.abortUpload(session.id);
+        // Deliberately NOT aborted. Aborting would discard the staged bytes and make the record
+        // useless, which is exactly what it used to do: a long outage destroyed the progress it
+        // was supposed to preserve. The session expires on its own, and the panel's discard
+        // button aborts it when the person decides not to continue.
         throw err;
       }
       // Retry the same range. If the server did receive it, the next response is a conflict
@@ -823,7 +1102,39 @@ async function uploadOne(
     }
   }
 
-  await api.completeUpload(session.id);
+  await api.completeUpload(rec.id);
+  forgetPending(rec.id);
+}
+
+/**
+ * resumeUpload continues a session recorded before a reload.
+ *
+ * The File object is the one thing a browser cannot keep: a reload loses the bytes, so the person
+ * has to pick the file again. What is checked is name + size + lastModified, and it is worth being
+ * precise about what that does and does not prove:
+ *
+ *   CATCHES   the ordinary mistakes — a different file picked by accident, a renamed file, a file
+ *             that was edited and saved since (its mtime moved), a truncation (its size moved).
+ *
+ *   DOES NOT  prove the bytes are identical. A file rewritten in place while preserving both its
+ *   CATCH     length and its modification time is indistinguishable from the original here, and the
+ *             server cannot help: it was told a name and a length and never saw the rest. Nor does
+ *             anything in the record identify the ACCOUNT, so on a shared browser the list is
+ *             whoever signed in last.
+ *
+ * Closing that would need a content fingerprint (sampled hashing is a cheap approximation) and an
+ * owner on the record. Until then this is a guard against the common mistake, not a cryptographic
+ * identity check, and the staging TTL bounds how long a stale record can be offered at all.
+ */
+async function resumeUpload(
+  rec: PendingUpload,
+  file: File,
+  onProgress: (sent: number) => void,
+): Promise<void> {
+  if (file.size !== rec.size || file.lastModified !== rec.lastModified) {
+    throw new APIError(0, "file_changed", "the selected file is not the one that was uploading");
+  }
+  await pumpChunks(rec, file, onProgress);
 }
 
 /* ---------- detail ---------- */
@@ -835,13 +1146,19 @@ interface DetailProps {
   onRename: () => void;
   onDelete: () => void;
   onShare: () => void;
+  onTransfer: (op: TransferOp) => void;
   onRefresh: () => void;
 }
 
-function Detail({ entry, onClose, onOpen, onRename, onDelete, onShare, onRefresh }: DetailProps) {
+function Detail({ entry, onClose, onOpen, onRename, onDelete, onShare, onTransfer, onRefresh }: DetailProps) {
   const { t, fmt } = useI18n();
   const toast = useToast();
   const [versions, setVersions] = useState<Version[] | null>(null);
+  // Whether the history below can actually be restored. The tree layout records version rows but
+  // keeps no content for them, so the server reports version_content_available=false and refuses the
+  // restore with 409. Offering the button anyway is a promise the deployment cannot keep (fourth
+  // independent review, 6.1): the list is a record of changes, not recoverable content.
+  const [versionsRestorable, setVersionsRestorable] = useState(false);
   const [shares, setShares] = useState<Share[] | null>(null);
 
   useEffect(() => {
@@ -849,10 +1166,19 @@ function Detail({ entry, onClose, onOpen, onRename, onDelete, onShare, onRefresh
     if (entry.has_versions) {
       api
         .versions(entry.path)
-        .then((res) => live && setVersions(res.versions ?? []))
-        .catch(() => live && setVersions([]));
+        .then((res) => {
+          if (!live) return;
+          setVersions(res.versions ?? []);
+          setVersionsRestorable(Boolean(res.version_content_available));
+        })
+        .catch(() => {
+          if (!live) return;
+          setVersions([]);
+          setVersionsRestorable(false);
+        });
     } else {
       setVersions([]);
+      setVersionsRestorable(false);
     }
     api
       .shares()
@@ -908,6 +1234,14 @@ function Detail({ entry, onClose, onOpen, onRename, onDelete, onShare, onRefresh
               {t("detail.download")}
             </a>
           ) : null}
+          <button type="button" className="btn sm" onClick={() => onTransfer("copy")}>
+            <Icon name="copy" size={12} />
+            {t("detail.copy")}
+          </button>
+          <button type="button" className="btn sm" onClick={() => onTransfer("move")}>
+            <Icon name="move" size={12} />
+            {t("detail.move")}
+          </button>
           <button type="button" className="btn sm" onClick={onShare}>
             <Icon name="link" size={12} />
             {t("detail.share")}
@@ -934,29 +1268,36 @@ function Detail({ entry, onClose, onOpen, onRename, onDelete, onShare, onRefresh
             ) : versions.length === 0 ? (
               <div className="hintline">{t("detail.versionsEmpty")}</div>
             ) : (
-              versions.map((v) => (
-                <div className="vrow" key={v.version}>
-                  <span className="no">v{v.version}</span>
-                  <span className="meta">
-                    {fmt.size(v.size)} · {fmt.relative(v.created_at)}
-                  </span>
-                  <button
-                    type="button"
-                    className="btn sm act"
-                    onClick={async () => {
-                      try {
-                        await api.restoreVersion(entry.path, v.version);
-                        toast.info(t("toast.versionRestored", { n: v.version }));
-                        onRefresh();
-                      } catch (err) {
-                        toast.error(err instanceof APIError ? err.message : String(err));
-                      }
-                    }}
-                  >
-                    {t("detail.restore")}
-                  </button>
-                </div>
-              ))
+              <>
+                {!versionsRestorable ? (
+                  <div className="hintline">{t("detail.versionsNoContent")}</div>
+                ) : null}
+                {versions.map((v) => (
+                  <div className="vrow" key={v.version}>
+                    <span className="no">v{v.version}</span>
+                    <span className="meta">
+                      {fmt.size(v.size)} · {fmt.relative(v.created_at)}
+                    </span>
+                    {versionsRestorable ? (
+                      <button
+                        type="button"
+                        className="btn sm act"
+                        onClick={async () => {
+                          try {
+                            await api.restoreVersion(entry.path, v.version);
+                            toast.info(t("toast.versionRestored", { n: v.version }));
+                            onRefresh();
+                          } catch (err) {
+                            toast.error(err instanceof APIError ? err.message : String(err));
+                          }
+                        }}
+                      >
+                        {t("detail.restore")}
+                      </button>
+                    ) : null}
+                  </div>
+                ))}
+              </>
             )}
           </div>
         </details>

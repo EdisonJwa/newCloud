@@ -523,12 +523,23 @@ export interface paths {
                 };
             };
             responses: {
-                /** @description restored */
-                204: {
+                /** @description The restored node */
+                200: {
                     headers: {
                         [name: string]: unknown;
                     };
-                    content?: never;
+                    content: {
+                        "application/json": components["schemas"]["FileNode"];
+                    };
+                };
+                /** @description This layout keeps no restorable version content (code no_version_content). */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
                 };
             };
         };
@@ -653,6 +664,180 @@ export interface paths {
                 };
             };
         };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/files/move": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Rename and/or reparent one node
+         * @description The single-item primitive: a move is a rename plus a reparent, and the two ends are checked
+         *     independently — `delete`-class authority on the source, `create`/`overwrite` on the
+         *     destination.
+         *
+         *     The file manager routes every transfer, single or multiple, through `/api/files/batch` so
+         *     that one code path covers both. This route stays because it is the shape scripts and the
+         *     existing tests use, and because a single operation deserves an unambiguous endpoint.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["MoveRequest"];
+                };
+            };
+            responses: {
+                /** @description the moved node */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["FileNode"];
+                    };
+                };
+                404: components["responses"]["NotFoundResult"];
+                /** @description something with that name already exists at the destination */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/files/batch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Copy or move one or many nodes
+         * @description One request for a multi-file selection, because partial failure has to be reportable: the
+         *     answer is a list with one result per item, in the order they were sent.
+         *
+         *     With a SINGLE item, a failure answers that item's own status (409 `target_exists`, 404
+         *     `not_found`, …) exactly like the dedicated routes. With two or more the response is 200 and
+         *     the caller inspects `results`, because "three moved, two did not" is the ordinary case and
+         *     no single status code can describe it.
+         *
+         *     `overwrite` defaults to false and answers 409 `target_exists` rather than replacing:
+         *     "replace it?" is a question, and an overwrite nobody confirmed is a deletion. A retry with
+         *     `overwrite: true` replaces, sending the previous node to the trash.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["BatchRequest"];
+                };
+            };
+            responses: {
+                /** @description per-item outcomes */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["BatchResponse"];
+                    };
+                };
+                /** @description invalid op */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                404: components["responses"]["NotFoundResult"];
+                /** @description a single-item request whose destination already exists */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/files/zip": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Download a ZIP of the selection
+         * @description Streams the archive as it is produced — nothing is staged to a temporary file and nothing is
+         *     assembled in memory, so a download the client abandons stops costing work immediately.
+         *
+         *     Every node is authorized BEFORE the first byte is written. Once the archive headers are on
+         *     the wire there is no way to answer 404, and a refusal discovered mid-stream could only
+         *     produce a truncated archive, which every extraction tool reports as corrupt rather than as
+         *     "you may not download that".
+         */
+        get: {
+            parameters: {
+                query: {
+                    /** @description Repeat once per selected node. */
+                    path: string[];
+                };
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description the archive */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/zip": string;
+                    };
+                };
+                404: components["responses"]["NotFoundResult"];
+            };
+        };
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -907,6 +1092,359 @@ export interface paths {
             };
         };
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/groups": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List groups and the accounts in them
+         * @description Administrator only; a non-admin gets 404, not 403, so the surface is invisible rather than
+         *     merely forbidden.
+         *
+         *     This exists because creation and membership were write-only: an operator could make a group
+         *     and put somebody in it, and had no way to find out what existed. Group ACLs are only usable
+         *     if the group can be discovered in the first place.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description ok */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            groups: components["schemas"]["Group"][];
+                        };
+                    };
+                };
+                404: components["responses"]["NotFoundResult"];
+            };
+        };
+        put?: never;
+        /**
+         * Create a group, or return the existing one of that name
+         * @description Idempotent by name, matching the store: group membership arrives from the IdP on every
+         *     login, so a non-idempotent create would fail the second time a known group signed in —
+         *     which is every sign-in.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": {
+                        name: string;
+                        display_name?: string;
+                    };
+                };
+            };
+            responses: {
+                /** @description created, or already existed */
+                201: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Group"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/groups/{id}/members": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Put an account into a group, or change its role
+         * @description Named by username or id. The response is the whole group, in the same shape the listing
+         *     uses — one concept, one shape.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": {
+                        username?: string;
+                        /** Format: uuid */
+                        user_id?: string;
+                        /** @enum {string} */
+                        role?: "viewer" | "editor" | "manager";
+                    };
+                };
+            };
+            responses: {
+                /** @description ok */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Group"];
+                    };
+                };
+                404: components["responses"]["NotFoundResult"];
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/groups/{id}/members/{userID}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Take an account out of a group */
+        delete: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: string;
+                    userID: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description removed */
+                204: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                404: components["responses"]["NotFoundResult"];
+            };
+        };
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/users/{id}/quota": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Change one account's byte quota
+         * @description Quotas are applied at provisioning and were otherwise unchangeable: an operator whose user
+         *     hit the limit could edit the database or tell the user to delete files, and the second is
+         *     not a policy.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": {
+                        /** @description Zero means unlimited. */
+                        bytes: number;
+                    };
+                };
+            };
+            responses: {
+                /** @description ok */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            id: string;
+                            quota: number;
+                            used_bytes: number;
+                        };
+                    };
+                };
+                404: components["responses"]["NotFoundResult"];
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/settings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List the runtime settings and where each value comes from
+         * @description The limits an administrator can change without a restart. Each entry reports its effective
+         *     value and whether that value is the configured default or an override, because "why is the
+         *     limit 4 MiB when the file says 8" is the question this screen exists to answer.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description ok */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            settings: components["schemas"]["AdminSetting"][];
+                        };
+                    };
+                };
+                404: components["responses"]["NotFoundResult"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/settings/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Override one runtime setting */
+        put: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    key: string;
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": number;
+                };
+            };
+            responses: {
+                /** @description ok */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            key: string;
+                            value: number;
+                        };
+                    };
+                };
+                /** @description unknown key */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        post?: never;
+        /** Remove an override, restoring the configured value */
+        delete: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    key: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description reset */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            key: string;
+                            configured: number;
+                        };
+                    };
+                };
+                /** @description unknown key */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
         options?: never;
         head?: never;
         patch?: never;
@@ -1311,18 +1849,7 @@ export interface paths {
             };
             requestBody: {
                 content: {
-                    "application/json": {
-                        path: string;
-                        kind: components["schemas"]["ShareKind"];
-                        password?: string;
-                        expires_in_seconds?: number;
-                        max_downloads?: number;
-                        max_uploads?: number;
-                        max_bytes_per_file?: number;
-                        allowed_mime?: string[];
-                        permissions?: string[];
-                        recipients?: string[];
-                    };
+                    "application/json": components["schemas"]["CreateShareRequest"];
                 };
             };
             responses: {
@@ -1616,6 +2143,40 @@ export interface components {
             /** @description The size the server suggests for each chunk. */
             chunk_size: number;
         };
+        MoveRequest: {
+            /** @description Existing path inside the caller's own namespace. */
+            from: string;
+            /** @description Destination path */
+            to: string;
+        };
+        BatchItem: {
+            from: string;
+            to: string;
+        };
+        BatchRequest: {
+            /** @enum {string} */
+            op: "copy" | "move";
+            /** @description Replace an existing destination instead of refusing it. */
+            overwrite?: boolean;
+            items: components["schemas"]["BatchItem"][];
+        };
+        BatchResult: {
+            from: string;
+            to: string;
+            ok: boolean;
+            /** @description Machine-readable cause, e.g. target_exists or not_found. */
+            code?: string;
+            error?: string;
+        };
+        BatchResponse: {
+            op: string;
+            results: components["schemas"]["BatchResult"][];
+            /** @description Items that succeeded. */
+            moved: number;
+            failed: number;
+            /** @description True when every item succeeded. */
+            complete: boolean;
+        };
         UploadConflict: {
             error: string;
             message?: string;
@@ -1646,6 +2207,31 @@ export interface components {
             is_breakglass?: boolean;
             created_at?: string;
         };
+        Group: {
+            /** Format: uuid */
+            id: string;
+            name: string;
+            display_name?: string;
+            members: components["schemas"]["GroupMember"][];
+        };
+        GroupMember: {
+            /** Format: uuid */
+            id: string;
+            username: string;
+            email?: string;
+            role: string;
+        };
+        AdminSetting: {
+            key: string;
+            value: number;
+            /** @description The value from the configuration file. */
+            configured: number;
+            /**
+             * @description Whether the effective value is the default or an administrative override.
+             * @enum {string}
+             */
+            source: "config" | "override";
+        };
         ACLGrant: {
             /** Format: uuid */
             id: string;
@@ -1671,9 +2257,9 @@ export interface components {
             permissions: string;
             children?: {
                 /** Format: uuid */
-                id?: string;
-                name?: string;
-                kind?: string;
+                id: string;
+                name: string;
+                kind: string;
                 size?: number;
             }[] | null;
         };
@@ -1685,10 +2271,31 @@ export interface components {
         VersionsResponse: {
             path: string;
             cheap_versions: boolean;
+            version_content_available: boolean;
             versions: components["schemas"]["Version"][];
         };
         /** @enum {string} */
         ShareKind: "link" | "email" | "request";
+        CreateShareRequest: {
+            path: string;
+            kind: components["schemas"]["ShareKind"];
+            label?: string;
+            password?: string;
+            expires_in_seconds?: number;
+            max_downloads?: number;
+            max_uploads?: number;
+            max_bytes_per_file?: number;
+            max_total_bytes?: number;
+            retention_seconds?: number;
+            max_upload_rate?: number;
+            upload_rate_window_seconds?: number;
+            allowed_mime?: string[];
+            permissions?: string[];
+            recipients?: string[];
+            hide_contents?: boolean;
+            /** Format: uuid */
+            node_id?: string;
+        };
         Share: {
             id: string;
             node_id: string;
@@ -1753,12 +2360,19 @@ export interface components {
         ShareLanding: {
             kind: components["schemas"]["ShareKind"];
             label?: string;
-            can_read: boolean;
-            requires_password: boolean;
-            requires_email: boolean;
+            can_read?: boolean;
+            requires_password?: boolean;
+            requires_email?: boolean;
             expires_at?: string;
+            root_name?: string;
+            /** @enum {string} */
+            root_kind?: "file" | "dir";
+            hide_contents?: boolean;
+            can_upload?: boolean;
             max_uploads?: number;
-            upload_count: number;
+            upload_count?: number;
+            max_bytes_per_file?: number;
+            allowed_mime?: string[];
             children?: components["schemas"]["FileNode"][];
         };
     };

@@ -30,6 +30,10 @@ const PATHS: Record<string, string> = {
   pulse: "M1.5 8h3l1.5-4 2.5 8 1.5-4h3.5",
   rows: "M2.5 4h11M2.5 8h11M2.5 12h11",
   grid: "M2.5 2.5h4.5v4.5H2.5zM9 2.5h4.5v4.5H9zM2.5 9h4.5v4.5H2.5zM9 9h4.5v4.5H9z",
+  // Two offset rectangles: the front one is the copy, the outline behind it is what it came from.
+  copy: "M5.5 5.5h7v7h-7zM2.5 10.5v-8h8",
+  // An arrow leaving one place and arriving at another, with the destination drawn as a bracket.
+  move: "M2.5 8h7.5m0 0L7.5 5.5m2.5 2.5L7.5 10.5M12 3v10h1.5",
   upload: "M8 11V3m0 0L5 6m3-3l3 3M2.5 11.5v1.5a1 1 0 001 1h9a1 1 0 001-1v-1.5",
   folderPlus:
     "M3 4.5A1.5 1.5 0 014.5 3h2.4l1.2 1.5H13A1 1 0 0114 5.5v7.5a1 1 0 01-1 1H4a1 1 0 01-1-1V4.5zM8 7.5v3.5M6.25 9.25h3.5",
