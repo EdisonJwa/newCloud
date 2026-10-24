@@ -20,6 +20,7 @@ import (
 	"github.com/EdisonJwa/newCloud/internal/dircommit"
 	"github.com/EdisonJwa/newCloud/internal/storage/layout"
 	"github.com/EdisonJwa/newCloud/internal/store"
+	"github.com/EdisonJwa/newCloud/internal/swap"
 )
 
 // fileJSON is the wire shape for a node.
@@ -795,17 +796,32 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	err = s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
-		if terr := tx.TrashCapped(ctx, node.ID, s.maxTrashBytes(ctx)); terr != nil {
-			return terr
-		}
-		return tx.Audit(ctx, store.AuditEntry{
-			ActorKind: "user", ActorUserID: actor.Ptr(), ActorEmail: actor.Email(),
-			ActorIP: clientIP(r), UserAgent: r.UserAgent(),
-			Action: "file.delete", TargetKind: "node", TargetID: node.ID.String(),
-			Result: "ok", Metadata: map[string]any{"name": node.Name},
+	// Move the content out of the live path, then trash the row — the same sequence WebDAV's
+	// DELETE uses, through the same primitive, so the two protocols cannot drift.
+	//
+	// Trashing is metadata-only: on the tree layout a deleted file used to keep occupying its path
+	// until the retention sweep, which left the name unavailable and the retained copy sitting at a
+	// path derived from a name that no longer existed in the namespace (2026-10-24 review, phase 0).
+	parentRel := path.Dir(strings.TrimSuffix(rel, "/"))
+	if parentRel == "." {
+		parentRel = ""
+	}
+	err = swap.Retire(r.Context(),
+		swap.Deps{Meta: s.deps.Meta, Content: s.deps.Content, Log: s.deps.Log,
+			TrashCap: s.maxTrashBytes(r.Context())},
+		node, parentRel,
+		func(ctx context.Context, tx store.Tx, retired store.Node) error {
+			if terr := tx.TrashCapped(ctx, retired.ID, s.maxTrashBytes(ctx)); terr != nil {
+				return terr
+			}
+			return tx.Audit(ctx, store.AuditEntry{
+				ActorKind: "user", ActorUserID: actor.Ptr(), ActorEmail: actor.Email(),
+				ActorIP: clientIP(r), UserAgent: r.UserAgent(),
+				Action: "file.delete", TargetKind: "node", TargetID: retired.ID.String(),
+				// The name the user deleted, not the reserved one the row carries in the trash.
+				Result: "ok", Metadata: map[string]any{"name": node.Name},
+			})
 		})
-	})
 	if err != nil {
 		s.writeStoreError(w, err)
 		return

@@ -691,3 +691,39 @@ func TestReservedSwapNamesAreNotAddressable(t *testing.T) {
 		}
 	})
 }
+
+// A DELETE frees the path its content occupied.
+//
+// Trashing is a metadata operation, so on a path-backed layout the bytes used to stay exactly where
+// the deleted file was. Two things followed: the name was not free until the retention sweep ran, so
+// nothing could publish there without replacing; and the retained copy sat at a path derived from a
+// name that no longer existed in the namespace. The delete now moves the content to a reserved
+// sibling name first — and the restore route moves it back, which is why this is safe to do.
+//
+// The blob layout has nothing to move (its path is a metadata mapping over content-addressed bytes),
+// which is asserted too, because "nothing happened" there is the correct answer, not a miss.
+func TestADeleteFreesTheContentPath(t *testing.T) {
+	layouts(t, func(t *testing.T, e *testEnv, mode layout.Mode) {
+		if rec := e.do(t, http.MethodPut, e.davPath("gone.txt"),
+			strings.NewReader("retained bytes"), nil); rec.Code != http.StatusCreated {
+			t.Fatalf("%s: seed: %d", mode, rec.Code)
+		}
+		if rec := e.do(t, http.MethodDelete, e.davPath("gone.txt"), nil, nil); rec.Code != http.StatusNoContent {
+			t.Fatalf("%s: delete: %d", mode, rec.Code)
+		}
+
+		_, err := displacedBytes(t, e, "gone.txt")
+		switch mode {
+		case layout.ModeTree:
+			if err == nil {
+				t.Fatal("tree: the deleted file's content is still at the path it occupied, so the " +
+					"name cannot be reused without replacing and the retained copy is reachable at a " +
+					"name that is no longer in the namespace")
+			}
+		default:
+			if err == nil {
+				t.Log("blob: content is content-addressed, so the path is only a mapping")
+			}
+		}
+	})
+}

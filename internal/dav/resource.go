@@ -18,6 +18,7 @@ import (
 	"github.com/EdisonJwa/newCloud/internal/dircommit"
 	"github.com/EdisonJwa/newCloud/internal/storage/layout"
 	"github.com/EdisonJwa/newCloud/internal/store"
+	"github.com/EdisonJwa/newCloud/internal/swap"
 )
 
 // handleGet serves a file, with Range support.
@@ -602,33 +603,48 @@ func (h *Handler) handleDelete(w http.ResponseWriter, r *http.Request, a authz.A
 		}
 	}
 
-	err = h.meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
-		// The trash is conditional on the node still being what this request resolved.
-		//
-		// A DELETE resolves the node, checks its lock and its ACL, then trashes it in this
-		// transaction. A PUT that updated the row in between would be trashed along with it:
-		// the writer was told 201/204 and its file vanishes from the namespace with no error
-		// addressed to it (2026-10-24 review, G1). The precondition is evaluated inside the
-		// statement that trashes, so a writer that committed first wins and this DELETE
-		// answers 412 — the same arbitration a stale If-Match gets.
-		//
-		// Directories carry no strong validator, so the expectation is only applied to files;
-		// a concurrent write inside a directory is still a membership change that the lock
-		// rules cover.
-		var expect *store.Precondition
-		if !node.IsDir() && node.ETag != "" {
-			expect = &store.Precondition{IfMatch: node.ETag}
-		}
-		if terr := tx.TrashCappedExpect(ctx, node.ID, h.trashCap(ctx), expect); terr != nil {
-			return terr
-		}
-		return tx.Audit(ctx, store.AuditEntry{
-			ActorKind: "user", ActorUserID: a.Ptr(),
-			ActorEmail: a.Email(), ActorIP: clientIP(r), UserAgent: r.UserAgent(),
-			Action: "file.delete", TargetKind: "node", TargetID: node.ID.String(),
-			Result: "ok", Metadata: map[string]any{"name": node.Name},
+	// Move the content out of the live path, then trash the row.
+	//
+	// Trashing is metadata-only, so on the tree layout a deleted file used to keep occupying its
+	// path until the retention sweep: the name was not free, which is why no-replace publish could
+	// not be enabled there, and the retained copy sat at a path derived from a name that no longer
+	// existed in the namespace (2026-10-24 review, phase 0 / ADR-0013).
+	_, rel, _ := h.splitPath(r.URL.Path)
+	parentRel := path.Dir(rel)
+	if parentRel == "." {
+		parentRel = ""
+	}
+	err = swap.Retire(r.Context(),
+		swap.Deps{Meta: h.meta, Content: h.content, Log: h.log, TrashCap: h.trashCap(r.Context())},
+		node, parentRel,
+		func(ctx context.Context, tx store.Tx, retired store.Node) error {
+			// The trash is conditional on the node still being what this request resolved.
+			//
+			// A DELETE resolves the node, checks its lock and its ACL, then trashes it in this
+			// transaction. A PUT that updated the row in between would be trashed along with it:
+			// the writer was told 201/204 and its file vanishes from the namespace with no error
+			// addressed to it (2026-10-24 review, G1). The precondition is evaluated inside the
+			// statement that trashes, so a writer that committed first wins and this DELETE
+			// answers 412 — the same arbitration a stale If-Match gets.
+			//
+			// Directories carry no strong validator, so the expectation is only applied to files;
+			// a concurrent write inside a directory is still a membership change that the lock
+			// rules cover.
+			var expect *store.Precondition
+			if !retired.IsDir() && retired.ETag != "" {
+				expect = &store.Precondition{IfMatch: retired.ETag}
+			}
+			if terr := tx.TrashCappedExpect(ctx, retired.ID, h.trashCap(ctx), expect); terr != nil {
+				return terr
+			}
+			return tx.Audit(ctx, store.AuditEntry{
+				ActorKind: "user", ActorUserID: a.Ptr(),
+				ActorEmail: a.Email(), ActorIP: clientIP(r), UserAgent: r.UserAgent(),
+				Action: "file.delete", TargetKind: "node", TargetID: retired.ID.String(),
+				// The name the user deleted, not the reserved one the row carries in the trash.
+				Result: "ok", Metadata: map[string]any{"name": node.Name},
+			})
 		})
-	})
 	if err != nil {
 		writeXMLError(w, statusForError(err), "")
 		return
