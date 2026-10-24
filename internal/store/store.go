@@ -66,6 +66,10 @@ func Path(ancestors []Node, leaf Node) string {
 var (
 	// ErrNotFound: no such node.
 	ErrNotFound = errors.New("store: not found")
+	// ErrInvalidCursor reports a page cursor this store did not issue, or one it can no longer
+	// parse. Distinguishable from a malformed request so the HTTP layer can answer 400 rather than
+	// silently starting from the beginning.
+	ErrInvalidCursor = errors.New("store: invalid cursor")
 	// ErrConflict: a sibling with that name already exists (or another
 	// uniqueness rule was violated).
 	ErrConflict = errors.New("store: conflict")
@@ -207,6 +211,10 @@ type Tx interface {
 	// would show a directory and its children as independent items, and restoring
 	// one child on its own is not something the UI can sensibly offer.
 	Trashed(ctx context.Context, ownerID uuid.UUID, limit int) ([]Node, error)
+	// TrashedAfter pages the trash, newest first, strictly after cursor. An empty cursor starts at
+	// the newest entry; the cursor comes from FormatTrashCursor, which the store owns because the
+	// ordering it has to match lives here.
+	TrashedAfter(ctx context.Context, ownerID uuid.UUID, cursor string, limit int) ([]Node, error)
 
 	// Versions lists kept versions of a file, newest first.
 	Versions(ctx context.Context, nodeID uuid.UUID, limit int) ([]Version, error)

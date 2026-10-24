@@ -231,6 +231,64 @@ func Run(t *testing.T, factory Factory, opts Options) {
 		}
 	})
 
+	// A paged listing must return every row exactly once. Trashing several nodes in the same instant
+	// gives them identical timestamps, so a cursor that orders by time alone either repeats a row at
+	// the page boundary or loses one — and the failure is invisible on page one.
+	t.Run("TrashPagesDoNotRepeatOrSkipRows", func(t *testing.T) {
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		const n = 5
+		for i := 0; i < n; i++ {
+			f := mkfile(t, s, owner, r.ID, fmt.Sprintf("gone-%d.txt", i), 4)
+			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				return tx.Trash(ctx, f.ID)
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		seen := map[uuid.UUID]int{}
+		cursor := ""
+		for pages := 0; ; pages++ {
+			if pages > n+2 {
+				t.Fatal("paging did not terminate: the cursor is not advancing")
+			}
+			var page []store.Node
+			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				got, err := tx.TrashedAfter(ctx, owner, cursor, 2)
+				page = got
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if len(page) == 0 {
+				break
+			}
+			for _, nd := range page {
+				seen[nd.ID]++
+			}
+			cursor = store.FormatTrashCursor(page[len(page)-1])
+		}
+
+		if len(seen) != n {
+			t.Fatalf("paging returned %d distinct items, want %d", len(seen), n)
+		}
+		for id, count := range seen {
+			if count != 1 {
+				t.Fatalf("item %s appeared %d times across pages: the page boundary repeated a row",
+					id, count)
+			}
+		}
+
+		// A cursor this store did not issue is a bad request, not "start from the beginning", or a
+		// client with a stale cursor would silently re-read page one forever.
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			_, terr := tx.TrashedAfter(ctx, owner, "not-a-cursor", 2)
+			return terr
+		}); !errors.Is(err, store.ErrInvalidCursor) {
+			t.Fatalf("a malformed cursor returned %v, want ErrInvalidCursor", err)
+		}
+	})
 	t.Run("TrashedSiblingDoesNotBlockReuse", func(t *testing.T) {
 		s, owner := factory(t)
 		r := rootOf(t, s, owner)

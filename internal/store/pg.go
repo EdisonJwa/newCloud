@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -702,6 +703,28 @@ func (t *pgTx) markTrashed(ctx context.Context, id uuid.UUID, expect *Preconditi
 // it. Listing every trashed row instead would present a deleted folder and all its
 // contents as independent, separately-restorable items.
 func (t *pgTx) Trashed(ctx context.Context, ownerID uuid.UUID, limit int) ([]Node, error) {
+	return t.TrashedAfter(ctx, ownerID, "", limit)
+}
+
+// TrashedAfter pages the trash, newest first, strictly after cursor.
+//
+// The cursor is a (trashed_at, id) pair rather than a bare timestamp because two items trashed in
+// the same instant are otherwise indistinguishable, and a keyset that cannot break ties either
+// repeats rows or skips them at the page boundary. id is in the ordering for the same reason: it
+// is the only column guaranteed unique within one owner.
+func (t *pgTx) TrashedAfter(ctx context.Context, ownerID uuid.UUID, cursor string, limit int) ([]Node, error) {
+	var (
+		at *time.Time
+		id *uuid.UUID
+	)
+	if cursor != "" {
+		parsedAt, parsedID, err := ParseTrashCursor(cursor)
+		if err != nil {
+			return nil, err
+		}
+		at, id = &parsedAt, &parsedID
+	}
+
 	const q = `SELECT ` + nodeColumns + ` FROM nodes n
 		WHERE n.owner_id = $1
 		  AND n.trashed_at IS NOT NULL
@@ -712,9 +735,10 @@ func (t *pgTx) Trashed(ctx context.Context, ownerID uuid.UUID, limit int) ([]Nod
 		          WHERE p.id = n.parent_id AND p.trashed_at IS NOT NULL
 		        )
 		  )
-		ORDER BY n.trashed_at DESC
-		LIMIT $2`
-	rows, err := t.tx.Query(ctx, q, ownerID, limitArg(limit))
+		AND ($2::timestamptz IS NULL OR (n.trashed_at, n.id) < ($2::timestamptz, $3::uuid))
+		ORDER BY n.trashed_at DESC, n.id DESC
+		LIMIT $4`
+	rows, err := t.tx.Query(ctx, q, ownerID, at, id, limitArg(limit))
 	if err != nil {
 		return nil, translate(err)
 	}
@@ -729,6 +753,34 @@ func (t *pgTx) Trashed(ctx context.Context, ownerID uuid.UUID, limit int) ([]Nod
 		out = append(out, n)
 	}
 	return out, translate(rows.Err())
+}
+
+// ParseTrashCursor decodes a trash page cursor.
+//
+// Exported so the HTTP layer can build the next one from the last row it emitted — the store owns
+// the format, because the ordering it must match lives here.
+func ParseTrashCursor(cursor string) (time.Time, uuid.UUID, error) {
+	atStr, idStr, ok := strings.Cut(cursor, ":")
+	if !ok {
+		return time.Time{}, uuid.UUID{}, fmt.Errorf("%w: malformed trash cursor", ErrInvalidCursor)
+	}
+	nanos, err := strconv.ParseInt(atStr, 10, 64)
+	if err != nil {
+		return time.Time{}, uuid.UUID{}, fmt.Errorf("%w: trash cursor timestamp", ErrInvalidCursor)
+	}
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		return time.Time{}, uuid.UUID{}, fmt.Errorf("%w: trash cursor id", ErrInvalidCursor)
+	}
+	return time.Unix(0, nanos).UTC(), id, nil
+}
+
+// FormatTrashCursor encodes the position of a trashed node for the next page.
+func FormatTrashCursor(n Node) string {
+	if n.TrashedAt == nil {
+		return ""
+	}
+	return fmt.Sprintf("%d:%s", n.TrashedAt.UTC().UnixNano(), n.ID)
 }
 func (t *pgTx) Restore(ctx context.Context, id uuid.UUID) (Node, error) {
 	// The bytes come back into the logical quota, so sum them before the update clears the marks.

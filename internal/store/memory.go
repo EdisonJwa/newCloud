@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/json"
@@ -771,6 +772,28 @@ func (t *memTx) trashRecursive(id uuid.UUID, depth int) error {
 // while its parent is not, whereas a child that was deleted along with its folder
 // has a trashed parent and must not appear as a separate entry.
 func (t *memTx) Trashed(ctx context.Context, ownerID uuid.UUID, limit int) ([]Node, error) {
+	return t.TrashedAfter(ctx, ownerID, "", limit)
+}
+
+// TrashedAfter pages the trash, newest first, strictly after cursor.
+//
+// The comparison is (trashed_at, id) in both directions, matching the SQL keyset: two items trashed
+// in the same instant are otherwise indistinguishable, and a page boundary that cannot break the tie
+// either repeats a row or loses one.
+func (t *memTx) TrashedAfter(ctx context.Context, ownerID uuid.UUID, cursor string, limit int) ([]Node, error) {
+	var (
+		afterAt time.Time
+		afterID uuid.UUID
+		have    bool
+	)
+	if cursor != "" {
+		at, id, err := ParseTrashCursor(cursor)
+		if err != nil {
+			return nil, err
+		}
+		afterAt, afterID, have = at, id, true
+	}
+
 	type entry struct {
 		node Node
 		at   time.Time
@@ -788,11 +811,26 @@ func (t *memTx) Trashed(ctx context.Context, ownerID uuid.UUID, limit int) ([]No
 				continue
 			}
 		}
+		if have {
+			// Strictly older than the cursor, with the id as the tiebreaker.
+			if n.TrashedAt.After(afterAt) {
+				continue
+			}
+			if n.TrashedAt.Equal(afterAt) && bytes.Compare(n.ID[:], afterID[:]) >= 0 {
+				continue
+			}
+		}
 		found = append(found, entry{node: n, at: *n.TrashedAt})
 	}
 
-	// Newest first, matching the query's ORDER BY trashed_at DESC.
-	sort.Slice(found, func(i, j int) bool { return found[i].at.After(found[j].at) })
+	// Newest first, matching the query's ORDER BY trashed_at DESC, n.id DESC. The id breaks ties so
+	// that paging is stable when several items were trashed in the same instant.
+	sort.Slice(found, func(i, j int) bool {
+		if found[i].at.Equal(found[j].at) {
+			return bytes.Compare(found[i].node.ID[:], found[j].node.ID[:]) > 0
+		}
+		return found[i].at.After(found[j].at)
+	})
 	if limit > 0 && len(found) > limit {
 		found = found[:limit]
 	}

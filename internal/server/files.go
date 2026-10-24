@@ -837,25 +837,40 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleTrashList(w http.ResponseWriter, r *http.Request) {
 	actor, _ := actorFrom(r.Context())
 
-	var nodes []store.Node
-	// One extra row answers "is there more?" without a second query.
+	// Paged by a keyset cursor over (trashed_at, id). One extra row answers "is there more?"
+	// without a second query.
 	//
-	// The trash has no cursor, so a client that hits this cap cannot page further — but it can at
-	// least tell a full page from a complete one. Before this, a trash larger than the cap was
-	// reported as if it were the whole thing, and a client offering "restore all" would silently
-	// restore a subset (2026-10-24 review, M8).
+	// Before this the trash had neither a cursor nor a truncation flag, so a trash larger than the
+	// cap was returned as if it were the whole thing: a client offering "restore everything"
+	// restored a subset and reported success (2026-10-24 review, M8).
 	limit := s.deps.Config.Limits.MaxProfindChildren
+	cursor := r.URL.Query().Get("cursor")
 	truncated := false
+	nextCursor := ""
+	var nodes []store.Node
 	err := s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
-		list, lerr := tx.Trashed(ctx, actor.ID(), limit+1)
+		list, lerr := tx.TrashedAfter(ctx, actor.ID(), cursor, limit+1)
+		if lerr != nil {
+			return lerr
+		}
 		if len(list) > limit {
 			truncated = true
 			list = list[:limit]
 		}
 		nodes = list
-		return lerr
+		if truncated && len(list) > 0 {
+			nextCursor = store.FormatTrashCursor(list[len(list)-1])
+		}
+		return nil
 	})
 	if err != nil {
+		if errors.Is(err, store.ErrInvalidCursor) {
+			// A cursor this server did not issue is a bad request. Starting over instead would make
+			// a client with a stale cursor silently re-read page one forever.
+			writeError(w, http.StatusBadRequest, "invalid_cursor",
+				"the cursor is not one this server issued; drop it to start from the newest entry")
+			return
+		}
 		s.writeStoreError(w, err)
 		return
 	}
@@ -880,10 +895,9 @@ func (s *Server) handleTrashList(w http.ResponseWriter, r *http.Request) {
 
 	body := map[string]any{
 		"items": out,
-		// True when the cap was reached and there are more entries the caller cannot see yet.
-		// There is no cursor for the trash, so this is the only warning a client gets: without it
-		// the page reads as the complete trash.
+		// True when there are more entries after this page; pass `cursor` to fetch them.
 		"truncated": truncated,
+		"cursor":    nextCursor,
 	}
 	// The window itself, so a client can explain the deadline without hardcoding a number that
 	// the operator may have changed.
