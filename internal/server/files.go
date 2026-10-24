@@ -811,7 +811,14 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 			TrashCap: s.maxTrashBytes(r.Context())},
 		node, parentRel,
 		func(ctx context.Context, tx store.Tx, retired store.Node) error {
-			if terr := tx.TrashCapped(ctx, retired.ID, s.maxTrashBytes(ctx)); terr != nil {
+			// Same guard as WebDAV's DELETE: the validator comes from before the retirement, so a
+			// writer that changed this file between the request resolving it and this transaction
+			// makes the trash refuse rather than taking the writer's update with it.
+			var expect *store.Precondition
+			if !retired.IsDir() && node.ETag != "" {
+				expect = &store.Precondition{IfMatch: node.ETag}
+			}
+			if terr := tx.TrashCappedExpect(ctx, retired.ID, s.maxTrashBytes(ctx), expect); terr != nil {
 				return terr
 			}
 			return tx.Audit(ctx, store.AuditEntry{

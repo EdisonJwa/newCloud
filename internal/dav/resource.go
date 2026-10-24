@@ -630,9 +630,13 @@ func (h *Handler) handleDelete(w http.ResponseWriter, r *http.Request, a authz.A
 			// Directories carry no strong validator, so the expectation is only applied to files;
 			// a concurrent write inside a directory is still a membership change that the lock
 			// rules cover.
+			// The validator is the one captured BEFORE the retirement, not the one on the renamed
+			// row: the point is to refuse the delete if a writer changed this file in the window
+			// between the request resolving it and this transaction. Reading it after the rename
+			// would compare the row against itself and always pass.
 			var expect *store.Precondition
-			if !retired.IsDir() && retired.ETag != "" {
-				expect = &store.Precondition{IfMatch: retired.ETag}
+			if !retired.IsDir() && node.ETag != "" {
+				expect = &store.Precondition{IfMatch: node.ETag}
 			}
 			if terr := tx.TrashCappedExpect(ctx, retired.ID, h.trashCap(ctx), expect); terr != nil {
 				return terr

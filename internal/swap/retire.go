@@ -19,9 +19,11 @@ package swap
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"path"
 
+	"github.com/EdisonJwa/newCloud/internal/storage/layout"
 	"github.com/EdisonJwa/newCloud/internal/store"
 )
 
@@ -70,25 +72,48 @@ func Retire(ctx context.Context, d Deps, n store.Node, parentRel string, trash T
 	fromRel := path.Join(parentRel, n.Name)
 	toRel := path.Join(parentRel, reserved)
 
-	moved, err := Relocate(ctx, d, Relocation{
-		Node: n, FromRel: fromRel, ParentID: *n.ParentID, Name: reserved, ToRel: toRel,
-	})
-	if err != nil {
-		return err
+	// Step 1: the content leaves the live path.
+	if err := d.Content.Move(ctx,
+		layout.Node{Owner: n.OwnerID.String(), Path: fromRel, IsDir: n.IsDir()},
+		layout.Node{Owner: n.OwnerID.String(), Path: toRel, IsDir: n.IsDir()}); err != nil {
+		// Nothing has changed in the namespace, so this is a clean failure.
+		return fmt.Errorf("swap: move the content out of the live path: %w", err)
 	}
 
+	// Step 2: the namespace switch, in one transaction, under whatever precondition the caller's
+	// trash step applies.
+	//
+	// This order is deliberate and it is not the obvious one. Switching the namespace first would
+	// free the name before the bytes moved, and the content move is keyed on the PATH — so a writer
+	// that created a new file at that path in the window would have ITS bytes moved to the reserved
+	// name instead. Measured: that ordering turned a successful writer's file into a 500 on the next
+	// read. Content first means the worst case is a superseded copy left behind, never a live
+	// writer's data taking a walk.
 	if terr := d.Meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		moved, rerr := tx.Rename(ctx, n.ID, reserved)
+		if rerr != nil {
+			return rerr
+		}
 		return trash(ctx, tx, moved)
 	}); terr != nil {
-		// Reverse the move: the delete did not happen, so the file must be exactly where it was,
-		// under the name the user knows.
-		if _, rerr := Relocate(ctx, d, Relocation{
-			Node: moved, FromRel: toRel, ParentID: *moved.ParentID, Name: n.Name, ToRel: fromRel,
-		}); rerr != nil {
-			d.Log.Error("swap: COMPENSATION FAILED — a failed delete left the node under a "+
-				"reserved name with its bytes intact; it was NOT deleted. An operator can recover "+
-				"it by hand",
-				"name", reserved, "node", moved.ID.String(), "error", rerr)
+		if errors.Is(terr, store.ErrPrecondition) {
+			// A writer changed this file while its content was being moved, so the delete refused.
+			// Its bytes are at the live path now and they are the ones that matter; moving the
+			// retired bytes back would overwrite exactly the write that was just protected. The
+			// superseded content stays at the reserved name, where it is not addressable.
+			d.Log.Warn("swap: delete refused because the file changed mid-retirement; the "+
+				"superseded content is left at the reserved name and the caller must retry",
+				"node", n.ID.String(), "reserved", reserved)
+			return terr
+		}
+		// Any other refusal happened before the transaction changed anything, so the content goes
+		// back where the user left it.
+		if mvErr := d.Content.Move(ctx,
+			layout.Node{Owner: n.OwnerID.String(), Path: toRel, IsDir: n.IsDir()},
+			layout.Node{Owner: n.OwnerID.String(), Path: fromRel, IsDir: n.IsDir()}); mvErr != nil {
+			d.Log.Error("swap: the delete failed and its content could not be put back; the bytes "+
+				"are at the reserved name and the row still names the original",
+				"node", n.ID.String(), "reserved", reserved, "error", mvErr)
 		}
 		return terr
 	}
