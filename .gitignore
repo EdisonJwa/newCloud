@@ -40,3 +40,10 @@ config.yml
 
 # Local package-manager cache (not project source).
 .pnpm-store/
+
+# Local design-exploration material. The frozen Cirrus 9.1 baseline is recorded in
+# docs/reference/cirrus-9.1-integration-plan.md; the working rounds stay on this machine.
+/design-studio/
+
+# Standalone UI-kit checkout destined for its own repository, not this one.
+/cirrus-ui/
