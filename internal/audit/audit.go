@@ -174,6 +174,12 @@ type Event struct {
 	// AuthMethod is how the actor authenticated: session, app_password, breakglass, oidc or
 	// share_link. Empty when no authentication was involved.
 	AuthMethod string
+	// HashVersion is the preimage version this event was sealed under.
+	//
+	// Zero means version 1, which is what every row written before the versioning column existed
+	// carries. It is deliberately NOT part of the preimage: it selects which preimage is used, so
+	// that a chain spanning the change still verifies event by event (see canonical).
+	HashVersion int
 }
 
 // GenesisHash is the chain seed: thirty-two zero bytes.
@@ -254,7 +260,35 @@ func (e *Event) canonical() ([]byte, error) {
 	}
 	writeBytes(meta)
 
+	// Version 2 appends the fields version 1 never covered.
+	//
+	// They are appended rather than inserted so the version-1 prefix stays byte-identical: a
+	// version-2 event and a version-1 event that agree on everything else share the first bytes
+	// of their preimage, which keeps "what changed between the versions" answerable by reading
+	// one function instead of diffing two.
+	//
+	// The 2026-10-24 review found these two stored but not hashed: a database writer could
+	// rewrite how an actor authenticated — session, app password, break-glass — and the chain
+	// would still verify. A field that is recorded but not covered is worse than an unrecorded
+	// one, because it reads as evidence (M6).
+	if e.hashVersion() >= 2 {
+		writeStr(e.RequestID)
+		writeStr(e.AuthMethod)
+	}
+
 	return buf, nil
+}
+
+// hashVersion is the preimage version this event is sealed under.
+//
+// Zero means "the row predates versioning", which is version 1. Rows read back from storage carry
+// the version they were written with, so a chain that spans the change still verifies: each event
+// is checked against the rules that were in force when it was written.
+func (e *Event) hashVersion() int {
+	if e.HashVersion <= 0 {
+		return 1
+	}
+	return e.HashVersion
 }
 
 // Seal computes e.Hash from e.PrevHash and the canonical form of the event.
