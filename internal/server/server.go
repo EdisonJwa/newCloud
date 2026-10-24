@@ -287,6 +287,7 @@ func (s *Server) Handler() http.Handler {
 				r.Delete("/{key}", s.handleAdminDeleteSetting)
 			})
 			r.Route("/admin/groups", func(r chi.Router) {
+				r.Get("/", s.handleAdminListGroups)
 				r.Post("/", s.handleAdminCreateGroup)
 				r.Post("/{id}/members", s.handleAdminAddGroupMember)
 				r.Delete("/{id}/members/{userID}", s.handleAdminRemoveGroupMember)

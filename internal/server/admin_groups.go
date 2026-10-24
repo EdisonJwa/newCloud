@@ -28,6 +28,73 @@ type groupJSON struct {
 	Members     []string `json:"members,omitempty"`
 }
 
+// groupMemberJSON is one membership row, resolved to the account it names.
+type groupMemberJSON struct {
+	ID       string `json:"id"`
+	Username string `json:"username"`
+	Email    string `json:"email,omitempty"`
+	Role     string `json:"role"`
+}
+
+// groupWithMembersJSON is a group and everyone in it.
+type groupWithMembersJSON struct {
+	ID          string            `json:"id"`
+	Name        string            `json:"name"`
+	DisplayName string            `json:"display_name"`
+	Members     []groupMemberJSON `json:"members"`
+}
+
+// handleAdminListGroups lists every group and its members.
+//
+// Group creation and membership existed as write-only endpoints: an operator could create a group
+// and put somebody in it, and could not then find out what existed or who was in it. That is the
+// same shape as a permission with no route that exercises it — the capability was there and the
+// product could not show it, which is precisely the class of gap the review counted as "backend
+// implemented, unreachable".
+func (s *Server) handleAdminListGroups(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requireAdmin(w, r); !ok {
+		return
+	}
+
+	out := make([]groupWithMembersJSON, 0, 8)
+	err := s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
+		groups, gerr := tx.Groups(ctx)
+		if gerr != nil {
+			return gerr
+		}
+		out = make([]groupWithMembersJSON, 0, len(groups))
+		for _, g := range groups {
+			members, merr := tx.GroupMembers(ctx, g.ID)
+			if merr != nil {
+				return merr
+			}
+			entry := groupWithMembersJSON{
+				ID: g.ID.String(), Name: g.Name, DisplayName: g.DisplayName,
+				Members: make([]groupMemberJSON, 0, len(members)),
+			}
+			for _, m := range members {
+				u, uerr := tx.UserByID(ctx, m.UserID)
+				if uerr != nil {
+					// A membership row whose account no longer resolves is not a reason to fail the
+					// whole listing: this screen is for looking, and the other groups are still
+					// readable. The row is simply not shown.
+					continue
+				}
+				entry.Members = append(entry.Members, groupMemberJSON{
+					ID: u.ID.String(), Username: u.Username, Email: u.Email, Role: m.Role,
+				})
+			}
+			out = append(out, entry)
+		}
+		return nil
+	})
+	if err != nil {
+		s.writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"groups": out})
+}
+
 // handleAdminCreateGroup creates a group, or returns the existing one with its id.
 //
 // Idempotent by name, matching CreateGroup: a sync job that creates the same group twice should not
@@ -93,7 +160,6 @@ func (s *Server) handleAdminAddGroupMember(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	var member store.User
 	var group store.Group
 	err = s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
 		g, gerr := tx.GroupByID(ctx, groupID)
@@ -119,7 +185,6 @@ func (s *Server) handleAdminAddGroupMember(w http.ResponseWriter, r *http.Reques
 			}
 			u = got
 		}
-		member = u
 		if aerr := tx.AddGroupMember(ctx, g.ID, u.ID, body.Role); aerr != nil {
 			return aerr
 		}
@@ -142,10 +207,45 @@ func (s *Server) handleAdminAddGroupMember(w http.ResponseWriter, r *http.Reques
 		s.writeStoreError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, groupJSON{
-		ID: group.ID.String(), Name: group.Name, DisplayName: group.DisplayName,
-		Members: []string{member.Username},
+	// The response is the group as the list endpoint would return it, not just the name that was
+	// added. Two shapes for one concept is how a client ends up needing two parsers, and the screen
+	// that called this is about to redraw the group anyway.
+	full, ferr := s.groupWithMembers(r.Context(), group.ID)
+	if ferr != nil {
+		s.writeStoreError(w, ferr)
+		return
+	}
+	writeJSON(w, http.StatusOK, full)
+}
+
+// groupWithMembers resolves one group and the accounts in it.
+func (s *Server) groupWithMembers(ctx context.Context, id uuid.UUID) (groupWithMembersJSON, error) {
+	out := groupWithMembersJSON{Members: []groupMemberJSON{}}
+	err := s.deps.Meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		g, gerr := tx.GroupByID(ctx, id)
+		if gerr != nil {
+			return gerr
+		}
+		out = groupWithMembersJSON{
+			ID: g.ID.String(), Name: g.Name, DisplayName: g.DisplayName,
+			Members: []groupMemberJSON{},
+		}
+		members, merr := tx.GroupMembers(ctx, g.ID)
+		if merr != nil {
+			return merr
+		}
+		for _, m := range members {
+			u, uerr := tx.UserByID(ctx, m.UserID)
+			if uerr != nil {
+				continue
+			}
+			out.Members = append(out.Members, groupMemberJSON{
+				ID: u.ID.String(), Username: u.Username, Email: u.Email, Role: m.Role,
+			})
+		}
+		return nil
 	})
+	return out, err
 }
 
 // handleAdminRemoveGroupMember takes an account out of a group.

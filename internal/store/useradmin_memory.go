@@ -28,7 +28,11 @@ func (t *memTx) ListUsers(ctx context.Context, status string, limit int) ([]User
 		if st != "" && u.Status != st {
 			continue
 		}
-		out = append(out, *u)
+		// Hydrated, not copied raw: quota and usage live in their own maps (see hydrateUser), so
+		// returning the stored struct reported quota_bytes=0 to the administrator who had just set
+		// one — and PostgreSQL, which reads the column, reported the real value. The admin screen is
+		// the one place those two figures are the point of the page.
+		out = append(out, t.hydrateUser(*u))
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
