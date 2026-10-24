@@ -38,43 +38,43 @@ production number and needs the fixture helpers in `pg_test.go`; that is not wir
 
 ## Baseline
 
-Measured on a 24-core workstation, `benchtime 3x`, Go 1.27. `ListChildren` is a 500-row page.
+Measured on a 24-core workstation, Go 1.27. `ListChildren` is a 500-row page.
 
 | Benchmark | Fixture | Time per page |
 |---|---|---|
 | `BenchmarkListChildren` (in memory) | 10,000 entries | **3.9 ms** |
 | `BenchmarkListChildren` (in memory) | 100,000 entries | **70 ms** |
-| `BenchmarkListChildrenPostgreSQL` | 10,000 entries | **5.6 ms** |
-| `BenchmarkListChildrenPostgreSQL` | 100,000 entries | **38 ms** |
+| `BenchmarkListChildrenPostgreSQL` | 10,000 entries | **0.92 ms** |
+| `BenchmarkListChildrenPostgreSQL` | 100,000 entries | **1.59 ms** |
 | `BenchmarkResolvePath` (in memory) | 10,000 siblings, 6 segments | **2.4 µs** |
 | `BenchmarkCreateFile` (in memory) | 10,000 entries | **6.7 µs** |
 
-The PostgreSQL run needs `TEST_DATABASE_URL`; it seeds its rows in one statement, because
-creating 100,000 of them through the store takes minutes and a benchmark whose fixture dominates
-its measurement is measuring the fixture.
+The PostgreSQL run needs `TEST_DATABASE_URL`; it seeds its rows in one statement and then runs
+`ANALYZE`, because creating 100,000 of them through the store takes minutes, and because without
+statistics the planner picks a plan no deployment would run.
 
 ### What the numbers say
 
-**Path resolution does not care about directory size** — 2.4 µs at 10k, 3.2 µs at 100k. That is
-the expected shape: resolution is a chain of per-level lookups, and the cost is the depth.
+**A listing page is flat on PostgreSQL now, and it was not before.** The page is the same 500 rows
+whatever the directory size, and the PostgreSQL figure grew 6.8× for ten times the data (5.6 ms at
+10k, 38 ms at 100k) until `migrations/0018_listing_index.sql` added an index on
+`(parent_id, name) WHERE trashed_at IS NULL` — the order the query sorts by. With it: 0.92 ms and
+1.59 ms, 6× and 24× faster, and a growth of 1.7× for 10× the data instead of 6.8×.
 
-**A listing page costs more as the directory grows, on both backends.**
+**The first measurement of the fix was wrong, and the reason is worth keeping.** After adding the
+index the 100k page still measured 30 ms, which looked like the index had not helped. The plan was
+fine — an index scan of 500 rows taking 0.11 ms — but the benchmark's own fixture had bulk-loaded
+100,000 rows and never run `ANALYZE`, so the planner estimated badly and sorted the directory. The
+fixture now analyzes; a benchmark that measures a plan no deployment would ever choose is measuring
+itself.
 
-| | 10k entries | 100k entries | growth for 10× the data |
-|---|---|---|---|
-| in memory | 3.9 ms | 70 ms | 18× |
-| PostgreSQL | 5.6 ms | 38 ms | 6.8× |
+**Path resolution does not care about directory size** — 2.4 µs at 10k, 3.2 µs at 100k. That is the
+expected shape: resolution is a chain of per-level lookups, and the cost is the depth.
 
-The page is always 500 rows, so neither number should move at all. The in-memory backend is the
-honest one about what its code does — it sorts every child before applying the limit — but
-PostgreSQL's 6.8× says its query is not behaving like an indexed top-N either: an index on
-`(parent_id, name_key)` should make a page cost the same in a directory of ten entries and ten
-million. That is the next thing to fix, and it is worth more than any of the numbers above: a
-sync client lists every folder it tracks, so this multiplies by the size of the tree.
-
-Getting the PostgreSQL figure required the harness to exist first. The in-memory number alone
-would have hidden it, because it looks like "the in-memory backend is slow" rather than "the
-listing query sorts a whole directory to return one page".
+**The in-memory backend still sorts the whole child set** — 3.9 ms at 10k and 70 ms at 100k, 18×
+for ten times the data. It is a test/dev backend, not a deployment, and it is the one number here
+that is still shaped wrong; matching PostgreSQL would mean an ordered index in memory, which is
+worth doing only if the memory backend stops being test-only.
 ## Not measured
 
 - **Upload throughput on a large file.** Needs a storage volume and a client outside the process.

@@ -1,0 +1,22 @@
+-- An index that makes a directory listing page cost the same in a directory of ten entries and
+-- one of ten million.
+--
+-- The listing query orders by name and takes a page:
+--
+--     SELECT ... FROM nodes WHERE parent_id = $1 AND trashed_at IS NULL ORDER BY name LIMIT $2
+--
+-- The index that existed was the uniqueness one on (parent_id, name_key), where name_key is the
+-- case-folded form (0007), plus a plain (parent_id). Neither supports ORDER BY name, so the
+-- database sorted the whole child set before applying the limit, which made a page's cost grow
+-- with the directory rather than with the page. Measured with internal/store/bench_test.go:
+-- 5.6 ms per 500-row page at 10,000 entries and 38 ms at 100,000 — 6.8x for ten times the data,
+-- for a page that is the same 500 rows in both cases.
+--
+-- The partial predicate matches every listing query: a trashed child is never listed.
+--
+-- Plain CREATE INDEX rather than CONCURRENTLY, because ApplySchema runs each migration inside a
+-- transaction and CONCURRENTLY cannot. On a deployment large enough for the lock to matter, run
+-- this statement by hand as CREATE INDEX CONCURRENTLY first; IF NOT EXISTS then makes the
+-- migration a no-op.
+CREATE INDEX IF NOT EXISTS nodes_parent_name_idx
+    ON nodes (parent_id, name) WHERE trashed_at IS NULL;

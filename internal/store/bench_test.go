@@ -154,6 +154,12 @@ func benchEnvPG(b *testing.B, n int) (store.Store, store.Node, uuid.UUID) {
 		FROM generate_series(0, $4 - 1) AS g`, dir.ID, owner, blobID, n); err != nil {
 		b.Fatalf("bulk seed %d rows: %v", n, err)
 	}
+	// Without statistics the planner has no idea how many children a directory holds and picks a
+	// seq scan plus a sort: the first version of this benchmark measured a plan no deployment
+	// would ever run, and reported the listing as 30 ms when the indexed query takes 0.1 ms.
+	if _, err := pool.Exec(ctx, `ANALYZE nodes`); err != nil {
+		b.Fatalf("analyze: %v", err)
+	}
 	return pg, dir, owner
 }
 
