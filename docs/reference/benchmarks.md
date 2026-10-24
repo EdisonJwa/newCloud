@@ -38,33 +38,43 @@ production number and needs the fixture helpers in `pg_test.go`; that is not wir
 
 ## Baseline
 
-Measured on a 24-core workstation, `benchtime 20x` (3x for the 100k fixture), Go 1.27.
+Measured on a 24-core workstation, `benchtime 3x`, Go 1.27. `ListChildren` is a 500-row page.
 
-| Benchmark | Fixture | Time per operation |
+| Benchmark | Fixture | Time per page |
 |---|---|---|
-| `BenchmarkListChildren` | 10,000 entries in the directory | **3.5 ms** per 500-row page |
-| `BenchmarkListChildren` | 100,000 entries | **66 ms** per 500-row page |
-| `BenchmarkResolvePath` | 10,000 siblings, 6 segments | **2.4 µs** |
-| `BenchmarkResolvePath` | 100,000 siblings, 6 segments | **3.2 µs** |
-| `BenchmarkCreateFile` | 10,000 entries in the directory | **6.7 µs** |
+| `BenchmarkListChildren` (in memory) | 10,000 entries | **3.9 ms** |
+| `BenchmarkListChildren` (in memory) | 100,000 entries | **70 ms** |
+| `BenchmarkListChildrenPostgreSQL` | 10,000 entries | **5.6 ms** |
+| `BenchmarkListChildrenPostgreSQL` | 100,000 entries | **38 ms** |
+| `BenchmarkResolvePath` (in memory) | 10,000 siblings, 6 segments | **2.4 µs** |
+| `BenchmarkCreateFile` (in memory) | 10,000 entries | **6.7 µs** |
+
+The PostgreSQL run needs `TEST_DATABASE_URL`; it seeds its rows in one statement, because
+creating 100,000 of them through the store takes minutes and a benchmark whose fixture dominates
+its measurement is measuring the fixture.
 
 ### What the numbers say
 
 **Path resolution does not care about directory size** — 2.4 µs at 10k, 3.2 µs at 100k. That is
 the expected shape: resolution is a chain of per-level lookups, and the cost is the depth.
 
-**Listing scales with the size of the directory, not with the size of the page.** A page is
-always 500 rows; the time is not constant. 3.5 ms at 10,000 entries and 66 ms at 100,000 means a
-directory ten times larger costs nineteen times more for the same page. That is what the in-memory
-backend's implementation does — it sorts every child before applying the limit — and it is the
-difference between "listing is fine" and the complaint §8 is about.
+**A listing page costs more as the directory grows, on both backends.**
 
-This is a finding about the in-memory backend, not a claim about a deployment: PostgreSQL orders
-with an index and applies the limit in the database, so the production path should not share this
-shape. Measuring that is the first thing this harness should be extended to do, because the
-in-memory number is the one a test suite pays for and the PostgreSQL number is the one a user
-pays for — and only one of them has been measured.
+| | 10k entries | 100k entries | growth for 10× the data |
+|---|---|---|---|
+| in memory | 3.9 ms | 70 ms | 18× |
+| PostgreSQL | 5.6 ms | 38 ms | 6.8× |
 
+The page is always 500 rows, so neither number should move at all. The in-memory backend is the
+honest one about what its code does — it sorts every child before applying the limit — but
+PostgreSQL's 6.8× says its query is not behaving like an indexed top-N either: an index on
+`(parent_id, name_key)` should make a page cost the same in a directory of ten entries and ten
+million. That is the next thing to fix, and it is worth more than any of the numbers above: a
+sync client lists every folder it tracks, so this multiplies by the size of the tree.
+
+Getting the PostgreSQL figure required the harness to exist first. The in-memory number alone
+would have hidden it, because it looks like "the in-memory backend is slow" rather than "the
+listing query sorts a whole directory to return one page".
 ## Not measured
 
 - **Upload throughput on a large file.** Needs a storage volume and a client outside the process.
