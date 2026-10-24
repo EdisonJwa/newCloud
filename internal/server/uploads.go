@@ -8,16 +8,22 @@ package server
 //
 // The protocol is deliberately small:
 //
-//	POST   /api/files/uploads             -> {id, offset, chunk_size}
+//	POST   /api/files/uploads             -> {id, offset, chunk_size, ranges}
+//	GET    /api/files/uploads/{id}        -> {id, offset, chunk_size, ranges}
 //	PUT    /api/files/uploads/{id}        -> Content-Range: bytes a-b/total
 //	POST   /api/files/uploads/{id}/complete
 //	DELETE /api/files/uploads/{id}
 //
 // It is not tus and not S3 multipart. Both are larger protocols with their own state machines;
-// this covers sequential chunking with resume, which is the whole requirement, without taking
-// on a specification the client would also have to implement correctly.
+// this covers parallel, out-of-order chunking with resume, which is the whole requirement, without
+// taking on a specification the client would also have to implement correctly.
+//
+// `offset` is always the contiguous prefix [0, offset): a sequential client can ignore `ranges`
+// and resume there. `ranges` is the full set of acknowledged half-open intervals, which is what a
+// client sending several chunks at once needs in order to know which holes are left.
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -29,6 +35,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/EdisonJwa/newCloud/internal/authz"
+	"github.com/EdisonJwa/newCloud/internal/storage/layout"
 	"github.com/EdisonJwa/newCloud/internal/upload"
 )
 
@@ -54,6 +61,23 @@ func (s *Server) handleUploadCreate(w http.ResponseWriter, r *http.Request) {
 	name := path.Base(body.Name)
 	if body.Name == "" || name == "" || name == "." || name == "/" {
 		writeError(w, http.StatusBadRequest, "invalid_name", "the file needs a name")
+		return
+	}
+	// Resumable sessions stage on local disk and publish through the local content store;
+	// a mount destination would stage locally only to stream remotely at complete, which
+	// is the single-request upload's job. Refused here, at session start, rather than at
+	// complete with gigabytes staged (ADR-0014).
+	if _, external := s.externalPath(r, body.Path); external {
+		writeError(w, http.StatusBadRequest, "external_not_supported",
+			"resumable uploads target local storage; a single-request upload can write into a mount")
+		return
+	}
+	// The store's own segment validator, applied before a session exists. The completion step
+	// validates the staged name the same way; catching it here means a session is never created
+	// for a name the store would refuse at the end, after the client has already uploaded every
+	// chunk. ".." passes the three-way check above, which is exactly why the validator is asked.
+	if verr := layout.ValidateSegment(name); verr != nil {
+		writeError(w, http.StatusBadRequest, "invalid_name", "the file needs a usable name")
 		return
 	}
 	if body.Size < 0 {
@@ -99,10 +123,45 @@ func (s *Server) handleUploadCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	offset, ranges := sess.Progress()
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"id":         sess.ID,
-		"offset":     sess.Offset,
-		"chunk_size": defaultChunkBytes,
+		"offset":     offset,
+		"chunk_size": s.suggestedChunkBytes(r.Context()),
+		"ranges":     ranges,
+	})
+}
+
+// suggestedChunkBytes is the size advertised to a client. It is the smaller of the built-in
+// default and the enforced per-request cap: advertising 8 MiB under a 1 MiB cap would make the
+// client's first chunk fail with 413 and point at a setting the client never saw.
+func (s *Server) suggestedChunkBytes(ctx context.Context) int64 {
+	limit := s.chunkBytes(ctx)
+	if limit <= 0 || limit > defaultChunkBytes {
+		return defaultChunkBytes
+	}
+	return limit
+}
+
+// handleUploadStatus reports the ranges the server has acknowledged.
+//
+// Resume used to trust the last offset the browser recorded in localStorage. With out-of-order
+// chunks that is not enough: the highest accepted byte can be far past the contiguous prefix, and
+// the missing set can be in the middle. This endpoint is the authoritative answer, and it is
+// owner-scoped exactly like the chunk endpoint.
+func (s *Server) handleUploadStatus(w http.ResponseWriter, r *http.Request) {
+	actor, _ := actorFrom(r.Context())
+	sess, err := s.deps.Uploads.Get(actor.ID(), chi.URLParam(r, "id"))
+	if err != nil {
+		s.writeUploadError(w, err)
+		return
+	}
+	offset, ranges := sess.Progress()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":         sess.ID,
+		"offset":     offset,
+		"chunk_size": s.suggestedChunkBytes(r.Context()),
+		"ranges":     ranges,
 	})
 }
 
@@ -166,8 +225,10 @@ func (s *Server) handleUploadChunk(w http.ResponseWriter, r *http.Request) {
 		s.writeUploadError(w, err)
 		return
 	}
-
-	writeJSON(w, http.StatusOK, map[string]any{"offset": offset})
+	// Append may have acknowledged this range out of order, so `offset` alone is not enough for a
+	// parallel client: the ranges show the holes that are still open.
+	_, ranges := sess.Progress()
+	writeJSON(w, http.StatusOK, map[string]any{"offset": offset, "ranges": ranges})
 }
 
 // handleUploadComplete publishes the staged bytes.
@@ -175,6 +236,14 @@ func (s *Server) handleUploadChunk(w http.ResponseWriter, r *http.Request) {
 //
 // INV-03: the file becomes visible only after its content is persisted and its hash verified and the
 // metadata row commits — a fault during any of those leaves no half-made file in a listing.
+//
+// Completion is a WRITE like any other, so it is arbitrated like any other. The first version
+// checked only the parent's create permission and then published, which made the resumable path
+// the one write in the product that answered 201 over a WebDAV lock, replaced a file the caller
+// had no `overwrite` grant for, and honoured no precondition — every check the single-request
+// upload makes, skipped by the one path a client can retry for hours. The guards below are the
+// single-request handler's own sequence (files.go), kept in the same order so the two ways of
+// writing the same bytes cannot drift apart again.
 func (s *Server) handleUploadComplete(w http.ResponseWriter, r *http.Request) {
 	actor, _ := actorFrom(r.Context())
 	id := chi.URLParam(r, "id")
@@ -199,6 +268,66 @@ func (s *Server) handleUploadComplete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rel := path.Join(relOfChain(chain), sess.Name)
+
+	// The folded sibling at the target decides three things below: whether the completion is a
+	// conflict (a name differing only in case or Unicode form — T-12), which lock rule applies,
+	// and which quota delta applies.
+	sibling, xerr := s.childAtTarget(r.Context(), parent.ID, sess.Name)
+	if xerr != nil {
+		s.writeStoreError(w, xerr)
+		return
+	}
+	if sibling != nil && sibling.Name != sess.Name {
+		writeError(w, http.StatusConflict, "conflict",
+			"something whose name differs only in case or Unicode form already exists there")
+		return
+	}
+
+	if sibling == nil || sibling.IsDir() {
+		// Creating a new name is a membership change on the parent, so a Depth: 0 parent lock
+		// blocks it (RFC 4918 §7.4) — the same rule the single-request upload applies. A name
+		// that already belongs to a directory is the same question: the completion cannot
+		// replace it, so what happens next is a store-level refusal, not a content overwrite.
+		if !s.guardParentUnlocked(w, r, actor, parent.ID) {
+			return
+		}
+	}
+	if sibling != nil && !sibling.IsDir() {
+		// Replacing an existing file needs `overwrite` (§4.2), and a WebDAV lock on the target
+		// blocks the replacement (§5.3), as does a Depth: infinity lock on an ancestor — the
+		// checks are the single-request upload's, in its order.
+		if !s.guardUnlocked(w, r, actor, sibling.ID) {
+			return
+		}
+		if !s.guardAncestorContentUnlocked(w, r, actor, sibling.ID) {
+			return
+		}
+		parentCap, cerr := s.deps.Authz.Authorize(actor, parent.ID)
+		if cerr != nil {
+			s.writeStoreError(w, cerr)
+			return
+		}
+		if !parentCap.Can(authz.PermOverwrite) {
+			writeError(w, http.StatusNotFound, "not_found", "no such directory")
+			return
+		}
+	}
+
+	// Preconditions and quota are decided BEFORE the Put, for the same reason the single-request
+	// upload decides them there: the tree layout publishes at the live path, so a completion that
+	// was going to be refused must not replace the bytes it was going to be refused for. Both are
+	// fast paths — publishFile re-runs the precondition inside WriteFile and CreateFile holds the
+	// authoritative reservation — so a writer committing in between still fails safely.
+	if !s.preconditionHoldsNow(r, sibling) {
+		writeError(w, http.StatusPreconditionFailed, "precondition_failed",
+			"the file changed since you last read it")
+		return
+	}
+	if !s.quotaHasRoomFor(r.Context(), actor.ID(), sess.Total, sibling) {
+		writeError(w, http.StatusInsufficientStorage, "quota_exceeded", "your storage quota is full")
+		return
+	}
+
 	res, err := s.deps.Content.Put(r.Context(), nodeFor(actor, rel), file, sess.Total)
 	if err != nil {
 		s.writeStoreError(w, err)
@@ -252,11 +381,19 @@ func (s *Server) writeUploadError(w http.ResponseWriter, err error) {
 
 	switch {
 	case errors.As(err, &conflict):
-		// 409 with the true offset: the client resumes from here instead of restarting.
+		// 409 with the true progress: the client sends what the ranges say is missing instead of
+		// restarting. `offset_mismatch` is kept as the machine code because clients already branch
+		// on it; the message distinguishes an overlapping chunk from an incomplete Finish, and the
+		// ranges carry the information either way.
+		message := "the chunk overlaps bytes the server already has; send only the returned missing ranges"
+		if conflict.Incomplete {
+			message = "the upload still has missing ranges"
+		}
 		writeJSON(w, http.StatusConflict, map[string]any{
 			"error":   "offset_mismatch",
-			"message": "resume from the returned offset",
+			"message": message,
 			"offset":  conflict.Offset,
+			"ranges":  conflict.Ranges,
 		})
 	case errors.Is(err, upload.ErrNotFound):
 		// Same answer for unknown, expired, finished and foreign sessions.

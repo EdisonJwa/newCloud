@@ -182,6 +182,29 @@ limits:
   version_count_limit: 0               # per-file version count cap; 0 = layout default (10 blob / 3 tree)
   upload_session_ttl_hours: 24         # how long an unfinished resumable upload may sit idle
 
+# External storage mounts (ADR-0014): SMB/SFTP/FTP/WebDAV remotes as top-level folders,
+# browsed in place, never copied. Disabled by default — enabling it is the decision to let
+# the file service talk to hosts it did not choose itself.
+mounts:
+  enabled: false
+  # Required when enabled: a hex-encoded 32-byte key encrypting mount credentials at rest.
+  # Generate with: openssl rand -hex 32 > /etc/newcloud/mounts.key (mode 0600).
+  secret_file: ""
+  # When true, any signed-in user may mount into their own tree. Off by default: mount
+  # creation points the server at a host of the creator's choosing.
+  allow_user_mounts: false
+  # Refuse USER-created mounts whose endpoint resolves to loopback/link-local/private
+  # space (the SSRF guard). Admin-created mounts are exempt.
+  deny_private_addresses: true
+  # Per-operation and dial timeout for every mount round trip, seconds.
+  timeout_seconds: 30
+  # One remote directory listing is fetched whole; refuse above this instead of truncating.
+  max_list_entries: 5000
+  # Cap for one file written into a mount. 0 means "use limits.max_file_bytes".
+  max_file_bytes: 0
+  # Schemes a mount may use. SMB has no provider in this build and is refused at creation.
+  allowed_schemes: [webdav, ftp, sftp]
+
 audit:
   retention_days: 365
   # anchor_dir publishes a daily checkpoint of the audit chain head (INV-09).
@@ -195,6 +218,20 @@ audit:
   # directory on the metadata volume makes the anchor decorative.
   # Left empty, anchoring is off and startup logs a warning saying so.
   anchor_dir: ""
+  # Ed25519 private key that signs every published checkpoint (§10.2). Generate with:
+  #   newcloud audit anchor-keygen --out /etc/newcloud/audit-anchor.key
+  #
+  # Empty stores checkpoints UNSIGNED, which still detects a truncated chain but not an
+  # anchor rewritten by someone with write access to the anchor directory. The private key
+  # must live OUTSIDE the anchor directory; give the public half (printed at generation,
+  # and at startup when configured) to whoever runs:
+  #   newcloud audit verify-anchors --dir <anchor dir> --pubkey <key>
+  anchor_signing_key_file: ""
+  # Where `newcloud audit prune` writes the events it is about to remove. The prune mark
+  # records this path as the answer to "where did that part of the log go", so it should
+  # point somewhere the database cannot rewrite — the same kind of location as anchor_dir.
+  # Empty means ./audit-archive next to the working directory.
+  archive_dir: ""
 
 # Mail delivers share recipient verification codes. It is required for email shares:
 # without it the server still accepts the invitation and generates the code, but can only

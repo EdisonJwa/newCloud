@@ -389,3 +389,12 @@ type UserLookup interface {
 	// UsernamesFor returns display names for the given account ids. Unknown ids are omitted.
 	UsernamesFor(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]string, error)
 }
+
+// FavoriteCounter is the optional reverse count the search index needs.
+//
+// §7.2 names `favorite_count` as an indexed field. It is a count of OTHER people's stars, so it is
+// not part of a viewer's own annotation and cannot be answered by SocialFor.
+type FavoriteCounter interface {
+	// FavoriteCount reports how many accounts have starred a node.
+	FavoriteCount(ctx context.Context, nodeID uuid.UUID) (int, error)
+}

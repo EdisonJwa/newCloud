@@ -15,6 +15,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/EdisonJwa/newCloud/internal/audit"
 	"github.com/EdisonJwa/newCloud/internal/authz"
 	"github.com/EdisonJwa/newCloud/internal/blob"
 	"github.com/EdisonJwa/newCloud/internal/dircommit"
@@ -61,6 +62,27 @@ type fileJSON struct {
 	// Omitted when zero, which is the common case and needs no ink.
 	ShareCount  int  `json:"share_count,omitempty"`
 	HasVersions bool `json:"has_versions,omitempty"`
+
+	// SHA256 is the file's content address (core-scope §2), hex-encoded.
+	//
+	// It already existed in the database — the blob address IS the content hash, and etagFor
+	// truncates it — but it was only ever surfaced on the version listing. A client could verify a
+	// historical version and had no way to verify the file it was actually looking at.
+	//
+	// Absent for directories (no content), and absent when the address is unknown, which is the
+	// honest answer rather than a row of zeroes a client might compare against.
+	SHA256 string `json:"sha256,omitempty"`
+	// Starred is the VIEWER's own star (core-scope §4).
+	//
+	// Per user, not per node: two people sharing a folder star independently, which is why the
+	// favorites table is keyed (user_id, node_id) rather than being a flag on the node.
+	Starred bool `json:"starred,omitempty"`
+	// FavoriteAt is when the viewer starred it, so a UI can sort or label by that. Only set on the
+	// favorites listing, where it is the ordering key; the ordinary listing omits it.
+	FavoriteAt string `json:"favorite_at,omitempty"`
+	// Tags are the labels on this node that the viewer may see: the deployment's system tags plus
+	// their own (core-scope §5). Omitted when there are none.
+	Tags []tagJSON `json:"tags,omitempty"`
 }
 
 func toFileJSON(n store.Node, rel string) fileJSON {
@@ -97,6 +119,13 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	rel := r.URL.Query().Get("path")
 	cursor := r.URL.Query().Get("cursor")
 	limit := parseLimit(r.URL.Query().Get("limit"), s.deps.Config.Limits.MaxProfindChildren)
+
+	// A path below a mount point has no rows to resolve against: the listing comes from
+	// the remote, live (ADR-0014).
+	if tgt, external := s.externalPath(r, rel); external {
+		s.handleExternalList(w, r, tgt.Rel)
+		return
+	}
 
 	nodes, err := s.deps.Meta.Resolve(r.Context(), actor.ID(), rel)
 	if err != nil {
@@ -206,6 +235,13 @@ func (s *Server) handleMkdir(w http.ResponseWriter, r *http.Request) {
 	parentRel, name := splitParent(body.Path)
 	if name == "" {
 		writeError(w, http.StatusBadRequest, "invalid_name", "a name is required")
+		return
+	}
+
+	// A directory below a mount point is created on the remote (ADR-0014). The fork
+	// resolves the PARENT: the new name does not exist yet, on either side.
+	if _, external := s.externalPath(r, parentRel); external {
+		s.handleExternalMkdir(w, r, parentRel, name)
 		return
 	}
 
@@ -415,6 +451,15 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	dirRel := r.FormValue("path")
+
+	// A file below a mount point is stored on the remote, never locally (ADR-0014). The
+	// fork sits before the local path's lock guards on purpose: an external write has no
+	// local node to fence, and the remote's own concurrency rules are the truth there.
+	if _, external := s.externalPath(r, dirRel); external {
+		s.handleExternalUpload(w, r, dirRel)
+		return
+	}
+
 	file, header, err := r.FormFile("file")
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "bad_upload", "no file in the request")
@@ -425,6 +470,17 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	name := path.Base(header.Filename)
 	if name == "" || name == "." || name == "/" {
 		writeError(w, http.StatusBadRequest, "invalid_name", "the file needs a name")
+		return
+	}
+	// The store's own segment validator, applied BEFORE any storage write.
+	//
+	// ".." passes the three-way check above (path.Base keeps it), and everything else the
+	// validator refuses — traversal, separators, reserved device names, control characters —
+	// would only be rejected later by CreateFile, which on the tree layout is after the bytes
+	// have already been published at that path. One validator, the same one the store applies,
+	// so the handler cannot drift from what the store will eventually decide.
+	if verr := layout.ValidateSegment(name); verr != nil {
+		writeError(w, http.StatusBadRequest, "invalid_name", "the file needs a usable name")
 		return
 	}
 
@@ -438,39 +494,55 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	// the listing's own "/docs" writes into "docs" on a path-backed layout instead of being refused.
 	rel := path.Join(relOfChain(parentChain), name)
 
-	// One resolution, used for both the membership and the overwrite decision. Asking twice also
-	// meant asking wrongly: existingFile reports "no such file" for a new name, so a guard written
-	// after it never ran for exactly the case it was there for.
-	exists, existingNode, xerr := s.existingFile(r.Context(), actor.ID(), rel)
+	// One resolution of the folded sibling, used for the fold check, the lock guards and the
+	// overwrite decision. The lookup used to be Resolve over the whole rel path, run twice and
+	// reporting "no such file" for a new name, so a guard written after it never ran for exactly
+	// the case it was there for.
+	sibling, xerr := s.childAtTarget(r.Context(), parent.ID, name)
 	if xerr != nil {
 		s.writeStoreError(w, xerr)
 		return
 	}
-	_ = existingNode
-	if !exists {
+
+	// A sibling that only FOLDS to this name is a conflict, decided before anything is written.
+	//
+	// The metadata layer keeps "README.md" and "Readme.md" as one name (T-12), so this upload would
+	// be refused at CreateFile with 409 — but on the tree layout the Put below runs first and
+	// publishes at this path, which on a case-insensitive filesystem destroys the live sibling's
+	// bytes for an upload that was never going to commit. The same defect class was fixed in the
+	// WebDAV PUT, where preconditions are decided before a single byte is written.
+	if sibling != nil && sibling.Name != name {
+		writeError(w, http.StatusConflict, "conflict",
+			"something whose name differs only in case or Unicode form already exists there")
+		return
+	}
+
+	if sibling == nil || sibling.IsDir() {
 		// Creating a new name is a membership change on the parent, so a Depth: 0 parent lock
-		// blocks it (RFC 4918 §7.4).
+		// blocks it (RFC 4918 §7.4). A name that already belongs to a DIRECTORY is the same
+		// question: the upload cannot replace it, so what happens next is a store-level refusal,
+		// not a content overwrite.
 		if !s.guardParentUnlocked(w, r, actor, parent.ID) {
 			return
 		}
 	}
-
-	// Replacing an existing file needs `overwrite`, which `create` alone does not imply.
-	//
-	// §4.2 separates them, and the distinction is the difference between "add files here" and
-	// "may replace my work". The existence check is a read; the authoritative guard is the
-	// precondition inside WriteFile, so a file created between here and the write still cannot be
-	// clobbered by a caller who lacks the bit — it fails the precondition instead.
-	if existing, node, xerr := s.existingFile(r.Context(), actor.ID(), rel); xerr == nil && existing {
+	if sibling != nil && !sibling.IsDir() {
+		// Replacing an existing file needs `overwrite`, which `create` alone does not imply.
+		//
+		// §4.2 separates them, and the distinction is the difference between "add files here" and
+		// "may replace my work". The existence check is a read; the authoritative guard is the
+		// precondition inside WriteFile, so a file created between here and the write still cannot
+		// be clobbered by a caller who lacks the bit — it fails the precondition instead.
+		//
 		// A WebDAV lock on the target blocks an HTTP overwrite (§5.3). Without this the two write
 		// paths disagree and the lock is advisory on one of them.
-		if !s.guardUnlocked(w, r, actor, node.ID) {
+		if !s.guardUnlocked(w, r, actor, sibling.ID) {
 			return
 		}
 
 		// A Depth: infinity lock on an ancestor also covers this child content (RFC 4918
 		// 7.4), which is the half that makes a subtree lock worth taking.
-		if !s.guardAncestorContentUnlocked(w, r, actor, node.ID) {
+		if !s.guardAncestorContentUnlocked(w, r, actor, sibling.ID) {
 			return
 		}
 		parentCap, cerr := s.deps.Authz.Authorize(actor, parent.ID)
@@ -482,6 +554,22 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "not_found", "no such directory")
 			return
 		}
+	}
+
+	// Preconditions and quota are decided BEFORE a byte is written, for the same reason the
+	// WebDAV PUT decided them there: the tree layout publishes at the live path, so a refusal
+	// that arrives after the Put has already replaced the bytes it was refusing to replace.
+	// Both are fast paths — the authoritative precondition re-runs inside WriteFile and the
+	// authoritative reservation inside CreateFile — so a writer committing in between still
+	// fails safely; these exist so a DOOMED upload never reaches the content store at all.
+	if !s.preconditionHoldsNow(r, sibling) {
+		writeError(w, http.StatusPreconditionFailed, "precondition_failed",
+			"the file changed since you last read it")
+		return
+	}
+	if !s.quotaHasRoomFor(r.Context(), actor.ID(), header.Size, sibling) {
+		writeError(w, http.StatusInsufficientStorage, "quota_exceeded", "your storage quota is full")
+		return
 	}
 
 	res, err := s.deps.Content.Put(r.Context(), nodeFor(actor, rel), file, header.Size)
@@ -522,10 +610,148 @@ func preconditionFromHeader(r *http.Request) *store.Precondition {
 	return &store.Precondition{IfMatch: im, IfNoneMatch: inm}
 }
 
+// childAtTarget resolves the sibling that occupies (parentID, name), or nil when the name is free.
+//
+// The lookup is the store's own folded comparison (T-12), so "readme.md" finds "README.md" —
+// which is what makes the fold-conflict pre-check in the upload handlers possible without a
+// second, weaker spelling of name identity.
+func (s *Server) childAtTarget(ctx context.Context, parentID uuid.UUID, name string) (*store.Node, error) {
+	var found *store.Node
+	err := s.deps.Meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		n, cerr := tx.ChildByName(ctx, parentID, name)
+		if cerr == nil {
+			found = &n
+			return nil
+		}
+		if errors.Is(cerr, store.ErrNotFound) {
+			return nil
+		}
+		return cerr
+	})
+	if err != nil {
+		return nil, err
+	}
+	return found, nil
+}
+
+// preconditionHoldsNow evaluates the request's conditional headers against the node that
+// currently occupies the target name, BEFORE any byte is written.
+//
+// The tree layout publishes at the live path, so a 412 decided after the Put — which is where
+// WriteFile's Expect evaluates it — has already replaced the bytes it refused to replace. The
+// WebDAV PUT made this exact move for this exact reason; this is the JSON API's half. It is a
+// fast path only: publishFile passes the same headers into WriteFile, whose Expect re-runs the
+// decision inside the UPDATE under the row lock, so a writer that commits between the two
+// checks still fails safely with 412.
+//
+// The comparison rules are the ones the DAV handler applies (RFC 7232 as they apply to a
+// state-changing request): If-Match with the strong comparison, failing outright on a target
+// that does not exist; If-None-Match with the weak comparison, where a match on a write is a
+// refusal; both must hold when both are present.
+func (s *Server) preconditionHoldsNow(r *http.Request, existing *store.Node) bool {
+	expect := preconditionFromHeader(r)
+	if expect == nil {
+		return true
+	}
+	exists := existing != nil && !existing.IsDir()
+	var etag string
+	if exists {
+		etag = existing.ETag
+	}
+	if expect.IfMatch != "" {
+		if !exists || !strongEtagMatches(expect.IfMatch, etag) {
+			return false
+		}
+	}
+	if expect.IfNoneMatch != "" && exists && (expect.IfNoneMatch == "*" || weakEtagMatches(expect.IfNoneMatch, etag)) {
+		return false
+	}
+	return true
+}
+
+// strongEtagMatches evaluates an If-Match list with the strong comparison: a member matches
+// when it is "*" or the current entity-tag, and a weakly-tagged member never matches.
+func strongEtagMatches(header, etag string) bool {
+	for _, part := range strings.Split(header, ",") {
+		part = strings.TrimSpace(part)
+		if strings.HasPrefix(part, "W/") {
+			continue
+		}
+		if part == "*" || part == etag {
+			return true
+		}
+	}
+	return false
+}
+
+// weakEtagMatches evaluates an If-None-Match list with the weak comparison: a weak spelling
+// of the current tag counts as a match.
+func weakEtagMatches(header, etag string) bool {
+	for _, part := range strings.Split(header, ",") {
+		part = strings.TrimSpace(part)
+		if part == "*" || part == etag || strings.TrimPrefix(part, "W/") == etag {
+			return true
+		}
+	}
+	return false
+}
+
+// quotaHasRoomFor is the best-effort quota fast-path for the upload handlers.
+//
+// The authoritative reservation happens inside WriteFile/CreateFile, under the same row lock
+// that commits the row — that check is the one that is correct under concurrency, and this one
+// is deliberately not a second copy of it. It exists because the content Put runs BEFORE that
+// reservation, so an upload that could never commit used to write its bytes first and only then
+// hear "507": on the tree layout those bytes replaced the live file at the target path.
+//
+// Racy by design: two concurrent requests can both pass this and still be settled correctly by
+// the authoritative check. A read error fails OPEN for the same reason — the slow path still
+// refuses. The delta accounts for a replacement, whose old bytes the write frees; without that,
+// re-uploading a large file at a full quota would be refused here although the authoritative
+// delta check would have admitted it.
+func (s *Server) quotaHasRoomFor(ctx context.Context, ownerID uuid.UUID, size int64, existing *store.Node) bool {
+	need := size
+	if existing != nil && !existing.IsDir() {
+		need = size - existing.Size
+		if need < 0 {
+			need = 0
+		}
+	}
+	// Two reads, deliberately not one transaction: Usage is a Store-level counter (a nested
+	// WithTx here would be refused on the in-memory backend and deadlocks on it), and the fast
+	// path gains nothing from a snapshot both halves agree on — it is racy by design, and the
+	// authoritative reservation inside WriteFile/CreateFile is what is exact.
+	used, uerr := s.deps.Meta.Usage(ctx, ownerID)
+	if uerr != nil {
+		return true
+	}
+	var quota int64
+	if err := s.deps.Meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		u, gerr := tx.UserByID(ctx, ownerID)
+		if gerr != nil {
+			return gerr
+		}
+		quota = u.QuotaBytes
+		return nil
+	}); err != nil {
+		return true
+	}
+	if quota <= 0 {
+		return true
+	}
+	return used+need <= quota
+}
+
 // handleDownload streams a file for the web UI.
 func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	actor, _ := actorFrom(r.Context())
 	rel := r.URL.Query().Get("path")
+
+	// Bytes below a mount point stream from the remote (ADR-0014).
+	if tgt, external := s.externalPath(r, rel); external {
+		s.handleExternalDownload(w, r, tgt.Rel)
+		return
+	}
 
 	nodes, err := s.deps.Meta.Resolve(r.Context(), actor.ID(), rel)
 	if err != nil {
@@ -677,6 +903,18 @@ func (s *Server) handleRename(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Renaming below a mount point is a remote rename. The mount point itself keeps its
+	// name: it is the mount's identity in listings and audit rows (ADR-0014).
+	if tgt, external := s.externalPath(r, body.Path); external {
+		if tgt.Rel == "" {
+			writeError(w, http.StatusConflict, "is_mount",
+				"the mount point's name is the mount's identity; unmount and remount under the new name")
+			return
+		}
+		s.handleExternalRename(w, r, tgt, body.Name)
+		return
+	}
+
 	nodes, err := s.deps.Meta.Resolve(r.Context(), actor.ID(), body.Path)
 	if err != nil {
 		s.writeStoreError(w, err)
@@ -768,6 +1006,19 @@ func (s *Server) handleMove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A move that touches a mount at either end is decided here: within one mount it is
+	// a remote rename; across a boundary it is a copy wearing a move's name, and the
+	// refusal says so rather than silently duplicating the bytes (ADR-0014).
+	if srcTgt, external := s.externalPath(r, body.From); external {
+		_ = srcTgt
+		s.handleExternalMove(w, r, body.From, body.To)
+		return
+	}
+	if _, external := s.externalPath(r, body.To); external {
+		s.handleExternalMove(w, r, body.From, body.To)
+		return
+	}
+
 	moved, err := s.moveOne(r.Context(), r, actor, body.From, body.To, false)
 	if err != nil {
 		s.writeTransferError(w, err)
@@ -780,6 +1031,19 @@ func (s *Server) handleMove(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	actor, _ := actorFrom(r.Context())
 	rel := r.URL.Query().Get("path")
+
+	// Deleting below a mount point deletes on the remote, immediately, with no trash —
+	// the response says so. The mount point itself is not deletable here: unmounting is
+	// a mount operation, and it never touches the remote's data (ADR-0014).
+	if tgt, external := s.externalPath(r, rel); external {
+		if tgt.Rel == "" {
+			writeError(w, http.StatusConflict, "is_mount",
+				"this folder is a mount point; DELETE /api/mounts/{id} removes it without touching the remote")
+			return
+		}
+		s.handleExternalDelete(w, r, tgt.Rel)
+		return
+	}
 
 	nodes, err := s.deps.Meta.Resolve(r.Context(), actor.ID(), rel)
 	if err != nil {
@@ -934,6 +1198,76 @@ func (s *Server) handleTrashList(w http.ResponseWriter, r *http.Request) {
 		body["retention_days"] = int(retention.Hours() / 24)
 	}
 	writeJSON(w, http.StatusOK, body)
+}
+
+// emptyTrashBatch bounds one purge call.
+//
+// The handler runs the purge in bounded batches and may be asked again (§3): a bin with a million
+// entries must not hold one request open for minutes, and a client that gets a timeout has to be
+// told "call me again" rather than left guessing. 500 roots is a few thousand rows in a subtree
+// delete, which completes well inside a proxy's idle timeout.
+const emptyTrashBatch = 500
+
+// handleEmptyTrash permanently deletes the caller's own trash (core-scope §3).
+//
+// Three properties, each of which is the reason for a line below:
+//
+//  1. ONE implementation. It calls PurgeTrashFor, which is the same accounting and the same
+//     recursive delete the worker's retention sweep uses (PurgeTrash). The acceptance criterion is
+//     that a concurrent purge and delete cannot double-release a blob refcount, and that is only
+//     true if the release exists once.
+//
+//  2. The caller's OWN trash. The owner id is a parameter of the statement that selects the roots,
+//     so no handler mistake can reach another account's rows.
+//
+//  3. Idempotent and batched. A timeout means "call me again", never "unknown state": the response
+//     says how much went and whether more remains.
+func (s *Server) handleEmptyTrash(w http.ResponseWriter, r *http.Request) {
+	actor, _ := actorFrom(r.Context())
+
+	var res store.PurgeResult
+	err := s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
+		got, perr := tx.PurgeTrashFor(ctx, actor.ID(), emptyTrashBatch)
+		res = got
+		if perr != nil {
+			return perr
+		}
+		// Audited as trash.purge with actor attribution (§3). The event vocabulary already
+		// existed — only the worker emitted it — and the counts-style single-event pattern is
+		// reused rather than one event per node: a thousand-node bin must not write a thousand
+		// audit rows, or the log becomes the noisiest thing in the database.
+		//
+		// `via=user` is what tells an operator reading the log whether a user emptied their bin or
+		// a retention policy did it. The two have different explanations to give.
+		if got.Nodes == 0 {
+			// Nothing was deleted. A sweep every few minutes would otherwise fill the log with
+			// "deleted 0 items"; the same reasoning as the worker's purge.
+			return nil
+		}
+		return tx.Audit(ctx, store.AuditEntry{
+			ActorKind: "user", ActorUserID: actor.Ptr(), ActorEmail: actor.Email(),
+			ActorIP: clientIP(r), UserAgent: r.UserAgent(),
+			Action: string(audit.ActionTrashPurge), TargetKind: "trash", TargetID: "own",
+			Result: "ok",
+			Metadata: map[string]any{
+				"nodes": got.Nodes, "roots": got.Roots, "bytes": got.Bytes,
+				"via": "user", "more": got.More,
+			},
+		})
+	})
+	if err != nil {
+		s.writeStoreError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"purged":      res.Roots,
+		"nodes":       res.Nodes,
+		"bytes_freed": res.Bytes,
+		// `more` is the whole contract for a client: true means the bin may still hold items and
+		// this call should be repeated. False means it is empty.
+		"more": res.More,
+	})
 }
 
 // handleRestore un-deletes a node and its subtree.
@@ -1272,29 +1606,6 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 }
 
 var _ = uuid.Nil
-
-// existingFile reports whether a live file already occupies rel.
-//
-// A miss is not an error: the common case is a new file, and an upload must not fail because
-// the caller has permission to create but the target happens not to exist yet.
-func (s *Server) existingFile(ctx context.Context, ownerID uuid.UUID, rel string) (bool, store.Node, error) {
-	var node store.Node
-	err := s.deps.Meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
-		nodes, rerr := s.deps.Meta.Resolve(ctx, ownerID, rel)
-		if rerr != nil {
-			return rerr
-		}
-		node = nodes[len(nodes)-1]
-		return nil
-	})
-	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			return false, store.Node{}, nil
-		}
-		return false, store.Node{}, err
-	}
-	return !node.IsDir(), node, nil
-}
 
 // formatRetainUntil renders the retention deadline, or "" when none applies.
 func formatRetainUntil(t *time.Time) string {

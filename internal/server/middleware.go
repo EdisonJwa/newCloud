@@ -47,55 +47,15 @@ func actorFrom(ctx context.Context) (authz.Actor, bool) {
 // disabled account takes effect on the next call rather than when a token would have expired.
 func (s *Server) requireSession(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c, err := r.Cookie(sessionCookie)
-		if err != nil || c.Value == "" {
-			writeError(w, http.StatusUnauthorized, "unauthenticated", "session required")
-			return
-		}
-
-		claims, err := s.deps.Sessions.Verify(r.Context(), c.Value)
+		user, err := s.sessionUser(r)
 		if err != nil {
-			// Clear the dead cookie so the browser stops sending it and the user is
-			// not stuck in a redirect loop.
-			s.clearSessionCookie(w)
-			writeError(w, http.StatusUnauthorized, "unauthenticated", "session expired")
-			return
-		}
-
-		user, err := s.userByID(r.Context(), claims.Subject)
-		if err != nil {
-			s.clearSessionCookie(w)
-			writeError(w, http.StatusUnauthorized, "unauthenticated", "account unavailable")
-			return
-		}
-
-		// Status is checked on every request, not only at login.
-		//
-		// Revocation on disable closes the common case, but it is not sufficient on its
-		// own: a session minted a millisecond before the disable commits, or a replica
-		// reading a snapshot taken before it, would survive. Checking here makes "disabled"
-		// true regardless of how the credential was obtained - the same reasoning that made
-		// the account lookup happen per request rather than being trusted from the token.
-		if !user.IsActive() {
-			s.clearSessionCookie(w)
-			writeError(w, http.StatusUnauthorized, "unauthenticated", "account is not active")
-			return
-		}
-
-		// ID-06 / WC-GAP-001: refuse a credential whose IdP confirmation has aged out.
-		//
-		// The role stored in this row was written by the last successful login. If the IdP has since
-		// removed this person from a group — or disabled them outright — nothing in this process knows
-		// yet, and the session keeps exercising the old role. "Effective at the next login" is not a
-		// bound when the person may never log in again.
-		//
-		// Refusing here converts that into a documented window: past auth.revalidate_minutes, the
-		// only way back in is an interactive sign-in, which re-reads the claims. It is deliberately
-		// not a silent role change — the request fails with the same 401 an expired session gets, so
-		// the client re-authenticates rather than continuing with privileges nobody has confirmed.
-		if s.credentialIsStale(user) {
-			s.clearSessionCookie(w)
-			writeError(w, http.StatusUnauthorized, "unauthenticated", "sign-in must be renewed")
+			// A cookie that is present but unusable is cleared so the browser stops
+			// sending it and the user is not stuck in a redirect loop. A request with no
+			// cookie at all is a plain 401 and gets no Set-Cookie.
+			if !errors.Is(err, errNoSession) {
+				s.clearSessionCookie(w)
+			}
+			writeError(w, http.StatusUnauthorized, "unauthenticated", err.Error())
 			return
 		}
 
@@ -117,6 +77,67 @@ func (s *Server) requireSession(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r.WithContext(context.WithValue(ctx, actorKey, actor)))
 	})
 }
+
+// sessionUser resolves the browser session on r, or returns one of the errors below.
+//
+// One resolver serves both this middleware and the Nextcloud login-flow consent page. Two
+// copies of "is this browser signed in" is how a page ends up trusting a session the API
+// has already refused: the consent page mints an App Password, so it has to apply the same
+// revocation and IdP-revalidation checks, not a weaker subset of them.
+func (s *Server) sessionUser(r *http.Request) (store.User, error) {
+	c, err := r.Cookie(sessionCookie)
+	if err != nil || c.Value == "" {
+		return store.User{}, errNoSession
+	}
+
+	claims, err := s.deps.Sessions.Verify(r.Context(), c.Value)
+	if err != nil {
+		return store.User{}, errSessionExpired
+	}
+
+	user, err := s.userByID(r.Context(), claims.Subject)
+	if err != nil {
+		return store.User{}, errAccountUnavailable
+	}
+
+	// Status is checked on every request, not only at login.
+	//
+	// Revocation on disable closes the common case, but it is not sufficient on its
+	// own: a session minted a millisecond before the disable commits, or a replica
+	// reading a snapshot taken before it, would survive. Checking here makes "disabled"
+	// true regardless of how the credential was obtained - the same reasoning that made
+	// the account lookup happen per request rather than being trusted from the token.
+	if !user.IsActive() {
+		return store.User{}, errAccountInactive
+	}
+
+	// ID-06 / WC-GAP-001: refuse a credential whose IdP confirmation has aged out.
+	//
+	// The role stored in this row was written by the last successful login. If the IdP has since
+	// removed this person from a group — or disabled them outright — nothing in this process knows
+	// yet, and the session keeps exercising the old role. "Effective at the next login" is not a
+	// bound when the person may never log in again.
+	//
+	// Refusing here converts that into a documented window: past auth.revalidate_minutes, the
+	// only way back in is an interactive sign-in, which re-reads the claims. It is deliberately
+	// not a silent role change — the request fails with the same 401 an expired session gets, so
+	// the client re-authenticates rather than continuing with privileges nobody has confirmed.
+	if s.credentialIsStale(user) {
+		return store.User{}, errSignInStale
+	}
+
+	return user, nil
+}
+
+// Session failures. The messages are the API's, and they are distinct because they point at
+// different remedies: sign in, wait for the account to be enabled, or re-authenticate.
+var (
+	errNoSession          = errors.New("session required")
+	errSessionExpired     = errors.New("session expired")
+	errAccountUnavailable = errors.New("account unavailable")
+	errAccountInactive    = errors.New("account is not active")
+	errSignInStale        = errors.New("sign-in must be renewed")
+)
 
 // credentialIsStale reports whether this account's IdP confirmation has aged past the window
 // (ID-06, WC-GAP-001).

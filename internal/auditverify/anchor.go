@@ -13,6 +13,7 @@
 package auditverify
 
 import (
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -231,7 +232,26 @@ type Chain interface {
 // the current head would miss a truncation followed by new activity: the attacker
 // deletes rows, the system keeps appending, and the head eventually differs from every
 // old checkpoint in a way that looks like ordinary growth.
+//
+// This is the UNSIGNED form: it asks "does the published record match the chain" and can
+// not ask "is this the record that was published", because it holds no public key. A
+// deployment that signs its checkpoints should be verified with VerifySigned, which the
+// worker's continuous check uses when it holds the signing key.
 func Verify(a *FileAnchor, chain Chain) (VerifyResult, error) {
+	return VerifySigned(a, chain, nil)
+}
+
+// VerifySigned is Verify plus checkpoint-signature verification.
+//
+// The signatures answer a question the chain comparison cannot: whether each checkpoint file
+// is the one that was published, as opposed to a rewritten one that happens to match a chain
+// that was rewritten to agree (see sign.go for the threat). A nil public key keeps the
+// unsigned behaviour exactly, which is what deployments without a signing key — and the
+// existing call sites — get.
+//
+// The public key is passed rather than read from the anchor on purpose: the anchor is the
+// ARTIFACT under test, and an artifact that vouches for itself proves nothing.
+func VerifySigned(a *FileAnchor, chain Chain, pub ed25519.PublicKey) (VerifyResult, error) {
 	cps, err := a.Checkpoints()
 	if err != nil {
 		return VerifyResult{}, err
@@ -241,6 +261,16 @@ func Verify(a *FileAnchor, chain Chain) (VerifyResult, error) {
 
 	prevHead := ""
 	for i, cp := range cps {
+		// 0. When a public key is available, the checkpoint must be the one that was
+		//    published. This runs before the structural checks so a forged file is
+		//    reported as a signature failure rather than as whatever else it also breaks.
+		if pub != nil {
+			if serr := VerifySignature(pub, cp); serr != nil {
+				res.Problems = append(res.Problems, serr.Error())
+				prevHead = cp.Head
+				continue
+			}
+		}
 		// 1. A published checkpoint must not be missing from the middle of the run.
 		//
 		// The PreviousHead link alone cannot catch this: the surviving checkpoints each

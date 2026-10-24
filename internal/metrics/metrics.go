@@ -98,6 +98,15 @@ type Registry struct {
 	jobsRunning atomic.Int64
 	jobsFailed  atomic.Int64
 
+	// Search-index health (core-scope §7.2).
+	//
+	// Two signals, because they answer the two questions an operator asks when content search
+	// "stops working": is the index behind (lag), and is the engine failing (errors). Both are
+	// absent on a deployment with no engine, which is correct — a gauge that reads zero because the
+	// feature is off is a gauge that hides an outage on the deployment that has it.
+	searchIndexLag  atomic.Int64
+	searchIndexErrs atomic.Uint64
+
 	startedAt time.Time
 }
 
@@ -115,9 +124,39 @@ func counter(m *sync.Map, key string) *atomic.Uint64 {
 	return actual.(*atomic.Uint64)
 }
 
+// allowedMethods is the fixed set of HTTP methods this server can observe, plus WebDAV's
+// extensions. Anything outside it is recorded as "OTHER".
+//
+// The method is a LABEL on a counter, and a label fed straight from r.Method is unbounded
+// cardinality: a client chooses its own method, so one garbage request per distinct spelling
+// ("GET\u{0}", a lowercase "get", a 2 KiB custom verb) creates a series that lives for the
+// lifetime of the process and is scraped forever. statusClass buckets the status for exactly
+// this reason; the method needed the same treatment and did not have it.
+var allowedMethods = map[string]bool{
+	"GET": true, "HEAD": true, "POST": true, "PUT": true, "DELETE": true, "PATCH": true,
+	"OPTIONS": true,
+	// WebDAV (RFC 4918) and the REPORT/SEARCH extensions some clients send against
+	// collections. These are the methods the /dav/ router actually dispatches on.
+	"PROPFIND": true, "PROPPATCH": true, "MKCOL": true, "COPY": true, "MOVE": true,
+	"LOCK": true, "UNLOCK": true, "REPORT": true, "SEARCH": true,
+}
+
+// normaliseMethod maps a raw request method onto the fixed label set.
+//
+// The comparison is exact rather than case-folding, deliberately: HTTP methods are
+// case-sensitive, and folding "get" into "GET" would merge a malformed client into the
+// series it is closest to instead of counting it as what it is — unusual traffic, visible
+// under OTHER.
+func normaliseMethod(method string) string {
+	if allowedMethods[method] {
+		return method
+	}
+	return "OTHER"
+}
+
 // ObserveRequest records one HTTP response.
 func (r *Registry) ObserveRequest(method string, status int, dav bool) {
-	counter(&r.httpRequests, method+" "+statusClass(status)).Add(1)
+	counter(&r.httpRequests, normaliseMethod(method)+" "+statusClass(status)).Add(1)
 	if dav {
 		r.davRequests.Add(1)
 		if status == http.StatusConflict || status == http.StatusPreconditionFailed {
@@ -200,6 +239,29 @@ func (r *Registry) SetJobs(pending, running, failed int) {
 	r.jobsFailed.Store(int64(failed))
 }
 
+// SetSearchIndexLag reports how far behind the content index is.
+//
+// Seconds since the oldest still-pending index job's due time. Zero means the index is caught up;
+// a number that keeps growing means the queue is not draining and searches are running against a
+// stale cache. On a deployment with no engine this is never set, and the alert therefore never
+// fires — which is why the alert rule pairs it with the error counter rather than firing on lag
+// alone.
+func (r *Registry) SetSearchIndexLag(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	r.searchIndexLag.Store(int64(d.Seconds()))
+}
+
+// ObserveSearchIndexError records one failure to write to or read from the index.
+//
+// Both directions count: a failed index write is why the index is stale, and a failed query is why
+// a search answered `degraded: true`. An operator alerting on "content search is degraded" wants
+// both in one series.
+func (r *Registry) ObserveSearchIndexError() {
+	r.searchIndexErrs.Add(1)
+}
+
 // statusClass buckets a status code.
 //
 // 2xx/3xx/4xx/5xx rather than the exact code: the useful question is "what fraction of
@@ -259,6 +321,12 @@ func (r *Registry) write(w http.ResponseWriter) {
 	fmt.Fprintln(w, "# HELP newcloud_dav_conflicts_total WebDAV 409/412 responses (lock contention or a stale etag).")
 	fmt.Fprintln(w, "# TYPE newcloud_dav_conflicts_total counter")
 	fmt.Fprintf(w, "newcloud_dav_conflicts_total %d\n", r.davConflicts.Load())
+	// HELP/TYPE are emitted for content_missing too: the exposition format has no default
+	// metric type, and a scrape of an untyped counter is rejected or guessed by collectors
+	// depending on which one is reading — an alert built on it then behaves differently by
+	// scraper version.
+	fmt.Fprintln(w, "# HELP newcloud_content_missing_total Responses for a file whose metadata exists but whose stored bytes could not be produced.")
+	fmt.Fprintln(w, "# TYPE newcloud_content_missing_total counter")
 	fmt.Fprintf(w, "newcloud_content_missing_total %d\n", r.contentMissing.Load())
 
 	writeCounterMap(w, "newcloud_uploads_total", "Upload outcomes.", &r.uploads)
@@ -269,6 +337,17 @@ func (r *Registry) write(w http.ResponseWriter) {
 	fmt.Fprintf(w, "newcloud_jobs{state=\"pending\"} %d\n", r.jobsPending.Load())
 	fmt.Fprintf(w, "newcloud_jobs{state=\"running\"} %d\n", r.jobsRunning.Load())
 	fmt.Fprintf(w, "newcloud_jobs{state=\"failed\"} %d\n", r.jobsFailed.Load())
+
+	// Content-search health (core-scope §7.2). Both families are always emitted, so an alert rule
+	// naming them is valid on every deployment and reads zero on one without an engine — which is
+	// the honest value ("there is no index to be behind") rather than a missing series that a scrape
+	// would treat as "no data" forever.
+	fmt.Fprintln(w, "# HELP newcloud_search_index_lag_seconds How far behind the content index is.")
+	fmt.Fprintln(w, "# TYPE newcloud_search_index_lag_seconds gauge")
+	fmt.Fprintf(w, "newcloud_search_index_lag_seconds %d\n", r.searchIndexLag.Load())
+	fmt.Fprintln(w, "# HELP newcloud_search_index_errors_total Failed index reads and writes.")
+	fmt.Fprintln(w, "# TYPE newcloud_search_index_errors_total counter")
+	fmt.Fprintf(w, "newcloud_search_index_errors_total %d\n", r.searchIndexErrs.Load())
 
 	fmt.Fprintln(w, "# HELP newcloud_blob_scrub_corrupt Blobs whose bytes do not match their address.")
 	fmt.Fprintln(w, "# TYPE newcloud_blob_scrub_corrupt gauge")

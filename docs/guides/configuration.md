@@ -126,7 +126,7 @@ a slowdown. Startup performs a real rename probe and refuses to start if it fail
 | `max_file_bytes` | `1099511627776` (1 TiB) | Hard cap for one file. |
 | `default_file_quota_bytes` | `10737418240` (10 GiB) | Per-user quota for new accounts. |
 | `max_propfind_children` | `100000` | Maximum entries returned for one `PROPFIND`. |
-| `upload_chunk_bytes` | `268435456` (256 MiB) | Advertised chunk size for resumable uploads and the **enforced** maximum for one chunk: a larger chunk is refused with `413 chunk_too_large`. Overridable at runtime through the admin settings API. |
+| `upload_chunk_bytes` | `268435456` (256 MiB) | **Enforced** maximum for one chunk: a larger chunk is refused with `413 chunk_too_large`. The size advertised to a new session is `min(8 MiB, this value)`, so a lowered cap is respected by the client on its first chunk rather than after a 413. Overridable at runtime through the admin settings API. |
 | `blob_scrub_per_pass` | `0` | Blobs read back and verified per scrub cycle. `0` disables the scrub. |
 | `blob_scrub_interval_seconds` | `0` | Scrub period. `0` uses the worker's six-hour sweep cadence. |
 | `trash_retention_days` | `0` | How long a deleted item stays restorable. `0` keeps it forever. |

@@ -11,6 +11,7 @@ document was written.
 | [Architecture](reference/architecture.md) | Components and request flow |
 | [Configuration](guides/configuration.md) | Each configuration key and its default |
 | [Deployment](guides/deployment.md) | A production deployment that does not lose data |
+| [Nextcloud desktop and mobile clients](guides/nextcloud-clients.md) | Connecting the official clients, and the boundaries they meet |
 | [Limitations](guides/limitations.md) | What is deliberately not implemented |
 
 ## Operating a deployment
@@ -51,6 +52,7 @@ the old one stays in the repository with its original date.
 | [0008](adr/0008-resumable-uploads.md) | Resumable chunked uploads without tus or S3 multipart | Accepted |
 | [0012](adr/0012-cursor-contract.md) | Cursor pagination for directory listings | Accepted |
 | [0013](adr/0013-file-operation-consistency.md) | Operation-private staging, conditional publish, and the file-operation correctness contract | Accepted (v2.1.1) |
+| [0015](adr/0015-nextcloud-client-compatibility.md) | Nextcloud client compatibility as a protocol subset, and the login-flow credential handshake | Accepted |
 
 ## Conventions
 

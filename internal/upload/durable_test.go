@@ -119,12 +119,10 @@ func TestASessionResumesAfterARestart(t *testing.T) {
 	}
 }
 
-// TestAResumedSessionRefusesASkippedChunk: the offset is authoritative, not advisory.
-//
-// A client that jumps ahead must be told the real offset rather than silently producing a file
-// with a hole. This is the same guarantee as the in-process case, re-established after recovery,
-// because an offset read from disk is exactly the kind of value that could be trusted too far.
-func TestAResumedSessionRefusesASkippedChunk(t *testing.T) {
+// TestAResumedSessionAcceptsAnOutOfOrderChunk: after recovery a client may keep filling gaps in
+// any order. The recovered contiguous offset stays 2 (the file is not publishable yet), but the
+// chunk at [4,6) is acknowledged and must survive the next restart.
+func TestAResumedSessionAcceptsAnOutOfOrderChunk(t *testing.T) {
 	dir := t.TempDir()
 	owner := uuid.New()
 
@@ -142,13 +140,30 @@ func TestAResumedSessionRefusesASkippedChunk(t *testing.T) {
 
 	release(first)
 	second := restart(t, dir)
-	_, err = second.Append(context.Background(), owner, sess.ID, 4, bytes.NewReader([]byte("cd")), 2)
-	var conflict *ConflictError
-	if !errors.As(err, &conflict) {
-		t.Fatalf("want ConflictError for a chunk that skips ahead, got %v", err)
+	off, err := second.Append(context.Background(), owner, sess.ID, 4, bytes.NewReader([]byte("ef")), 2)
+	if err != nil {
+		t.Fatalf("a disjoint out-of-order chunk after recovery: %v", err)
 	}
-	if conflict.Offset != 2 {
-		t.Fatalf("the conflict should report the recovered offset 2, got %d", conflict.Offset)
+	if off != 2 {
+		t.Fatalf("contiguous offset after the out-of-order chunk = %d, want 2", off)
+	}
+	if _, _, err := second.Finish(owner, sess.ID); err == nil {
+		t.Fatal("Finish must refuse an upload with a hole")
+	}
+	if _, err := second.Append(context.Background(), owner, sess.ID, 2, bytes.NewReader([]byte("cd")), 2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.Append(context.Background(), owner, sess.ID, 6, bytes.NewReader([]byte("gh")), 2); err != nil {
+		t.Fatal(err)
+	}
+	f, _, err := second.Finish(owner, sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	body, _ := io.ReadAll(f)
+	if string(body) != "abcdefgh" {
+		t.Fatalf("content after out-of-order resume = %q, want abcdefgh", body)
 	}
 }
 

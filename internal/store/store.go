@@ -422,8 +422,7 @@ type Tx interface {
 	SetUserQuota(ctx context.Context, userID uuid.UUID, bytes int64) error
 
 	// SampleBlobHashes returns up to limit content addresses ordered after `after`, for an integrity
-	// scrub.
-	//
+	// scrub.	//
 	// It reads the metadata rather than the storage directory because the metadata is what knows
 	// which blobs are SUPPOSED to exist — a directory scan verifies exactly the blobs that are
 	// easy to find and misses a row whose bytes are gone.
@@ -512,6 +511,27 @@ type Tx interface {
 
 	// Enqueue adds an asynchronous job in the same transaction.
 	Enqueue(ctx context.Context, j Job) error
+
+	// NodesAfter pages every node in id order, for the search backfill.
+	//
+	// Keyset on id rather than on updated_at: the id is immutable, so a walk that resumes after a
+	// document was renamed or moved neither skips a row nor returns one twice. Trashed rows are
+	// included, because the caller has to be able to tell "this document is gone" — it decides what
+	// to do about that, and a walk that silently omitted them would leave deleted files in the index
+	// forever.
+	//
+	// A nil uuid starts from the beginning; an empty result means the walk reached the end and the
+	// next pass should start over.
+	NodesAfter(ctx context.Context, after uuid.UUID, limit int) ([]Node, error)
+
+	// OldestPendingJob reports when the oldest still-pending job of this kind was due, for the
+	// search-index lag gauge (§7.2).
+	//
+	// Due time rather than creation time: a job scheduled a minute in the future is not late yet,
+	// and a lag that counted it would report a backlog that is not one.
+	//
+	// ok is false when nothing of that kind is pending, which is the caught-up answer.
+	OldestPendingJob(ctx context.Context, kind string) (due time.Time, ok bool, err error)
 
 	// The consumer side of the queue (INV-06).
 	ClaimJobs(ctx context.Context, workerID string, limit int, lease time.Duration) ([]QueuedJob, error)

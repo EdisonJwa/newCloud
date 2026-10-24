@@ -28,13 +28,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
-
 	"log/slog"
 
 	"github.com/EdisonJwa/newCloud/internal/auth"
 	"github.com/EdisonJwa/newCloud/internal/authz"
 	"github.com/EdisonJwa/newCloud/internal/config"
+	"github.com/EdisonJwa/newCloud/internal/mount"
 	"github.com/EdisonJwa/newCloud/internal/storage/layout"
 	"github.com/EdisonJwa/newCloud/internal/store"
 	"github.com/EdisonJwa/newCloud/internal/swap"
@@ -60,6 +59,8 @@ type Handler struct {
 	// when an account is stale: two implementations of one policy is how one of them ends up
 	// letting a demoted admin through.
 	revalidate func(store.User) bool
+	// mounts serves external storage (ADR-0014). Nil keeps the handler entirely local.
+	mounts *mount.Service
 }
 
 // WithRevalidation supplies the staleness predicate used to expire App Passwords.
@@ -126,6 +127,40 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	actor, ok := h.authenticate(w, r)
 	if !ok {
+		return
+	}
+
+	// The external fork (ADR-0014): a URL below a mount point never reaches the local
+	// handlers. Everything else — the whole local surface — is byte-for-byte unchanged
+	// when no mount service is wired.
+	if tgt, cap, external := h.externalTarget(r.Context(), actor, r.URL.Path); external {
+		switch r.Method {
+		case "PROPFIND":
+			h.handleExternalPropfind(w, r, actor, tgt, cap)
+		case http.MethodGet:
+			h.handleExternalGet(w, r, actor, tgt, cap, false)
+		case http.MethodHead:
+			h.handleExternalGet(w, r, actor, tgt, cap, true)
+		case http.MethodPut:
+			h.handleExternalPut(w, r, actor, tgt, cap)
+		case "MKCOL":
+			h.handleExternalMkcol(w, r, actor, tgt, cap)
+		case http.MethodDelete:
+			h.handleExternalDelete(w, r, actor, tgt, cap)
+		case "MOVE":
+			h.handleExternalMove(w, r, actor, tgt, cap)
+		case "COPY", "PROPPATCH":
+			// A copy out of a mount duplicates the bytes the mount promised not to
+			// duplicate silently; dead properties have no rows below a mount point.
+			writeXMLError(w, http.StatusForbidden, "external-not-supported")
+		case "LOCK", "UNLOCK":
+			// The lock register fences local writers. A remote with concurrent writers
+			// of its own cannot be fenced by a local token, and a LOCK that pretended
+			// otherwise would be a lie a client schedules work around.
+			writeXMLError(w, http.StatusForbidden, "external-not-supported")
+		default:
+			writeXMLError(w, http.StatusNotImplemented, "")
+		}
 		return
 	}
 
@@ -253,9 +288,14 @@ func (h *Handler) resolvePath(ctx context.Context, a authz.Actor, urlPath string
 		return authz.Cap{}, store.Node{}, authz.ErrDenied
 	}
 
-	// A client may only address its own namespace unless the share handler
-	// resolved it; the handler always uses the authenticated account here.
-	_ = user
+	// The name in the URL is not authorization — the credential is — but a URL that
+	// names somebody else's namespace must not answer with the caller's own file under
+	// the other account's label. Nextcloud clients address /remote.php/dav/files/<user>/,
+	// so a mismatched segment is a 404, which is also this project's rule for denials.
+	if user != "" && user != a.Username() {
+		h.logf("resolve: namespace mismatch url=%q user=%q actor=%q", urlPath, user, a.Username())
+		return authz.Cap{}, store.Node{}, authz.ErrNotFound
+	}
 
 	nodes, err := h.meta.Resolve(ctx, a.ID(), rel)
 	if err != nil {
@@ -278,16 +318,60 @@ func (h *Handler) resolvePath(ctx context.Context, a authz.Actor, urlPath string
 
 // splitPath extracts the owner namespace and relative path from a URL.
 //
-// The layout is /dav/<username>/<path>. The username is checked against the
-// authenticated actor: addressing somebody else's namespace must fail here rather
-// than rely on the node lookup returning nothing.
+// Three URL shapes are accepted, because they are the shapes real clients send:
+//
+//	/dav/<username>/<path>                       this server's native form
+//	/remote.php/dav/files/<username>/<path>      Nextcloud desktop and mobile clients
+//	/remote.php/webdav/<path>                    the legacy ownCloud/Nextcloud form
+//
+// plus the two root forms (no trailing path). The owner segment is returned rather than
+// trusted: resolvePath refuses a URL that names a different account. A path outside those
+// shapes is ErrNotFound, never a relative name — the old default branch silently treated
+// any unprefixed path as relative to the caller's root.
 func (h *Handler) splitPath(urlPath string) (owner, rel string, err error) {
-	p := strings.TrimPrefix(urlPath, "/dav")
-	p = strings.TrimPrefix(p, "/")
-	if p == "" {
+	p := urlPath
+	switch {
+	case p == "/remote.php/webdav" || strings.HasPrefix(p, "/remote.php/webdav/"):
+		// The legacy endpoint carries no owner: the account comes from the credential.
+		p = strings.TrimPrefix(p, "/remote.php/webdav")
+		p = strings.TrimPrefix(p, "/")
+		if p == "" {
+			return "", "", nil
+		}
+	case strings.HasPrefix(p, "/remote.php/dav/files/"):
+		p = strings.TrimPrefix(p, "/remote.php/dav/files/")
+		owner, p, _ = strings.Cut(p, "/")
+		if p == "" {
+			return owner, "", nil
+		}
+	case p == "/remote.php/dav" || p == "/remote.php/dav/":
 		return "", "", nil
+	case p == "/dav" || strings.HasPrefix(p, "/dav/"):
+		p = strings.TrimPrefix(p, "/dav")
+		p = strings.TrimPrefix(p, "/")
+		if p == "" {
+			return "", "", nil
+		}
+		owner, p, _ = strings.Cut(p, "/")
+		if p == "" {
+			return owner, "", nil
+		}
+	default:
+		// /remote.php/dav/uploads/..., /remote.php/dav/versions/... and every other
+		// address belong to a Nextcloud feature this server does not implement. They must
+		// not fall through to a relative name that could resolve inside somebody's tree.
+		return "", "", store.ErrNotFound
 	}
-	owner, rel, _ = strings.Cut(p, "/")
+
+	rel = p
+	// Clients address a collection with a trailing slash (".../folder/"). It is a
+	// separator, not part of the name, and layout.ValidatePath would reject or normalise
+	// it differently — a 404 for the URL a client just created a folder at, which is
+	// exactly what a Nextcloud client asks for on every listing.
+	rel = strings.TrimSuffix(rel, "/")
+	if rel == "" {
+		return owner, "", nil
+	}
 	segs, err := layout.ValidatePath(rel)
 	if err != nil {
 		return "", "", err
@@ -415,5 +499,3 @@ func statusForError(err error) int {
 		return http.StatusInternalServerError
 	}
 }
-
-var _ = uuid.Nil

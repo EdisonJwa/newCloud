@@ -170,6 +170,23 @@ func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A batch is a LOCAL operation (ADR-0014): a source below a mount cannot be read
+	// from rows that do not exist, and a destination below one would create rows under
+	// a mount point — invisible to every listing, since listings fork to the remote.
+	// Refused whole rather than per item so a mixed selection fails loudly.
+	for _, item := range body.Items {
+		if _, ext := s.externalPath(r, item.From); ext {
+			writeError(w, http.StatusBadRequest, "external_not_supported",
+				"mounted storage cannot take part in a batch transfer; copy or move it on the remote")
+			return
+		}
+		if _, ext := s.externalPath(r, item.To); ext {
+			writeError(w, http.StatusBadRequest, "external_not_supported",
+				"mounted storage cannot take part in a batch transfer; copy or move it on the remote")
+			return
+		}
+	}
+
 	results := make([]batchResult, 0, len(body.Items))
 	var moved, failed int
 
@@ -293,6 +310,19 @@ func (s *Server) copyOne(
 	tree, err := s.completeTree(ctx, src, srcRel, traversalLimit())
 	if err != nil {
 		return store.Node{}, err
+	}
+
+	// The quota fast-path runs off that same resolved tree, for the same reason the upload
+	// handlers pre-check: copyResolved writes every member's bytes before its CreateFile decides
+	// quota, so a copy that could never commit used to stage all of them first and answer 507
+	// with a store full of orphans. Best-effort and racy by design — the authoritative
+	// reservation stays inside CreateFile, which is what keeps two concurrent copies honest; a
+	// read error fails open, and per-member deduplication (identical bytes do not cost twice) can
+	// make the real cost SMALLER than this estimate, never larger. `existing` is the target the
+	// overwrite will replace, so a file-over-file copy is charged its delta, not its whole size.
+	if !s.quotaHasRoomFor(ctx, actor.ID(), treeBytes(tree), existing) {
+		return store.Node{}, refuse(http.StatusInsufficientStorage, "quota_exceeded",
+			"the copy would exceed the account's storage quota")
 	}
 
 	dstRel := path.Join(parentRel, name)
@@ -864,7 +894,23 @@ func (s *Server) handleZip(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "not_found", "no such file or directory")
 			return
 		}
-		if node.IsDir() && !s.checkSubtreePerm(r, actor, node.ID, authz.PermRead) {
+		// The subtree is held to the SAME primitive the individual download route holds the root
+		// to. It used to walk with `read`, which made the archive the one download that granted
+		// itself: a folder whose members were visible but not takeable zipped them all out, one
+		// request, bypassing the exact check /api/files/download makes per file. The check here
+		// refuses the WHOLE archive rather than omitting members — a truncated archive is a valid
+		// ZIP that every extraction tool reports as a success, so "absent from the archive" is
+		// not an honest answer for a refusal, and partial output is the failure this endpoint
+		// exists never to produce.
+		// The archive builder proves completeness over a metadata walk; a remote walk
+		// cannot make that promise cheaply, so an external subtree is refused rather
+		// than archived possibly-incompletely (ADR-0014).
+		if _, external := s.externalPath(r, p); external {
+			writeError(w, http.StatusBadRequest, "external_not_supported",
+				"mounted storage cannot be archived; download its files individually")
+			return
+		}
+		if node.IsDir() && !s.checkSubtreePerm(r, actor, node.ID, authz.PermDownload) {
 			writeError(w, http.StatusNotFound, "not_found", "no such file or directory")
 			return
 		}
@@ -960,6 +1006,20 @@ func treeEntries(n *treeNode) int {
 		count += treeEntries(c)
 	}
 	return count
+}
+
+// treeBytes sums the file sizes in a resolved subtree: the cost a copy is about to attempt.
+// Directories contribute nothing — the quota accounts file bytes, which is what CreateFile
+// reserves.
+func treeBytes(n *treeNode) int64 {
+	if n.Node.IsDir() {
+		var sum int64
+		for _, c := range n.Children {
+			sum += treeBytes(c)
+		}
+		return sum
+	}
+	return n.Node.Size
 }
 
 // zipTree writes one resolved subtree into the archive.

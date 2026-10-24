@@ -111,6 +111,23 @@ const (
 	ActionVersionExpire Action = "version.expire"
 	ActionBlobCollect   Action = "blob.collect"
 
+	// Social metadata (core-scope §8).
+	//
+	// The policy is stated once, there, and the two constants here are the exceptions it names.
+	// Favorites, tag ASSIGNMENT and comment create/edit are deliberately absent from this
+	// vocabulary: they are not security-relevant actions, and putting them in the hash chain would
+	// dilute the entries that decide accountability — volume without evidentiary value.
+	//
+	//	comment.moderate    somebody removed a comment they did not write. That is a privileged act
+	//	                    on another person's words, and "who silenced whom" is exactly what the
+	//	                    chain is for. No body: a comment is user content, not a security fact,
+	//	                    and §8 forbids writing one into audit metadata.
+	//	tag.system.change   an administrator changed the deployment's shared label vocabulary.
+	//	                    A system tag is visible to every account, so removing one silently
+	//	                    edits other people's files' metadata.
+	ActionCommentModerate Action = "comment.moderate"
+	ActionTagSystemChange Action = "tag.system.change"
+
 	// Anomalies.
 	ActionAnomaly Action = "security.anomaly"
 )
@@ -135,6 +152,15 @@ const (
 	TargetSetting TargetKind = "setting"
 	TargetSession TargetKind = "session"
 	TargetNone    TargetKind = "none"
+	// TargetComment names a moderated comment by id (core-scope §8).
+	TargetComment TargetKind = "comment"
+	// TargetTag names a system tag whose definition changed (core-scope §8).
+	TargetTag TargetKind = "tag"
+	// TargetTrash names a purge run rather than a single node — the counts-style single-event
+	// pattern the existing trash.purge uses, which the user-initiated purge reuses (§3).
+	TargetTrash TargetKind = "trash"
+	// TargetVersion names a version-retention or version-level operation.
+	TargetVersion TargetKind = "version"
 )
 
 // ActorKind distinguishes who acted. Anonymous matters: file-request uploads and

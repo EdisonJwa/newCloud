@@ -30,6 +30,9 @@ import (
 	"github.com/EdisonJwa/newCloud/internal/dav"
 	"github.com/EdisonJwa/newCloud/internal/mail"
 	"github.com/EdisonJwa/newCloud/internal/metrics"
+	"github.com/EdisonJwa/newCloud/internal/mount"
+	"github.com/EdisonJwa/newCloud/internal/nccompat"
+	"github.com/EdisonJwa/newCloud/internal/search"
 	"github.com/EdisonJwa/newCloud/internal/share"
 	"github.com/EdisonJwa/newCloud/internal/storage/layout"
 	"github.com/EdisonJwa/newCloud/internal/store"
@@ -65,6 +68,11 @@ type Deps struct {
 	AppPass      *auth.AppPasswords
 	Shares       *share.Service
 	Provider     *auth.Provider
+	// Mounts serves external storage mounts (ADR-0014). Nil means the surface is
+	// unwired: the mount routes answer 503 and no path resolves as external, because
+	// without the service there is no way to know a node is a mount point — the same
+	// fail-closed shape the other optional dependencies take.
+	Mounts *mount.Service
 	// Providers holds the OIDC provider when it may not have been discovered yet (ID-07).
 	//
 	// Distinct from Provider, which is the "already known at startup" case the tests use. In
@@ -84,6 +92,13 @@ type Deps struct {
 	// Metrics records request outcomes and operational signals. Nil means metrics are not
 	// collected, which is the default for tests that do not care.
 	Metrics *metrics.Registry
+	// Search is the OPTIONAL content-search engine (core-scope §7.2).
+	//
+	// Nil means the deployment runs `search.engine: none`: name-and-filter search works, content
+	// search answers `mode: name` with `degraded: true`, and no write ever depends on an index.
+	// That is a decision rather than a gap — the single-binary product is the default, and the
+	// engine is what a deployment adds when it wants full-text.
+	Search  search.Engine
 	Log     *slog.Logger
 	Version string
 }
@@ -108,6 +123,11 @@ type Server struct {
 	// for an API-only deployment and for tests that assert on 404s.
 	ui     *webassets.Handler
 	thumbs *thumbnail.Generator
+	// nc is the Nextcloud client compatibility layer (ADR-0015): status.php, the OCS
+	// capabilities/user endpoints, and login flow v2. Built even without an App Password
+	// service, because status.php must answer on an API-only deployment too; the
+	// authenticated endpoints degrade with a 503 rather than disappearing.
+	nc *nccompat.Handler
 }
 
 // New builds the server but does not start listening.
@@ -150,10 +170,27 @@ func New(deps Deps) (*Server, error) {
 
 	s := &Server{deps: deps, started: time.Now(), thumbs: thumbs}
 	if deps.AppPass != nil {
-		s.dav = dav.New(deps.Config, deps.Meta, deps.Content, deps.Authz, deps.AppPass).WithLogger(deps.Log).
+		davHandler := dav.New(deps.Config, deps.Meta, deps.Content, deps.Authz, deps.AppPass).WithLogger(deps.Log).
 			WithTrashLimit(s.maxTrashBytes).
 			WithRevalidation(s.credentialIsStale)
+		if deps.Mounts != nil {
+			davHandler = davHandler.WithMounts(deps.Mounts)
+		}
+		s.dav = davHandler
 	}
+
+	// The Nextcloud compatibility layer. Its consent page resolves the browser session
+	// through the same resolver the API uses, so the two cannot disagree about whether a
+	// session is still valid — the page mints an App Password, which makes a weaker check
+	// there a credential-issuing hole.
+	s.nc = nccompat.New(nccompat.Deps{
+		PublicURL:   deps.Config.Server.PublicURL,
+		Meta:        deps.Meta,
+		AppPass:     deps.AppPass,
+		SessionUser: s.sessionUser,
+		Stale:       s.credentialIsStale,
+		Log:         deps.Log,
+	})
 
 	// The client is embedded in the binary, so there is nothing to configure. A
 	// failure here means the build is corrupt, not that the operator got something
@@ -212,6 +249,30 @@ func (s *Server) Handler() http.Handler {
 		r.Method(http.MethodGet, "/metrics", s.deps.Metrics.Handler())
 	}
 
+	// Nextcloud client compatibility (ADR-0015).
+	//
+	// These are the paths the official desktop and mobile clients use before and around
+	// WebDAV. status.php is deliberately anonymous: a client checks it before it has any
+	// credential. The OCS endpoints authenticate with an App Password and require the
+	// OCS-APIRequest header, and the login-flow pages are ordinary browser pages that use
+	// the OIDC session.
+	r.Get("/status.php", s.nc.HandleStatus)
+	r.Get("/ocs/v1.php/cloud/capabilities", s.nc.HandleCapabilities)
+	r.Get("/ocs/v2.php/cloud/capabilities", s.nc.HandleCapabilities)
+	r.Get("/ocs/v1.php/cloud/user", s.nc.HandleUser)
+	r.Get("/ocs/v2.php/cloud/user", s.nc.HandleUser)
+	// Account removal in the desktop client revokes the credential it was using.
+	r.Delete("/ocs/v1.php/core/apppassword", s.nc.HandleAppPasswordDelete)
+	r.Delete("/ocs/v2.php/core/apppassword", s.nc.HandleAppPasswordDelete)
+	// The desktop client starts the flow with POST /index.php/login/v2 and then polls the
+	// absolute "endpoint" from the reply (/login/v2/poll). The /index.php alias exists
+	// because some client versions concatenate it themselves.
+	r.Post("/index.php/login/v2", s.nc.HandleLoginFlowStart)
+	r.Post("/login/v2/poll", s.nc.HandleLoginFlowPoll)
+	r.Post("/index.php/login/v2/poll", s.nc.HandleLoginFlowPoll)
+	r.Get("/login/v2/flow/{token}", s.nc.HandleLoginFlowApprove)
+	r.Post("/login/v2/flow/{token}", s.nc.HandleLoginFlowApprove)
+
 	r.Route("/api", func(r chi.Router) {
 		r.Route("/auth", func(r chi.Router) {
 			r.Get("/login", s.handleLogin)
@@ -253,6 +314,11 @@ func (s *Server) Handler() http.Handler {
 				r.Get("/", s.handleList)
 				r.Get("/recent", s.handleRecent)
 				r.Get("/search", s.handleSearch)
+				// The star toggle (core-scope §4). PUT/DELETE rather than POST: both are
+				// idempotent, so a retried request or a double-clicked toggle cannot create two
+				// rows, and the client never has to ask "is it starred now?".
+				r.Put("/favorite", s.handleFavoriteStar)
+				r.Delete("/favorite", s.handleFavoriteUnstar)
 				r.Post("/mkdir", s.handleMkdir)
 				r.Post("/upload", s.handleUpload)
 				r.Get("/download", s.handleDownload)
@@ -266,10 +332,18 @@ func (s *Server) Handler() http.Handler {
 				r.Get("/zip", s.handleZip)
 				r.Delete("/", s.handleDelete)
 				r.Get("/trash", s.handleTrashList)
+				// Empty trash (core-scope §3). POST rather than DELETE because it is an ACTION on
+				// a collection, not the removal of one named resource: DELETE /api/files/trash
+				// would read as "delete the trash listing", and a client retrying it after a
+				// timeout needs the "call me again" semantics this endpoint documents.
+				r.Post("/trash/empty", s.handleEmptyTrash)
 				r.Post("/restore", s.handleRestore)
 				r.Get("/thumbnail", s.handleThumbnail)
 				r.Route("/uploads", func(r chi.Router) {
 					r.Post("/", s.handleUploadCreate)
+					// Status is what makes resume correct once chunks can be acknowledged out of
+					// order: the contiguous offset alone cannot name the holes.
+					r.Get("/{id}", s.handleUploadStatus)
 					r.Put("/{id}", s.handleUploadChunk)
 					r.Post("/{id}/complete", s.handleUploadComplete)
 					r.Delete("/{id}", s.handleUploadAbort)
@@ -289,6 +363,31 @@ func (s *Server) Handler() http.Handler {
 			// The content half: without it `download` on a shared node was a permission with
 			// no route that could exercise it.
 			r.Get("/shared/{id}/content", s.handleSharedContent)
+
+			// Favorites (core-scope §4): the listing, newest first under the ADR-0012 cursor
+			// contract. The toggle above lives with the file routes because it is addressed like
+			// a file (?path= or ?id=).
+			r.Get("/favorites", s.handleFavorites)
+
+			// Tags (core-scope §5). Personal tags belong to their owner; system tags are the
+			// deployment's shared vocabulary and only an administrator may change one.
+			r.Route("/tags", func(r chi.Router) {
+				r.Get("/", s.handleTagList)
+				r.Post("/", s.handleTagCreate)
+				r.Patch("/{id}", s.handleTagUpdate)
+				r.Delete("/{id}", s.handleTagDelete)
+			})
+
+			// Assignment and discussion are node-scoped, so they hang off /nodes rather than
+			// carrying their own top-level collection: both require a grant on the node, and the
+			// only handle the caller has for a node is its id.
+			r.Post("/nodes/{id}/tags", s.handleNodeTagsSet)
+			r.Delete("/nodes/{id}/tags", s.handleNodeTagsDelete)
+			r.Get("/nodes/{id}/comments", s.handleCommentsList)
+			r.Post("/nodes/{id}/comments", s.handleCommentCreate)
+			// One comment by id: edit (own) and delete (own, admin, or manage_permissions).
+			r.Patch("/comments/{id}", s.handleCommentUpdate)
+			r.Delete("/comments/{id}", s.handleCommentDelete)
 
 			// Account administration. Approving a JIT-provisioned account is the
 			// remedy the provisioning policy names, and until this existed the policy
@@ -323,6 +422,15 @@ func (s *Server) Handler() http.Handler {
 				r.Get("/", s.handleACLList)
 				r.Post("/", s.handleACLGrant)
 				r.Delete("/{id}", s.handleACLRevoke)
+			})
+
+			// External mounts (ADR-0014). Present whenever the router is; the handlers
+			// answer 503 themselves when the service is not wired, so the route table
+			// always tells the truth about what exists.
+			r.Route("/mounts", func(r chi.Router) {
+				r.Get("/", s.handleMountList)
+				r.Post("/", s.handleMountCreate)
+				r.Delete("/{id}", s.handleMountDelete)
 			})
 
 			r.Route("/shares", func(r chi.Router) {
@@ -754,18 +862,26 @@ func writeError(w http.ResponseWriter, status int, code, msg string) {
 	writeJSON(w, status, apiError{Error: code, Message: msg})
 }
 
-// davInterceptor routes every request under /dav to the WebDAV handler.
+// davInterceptor routes every DAV-shaped request to the WebDAV handler.
 //
 // It runs before the router because chi cannot register extension methods, and a
 // 405 from the router would be indistinguishable to a client from "this server has
 // no WebDAV".
+//
+// The Nextcloud client paths are handled here rather than rewritten to /dav/: the
+// handler builds the hrefs it returns from the request's own escaped path, so a rewrite
+// would make every PROPFIND response point at a URL the client never asked about.
+// splitPath understands all three shapes and refuses a URL that names another account's
+// namespace.
 func (s *Server) davInterceptor(next http.Handler) http.Handler {
 	if s.dav == nil {
 		return next
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
-		if p == "/dav" || strings.HasPrefix(p, "/dav/") {
+		if p == "/dav" || strings.HasPrefix(p, "/dav/") ||
+			p == "/remote.php/dav" || strings.HasPrefix(p, "/remote.php/dav/") ||
+			p == "/remote.php/webdav" || strings.HasPrefix(p, "/remote.php/webdav/") {
 			s.dav.ServeHTTP(w, r)
 			return
 		}

@@ -38,6 +38,9 @@ var knownUncalled = map[string]string{
 		"_test.go file rather than being compiled into the server",
 	"spoolDirFor": "internal/storage/blobstore: the spool path is computed inline; this helper is " +
 		"left over from an earlier shape",
+	"encodeAttrs": "internal/external: the SFTP v3 attribute encoder. The client never sends " +
+		"attrs (its writes carry only pflags/perms), but the loopback test server answers with " +
+		"them, and both sides sharing one codec is what keeps the wire format honest",
 }
 
 func TestNoNewUncalledFunctions(t *testing.T) {

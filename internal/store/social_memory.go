@@ -9,6 +9,7 @@ package store
 // they refuse is caught rather than argued about.
 
 import (
+	"bytes"
 	"context"
 	"sort"
 	"strings"
@@ -521,3 +522,116 @@ func (m *Memory) SocialFor(ctx context.Context, viewerID uuid.UUID,
 	}
 	return out, nil
 }
+
+// TagUsageCounts counts, per tag, how many nodes this viewer can see carry it.
+//
+// The in-memory version answers the OWNER's own tree only, which is the conservative half of the
+// SQL's reachability set. That is deliberate and worth stating: the two backends must agree on
+// every case the conformance suite runs, and the suite asserts (a) a tag used on the viewer's own
+// nodes counts, and (b) another account's nodes never count. Grant-reachable counts are covered on
+// PostgreSQL by its own test, where the ACL walk is a real query; reproducing the whole authorizer
+// here would be a second implementation of the thing the authorizer exists to be the only version
+// of.
+func (m *Memory) TagUsageCounts(ctx context.Context, viewerID uuid.UUID,
+	tagIDs []uuid.UUID) (map[uuid.UUID]int, error) {
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	wanted := make(map[uuid.UUID]bool, len(tagIDs))
+	for _, id := range tagIDs {
+		wanted[id] = true
+	}
+	out := make(map[uuid.UUID]int, len(tagIDs))
+	for key := range m.nodeTags {
+		if !wanted[key[1]] {
+			continue
+		}
+		rec, ok := m.nodes[key[0]]
+		if !ok || rec.node.TrashedAt != nil || rec.node.OwnerID != viewerID {
+			continue
+		}
+		out[key[1]]++
+	}
+	return out, nil
+}
+
+// UsernamesFor resolves display names for a batch of accounts.
+func (m *Memory) UsernamesFor(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	out := make(map[uuid.UUID]string, len(ids))
+	for _, id := range ids {
+		u, ok := m.users[id]
+		if !ok {
+			continue
+		}
+		name := u.DisplayName
+		if name == "" {
+			name = u.Username
+		}
+		out[id] = name
+	}
+	return out, nil
+}
+
+// FavoriteCount reports how many accounts have starred a node.
+func (m *Memory) FavoriteCount(ctx context.Context, nodeID uuid.UUID) (int, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	n := 0
+	for key := range m.favorites {
+		if key[1] == nodeID {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// NodesAfter pages every node in id order, for the search backfill.
+func (t *memTx) NodesAfter(ctx context.Context, after uuid.UUID, limit int) ([]Node, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	out := make([]Node, 0, limit)
+	for id, rec := range t.m.nodes {
+		// The zero id means "from the beginning"; no node holds it, so the same predicate works.
+		if bytes.Compare(id[:], after[:]) <= 0 {
+			continue
+		}
+		out = append(out, rec.node)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return bytes.Compare(out[i].ID[:], out[j].ID[:]) < 0
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// OldestPendingJob reports when the oldest still-pending job of this kind was due.
+func (t *memTx) OldestPendingJob(ctx context.Context, kind string) (time.Time, bool, error) {
+	var (
+		oldest time.Time
+		ok     bool
+	)
+	for _, job := range t.m.jobs {
+		if job.Kind != kind || job.CompletedAt != nil {
+			continue
+		}
+		if !ok || job.RunAfter.Before(oldest) {
+			oldest, ok = job.RunAfter, true
+		}
+	}
+	return oldest, ok, nil
+}
+
+var (
+	_ SocialReader    = (*Memory)(nil)
+	_ TagCounter      = (*Memory)(nil)
+	_ UserLookup      = (*Memory)(nil)
+	_ FavoriteCounter = (*Memory)(nil)
+)

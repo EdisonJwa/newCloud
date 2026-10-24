@@ -20,7 +20,9 @@ import (
 	"github.com/EdisonJwa/newCloud/internal/auditverify"
 	"github.com/EdisonJwa/newCloud/internal/blob"
 	"github.com/EdisonJwa/newCloud/internal/metrics"
+	"github.com/EdisonJwa/newCloud/internal/search"
 	"github.com/EdisonJwa/newCloud/internal/store"
+	"github.com/google/uuid"
 )
 
 // Worker runs the periodic jobs.
@@ -64,6 +66,10 @@ type Worker struct {
 	// implement blob.UploadCleaner.
 	uploads     blob.UploadCleaner
 	uploadGrace time.Duration
+	// byteDeleter removes the stored bytes once their metadata row is gone. Nil means the
+	// deployment has no content store to delete from (or wiring was skipped): the sweep then
+	// collects rows only, and serve says so at startup.
+	byteDeleter ByteDeleter
 
 	// jobInterval is how often the queue is polled. Short enough that work queued by
 	// a request is picked up in the same second a user is still watching, long enough
@@ -99,6 +105,27 @@ type Worker struct {
 
 	// metrics is optional; nil means nothing is recorded.
 	metrics *metrics.Registry
+
+	// The optional content-search engine (core-scope §7.2). Nil is the `search.engine: none`
+	// deployment: every index duty becomes a no-op and no write waits on an index.
+	search search.Engine
+	// reader supplies document BYTES for text extraction. Nil means metadata-only indexing, which
+	// is the honest limit of a worker that has no content store wired.
+	reader DocumentReader
+	// contentTypes is the set of types whose text is extracted (search.content_types).
+	contentTypes []string
+	// indexBytes is the largest body the indexer reads (search.index_bytes). Zero disables
+	// extraction entirely, so a deployment can have metadata-only content search on purpose.
+	indexBytes int64
+	// searchCursor is where the last backfill pass stopped. In-process on purpose: it decides where
+	// THIS worker resumes, and losing it costs a redundant idempotent pass rather than correctness.
+	searchCursor uuid.UUID
+
+	// runMu guards done, which is closed exactly once, when Run finishes. Run must be
+	// started once per process: a second call must not start a second set of duty
+	// goroutines on the same store. done is what serve joins at shutdown.
+	runMu sync.Mutex
+	done  chan struct{}
 }
 
 // WithBlobScrub enables the integrity scrub over blobs, verifying up to limit blobs per pass.
@@ -112,6 +139,30 @@ func (w *Worker) WithBlobScrub(blobs BlobReader, limit int) *Worker {
 	return w
 }
 
+// ByteDeleter is the physical half of blob collection: removing the stored bytes once their
+// metadata row is gone.
+//
+// The method matches blob.Store's Delete signature on purpose — both shipped backends are
+// content-addressed, so both already implement it and wiring needs no adapter. It is a
+// one-method interface rather than blob.Store because the collector must never PUT, OPEN or
+// STAT anything: a garbage collector with write access to the live content it exists to
+// reclaim is one refcount bug away from deleting referenced data.
+type ByteDeleter interface {
+	Delete(ctx context.Context, h blob.Hash) error
+}
+
+// WithByteDeletion wires physical byte deletion into the blob sweep.
+//
+// Without it the sweep deletes only metadata rows, and the bytes stay on the storage device
+// forever while the metrics report them collected — the collector reclaimed rows and called it
+// disk. Nil is legitimate (the tree layout has no content store to address bytes with) and
+// serve logs that at startup, so the gap is a visible decision rather than a surprise found
+// by a full disk.
+func (w *Worker) WithByteDeletion(d ByteDeleter) *Worker {
+	w.byteDeleter = d
+	return w
+}
+
 // WithScrubInterval sets how often the integrity scrub runs. Zero keeps the sweep cadence.
 func (w *Worker) WithScrubInterval(d time.Duration) *Worker {
 	w.scrubInterval = d
@@ -121,6 +172,33 @@ func (w *Worker) WithScrubInterval(d time.Duration) *Worker {
 // WithMetrics attaches a metrics registry.
 func (w *Worker) WithMetrics(r *metrics.Registry) *Worker {
 	w.metrics = r
+	return w
+}
+
+// DocumentReader supplies a node's bytes for text extraction (core-scope §7.2).
+//
+// One method rather than the whole ContentStore: the indexer must never write, move or delete
+// anything. A worker that could PUT would be one bug away from rewriting a user's file with the
+// text it was supposed to be indexing.
+type DocumentReader interface {
+	// ReadContent returns at most maxBytes of a node's text, already converted to searchable
+	// plain text. It must not return the raw bytes of a PDF as if they were words — that is the
+	// caller's job to avoid by only asking for types it can handle.
+	ReadContent(ctx context.Context, node store.Node, maxBytes int64) (string, error)
+}
+
+// WithContentSearch wires the content indexer.
+//
+// Everything is optional and nothing fails a write: the producer enqueues, and this runs later.
+// A deployment with a nil engine keeps name-and-filter search and answers `degraded: true` for
+// content queries, which is the documented posture (§7.2, ADR-0016).
+func (w *Worker) WithContentSearch(engine search.Engine, reader DocumentReader,
+	contentTypes []string, indexBytes int64) *Worker {
+
+	w.search = engine
+	w.reader = reader
+	w.contentTypes = contentTypes
+	w.indexBytes = indexBytes
 	return w
 }
 
@@ -311,6 +389,20 @@ func (w *Worker) duties() []duty {
 			w.pruneRateLimitRows(ctx)
 			return nil
 		}},
+		// Session rows are one per login, and nothing read a dead one again: expiry and
+		// revocation make a row inert, not absent, so without this pass the table grows
+		// with every login ever made. Daily is enough — the retention horizon is thirty
+		// days, so an hourly tick would delete the same nothing 23 times out of 24.
+		{name: "session-prune", interval: sessionPruneInterval, run: func(ctx context.Context) error {
+			n, err := w.PruneSessions(ctx)
+			if err != nil {
+				return fmt.Errorf("session prune: %w", err)
+			}
+			if n > 0 {
+				w.log.Debug("pruned dead session rows", "count", n)
+			}
+			return nil
+		}},
 		// Share retention (SHARE-05 保留期限). Separate from PurgeTrash: this moves expired
 		// deliveries to the trash, and the trash window still applies before anything is
 		// destroyed.
@@ -349,6 +441,31 @@ func (w *Worker) duties() []duty {
 			}
 			return firstErr
 		}},
+		// Content-search maintenance (core-scope §7.2). Two things in one pass, both no-ops when no
+		// engine is wired:
+		//
+		//   backfill  walks nodes by cursor so a fresh engine converges without a migration flag;
+		//   lag       publishes how far behind the queue is, which is the alert signal.
+		//
+		// The lag is published even when the backfill indexed nothing: the interesting number is
+		// often "the queue is not draining", and a gauge that only reported on activity would go
+		// quiet exactly when the backlog builds. The same reasoning as the job-depth gauges.
+		{name: "search-index", interval: w.jobInterval, run: func(ctx context.Context) error {
+			if w.search == nil {
+				return nil
+			}
+			if n, err := w.BackfillSearchIndex(ctx); err != nil {
+				return fmt.Errorf("search backfill: %w", err)
+			} else if n > 0 {
+				w.log.Debug("indexed documents", "count", n)
+			}
+			if lag, err := w.SearchIndexLag(ctx); err != nil {
+				return fmt.Errorf("search index lag: %w", err)
+			} else if w.metrics != nil {
+				w.metrics.SetSearchIndexLag(lag)
+			}
+			return nil
+		}},
 	}
 }
 
@@ -357,7 +474,23 @@ func (w *Worker) duties() []duty {
 // Each duty runs in its own goroutine, so a slow blob sweep cannot delay lock expiry. The
 // wait at the end is what makes shutdown joined: returning while a purge was still writing
 // would kill it half-way through a transaction that the next start has to reason about.
+//
+// A second call in the same process does not start a second set of duties — it blocks until
+// the first Run finishes. Completion is observable with Wait, which is what the serving
+// process joins at shutdown; before Wait existed, nothing joined the worker at all.
 func (w *Worker) Run(ctx context.Context) {
+	w.runMu.Lock()
+	if w.done != nil {
+		done := w.done
+		w.runMu.Unlock()
+		<-done
+		return
+	}
+	w.done = make(chan struct{})
+	w.runMu.Unlock()
+
+	defer close(w.done)
+
 	w.log.Info("worker started",
 		"lock_interval", w.lockInterval, "sweep_interval", w.sweepInterval,
 		"purge_interval", w.purgeInterval,
@@ -379,6 +512,38 @@ func (w *Worker) Run(ctx context.Context) {
 	w.AuditHealth(ctx)
 
 	w.runDuties(ctx, w.duties())
+}
+
+// Wait blocks until a previously started Run has finished, and reports whether it did.
+//
+// False means the timeout elapsed while the worker was still shutting down — a pass stuck on
+// a slow query, most likely. The caller decides what abandoning means; the serving process
+// logs it, because a shutdown that gave up on its maintenance loop is a fact about that
+// shutdown, not a success.
+//
+// A Run that was never started needs no join, so Wait returns true immediately — there is
+// nothing in flight to wait for.
+func (w *Worker) Wait(timeout time.Duration) bool {
+	w.runMu.Lock()
+	done := w.done
+	w.runMu.Unlock()
+	if done == nil {
+		return true
+	}
+	// An already-finished Run must satisfy even a zero timeout: with both channels
+	// ready, select picks randomly, so the timed wait below would report the finished
+	// worker as still running about half the time.
+	select {
+	case <-done:
+		return true
+	default:
+	}
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
 }
 
 // runDuties starts one goroutine per duty and waits for all of them at shutdown.
@@ -560,6 +725,15 @@ func (w *Worker) ExpireLocks(ctx context.Context) (int, error) {
 // then hitting "undo" would find the bytes already gone. Seven days is long enough
 // that a user notices and restores, short enough that the disk does not fill with
 // forgotten content.
+//
+// Two halves, both required for the sweep to actually reclaim disk: the metadata row and
+// the physical bytes. When a byte deleter is wired, each successful row delete is followed
+// by the physical delete. The honest limitation: that second step is best-effort, because
+// the row is already committed by the time it runs. A physical delete that fails is logged
+// with the blob id and the sweep CONTINUES — failing here would report a collection that
+// happened as failed, and the caller would re-collect nothing. The retry is an orphan sweep
+// (storage-side listing against the metadata), not this pass, which by construction can no
+// longer see the rows it removed.
 func (w *Worker) SweepBlobs(ctx context.Context) (int, error) {
 	var candidates []store.BlobRef
 	err := w.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
@@ -576,10 +750,20 @@ func (w *Worker) SweepBlobs(ctx context.Context) (int, error) {
 
 	removed := 0
 	for _, ref := range candidates {
+		var hash []byte
 		// Delete the row first: if the process dies midway, the bytes are orphaned
 		// rather than the row pointing at nothing. An orphan costs disk; a dangling
 		// row costs a broken file for a user.
+		//
+		// The content address is read in the SAME transaction, immediately before the
+		// delete: once the row is gone, nothing in the metadata can name the bytes, so
+		// this is the last moment the physical half can learn where to aim.
 		err := w.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+			h, herr := tx.BlobHash(ctx, ref.ID)
+			if herr != nil {
+				return herr
+			}
+			hash = h
 			return tx.DeleteBlob(ctx, ref.ID)
 		})
 		if err != nil {
@@ -589,6 +773,19 @@ func (w *Worker) SweepBlobs(ctx context.Context) (int, error) {
 			return removed, fmt.Errorf("worker: delete blob %s: %w", ref.ID, err)
 		}
 		removed++
+
+		// Now the bytes. Not wired means the deployment has no content store to delete
+		// from; serve logs that once at startup and the sweep here does the row half only.
+		if w.byteDeleter == nil || len(hash) != len(blob.Hash{}) {
+			continue
+		}
+		var h blob.Hash
+		copy(h[:], hash)
+		if derr := w.byteDeleter.Delete(ctx, h); derr != nil {
+			w.log.Error("a collected blob's bytes could not be deleted; the row is already "+
+				"gone, so the object must be reclaimed by an orphan sweep",
+				"blob", ref.ID.String(), "sha256", h.String(), "error", derr)
+		}
 	}
 
 	// One audit row per RUN, not per blob.
@@ -731,6 +928,25 @@ func (w *Worker) pruneRateLimitRows(ctx context.Context) {
 		w.log.Debug("pruned rate-limit rows",
 			"otp_attempts", otp, "upload_events", uploads, "password_attempts", passwords)
 	}
+}
+
+// sessionPruneInterval is how often dead session rows are collected. Daily, because the
+// retention horizon is measured in weeks and the pass deletes nothing most days.
+const sessionPruneInterval = 24 * time.Hour
+
+// PruneSessions removes session rows that died (expired or revoked) further back than the
+// store's retention horizon.
+//
+// A no-op on a small deployment and a bounded delete on a busy one; the retention constant
+// lives with the store implementations, which is where the death comparison is defined.
+func (w *Worker) PruneSessions(ctx context.Context) (int64, error) {
+	var n int64
+	err := w.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		got, perr := tx.PruneSessions(ctx, store.SessionRetention)
+		n = got
+		return perr
+	})
+	return n, err
 }
 
 // reapExpiredJobLeases releases leases held past their expiry and reports them.

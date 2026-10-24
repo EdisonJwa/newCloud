@@ -82,6 +82,26 @@ func (s *Server) handleAuditExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The preimage version per row. Without it an export cannot be re-verified: a
+	// version-2 event re-hashed under the version-1 preimage reports "the record was
+	// modified", accusing an honest export of tampering. A backend that cannot answer
+	// gets rows with no version, which the loader reads as 1 — correct for a backend
+	// that never wrote versioned rows, and never true of the PostgreSQL one, which is
+	// why a failure to read versions from a backend that CLAIMS to know them fails the
+	// export rather than shipping one that verifies as broken.
+	versions := map[int64]int{}
+	if vr, ok := s.deps.Meta.(store.AuditVersionReader); ok {
+		v, verr := vr.AuditHashVersions(r.Context(), filter)
+		if verr != nil {
+			s.writeStoreError(w, verr)
+			return
+		}
+		versions = v
+	} else {
+		s.deps.Log.Warn("this metadata backend cannot report audit hash versions; the export " +
+			"will not carry a hash_version column and may not survive `audit verify --export`")
+	}
+
 	// Exporting the log is itself an auditable act: a log whose readers are unrecorded
 	// cannot answer "who looked at this".
 	_ = s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
@@ -113,12 +133,12 @@ func (s *Server) handleAuditExport(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 		w.Header().Set("Content-Disposition",
 			`attachment; filename="audit-`+stamp+`.csv"`)
-		writeAuditCSV(w, rows)
+		writeAuditCSV(w, rows, versions)
 	default:
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.Header().Set("Content-Disposition",
 			`attachment; filename="audit-`+stamp+`.json"`)
-		writeAuditJSON(w, rows, total)
+		writeAuditJSON(w, rows, total, versions)
 	}
 }
 
@@ -199,26 +219,32 @@ func parseAuditTime(v string) (time.Time, error) {
 }
 
 // writeAuditJSON emits the full structure, hashes included.
-func writeAuditJSON(w http.ResponseWriter, rows []store.AuditRow, total int) {
+//
+// Every field the canonical preimage covers must be present — including hash_version,
+// which selects the preimage the hash was computed under. Omitting one is how an honest
+// export came to report "the record was modified" the moment it was verified: the loader
+// rebuilt a different event than the one that was sealed.
+func writeAuditJSON(w http.ResponseWriter, rows []store.AuditRow, total int, versions map[int64]int) {
 	type jsonRow struct {
-		ID         int64          `json:"id"`
-		Time       string         `json:"ts"`
-		ActorKind  string         `json:"actor_kind"`
-		ActorID    string         `json:"actor_user_id,omitempty"`
-		ActorEmail string         `json:"actor_email,omitempty"`
-		ActorIP    string         `json:"actor_ip,omitempty"`
-		UserAgent  string         `json:"user_agent,omitempty"`
-		Action     string         `json:"action"`
-		TargetKind string         `json:"target_kind"`
-		TargetID   string         `json:"target_id,omitempty"`
-		ShareID    string         `json:"share_id,omitempty"`
-		Result     string         `json:"result"`
-		Bytes      *int64         `json:"bytes,omitempty"`
-		Metadata   map[string]any `json:"metadata,omitempty"`
-		RequestID  string         `json:"request_id,omitempty"`
-		AuthMethod string         `json:"auth_method,omitempty"`
-		PrevHash   string         `json:"prev_hash"`
-		Hash       string         `json:"hash"`
+		ID          int64          `json:"id"`
+		Time        string         `json:"ts"`
+		ActorKind   string         `json:"actor_kind"`
+		ActorID     string         `json:"actor_user_id,omitempty"`
+		ActorEmail  string         `json:"actor_email,omitempty"`
+		ActorIP     string         `json:"actor_ip,omitempty"`
+		UserAgent   string         `json:"user_agent,omitempty"`
+		Action      string         `json:"action"`
+		TargetKind  string         `json:"target_kind"`
+		TargetID    string         `json:"target_id,omitempty"`
+		ShareID     string         `json:"share_id,omitempty"`
+		Result      string         `json:"result"`
+		Bytes       *int64         `json:"bytes,omitempty"`
+		Metadata    map[string]any `json:"metadata,omitempty"`
+		RequestID   string         `json:"request_id,omitempty"`
+		AuthMethod  string         `json:"auth_method,omitempty"`
+		HashVersion int            `json:"hash_version"`
+		PrevHash    string         `json:"prev_hash"`
+		Hash        string         `json:"hash"`
 	}
 
 	out := struct {
@@ -235,6 +261,12 @@ func writeAuditJSON(w http.ResponseWriter, rows []store.AuditRow, total int) {
 	}
 
 	for _, r := range rows {
+		hv := versions[r.ID]
+		if hv <= 0 {
+			// No version from either source means a row from before versioning existed,
+			// which is version 1's exact meaning everywhere else in the chain reader.
+			hv = 1
+		}
 		row := jsonRow{
 			ID: r.ID, Time: r.Time.UTC().Format(time.RFC3339Nano),
 			ActorKind: r.ActorKind, ActorEmail: r.ActorEmail, ActorIP: r.ActorIP,
@@ -242,6 +274,7 @@ func writeAuditJSON(w http.ResponseWriter, rows []store.AuditRow, total int) {
 			TargetID: r.TargetID, Result: r.Result, Bytes: r.Bytes, Metadata: r.Metadata,
 			PrevHash: hex.EncodeToString(r.PrevHash), Hash: hex.EncodeToString(r.Hash),
 			RequestID: r.RequestID, AuthMethod: r.AuthMethod,
+			HashVersion: hv,
 		}
 		if r.ActorUserID != nil {
 			row.ActorID = r.ActorUserID.String()
@@ -257,7 +290,13 @@ func writeAuditJSON(w http.ResponseWriter, rows []store.AuditRow, total int) {
 }
 
 // writeAuditCSV emits a flattened table.
-func writeAuditCSV(w http.ResponseWriter, rows []store.AuditRow) {
+//
+// The three trailing columns (hash_version, request_id, auth_method) were added AFTER the
+// columns operators already script against, in that order, and must stay there: reordering
+// the existing columns silently breaks every consumer that reads by position. The loader
+// reads by header name and treats a missing trailing column as version 1 with empty
+// request/auth fields, so old exports keep loading as what they are.
+func writeAuditCSV(w http.ResponseWriter, rows []store.AuditRow, versions map[int64]int) {
 	cw := csv.NewWriter(w)
 	defer cw.Flush()
 
@@ -265,6 +304,8 @@ func writeAuditCSV(w http.ResponseWriter, rows []store.AuditRow) {
 		"id", "ts", "actor_kind", "actor_user_id", "actor_email", "actor_ip",
 		"user_agent", "action", "target_kind", "target_id", "share_id", "result",
 		"bytes", "metadata", "prev_hash", "hash",
+		// Appended, never re-inserted: see the comment above.
+		"hash_version", "request_id", "auth_method",
 	})
 
 	for _, r := range rows {
@@ -278,6 +319,10 @@ func writeAuditCSV(w http.ResponseWriter, rows []store.AuditRow) {
 		bytesField := ""
 		if r.Bytes != nil {
 			bytesField = strconv.FormatInt(*r.Bytes, 10)
+		}
+		hv := versions[r.ID]
+		if hv <= 0 {
+			hv = 1
 		}
 		// Metadata is serialised as JSON in one cell rather than exploded into columns:
 		// the keys differ per action, and a union of all of them would be unusable.
@@ -294,6 +339,7 @@ func writeAuditCSV(w http.ResponseWriter, rows []store.AuditRow) {
 			r.ActorKind, actorID, r.ActorEmail, r.ActorIP, r.UserAgent,
 			r.Action, r.TargetKind, r.TargetID, shareID, r.Result, bytesField, meta,
 			hex.EncodeToString(r.PrevHash), hex.EncodeToString(r.Hash),
+			strconv.Itoa(hv), r.RequestID, r.AuthMethod,
 		})
 	}
 }

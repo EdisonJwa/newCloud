@@ -26,7 +26,14 @@ import (
 // Everything an ordinary collaborator needs and nothing that manages the space itself: a member can
 // read, write, delete and list, but cannot re-grant, because a shared space whose members can
 // re-share it is one nobody can reason about.
-const spaceMemberPerms = store.PermRead | store.PermWrite | store.PermDelete | store.PermListChildren
+//
+// The fine-grained primitives are granted explicitly, because the coarse bits no longer carry them:
+// `read` deliberately does not imply `download` (internal/authz), and `write` implies only
+// create/overwrite. Omitting them made a space a folder its members could see the listing of and
+// could never take a file out of, rename, move, or read the history of — every content route
+// answered 404 while the metadata routes worked.
+const spaceMemberPerms = store.PermRead | store.PermWrite | store.PermDelete | store.PermListChildren |
+	store.PermDownload | store.PermRename | store.PermMove | store.PermReadVersions
 
 // handleSpacesList returns the group spaces the caller belongs to.
 func (s *Server) handleSpacesList(w http.ResponseWriter, r *http.Request) {

@@ -62,25 +62,34 @@ func LoadFile(path string) ([]audit.Event, error) {
 }
 
 // loadServerJSON reads the shape writeAuditJSON produces.
+//
+// hash_version, request_id and auth_method are part of the event, and an export that carries
+// them must arrive here: dropping any one rebuilds a different event than the one that was
+// sealed, and an honest export verifies as "modified". Older exports without the fields are
+// still read — a zero version means 1, and the empty request/auth strings are exactly what a
+// version-1 preimage hashes.
 func loadServerJSON(body []byte) ([]audit.Event, error) {
 	var doc struct {
 		Events []struct {
-			ID         int64          `json:"id"`
-			Time       string         `json:"ts"`
-			ActorKind  string         `json:"actor_kind"`
-			ActorID    string         `json:"actor_user_id"`
-			ActorEmail string         `json:"actor_email"`
-			ActorIP    string         `json:"actor_ip"`
-			UserAgent  string         `json:"user_agent"`
-			ShareID    string         `json:"share_id"`
-			Action     string         `json:"action"`
-			TargetKind string         `json:"target_kind"`
-			TargetID   string         `json:"target_id"`
-			Result     string         `json:"result"`
-			Bytes      *int64         `json:"bytes"`
-			Metadata   map[string]any `json:"metadata"`
-			PrevHash   string         `json:"prev_hash"`
-			Hash       string         `json:"hash"`
+			ID          int64          `json:"id"`
+			Time        string         `json:"ts"`
+			ActorKind   string         `json:"actor_kind"`
+			ActorID     string         `json:"actor_user_id"`
+			ActorEmail  string         `json:"actor_email"`
+			ActorIP     string         `json:"actor_ip"`
+			UserAgent   string         `json:"user_agent"`
+			ShareID     string         `json:"share_id"`
+			Action      string         `json:"action"`
+			TargetKind  string         `json:"target_kind"`
+			TargetID    string         `json:"target_id"`
+			Result      string         `json:"result"`
+			Bytes       *int64         `json:"bytes"`
+			Metadata    map[string]any `json:"metadata"`
+			RequestID   string         `json:"request_id"`
+			AuthMethod  string         `json:"auth_method"`
+			HashVersion int            `json:"hash_version"`
+			PrevHash    string         `json:"prev_hash"`
+			Hash        string         `json:"hash"`
 		} `json:"events"`
 	}
 	if err := json.Unmarshal(body, &doc); err != nil {
@@ -107,6 +116,11 @@ func loadServerJSON(body []byte) ([]audit.Event, error) {
 			Action: audit.Action(r.Action), TargetKind: audit.TargetKind(r.TargetKind),
 			TargetID: r.TargetID, Result: audit.Result(r.Result),
 			Bytes: r.Bytes, Metadata: r.Metadata, PrevHash: prev, Hash: hash,
+			// Zero means 1 inside the audit package; the value is carried through as read
+			// so a chain that spans the version change verifies event by event.
+			HashVersion: r.HashVersion,
+			RequestID:   r.RequestID,
+			AuthMethod:  r.AuthMethod,
 		}
 		if r.ShareID != "" {
 			sh, serr := uuid.Parse(r.ShareID)
@@ -220,6 +234,10 @@ func loadCSV(body []byte) ([]audit.Event, error) {
 		// Every field the canonical form hashes, or the row reconstructs into a different event and
 		// an honest export is reported as tampered with. The CSV writer emits all of them; dropping
 		// one here was a bug that only a fixture with a real user agent, address and share id showed.
+		//
+		// hash_version, request_id and auth_method are read BY NAME and are optional: an old
+		// export without the trailing columns decodes as version 1 with empty request/auth
+		// values, which is precisely the event a version-1 row was sealed from.
 		e := audit.Event{
 			ID: id, Time: ts,
 			ActorKind:  audit.ActorKind(get(row, "actor_kind")),
@@ -230,7 +248,16 @@ func loadCSV(body []byte) ([]audit.Event, error) {
 			TargetKind: audit.TargetKind(get(row, "target_kind")),
 			TargetID:   get(row, "target_id"),
 			Result:     audit.Result(get(row, "result")),
+			RequestID:  get(row, "request_id"),
+			AuthMethod: get(row, "auth_method"),
 			PrevHash:   prev, Hash: hash,
+		}
+		if s := get(row, "hash_version"); s != "" {
+			var hv int
+			if _, herr := fmt.Sscanf(s, "%d", &hv); herr != nil {
+				return nil, fmt.Errorf("auditverify: row %d hash_version %q: %w", n+1, s, herr)
+			}
+			e.HashVersion = hv
 		}
 		if s := get(row, "actor_user_id"); s != "" {
 			uid, uerr := uuid.Parse(s)

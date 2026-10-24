@@ -1642,6 +1642,243 @@ func socialAnnotationSuite(t *testing.T, factory Factory) {
 			t.Fatalf("an empty batch returned %d entries", len(got))
 		}
 	})
+
+	t.Run("TheTagUsageCountIsPerViewer", func(t *testing.T) {
+		// §5's acceptance criterion again, from the counting side: a tag showing "3 uses" while the
+		// caller can only find one of them tells them two files exist that they must not know about.
+		s, mine := factory(t)
+		other := addUser(t, s, "tag-count-other")
+		r := rootOf(t, s, mine)
+		a := mkfile(t, s, mine, r.ID, "count-a.txt", 4)
+		b := mkfile(t, s, mine, r.ID, "count-b.txt", 4)
+
+		var tag store.Tag
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			var err error
+			tag, err = tx.CreateTag(ctx, store.Tag{OwnerID: &mine, Name: "counted"})
+			if err != nil {
+				return err
+			}
+			if err := tx.AssignTag(ctx, a.ID, tag.ID, mine); err != nil {
+				return err
+			}
+			return tx.AssignTag(ctx, b.ID, tag.ID, mine)
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		counter, ok := s.(store.TagCounter)
+		if !ok {
+			t.Fatalf("%T does not implement store.TagCounter; the tag list would lose its counts", s)
+		}
+		counts, err := counter.TagUsageCounts(context.Background(), mine, []uuid.UUID{tag.ID})
+		if err != nil {
+			t.Fatalf("TagUsageCounts: %v", err)
+		}
+		if counts[tag.ID] != 2 {
+			t.Fatalf("the owner's count is %d, want 2", counts[tag.ID])
+		}
+
+		// Another account sees the tag only if it is a SYSTEM tag; a personal one is not theirs to
+		// count, so it must be absent rather than zero.
+		theirs, err := counter.TagUsageCounts(context.Background(), other.ID, []uuid.UUID{tag.ID})
+		if err != nil {
+			t.Fatalf("TagUsageCounts for the other viewer: %v", err)
+		}
+		if n := theirs[tag.ID]; n != 0 {
+			t.Fatalf("another account's count for a personal tag is %d, want 0: a count over "+
+				"nodes the caller cannot read leaks that they exist", n)
+		}
+	})
+
+	t.Run("TheFavoriteCountCountsEverybody", func(t *testing.T) {
+		// The index's favorite_count is "how many people starred this", which is a property of the
+		// document rather than of a viewer — unlike NodeSocial.Starred.
+		s, mine := factory(t)
+		other := addUser(t, s, "fav-count-other")
+		r := rootOf(t, s, mine)
+		f := mkfile(t, s, mine, r.ID, "popular.txt", 4)
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			if err := tx.SetFavorite(ctx, mine, f.ID); err != nil {
+				return err
+			}
+			return tx.SetFavorite(ctx, other.ID, f.ID)
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		counter, ok := s.(store.FavoriteCounter)
+		if !ok {
+			t.Fatalf("%T does not implement store.FavoriteCounter; the index's favorite facet "+
+				"would always be zero", s)
+		}
+		n, err := counter.FavoriteCount(context.Background(), f.ID)
+		if err != nil {
+			t.Fatalf("FavoriteCount: %v", err)
+		}
+		if n != 2 {
+			t.Fatalf("FavoriteCount = %d, want 2", n)
+		}
+	})
+
+	t.Run("UsernamesResolveInOneBatch", func(t *testing.T) {
+		s, mine := factory(t)
+		other := addUser(t, s, "named-other")
+
+		lookup, ok := s.(store.UserLookup)
+		if !ok {
+			t.Fatalf("%T does not implement store.UserLookup; a comment thread would show raw ids", s)
+		}
+		names, err := lookup.UsernamesFor(context.Background(), []uuid.UUID{mine, other.ID, uuid.New()})
+		if err != nil {
+			t.Fatalf("UsernamesFor: %v", err)
+		}
+		if names[mine] == "" {
+			t.Fatalf("the owner's name did not resolve: %v", names)
+		}
+		if names[other.ID] == "" {
+			t.Fatalf("the second account's name did not resolve: %v", names)
+		}
+		// An unknown id is omitted rather than returned as an empty string, so a caller can tell
+		// "no such account" from "an account with a blank name".
+		if _, present := names[uuid.New()]; present {
+			t.Fatal("an unknown account id was returned by UsernamesFor")
+		}
+	})
+}
+
+// backfillSuite covers the two reads the search index depends on (core-scope §7.2).
+//
+// Both are Store-level rather than Tx-level, and both are easy to get subtly wrong in a way only a
+// long-running deployment would notice: a backfill cursor that is not total re-indexes or skips
+// rows forever, and a lag gauge measured from the wrong timestamp either never fires or fires on a
+// healthy deployment.
+func backfillSuite(t *testing.T, factory Factory) {
+	t.Helper()
+
+	t.Run("NodesAfterWalksEveryRowExactlyOnce", func(t *testing.T) {
+		// The backfill's whole correctness argument: id is immutable, so a keyset on it neither
+		// repeats nor skips a row across a walk that spans many passes.
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		want := map[uuid.UUID]bool{}
+		for i := 0; i < 5; i++ {
+			f := mkfile(t, s, owner, r.ID, "walk-"+itoa(i)+".txt", 4)
+			want[f.ID] = true
+		}
+
+		seen := map[uuid.UUID]int{}
+		cursor := uuid.Nil
+		for pass := 0; pass < 10; pass++ {
+			var got []store.Node
+			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				list, err := tx.NodesAfter(ctx, cursor, 2)
+				got = list
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if len(got) == 0 {
+				break
+			}
+			for _, n := range got {
+				seen[n.ID]++
+			}
+			cursor = got[len(got)-1].ID
+		}
+		for id := range want {
+			if seen[id] != 1 {
+				t.Fatalf("node %s appeared %d times across backfill passes, want exactly 1",
+					id, seen[id])
+			}
+		}
+	})
+
+	t.Run("NodesAfterIncludesTrashedRowsSoTheIndexCanForgetThem", func(t *testing.T) {
+		// A walk that omitted trashed rows would leave deleted files in the index forever: the
+		// purge job removes the document by id, and this is the read that lets the backfill see
+		// that the row is still there but binned.
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		gone := mkfile(t, s, owner, r.ID, "binned.txt", 4)
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.Trash(ctx, gone.ID)
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		found := false
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			list, err := tx.NodesAfter(ctx, uuid.Nil, 500)
+			for _, n := range list {
+				if n.ID == gone.ID && n.TrashedAt != nil {
+					found = true
+				}
+			}
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if !found {
+			t.Fatal("the backfill walk skipped a trashed node; the index would keep serving it")
+		}
+	})
+
+	t.Run("OldestPendingJobReportsTheBacklogOrNothing", func(t *testing.T) {
+		// The lag gauge is computed from this. "Nothing pending" has to be distinguishable from
+		// "a job due now", or a caught-up deployment reports a lag of zero seconds forever and the
+		// alert on it is dead.
+		s, owner := factory(t)
+		rootOf(t, s, owner)
+
+		const kind = "search.index"
+		var (
+			due time.Time
+			ok  bool
+		)
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			var gerr error
+			due, ok, gerr = tx.OldestPendingJob(ctx, kind)
+			return gerr
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if ok {
+			t.Fatalf("a store with no index jobs reports a pending one due at %s", due)
+		}
+
+		// A due-in-the-future job is pending but not LATE. Reporting it as a backlog would make the
+		// gauge fire on a healthy deployment that merely scheduled something.
+		first := time.Now().Add(2 * time.Minute).UTC()
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			if err := tx.Enqueue(ctx, store.Job{Kind: kind, RunAfter: first,
+				Payload: map[string]any{"node_id": uuid.New().String()}}); err != nil {
+				return err
+			}
+			// An older due time must win, because the lag is "how long has the OLDEST been waiting".
+			return tx.Enqueue(ctx, store.Job{Kind: kind, RunAfter: first.Add(time.Minute),
+				Payload: map[string]any{"node_id": uuid.New().String()}})
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			var gerr error
+			due, ok, gerr = tx.OldestPendingJob(ctx, kind)
+			return gerr
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if !ok {
+			t.Fatal("a queued index job is not reported as pending; the lag gauge would read zero " +
+				"while the queue backs up")
+		}
+		if delta := due.Sub(first); delta < -time.Second || delta > time.Second {
+			t.Fatalf("the oldest pending job is reported due at %s, want the earlier of the two "+
+				"(%s)", due, first)
+		}
+	})
 }
 
 // warning: the suites above are small on purpose relative to the whole surface; what follows wires

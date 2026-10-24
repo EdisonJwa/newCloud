@@ -39,9 +39,11 @@ import (
 	s3blob "github.com/EdisonJwa/newCloud/internal/blob/s3"
 	"github.com/EdisonJwa/newCloud/internal/config"
 	"github.com/EdisonJwa/newCloud/internal/consistency"
+	"github.com/EdisonJwa/newCloud/internal/external"
 	"github.com/EdisonJwa/newCloud/internal/lease"
 	"github.com/EdisonJwa/newCloud/internal/mail"
 	"github.com/EdisonJwa/newCloud/internal/metrics"
+	"github.com/EdisonJwa/newCloud/internal/mount"
 	"github.com/EdisonJwa/newCloud/internal/password"
 	"github.com/EdisonJwa/newCloud/internal/server"
 	"github.com/EdisonJwa/newCloud/internal/share"
@@ -256,6 +258,12 @@ func auditPrune(args []string) error {
 // The file is written and closed BEFORE the prune transaction starts, and fsync'd, because the mark
 // records its path as the place the history went. A path that points at a half-written file would be
 // worse than no path: it would look like an archive.
+//
+// The events are materialised whole rather than streamed: Encode goes to an in-memory slice first
+// (pg.AuditEventsBefore), so the command's memory is bounded by the retention window — everything
+// older than the cutoff, which the operator chose — and not by the size of the log. A streaming
+// reader would remove even that bound, but the store has no iterator for it and the retention bound
+// is the one the operator already controls.
 func archiveAudit(ctx context.Context, pg *storepkg.PG, cfg config.Config, cutoff time.Time) (string, error) {
 	// The destination defaults next to the anchors, which is the one place an operator is already
 	// expected to send data somewhere the database cannot rewrite.
@@ -452,6 +460,13 @@ func serve() error {
 	}
 
 	warnAboutUnusedConfig(log, cfg)
+	// Non-fatal findings from validation (an http:// public URL, say): legal, so the
+	// process starts, but a decision an operator should see made rather than inherit.
+	// Logged here rather than printed by Validate because commands that only read
+	// configuration share the loader and must keep their output machine-readable.
+	for _, warn := range cfg.Warnings() {
+		log.Warn("configuration warning", "warning", warn)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -560,9 +575,6 @@ func serve() error {
 		log.Info("resumed unfinished uploads from the staging directory", "sessions", n,
 			"dir", uploadDir)
 	}
-	if err != nil {
-		return err
-	}
 	// WC-GAP-002 / NC-RR-001: shutdown must PRESERVE unfinished uploads, not delete them.
 	//
 	// This was `defer uploads.Close()`, and Close aborts every session: bytes and record both
@@ -578,8 +590,12 @@ func serve() error {
 	}()
 
 	// Expired sessions hold staging files, so the sweep has to run periodically rather than
-	// only at startup.
+	// only at startup. sweepDone is joined at shutdown: an unjoined goroutine loses the race
+	// with process exit, and a sweep killed mid-way leaves staging state for the next start
+	// to reason about for no reason.
+	sweepDone := make(chan struct{})
 	go func() {
+		defer close(sweepDone)
 		ticker := time.NewTicker(15 * time.Minute)
 		defer ticker.Stop()
 		for {
@@ -597,6 +613,24 @@ func serve() error {
 	// One registry shared by the server and the worker, so a scrape sees the request
 	// counters and the queue depth in the same document.
 	reg := metrics.New()
+
+	// External mounts (ADR-0014): built only when the section is enabled, so a
+	// deployment that never opted in carries no credential key and no routes — the
+	// handlers answer 503 without the service, and nothing dials outward.
+	var mounts *mount.Service
+	if cfg.Mounts.Enabled {
+		cipher, err := mount.LoadKeyFile(cfg.Mounts.SecretFile)
+		if err != nil {
+			return fmt.Errorf("mounts: %w", err)
+		}
+		mounts = mount.New(meta, cfg.Mounts, cipher, log)
+		mounts.RegisterDial("webdav", external.DialWebDAV)
+		mounts.RegisterDial("ftp", external.DialFTP)
+		mounts.RegisterDial("sftp", external.DialSFTP)
+		log.Info("external mounts enabled",
+			"schemes", strings.Join(cfg.Mounts.AllowedSchemes, ","),
+			"user_mounts", cfg.Mounts.AllowUserMounts)
+	}
 
 	deps := server.Deps{
 		Config:  cfg,
@@ -619,6 +653,7 @@ func serve() error {
 		Providers:    providers,
 		Uploads:      uploads,
 		Metrics:      reg,
+		Mounts:       mounts,
 		Log:          log,
 		Version:      version,
 	}
@@ -688,6 +723,18 @@ func serve() error {
 		log.Warn("blob integrity scrub is disabled: silent corruption will not be detected",
 			"hint", "set limits.blob_scrub_per_pass to the number of blobs to verify per cycle")
 	}
+	// The collector's physical half. Row deletion alone reclaims nothing: the bytes stayed on
+	// the device while the metrics reported them collected, which is how a "working" GC coexists
+	// with a full disk. The blob store's Delete takes a content address, which is exactly what
+	// the collector reads out of the metadata before the row goes.
+	if blobStore != nil {
+		wk.WithByteDeletion(blobStore)
+		log.Info("blob GC deletes stored bytes after their metadata rows",
+			"note", "a byte delete that fails after the row is committed is logged and left to an orphan sweep")
+	} else {
+		log.Warn("blob GC cannot delete stored bytes: this storage layout exposes no content " +
+			"store to delete from, so collected rows leave their objects on disk")
+	}
 	if cfg.Audit.AnchorSigningKeyFile != "" {
 		signer, err := auditverify.LoadSigner(cfg.Audit.AnchorSigningKeyFile)
 		if err != nil {
@@ -713,8 +760,10 @@ func serve() error {
 		log.Warn("audit anchoring is disabled: a truncated log will still verify",
 			"hint", "set audit.anchor_dir to a location with different credentials from the database")
 	}
+	// The worker is joined at shutdown (wk.Wait below, bounded): a purge killed mid-transaction
+	// is exactly the state the operation journal exists to repair, so shutdown waits for the
+	// in-flight pass rather than manufacturing one on every deploy.
 	go wk.Run(ctx)
-
 	// ID-06 / WC-GAP-001: say what the deprovisioning bound actually is, because the honest answer
 	// without an IdP event feed is "however long it takes this person to sign in again".
 	if w := cfg.Auth.RevalidateWindow(); w > 0 {
@@ -809,6 +858,10 @@ func serve() error {
 
 	select {
 	case err := <-errCh:
+		// The listener failed, so the context is not cancelled by any signal — cancel it here,
+		// or the join below would wait its whole timeout for a worker that is not stopping.
+		stop()
+		joinWorkerAndSweep(log, wk, sweepDone)
 		return err
 	case <-ctx.Done():
 		log.Info("shutdown signal received")
@@ -829,7 +882,33 @@ func serve() error {
 		}()
 		defer wg.Wait()
 	}
-	return httpSrv.Shutdown(shutdownCtx)
+	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+		joinWorkerAndSweep(log, wk, sweepDone)
+		return err
+	}
+	joinWorkerAndSweep(log, wk, sweepDone)
+	return nil
+}
+
+// joinWorkerAndSweep waits, briefly, for the maintenance loop and the upload sweep to finish.
+//
+// A bounded wait rather than an unbounded one: the worker joins its own in-flight passes, but
+// a pass stuck on a slow query could otherwise hold the process open past every container
+// shutdown budget. The timeout is the decision "we would rather leave than wait", and it is
+// logged when it fires — a shutdown that abandoned its worker mid-pass is a fact the next
+// start's recovery pass has to know about.
+func joinWorkerAndSweep(log *slog.Logger, wk *worker.Worker, sweepDone <-chan struct{}) {
+	const workerJoinTimeout = 10 * time.Second
+	if !wk.Wait(workerJoinTimeout) {
+		log.Warn("worker still shutting down after its grace period; abandoning it",
+			"timeout", workerJoinTimeout,
+			"note", "an interrupted pass is retried by the next start; nothing is lost")
+	}
+	select {
+	case <-sweepDone:
+	case <-time.After(2 * time.Second):
+		log.Warn("upload sweep still running after its grace period; abandoning it")
+	}
 }
 
 // openMetadata builds the metadata store: PostgreSQL when configured, otherwise

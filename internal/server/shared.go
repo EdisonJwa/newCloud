@@ -103,6 +103,30 @@ func (s *Server) handleSharedNode(w http.ResponseWriter, r *http.Request) {
 	// cover a child that carries its own non-inheriting restriction.
 	var children []map[string]any
 	if node.IsDir() && cap.Can(authz.PermListChildren) {
+		// A mount point's children live on the remote (ADR-0014): the metadata store
+		// has no rows below it, by construction, so the ordinary loop would answer a
+		// confident, successful, empty folder.
+		if extKids, isMount, merr := s.mountPointChildren(r, node); isMount {
+			if merr != nil {
+				s.writeExternalError(w, merr)
+				return
+			}
+			children = extKids
+			writeJSON(w, http.StatusOK, map[string]any{
+				"id":          node.ID.String(),
+				"name":        node.Name,
+				"kind":        string(node.Kind),
+				"size":        node.Size,
+				"mime":        node.Mime,
+				"modified_at": node.ModifiedAt.UTC().Format("2006-01-02T15:04:05Z07:00"),
+				"permissions": cap.Perms().String(),
+				"children":    children,
+				"mounted":     true,
+			})
+			return
+		}
+	}
+	if node.IsDir() && cap.Can(authz.PermListChildren) {
 		// A failed read is reported, not rendered as "this folder is empty".
 		//
 		// The error used to be discarded, so a metadata failure produced a perfectly successful

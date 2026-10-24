@@ -13,6 +13,7 @@ package worker
 
 import (
 	"context"
+	"crypto/ed25519"
 	"time"
 
 	"github.com/EdisonJwa/newCloud/internal/audit"
@@ -228,9 +229,24 @@ func (w *Worker) AnchorNow(ctx context.Context) error { return w.anchorOnce(ctx)
 //
 // This is the operation that turns the anchor from a write-only ritual into evidence:
 // an anchor nobody ever compares against the log proves nothing.
+//
+// When this worker signs checkpoints it also holds the public half of that key, so the
+// check verifies SIGNATURES too, the same thing `newcloud audit verify-anchors` does with
+// the same key. The two checks answer different questions and the continuous path can now
+// ask both: the chain comparison detects a truncated log, the signature detects an anchor
+// file rewritten to agree with it. Without the key configured, only the first question is
+// asked — which is the behaviour an unsigned deployment always had.
+//
+// A key rotation is the one case this shapes: checkpoints signed by the previous key fail
+// here until the configured key matches them, and that failure is loud on purpose. An
+// operator rotating keys is re-reading this file; silence about a key mismatch is not.
 func (w *Worker) VerifyAnchor() (auditverify.VerifyResult, error) {
 	if w.anchor == nil || w.chain == nil {
 		return auditverify.VerifyResult{}, nil
 	}
-	return auditverify.Verify(w.anchor, w.chain)
+	var pub ed25519.PublicKey
+	if w.anchorSigner != nil {
+		pub = w.anchorSigner.PublicKey()
+	}
+	return auditverify.VerifySigned(w.anchor, w.chain, pub)
 }

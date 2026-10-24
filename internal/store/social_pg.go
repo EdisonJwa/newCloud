@@ -608,3 +608,178 @@ func (s *PG) SocialFor(ctx context.Context, viewerID uuid.UUID,
 	hashRows.Close()
 	return out, translate(hashRows.Err())
 }
+
+// TagUsageCounts counts, per tag, how many nodes THIS VIEWER can see carry it.
+//
+// "This viewer can see" is the security-relevant half: a count over every node would let a caller
+// infer the existence of files they have no access to — a tag showing "3 uses" while the caller can
+// only find one of them tells them two files exist that they must not know about. So the query
+// joins the ACL walk: a node counts when the caller owns it, or when a live grant reaches it.
+//
+// The join is written against acl_entries directly rather than through EffectivePermsFor, because
+// that method is per-node and this is one query for the whole tag list. The rules it reproduces are
+// the authorizer's: the owner always sees their own tree, a grant inherits downward, and the walk
+// stops at the owner's namespace root.
+func (s *PG) TagUsageCounts(ctx context.Context, viewerID uuid.UUID,
+	tagIDs []uuid.UUID) (map[uuid.UUID]int, error) {
+
+	out := make(map[uuid.UUID]int, len(tagIDs))
+	if len(tagIDs) == 0 {
+		return out, nil
+	}
+
+	const q = `
+		WITH RECURSIVE visible AS (
+		    -- The caller's own live nodes.
+		    SELECT n.id FROM nodes n
+		    WHERE n.owner_id = $1 AND n.trashed_at IS NULL
+		    UNION
+		    -- Nodes a live grant reaches, walking downward from every granted node.
+		    SELECT child.id
+		    FROM nodes child
+		    JOIN visible parent ON child.parent_id = parent.id
+		    WHERE child.trashed_at IS NULL
+		), granted AS (
+		    -- A grant on a node covers that node and, when it inherits, its subtree.
+		    SELECT n.id FROM nodes n
+		    WHERE n.trashed_at IS NULL
+		      AND EXISTS (
+		        SELECT 1 FROM acl_entries e
+		        WHERE e.node_id = n.id
+		          AND (e.user_id = $1 OR (e.group_id IS NOT NULL AND EXISTS (
+		                SELECT 1 FROM group_members m
+		                WHERE m.group_id = e.group_id AND m.user_id = $1))))
+		    UNION
+		    SELECT child.id
+		    FROM nodes child
+		    JOIN granted parent ON child.parent_id = parent.id
+		    WHERE child.trashed_at IS NULL
+		      AND EXISTS (
+		        SELECT 1 FROM acl_entries e
+		        WHERE e.node_id = parent.id AND e.inherit
+		          AND (e.user_id = $1 OR (e.group_id IS NOT NULL AND EXISTS (
+		                SELECT 1 FROM group_members m
+		                WHERE m.group_id = e.group_id AND m.user_id = $1))))
+		), reachable AS (
+		    SELECT id FROM visible UNION SELECT id FROM granted
+		)
+		SELECT nt.tag_id, count(*)
+		FROM node_tags nt
+		JOIN nodes n ON n.id = nt.node_id AND n.trashed_at IS NULL
+		JOIN reachable r ON r.id = nt.node_id
+		JOIN tags t ON t.id = nt.tag_id AND (t.owner_id IS NULL OR t.owner_id = $1)
+		WHERE nt.tag_id = ANY($2)
+		GROUP BY nt.tag_id`
+
+	rows, err := s.pool.Query(ctx, q, viewerID, tagIDs)
+	if err != nil {
+		return nil, translate(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id uuid.UUID
+		var n int
+		if err := rows.Scan(&id, &n); err != nil {
+			return nil, translate(err)
+		}
+		out[id] = n
+	}
+	return out, translate(rows.Err())
+}
+
+// UsernamesFor resolves display names for a batch of accounts.
+func (s *PG) UsernamesFor(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]string, error) {
+	out := make(map[uuid.UUID]string, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, username, display_name FROM users WHERE id = ANY($1)`, ids)
+	if err != nil {
+		return nil, translate(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id uuid.UUID
+		var username, display string
+		if err := rows.Scan(&id, &username, &display); err != nil {
+			return nil, translate(err)
+		}
+		// The display name when set, the username otherwise. Never the email: a comment author
+		// column is visible to everybody who can read the node, and an address is not something
+		// every reader of a shared folder should be handed.
+		if display == "" {
+			display = username
+		}
+		out[id] = display
+	}
+	return out, translate(rows.Err())
+}
+
+// FavoriteCount reports how many accounts have starred a node.
+//
+// The count of OTHER people's stars, which is what the index's facet field is for. It is not
+// filtered by viewer: "how popular is this document" is a property of the document, and the query
+// path decides who may see the document at all.
+func (s *PG) FavoriteCount(ctx context.Context, nodeID uuid.UUID) (int, error) {
+	var n int
+	if err := s.pool.QueryRow(ctx,
+		`SELECT count(*) FROM favorites WHERE node_id = $1`, nodeID).Scan(&n); err != nil {
+		return 0, translate(err)
+	}
+	return n, nil
+}
+
+// NodesAfter pages every node in id order, for the search backfill.
+func (t *pgTx) NodesAfter(ctx context.Context, after uuid.UUID, limit int) ([]Node, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	// A zero id is "from the beginning": no node has an all-zero primary key, so a plain `>` with
+	// the zero value is already correct and needs no branch.
+	const q = `SELECT ` + nodeColumns + ` FROM nodes
+		WHERE id > $1
+		ORDER BY id
+		LIMIT $2`
+	rows, err := t.tx.Query(ctx, q, after, limit)
+	if err != nil {
+		return nil, translate(err)
+	}
+	defer rows.Close()
+
+	out := make([]Node, 0, limit)
+	for rows.Next() {
+		n, serr := scanNode(rows)
+		if serr != nil {
+			return nil, serr
+		}
+		out = append(out, n)
+	}
+	return out, translate(rows.Err())
+}
+
+// OldestPendingJob reports when the oldest still-pending job of this kind was due.
+func (t *pgTx) OldestPendingJob(ctx context.Context, kind string) (time.Time, bool, error) {
+	var due *time.Time
+	err := t.tx.QueryRow(ctx,
+		`SELECT min(run_after) FROM jobs WHERE kind = $1 AND completed_at IS NULL`,
+		kind).Scan(&due)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return time.Time{}, false, nil
+		}
+		return time.Time{}, false, translate(err)
+	}
+	if due == nil {
+		// min() over an empty set is NULL, which is the caught-up answer.
+		return time.Time{}, false, nil
+	}
+	return due.UTC(), true, nil
+}
+
+var (
+	_ SocialReader    = (*PG)(nil)
+	_ TagCounter      = (*PG)(nil)
+	_ UserLookup      = (*PG)(nil)
+	_ FavoriteCounter = (*PG)(nil)
+)

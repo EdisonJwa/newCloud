@@ -8,9 +8,16 @@ package server
 // review_fixes_test.go (package server_test).
 
 import (
+	"context"
+	"errors"
+	"io"
+	"log/slog"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
+	"github.com/EdisonJwa/newCloud/internal/authz"
 	"github.com/EdisonJwa/newCloud/internal/config"
 	"github.com/EdisonJwa/newCloud/internal/store"
 )
@@ -164,4 +171,114 @@ func TestBreakglassThrottleResetsOnSuccess(t *testing.T) {
 	if !l2.allow("10.0.0.9", now.Add(store.PasswordWindow+time.Minute)) {
 		t.Fatal("failures older than the window must stop counting")
 	}
+}
+
+// TestTheSubtreeDownloadWalkDemandsDownloadOfEveryMember pins the primitive the zip route hands
+// its decision to. The route resolves `path` in the caller's own tree, where the caller is the
+// owner and holds every permission, so the refusal is not reachable through HTTP today — the
+// walk is what an id-addressed zip will call, and it must demand `download` of every member,
+// not `read`, and refuse when any member lacks it.
+func TestTheSubtreeDownloadWalkDemandsDownloadOfEveryMember(t *testing.T) {
+	meta := store.NewMemory()
+	owner := meta.AddUser(store.User{Username: "owner", Email: "owner@example.test", Role: "user"})
+	root, err := meta.EnsureRoot(context.Background(), owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mate := meta.AddUser(store.User{Username: "zipper", Email: "zipper@example.test", Role: "user"})
+
+	var vault, inside store.Node
+	err = meta.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+		v, verr := tx.CreateDir(ctx, store.NewNode{OwnerID: owner.ID, ParentID: root.ID, Name: "vault"})
+		if verr != nil {
+			return verr
+		}
+		vault = v
+		inside, verr = tx.CreateFile(ctx, store.NewFile{
+			OwnerID: owner.ID, ParentID: vault.ID, Name: "inside.txt",
+			Size: 4, Mime: "text/plain", ETag: "etag-1",
+			BlobID: uuid.New(), BlobHash: [32]byte{1},
+		})
+		return verr
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	grant := func(node uuid.UUID, perms store.Perm, inherit bool) {
+		t.Helper()
+		err := meta.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			_, gerr := tx.Grant(ctx, store.ACLEntry{NodeID: node, UserID: &mate.ID, Perms: perms, Inherit: inherit})
+			return gerr
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The folder: visible and takeable, but the grant does NOT inherit (the child's own entry
+	// decides it). The child: visible, not takeable — the exact split §4.2's download bit is for.
+	grant(vault.ID, store.PermRead|store.PermDownload|store.PermListChildren, false)
+	grant(inside.ID, store.PermRead|store.PermListChildren, true)
+
+	s := &Server{deps: Deps{
+		Meta:  meta,
+		Authz: authz.NewService(&reviewAccessor{m: meta}),
+		Log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}}
+	actor := authz.NewUserActor(mate.ID, mate.Email, authz.RoleUser, authz.ScopeRead|authz.ScopeWrite)
+
+	if s.checkSubtreePermCtx(context.Background(), actor, vault.ID, authz.PermDownload) {
+		t.Fatal("a subtree with a non-downloadable member must not pass the download walk")
+	}
+	if !s.checkSubtreePermCtx(context.Background(), actor, vault.ID, authz.PermRead) {
+		t.Fatal("the same subtree is readable; the refusal must be about download, not access")
+	}
+
+	// Grant download on the child and the walk passes — one grant on one member, nothing else
+	// changed. This is what proves the refusal above is the missing bit and not a broken setup.
+	grant(inside.ID, store.PermRead|store.PermListChildren|store.PermDownload, true)
+	if !s.checkSubtreePermCtx(context.Background(), actor, vault.ID, authz.PermDownload) {
+		t.Fatal("after the member is takeable the download walk must pass")
+	}
+}
+
+// reviewAccessor adapts the in-memory store to the authorizer. It mirrors the accessor in
+// e2e_test.go (which lives in the external test package and cannot be shared); if the two
+// drift, the conformance suite is what holds both to the store's real answers.
+type reviewAccessor struct{ m *store.Memory }
+
+func (a *reviewAccessor) LoadNode(id uuid.UUID) (authz.Node, error) {
+	var n store.Node
+	err := a.m.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+		got, gerr := tx.Node(ctx, id)
+		n = got
+		return gerr
+	})
+	if err != nil {
+		return authz.Node{}, authz.ErrNotFound
+	}
+	return authz.Node{ID: n.ID, OwnerID: n.OwnerID, ParentID: n.ParentID}, nil
+}
+
+func (a *reviewAccessor) OwnerGroupPerm(actorID, nodeID uuid.UUID) (authz.Perm, bool, error) {
+	var (
+		perms store.Perm
+		ok    bool
+	)
+	err := a.m.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+		p, found, gerr := tx.EffectivePermsFor(ctx, actorID, nodeID)
+		perms, ok = p, found
+		return gerr
+	})
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	return authz.Perm(perms), ok, nil
+}
+
+func (a *reviewAccessor) ShareForActor(actorID, nodeID uuid.UUID) (*authz.ShareGrant, error) {
+	return nil, nil
 }

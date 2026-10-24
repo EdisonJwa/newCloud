@@ -28,6 +28,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -50,17 +51,34 @@ var (
 	ErrPendingFull = errors.New("upload: pending uploads exceed the account limit")
 )
 
-// ConflictError reports that the chunk did not start where the server expected. Offset is
-// authoritative: the client resumes from it rather than guessing.
+// ConflictError reports that the chunk overlaps bytes the server already holds. Offset is the
+// contiguous prefix the client can rely on, and Ranges is the full set of acknowledged half-open
+// intervals, which is what a parallel client needs to know which chunks are still missing.
 type ConflictError struct {
 	Offset int64
+	Ranges []Range
+	// Incomplete is set by Finish when the upload still has a hole, as opposed to Append
+	// refusing a chunk that overlaps bytes already present. Both are 409; the client's next move
+	// is the same (send what the ranges say is missing), but the message can be honest.
+	Incomplete bool
 }
 
 func (e *ConflictError) Error() string {
 	return fmt.Sprintf("upload: offset conflict, server is at %d", e.Offset)
 }
 
+// Range is one acknowledged half-open byte interval, [Start, End), in a session's staging file.
+// The protocol's Content-Range end is inclusive; this representation is exclusive so that a range
+// can be expressed as Start+length without the off-by-one that makes holes easy to create.
+type Range struct {
+	Start int64 `json:"start"`
+	End   int64 `json:"end"`
+}
+
 // Session is one in-progress upload.
+//
+// Offset is the contiguous acknowledged prefix ([0, Offset) has every byte). Out-of-order chunks
+// are tracked separately in received; the two are always kept consistent by addRangeLocked.
 type Session struct {
 	ID      string
 	Owner   uuid.UUID
@@ -70,10 +88,33 @@ type Session struct {
 	Offset  int64
 	Created time.Time
 
-	mu      sync.Mutex
-	file    *os.File
+	mu sync.Mutex
+	// cond is signalled whenever an in-flight chunk finishes. Teardown marks closing, then waits
+	// for writers to drain before closing the handle, so a concurrent WriteAt cannot race Close.
+	cond *sync.Cond
+	file *os.File
+	// received is the sorted, merged set of acknowledged ranges.
+	received []Range
+	// inflight reserves ranges currently being written. A reservation is what makes two parallel
+	// requests for overlapping bytes conflict instead of racing; it is not persisted.
+	inflight []Range
+	// writers counts Append calls that have reserved a range and are still copying/syncing.
+	writers int
+	// closing stops NEW reservations while already-running writes are allowed to finish. It is set
+	// by Finish/Abort/Shutdown and by a broken-handle path.
+	closing bool
+	// broken records a local staging-file failure that makes the session unusable. Such a session
+	// is reaped rather than offered for resume, because its bytes are of unknown provenance.
+	broken  bool
 	touched time.Time
 	closed  bool
+}
+
+// Progress returns the contiguous acknowledged offset and a copy of the acknowledged ranges.
+func (s *Session) Progress() (int64, []Range) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Offset, cloneRanges(s.received)
 }
 
 // record is the on-disk form of a session (WC-GAP-002).
@@ -82,9 +123,13 @@ type Session struct {
 // diagnosed by an operator reading this file, and a format that needs the running binary to explain
 // itself is the wrong choice for the one piece of state that exists to survive the binary going away.
 //
-// `Offset` names the number of bytes ALREADY written to the staging file and fsynced. Every field is
-// written on every advance, which is a few hundred bytes per chunk: negligible next to the chunk
-// that just crossed the network, and it keeps the recovery path to a single read.
+// `Offset` names the contiguous prefix that is ALREADY written to the staging file and fsynced.
+// `Ranges` names every acknowledged interval, including ranges beyond a hole. A record written by
+// the sequential-only version has no `ranges` field at all (nil after unmarshal), which recovery
+// treats as the single range [0, Offset) — that is what keeps an in-flight upgrade resumable.
+//
+// Every field is written on every advance, which is a few hundred bytes per chunk: negligible next
+// to the chunk that just crossed the network, and it keeps the recovery path to a single read.
 type record struct {
 	ID      string    `json:"id"`
 	Owner   string    `json:"owner"`
@@ -92,6 +137,7 @@ type record struct {
 	Name    string    `json:"name"`
 	Total   int64     `json:"total"`
 	Offset  int64     `json:"offset"`
+	Ranges  []Range   `json:"ranges"`
 	Created time.Time `json:"created"`
 	Touched time.Time `json:"touched"`
 }
@@ -263,24 +309,34 @@ func (m *Manager) recoverOne(id string, present map[string]bool) bool {
 		return false
 	}
 
-	// Rule 3: the offset must be a promise about bytes on disk.
+	// Rule 3: every acknowledged range must be a promise about bytes on disk.
 	info, err := os.Stat(dataPath)
 	if err != nil {
 		_ = os.Remove(recPath)
 		return false
 	}
-	offset := r.Offset
-	if info.Size() < offset {
+	received, offset, err := recoveryRanges(r)
+	if err != nil {
 		_ = os.Remove(recPath)
 		_ = os.Remove(dataPath)
 		return false
 	}
-	if info.Size() > offset {
-		// The bytes ran ahead of the record: a crash between the write and the record update. The
-		// record is the acknowledged offset, so the extra bytes are discarded. Truncating here is
-		// what keeps "resume at the acknowledged offset" true rather than "resume at whatever
-		// landed".
-		if terr := os.Truncate(dataPath, offset); terr != nil {
+	highWater := int64(0)
+	if len(received) > 0 {
+		highWater = received[len(received)-1].End
+	}
+	if info.Size() < highWater {
+		// The record names bytes the file does not contain: there is no honest offset to resume to.
+		_ = os.Remove(recPath)
+		_ = os.Remove(dataPath)
+		return false
+	}
+	if info.Size() > highWater {
+		// Bytes past the highest acknowledged range were written by a chunk whose record update did
+		// not land. Truncate them, because no client was ever told they were accepted. A hole
+		// BETWEEN acknowledged ranges is not truncatable and is left alone: it is missing according
+		// to `received`, and the next retry overwrites it.
+		if terr := os.Truncate(dataPath, highWater); terr != nil {
 			_ = os.Remove(recPath)
 			_ = os.Remove(dataPath)
 			return false
@@ -295,20 +351,77 @@ func (m *Manager) recoverOne(id string, present map[string]bool) bool {
 		_ = os.Remove(recPath)
 		return false
 	}
-	if _, err := file.Seek(offset, io.SeekStart); err != nil {
-		_ = file.Close()
-		_ = os.Remove(recPath)
-		_ = os.Remove(dataPath)
-		return false
-	}
 
-	s := &Session{
-		ID: id, Owner: owner, Dir: r.Dir, Name: r.Name, Total: r.Total,
-		Offset: offset, Created: r.Created, touched: r.Touched, file: file,
-	}
+	s := newSession(id, owner, r.Dir, r.Name, r.Total, r.Created, r.Touched, file)
+	s.Offset = offset
+	s.received = received
 	m.sessions[id] = s
 	m.byOwner[owner]++
 	return true
+}
+
+// recoveryRanges turns a record into the acknowledged ranges it promises.
+//
+// A record from the sequential-only format has Ranges == nil (the field is absent). Its promise is
+// exactly [0, Offset), which is why an upgrade in the middle of an upload resumes rather than
+// throwing the transfer away. A record from this version always has a non-nil Ranges slice, even
+// when it is empty, so "no bytes yet" and "an old record with offset 0" remain distinguishable.
+func recoveryRanges(r record) ([]Range, int64, error) {
+	if r.Total < 0 {
+		return nil, 0, errors.New("upload: record has a negative total")
+	}
+	if r.Ranges == nil {
+		if r.Offset < 0 || r.Offset > r.Total {
+			return nil, 0, errors.New("upload: legacy record has an invalid offset")
+		}
+		if r.Offset == 0 {
+			return []Range{}, 0, nil
+		}
+		return []Range{{Start: 0, End: r.Offset}}, r.Offset, nil
+	}
+
+	received, err := validateRanges(r.Ranges, r.Total)
+	if err != nil {
+		return nil, 0, err
+	}
+	offset := contiguousOffset(received)
+	if offset != r.Offset {
+		// Both halves of the record are written under the same session lock, so a disagreement
+		// cannot be a normal crash window; it is corruption, and guessing which half is right is
+		// how a resumed upload gets bytes nobody sent.
+		return nil, 0, errors.New("upload: record offset disagrees with its ranges")
+	}
+	return received, offset, nil
+}
+
+// validateRanges checks a persisted range list and returns it with adjacent ranges merged.
+//
+// Overlaps are rejected rather than merged: two acknowledged intervals that overlap could describe
+// different bytes for the same offset, and there is no way after the fact to decide which write was
+// the client's. The writer in this package never produces an overlap; a record that has one is
+// corrupt.
+func validateRanges(rs []Range, total int64) ([]Range, error) {
+	out := make([]Range, 0, len(rs))
+	for _, r := range rs {
+		if r.Start < 0 || r.End <= r.Start {
+			return nil, fmt.Errorf("upload: record has an invalid range [%d,%d)", r.Start, r.End)
+		}
+		if r.End > total {
+			return nil, fmt.Errorf("upload: record range [%d,%d) exceeds total %d", r.Start, r.End, total)
+		}
+		if len(out) > 0 {
+			last := out[len(out)-1]
+			if r.Start < last.End {
+				return nil, fmt.Errorf("upload: record ranges overlap at %d", r.Start)
+			}
+			if r.Start == last.End {
+				out[len(out)-1].End = r.End
+				continue
+			}
+		}
+		out = append(out, r)
+	}
+	return out, nil
 }
 
 // Create starts a session for one file.
@@ -350,10 +463,7 @@ func (m *Manager) Create(owner uuid.UUID, dir, name string, total int64) (*Sessi
 	}
 
 	now := m.now()
-	s := &Session{
-		ID: id, Owner: owner, Dir: dir, Name: name, Total: total,
-		Created: now, touched: now, file: file,
-	}
+	s := newSession(id, owner, dir, name, total, now, now, file)
 	// Record the session before returning it (WC-GAP-002). A session a client has been told about
 	// but the disk has not recorded would vanish on restart, which is the defect this exists to
 	// fix. Failing here rather than returning an unrecorded session keeps the promise exact: if
@@ -376,16 +486,26 @@ func (m *Manager) Get(owner uuid.UUID, id string) (*Session, error) {
 		ok = false
 	}
 	var victim *Session
-	if ok && m.stale(s) {
+	if ok && m.expireLocked(s) {
 		m.forgetLocked(s)
 		victim = s
 		ok = false
+	}
+	if ok {
+		// A session being torn down (Finish, Abort, Shutdown, or a broken handle) must not be
+		// handed out: Append would reject it anyway, and a status read would report a progress
+		// snapshot that is about to be deleted.
+		s.mu.Lock()
+		if s.closed || s.closing {
+			ok = false
+		}
+		s.mu.Unlock()
 	}
 	m.mu.Unlock()
 
 	if victim != nil {
 		// Dropping the file needs the session lock, which must not be taken while the manager
-		// lock is held.
+		// lock is held. expireLocked set closing, so no new writer can reserve a range.
 		victim.mu.Lock()
 		victim.closed = true
 		_ = victim.file.Close()
@@ -398,11 +518,20 @@ func (m *Manager) Get(owner uuid.UUID, id string) (*Session, error) {
 	return s, nil
 }
 
-// Append writes one chunk.
+// Append writes one chunk at the range the client declared.
 //
-// start must equal the session's current offset. Accepting an arbitrary offset would let a
-// retried request interleave with a fresh one and produce bytes that hash to nothing; the
-// client is told the real offset instead and resumes from there.
+// Unlike the sequential-only version, start does NOT have to equal Offset: a client may send
+// chunks in any order, and may send several at once. Two rules keep that safe:
+//
+//   - A range that overlaps an acknowledged range or another in-flight range is refused with a
+//     ConflictError carrying the acknowledged set. Without that reservation two concurrent
+//     writers could put different bytes at the same offset and the winner would be whichever
+//     kernel write landed last.
+//   - The file is written with WriteAt, not with a shared seek-then-copy, so disjoint chunks do
+//     not influence each other's position and can be in flight at the same time.
+//
+// The returned offset remains the contiguous prefix: it is what a sequential client resumes from,
+// and what Finish checks. A parallel client reads Ranges (or GET status) to learn the holes.
 func (m *Manager) Append(ctx context.Context, owner uuid.UUID, id string, start int64, r io.Reader, size int64) (int64, error) {
 	s, err := m.Get(owner, id)
 	if err != nil {
@@ -410,128 +539,157 @@ func (m *Manager) Append(ctx context.Context, owner uuid.UUID, id string, start 
 	}
 
 	s.mu.Lock()
-	// The reap runs after the session lock is released, because reaping needs the manager lock
-	// and the lock order is manager-then-session. A no-op unless a rollback failed.
-	broken := false
-	defer func() {
+	if s.closed || s.closing {
 		s.mu.Unlock()
-		if broken {
-			m.reapBroken(s)
-		}
-	}()
-
-	if s.closed {
 		return 0, ErrNotFound
 	}
-	if start != s.Offset {
-		return s.Offset, &ConflictError{Offset: s.Offset}
-	}
 	if size < 0 {
+		s.mu.Unlock()
 		return s.Offset, errors.New("upload: chunk size is required")
 	}
-	if s.Total > 0 && s.Offset+size > s.Total {
+	if start < 0 || start > s.Total {
+		s.mu.Unlock()
+		return s.Offset, fmt.Errorf("upload: chunk starts outside the declared size %d", s.Total)
+	}
+	if size > s.Total-start {
+		s.mu.Unlock()
 		return s.Offset, fmt.Errorf("upload: chunk would exceed the declared size %d", s.Total)
 	}
 
-	// Position the handle at the offset the client was told about BEFORE writing (NC-RR-002).
+	// A zero-length chunk is a no-op. It exists in the protocol for the case where a client's
+	// final slice is empty (size is an exact multiple of the chunk size); it must not reserve or
+	// acknowledge a range.
+	if size == 0 {
+		offset := s.Offset
+		s.mu.Unlock()
+		return offset, nil
+	}
+
+	span := Range{Start: start, End: start + size}
+	if overlapsAny(s.received, span) || overlapsAny(s.inflight, span) {
+		offset, ranges := s.Offset, cloneRanges(s.received)
+		s.mu.Unlock()
+		return offset, &ConflictError{Offset: offset, Ranges: ranges}
+	}
+	s.inflight = append(s.inflight, span)
+	s.writers++
+	s.mu.Unlock()
+
+	written, copyErr := s.writeChunk(ctx, span, r)
+	var syncErr error
+	if copyErr == nil && written == size {
+		// fsync before acknowledging, per range. A concurrent chunk at another offset may have
+		// written bytes too; fsync flushes the whole file, which is a superset of this chunk and
+		// never makes an unacknowledged range durable enough to be trusted — the record is what
+		// decides that.
+		syncErr = s.file.Sync()
+	}
+
+	s.mu.Lock()
+	s.removeInflightLocked(span)
+	s.writers--
+	if s.writers == 0 {
+		s.cond.Broadcast()
+	}
+
+	localErr := copyErr
+	if localErr == nil {
+		localErr = syncErr
+	}
+	if localErr != nil && errors.Is(localErr, os.ErrClosed) {
+		// The staging handle is gone. Every future write to this session would fail the same way,
+		// and a resume would splice bytes of unknown provenance into the user's file, so the
+		// honest answer is to invalidate it rather than leave it looking resumable.
+		s.broken = true
+		s.closing = true
+		offset := s.Offset
+		s.mu.Unlock()
+		m.reapBroken(s)
+		return offset, fmt.Errorf("upload: staging file is closed: %w", localErr)
+	}
+	if copyErr != nil {
+		offset := s.Offset
+		s.mu.Unlock()
+		return offset, fmt.Errorf("upload: write chunk: %w", copyErr)
+	}
+	if written != size {
+		offset := s.Offset
+		s.mu.Unlock()
+		return offset, fmt.Errorf("upload: short read: got %d of %d bytes", written, size)
+	}
+	if syncErr != nil {
+		offset := s.Offset
+		s.mu.Unlock()
+		return offset, fmt.Errorf("upload: sync chunk: %w", syncErr)
+	}
+
+	// Ordering is the durability argument: fsync the bytes, THEN record the acknowledged ranges.
+	// A crash between the two leaves bytes the record does not mention; recovery truncates the
+	// unacknowledged tail and the client re-sends just that range.
 	//
-	// This is not redundant with the seek in recoverOne. A file's I/O offset is independent of
-	// its length, so a previous request that wrote bytes and then rolled the LENGTH back left
-	// the handle still pointing past the truncated end. The next append would then write at
-	// that stale position and the file would grow a zero-filled hole between the acknowledged
-	// bytes and the new chunk — bytes that were never sent, hashing to something no client
-	// asked for. Seeking first makes every append land exactly where the offset says it does,
-	// whatever a failed predecessor did.
-	if _, serr := s.file.Seek(s.Offset, io.SeekStart); serr != nil {
-		s.closed = true
-		broken = true
-		return 0, fmt.Errorf("upload: seek to the acknowledged offset: %w", serr)
-	}
-
-	written, err := io.Copy(s.file, &ctxReader{ctx: ctx, r: io.LimitReader(r, size)})
-	if err != nil || written != size {
-		// A partially written chunk must not advance the offset, or the file gains a hole.
-		// Rolling back means BOTH truncating the extra bytes and repositioning the handle: see
-		// rollbackLocked. If that cannot be done the session is unusable rather than resumable,
-		// because resuming would splice bytes of unknown provenance into the user's file.
-		if rerr := s.rollbackLocked(s.Offset); rerr != nil {
-			s.closed = true
-			broken = true
-			return 0, fmt.Errorf("upload: write failed and the staging file could not be "+
-				"repaired (%v); this session must be restarted: %w", rerr, err)
-		}
-		if err != nil {
-			return s.Offset, fmt.Errorf("upload: write chunk: %w", err)
-		}
-		return s.Offset, fmt.Errorf("upload: short read: got %d of %d bytes", written, size)
-	}
-
-	// Ordering is the whole durability argument (WC-GAP-002): fsync the bytes, THEN record the
-	// offset. A crash between the two leaves bytes on disk that the record does not mention, and
-	// recovery truncates them (see recoverOne), so the client re-sends a chunk it had not been
-	// told about. Doing it the other way round would record an offset for bytes that might not
-	// have landed, and the resumed file would contain a gap that hashes to something wrong.
-	newOffset := s.Offset + written
-	if err := s.file.Sync(); err != nil {
-		// The bytes are written but not durable. Rolling the offset back is the safe move: the
-		// client retries the chunk, which is cheap, whereas pretending it is durable is not.
-		if rerr := s.rollbackLocked(s.Offset); rerr != nil {
-			s.closed = true
-			broken = true
-			return 0, fmt.Errorf("upload: sync failed and the staging file could not be "+
-				"repaired (%v); this session must be restarted: %w", rerr, err)
-		}
-		return s.Offset, fmt.Errorf("upload: sync chunk: %w", err)
-	}
-	prev := s.Offset
-	s.Offset = newOffset
+	// A persist failure removes the range from memory again, so the server never advertises an
+	// acknowledgement its own restart would not honour. The bytes stay in the file but remain
+	// unacknowledged; a retry overwrites them, exactly as it would after a crash.
+	before := cloneRanges(s.received)
+	prevOffset, prevTouched := s.Offset, s.touched
+	s.addRangeLocked(span)
 	s.touched = m.now()
 	if err := m.persist(s); err != nil {
-		// The offset could not be recorded. Report the chunk as unacknowledged and roll back, so
-		// the in-memory state never claims more than the disk will resume to. Rolling back the
-		// MEMORY alone is not enough: the bytes are on disk, and without truncating them the
-		// retry would be appended after them (that was NC-RR-002's second half, and it left a
-		// file containing the chunk twice).
-		s.Offset = prev
-		if rerr := s.rollbackLocked(prev); rerr != nil {
-			s.closed = true
-			broken = true
-			return 0, fmt.Errorf("upload: could not record the offset and the staging file "+
-				"could not be repaired (%v); this session must be restarted: %w", rerr, err)
+		s.received = before
+		s.Offset = prevOffset
+		s.touched = prevTouched
+		offset := s.Offset
+		s.mu.Unlock()
+		return offset, fmt.Errorf("upload: record offset: %w", err)
+	}
+	offset := s.Offset
+	s.mu.Unlock()
+	return offset, nil
+}
+
+// writeChunk copies exactly span's length to span.Start using WriteAt.
+//
+// The handle's shared file position is deliberately not used. A seek-then-copy would be correct
+// only while one request owns the session; with parallel chunks two writers would race for the
+// same cursor. WriteAt is the primitive the OS already provides for "these bytes at this offset".
+func (s *Session) writeChunk(ctx context.Context, span Range, r io.Reader) (int64, error) {
+	src := io.LimitReader(&ctxReader{ctx: ctx, r: r}, span.End-span.Start)
+	dst := &chunkWriter{file: s.file, off: span.Start}
+	return io.Copy(dst, src)
+}
+
+type chunkWriter struct {
+	file *os.File
+	off  int64
+}
+
+func (w *chunkWriter) Write(p []byte) (int, error) {
+	n, err := w.file.WriteAt(p, w.off)
+	w.off += int64(n)
+	return n, err
+}
+
+// addRangeLocked inserts a non-overlapping range and recomputes the contiguous prefix.
+func (s *Session) addRangeLocked(span Range) {
+	s.received = mergeRange(s.received, span)
+	s.Offset = contiguousOffset(s.received)
+}
+
+func (s *Session) removeInflightLocked(span Range) {
+	for i, r := range s.inflight {
+		if r == span {
+			s.inflight = append(s.inflight[:i], s.inflight[i+1:]...)
+			return
 		}
-		return s.Offset, fmt.Errorf("upload: record offset: %w", err)
 	}
-	return s.Offset, nil
 }
 
-// rollbackLocked restores the staging file to `to` after a failed append.
+// reapBroken discards a session whose staging file failed locally.
 //
-// Both halves are load-bearing, which is exactly what NC-RR-002 found missing:
-//
-//	Truncate(to) drops the bytes the failed chunk wrote past the acknowledged offset.
-//	Seek(to)     moves the HANDLE back, so the retried chunk is written at `to`.
-//
-// In Go, and in every POSIX filesystem, truncating a file does not change the file
-// description's offset. Doing only the truncate leaves the next write positioned past the new
-// end, and the kernel fills the gap with zeroes — a file longer than the client's own size,
-// containing bytes nobody sent. The caller must therefore treat an error from here as fatal to
-// the session rather than retrying the truncate.
-func (s *Session) rollbackLocked(to int64) error {
-	if err := s.file.Truncate(to); err != nil {
-		return fmt.Errorf("truncate to %d: %w", to, err)
-	}
-	if _, err := s.file.Seek(to, io.SeekStart); err != nil {
-		return fmt.Errorf("seek to %d: %w", to, err)
-	}
-	return nil
-}
-
-// reapBroken discards a session whose staging file could not be rolled back (NC-RR-002).
-//
-// The file is left for the caller to delete along with the record, so a later restart cannot
-// resurrect a session whose bytes are of unknown provenance. Doing it here rather than inline in
-// Append is a lock-order requirement: the manager lock must be taken before the session lock, so
-// the session cannot be removed from the map while Append still holds its own lock.
+// `closing` was already set by Append, so no new range can be reserved. The wait is for writers
+// that were already in flight: they must finish before the handle is closed and the files
+// unlinked, or a WriteAt could land in a file that has been deleted (on Unix) or fail with an
+// unrelated error (Windows) while the teardown reports success.
 func (m *Manager) reapBroken(s *Session) {
 	m.mu.Lock()
 	if _, live := m.sessions[s.ID]; live {
@@ -540,6 +698,11 @@ func (m *Manager) reapBroken(s *Session) {
 	m.mu.Unlock()
 
 	s.mu.Lock()
+	s.closing = true
+	for s.writers > 0 {
+		s.cond.Wait()
+	}
+	s.closed = true
 	_ = s.file.Close()
 	s.mu.Unlock()
 	m.discard(s)
@@ -558,7 +721,8 @@ func (m *Manager) reapBroken(s *Session) {
 func (m *Manager) persist(s *Session) error {
 	rec := record{
 		ID: s.ID, Owner: s.Owner.String(), Dir: s.Dir, Name: s.Name,
-		Total: s.Total, Offset: s.Offset, Created: s.Created, Touched: s.touched,
+		Total: s.Total, Offset: s.Offset, Ranges: cloneRanges(s.received),
+		Created: s.Created, Touched: s.touched,
 	}
 	body, err := json.Marshal(rec)
 	if err != nil {
@@ -630,28 +794,46 @@ func (m *Manager) Finish(owner uuid.UUID, id string) (*os.File, *Session, error)
 	// the permitted direction, and peeking first means an incomplete upload never leaves the
 	// session map at all.
 	s.mu.Lock()
-	if s.closed {
+	if s.closed || s.closing {
 		s.mu.Unlock()
 		m.mu.Unlock()
 		return nil, nil, ErrNotFound
 	}
 	if s.Total > 0 && s.Offset != s.Total {
-		offset := s.Offset
+		offset, ranges := s.Offset, cloneRanges(s.received)
 		s.mu.Unlock()
 		m.mu.Unlock()
-		return nil, nil, &ConflictError{Offset: offset}
+		return nil, nil, &ConflictError{Offset: offset, Ranges: ranges, Incomplete: true}
 	}
 	m.forgetLocked(s)
+	// Stop new reservations before the manager lock is released. An already-running writer may
+	// still be finishing; it is allowed to complete and record its range, so the wait below is
+	// outside the lock (the session lock must be available for that writer to signal it).
+	s.closing = true
+	s.mu.Unlock()
 	m.mu.Unlock()
 
+	// The session has been removed from the registry, so no new Append can find it. Wait for any
+	// writer that got its reservation before closing.
+	s.mu.Lock()
+	for s.writers > 0 {
+		s.cond.Wait()
+	}
+	if s.closed {
+		s.mu.Unlock()
+		m.discard(s)
+		return nil, nil, ErrNotFound
+	}
 	if err := s.file.Sync(); err != nil {
 		_ = s.file.Close()
+		s.closed = true
 		s.mu.Unlock()
 		m.discard(s)
 		return nil, nil, fmt.Errorf("upload: sync: %w", err)
 	}
 	if _, err := s.file.Seek(0, io.SeekStart); err != nil {
 		_ = s.file.Close()
+		s.closed = true
 		s.mu.Unlock()
 		m.discard(s)
 		return nil, nil, fmt.Errorf("upload: rewind: %w", err)
@@ -685,6 +867,10 @@ func (m *Manager) Abort(owner uuid.UUID, id string) error {
 	}
 
 	s.mu.Lock()
+	s.closing = true
+	for s.writers > 0 {
+		s.cond.Wait()
+	}
 	s.closed = true
 	_ = s.file.Close()
 	s.mu.Unlock()
@@ -698,7 +884,7 @@ func (m *Manager) Sweep() int {
 	m.mu.Lock()
 	victims := make([]*Session, 0, 4)
 	for _, s := range m.sessions {
-		if m.stale(s) {
+		if m.expireLocked(s) {
 			victims = append(victims, s)
 		}
 	}
@@ -709,6 +895,10 @@ func (m *Manager) Sweep() int {
 
 	for _, s := range victims {
 		s.mu.Lock()
+		s.closing = true
+		for s.writers > 0 {
+			s.cond.Wait()
+		}
 		s.closed = true
 		_ = s.file.Close()
 		s.mu.Unlock()
@@ -734,6 +924,10 @@ func (m *Manager) Close() {
 
 	for _, s := range live {
 		s.mu.Lock()
+		s.closing = true
+		for s.writers > 0 {
+			s.cond.Wait()
+		}
 		s.closed = true
 		_ = s.file.Close()
 		s.mu.Unlock()
@@ -779,6 +973,13 @@ func (m *Manager) Shutdown() error {
 	var errs []error
 	for _, s := range live {
 		s.mu.Lock()
+		s.closing = true
+		// Let a chunk that already reserved a range finish and record it. Closing the handle first
+		// would turn a graceful shutdown into a failed request whose bytes are then lost from the
+		// record even though they are on disk.
+		for s.writers > 0 {
+			s.cond.Wait()
+		}
 		if s.closed {
 			s.mu.Unlock()
 			continue
@@ -813,12 +1014,23 @@ func (m *Manager) Count() int {
 	return len(m.sessions)
 }
 
-// stale reports whether a session has been idle past the TTL. The caller must hold the manager
-// lock, so this takes the session lock in the one direction that is safe.
-func (m *Manager) stale(s *Session) bool {
+// expireLocked marks an idle session closing, returning true if it should be swept.
+//
+// The caller must hold the manager lock, so taking the session lock here is the permitted
+// direction. A session with a writer in flight is never expired: the TTL measures idle time, and a
+// chunk that is still arriving has not been idle. Setting closing while the session lock is held is
+// what closes the race between observing "idle" and a new Append reserving a range.
+func (m *Manager) expireLocked(s *Session) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return m.now().Sub(s.touched) > m.ttl
+	if s.closed || s.closing || s.writers > 0 {
+		return false
+	}
+	if m.now().Sub(s.touched) <= m.ttl {
+		return false
+	}
+	s.closing = true
+	return true
 }
 
 func (m *Manager) forgetLocked(s *Session) {
@@ -846,6 +1058,73 @@ func newID() (string, error) {
 	}
 	return hex.EncodeToString(buf), nil
 }
+
+func newSession(id string, owner uuid.UUID, dir, name string, total int64, created, touched time.Time, file *os.File) *Session {
+	s := &Session{
+		ID: id, Owner: owner, Dir: dir, Name: name, Total: total,
+		Created: created, touched: touched, file: file,
+		received: make([]Range, 0),
+	}
+	s.cond = sync.NewCond(&s.mu)
+	return s
+}
+
+// cloneRanges copies a range list, returning a non-nil empty slice for no ranges. The non-nil
+// distinction is load-bearing in the on-disk record: nil means "written by the sequential-only
+// version, use Offset", while [] means "this version, and nothing has been acknowledged yet".
+func cloneRanges(rs []Range) []Range {
+	out := make([]Range, len(rs))
+	copy(out, rs)
+	return out
+}
+
+// overlapsAny reports whether want intersects any of rs. Intervals are half-open, so a chunk that
+// begins exactly where another ends does not overlap it.
+func overlapsAny(rs []Range, want Range) bool {
+	for _, r := range rs {
+		if want.Start < r.End && r.Start < want.End {
+			return true
+		}
+	}
+	return false
+}
+
+// mergeRange inserts span into a sorted range list and merges adjacency. Overlaps are not expected
+// here (Append rejects them); merging is for the adjacent case so the persisted set stays canonical.
+func mergeRange(rs []Range, span Range) []Range {
+	out := make([]Range, 0, len(rs)+1)
+	out = append(out, rs...)
+	out = append(out, span)
+	sort.Slice(out, func(i, j int) bool { return out[i].Start < out[j].Start })
+
+	merged := out[:0]
+	for _, r := range out {
+		if len(merged) == 0 || r.Start > merged[len(merged)-1].End {
+			merged = append(merged, r)
+			continue
+		}
+		if r.End > merged[len(merged)-1].End {
+			merged[len(merged)-1].End = r.End
+		}
+	}
+	return merged
+}
+
+// contiguousOffset returns the length of the acknowledged prefix starting at zero.
+func contiguousOffset(rs []Range) int64 {
+	var off int64
+	for _, r := range rs {
+		if r.Start > off {
+			break
+		}
+		if r.End > off {
+			off = r.End
+		}
+	}
+	return off
+}
+
+// ctxReader stops a chunk write when the request is cancelled.
 
 // ctxReader stops a chunk write when the request is cancelled.
 type ctxReader struct {

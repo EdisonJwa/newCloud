@@ -105,6 +105,19 @@ func (s *Server) handleNodeChildren(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A mount point's children are the remote's root, live (ADR-0014): no rows exist
+	// below it, so the row listing below would answer a confident empty folder.
+	if extKids, isMount, merr := s.mountPointChildren(r, store.Node{ID: id}); isMount {
+		if merr != nil {
+			s.writeExternalError(w, merr)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"id": id.String(), "children": extKids, "truncated": false, "cursor": "",
+		})
+		return
+	}
+
 	limit := s.deps.Config.Limits.MaxProfindChildren
 	cursor := r.URL.Query().Get("cursor")
 	truncated := false

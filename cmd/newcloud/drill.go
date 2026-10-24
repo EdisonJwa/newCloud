@@ -24,6 +24,7 @@ package main
 //  6. Measure elapsed time against the documented RTO and print a verdict.
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -463,9 +464,13 @@ func verifyRestoredChain(ctx context.Context, scratchDSN string) (bool, int64, [
 
 	restored := store.NewPG(pool)
 
-	// The rows are read in pages so a large log does not have to fit in memory, and the
-	// chain is verified across the whole run: a chain that verifies per page but not across
-	// page boundaries would be a false pass.
+	// The rows are read in pages, and the chain is verified across the whole run: a chain
+	// that verifies per page but not across page boundaries would be a false pass. The
+	// paged read bounds each ROUND TRIP, not total memory — the events accumulate in
+	// `all` and are verified in one pass. That is bounded by the audit retention policy
+	// (audit.retention_days plus what pruning has already archived), not by the size of
+	// the disk, which is the honest statement: a deployment that keeps ten years of
+	// events holds ten years of events here.
 	var (
 		all    []audit.Event
 		after  int64
@@ -618,26 +623,96 @@ func runTool(ctx context.Context, name string, args ...string) error {
 	return runToolEnv(ctx, nil, name, args...)
 }
 
+// toolCommand is one planned invocation of a pg client tool.
+type toolCommand struct {
+	// argv is what to exec, docker prefix included when a container is in play.
+	argv []string
+	// stdin is written to the child's standard input. Non-nil only when a secret travels
+	// this way; a nil means the child's stdin is left alone.
+	stdin []byte
+	// overlayEnv is true for a direct (non-container) exec whose env must be layered over
+	// the parent environment. A process environment is not visible in `ps`; an argument
+	// is, which is the whole distinction this structure exists to preserve.
+	overlayEnv bool
+}
+
+// buildToolCommand assembles how one tool runs. It is a pure function so the property that
+// matters — NO argv element ever contains the database password — is unit-testable without
+// a Docker daemon.
+//
+// Locally, the connection reaches libpq through process environment variables: an env entry
+// is invisible to other users, while every argv entry is world-readable in `ps` for as long
+// as a multi-gigabyte dump runs.
+//
+// Inside a container an environment variable cannot be set privately any more: the only way
+// to deliver one is `docker exec -e K=V`, and every -e flag is an argv element of the docker
+// process — exactly the exposure the local mode avoids. So the password takes a different
+// route entirely: the container runs `sh -c 'PGPASSWORD="$(cat)" pg_dump …'` with ONLY the
+// password on stdin. The sh command line names no secret, so `docker inspect` and `ps` see
+// nothing; the password exists in one pipe that the shell consumes at startup. The remaining
+// -e flags carry only non-secret connection settings (host, port, user, database, sslmode).
+func buildToolCommand(container, name string, args []string, env []string) toolCommand {
+	if container == "" {
+		return toolCommand{
+			argv:       append([]string{name}, args...),
+			overlayEnv: len(env) > 0,
+		}
+	}
+
+	// Split the secret from the connection settings that may safely ride -e.
+	var plain []string
+	var password string
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "PGPASSWORD=") {
+			password = strings.TrimPrefix(kv, "PGPASSWORD=")
+			continue
+		}
+		plain = append(plain, kv)
+	}
+
+	dockerArgs := []string{"exec"}
+	for _, kv := range plain {
+		dockerArgs = append(dockerArgs, "-e", kv)
+	}
+	dockerArgs = append(dockerArgs, container)
+
+	if password == "" {
+		// Nothing to hide, so keep the direct exec: a failure names the tool rather than
+		// a shell wrapper, which is one less layer between an operator and the cause.
+		return toolCommand{argv: append(dockerArgs, append([]string{name}, args...)...)}
+	}
+
+	script := `PGPASSWORD="$(cat)" ` + name
+	for _, a := range args {
+		script += " " + shellQuote(a)
+	}
+	return toolCommand{
+		argv:  append(dockerArgs, "-i", "sh", "-c", script),
+		stdin: []byte(password),
+	}
+}
+
+// shellQuote quotes s so a POSIX shell reads it back as one word.
+//
+// The tool arguments contain host paths produced by this process, never secrets — the
+// password is the one value that must not reach a command line, and it travels on stdin
+// instead (see buildToolCommand). Quoting is still not optional: the scratch directory and
+// the dump path are interpolated into a shell command here, and a path is data, not code.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
 // runToolEnv runs a pg client tool with an environment overlay, which is how the DSN reaches
-// pg_dump and pg_restore (see pgEnvFromDSN). Inside the container the environment is
-// forwarded with `docker exec -e` flags, so the DSN travels the same way in both modes.
+// pg_dump and pg_restore (see pgEnvFromDSN). The command shape — and how the password
+// travels — is decided by buildToolCommand.
 func runToolEnv(ctx context.Context, env []string, name string, args ...string) error {
-	var cmd *exec.Cmd
-	if c := os.Getenv("DRILL_PG_CONTAINER"); c != "" {
-		// docker exec [-e K=V]… <c> pg_dump … — the -e flags must precede the container
-		// name, and the tool's arguments are passed through verbatim after it.
-		dockerArgs := []string{"exec"}
-		for _, kv := range env {
-			dockerArgs = append(dockerArgs, "-e", kv)
-		}
-		dockerArgs = append(dockerArgs, c, name)
-		dockerArgs = append(dockerArgs, args...)
-		cmd = exec.CommandContext(ctx, "docker", dockerArgs...)
-	} else {
-		cmd = exec.CommandContext(ctx, name, args...)
-		if len(env) > 0 {
-			cmd.Env = append(os.Environ(), env...)
-		}
+	tc := buildToolCommand(os.Getenv("DRILL_PG_CONTAINER"), name, args, env)
+	cmd := exec.CommandContext(ctx, tc.argv[0], tc.argv[1:]...)
+	if tc.overlayEnv {
+		cmd.Env = append(os.Environ(), env...)
+	}
+	if tc.stdin != nil {
+		cmd.Stdin = bytes.NewReader(tc.stdin)
 	}
 
 	// Output is captured rather than streamed: a successful pg_restore is silent, and the

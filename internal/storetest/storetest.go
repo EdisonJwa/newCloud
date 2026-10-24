@@ -3953,6 +3953,7 @@ func Run(t *testing.T, factory Factory, opts Options) {
 	t.Run("FilteredSearch", func(t *testing.T) { filteredSearchSuite(t, factory) })
 	t.Run("OwnerTrashPurge", func(t *testing.T) { ownerPurgeSuite(t, factory) })
 	t.Run("SocialAnnotations", func(t *testing.T) { socialAnnotationSuite(t, factory) })
+	t.Run("SearchBackfill", func(t *testing.T) { backfillSuite(t, factory) })
 }
 
 // upsertUser runs UpsertIdPUser in a transaction.

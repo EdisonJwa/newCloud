@@ -11,6 +11,47 @@ command that can be run by hand, and every unverified property is stated next to
 Newest first. Each round gives the finding that changed the code, the tests that pin it, and a lesson only
 where the lesson keeps the defect from returning. A round that covered two topics has two headings.
 
+### Round 48: The clients could not connect, and the two tokens that fixed it
+
+The limitations page said honestly that there was no Nextcloud client compatibility mode, and the
+price of that honesty was that the clients this product is compared with could not connect at all.
+Standard WebDAV is not their bootstrap: they probe `/status.php`, read an OCS capabilities envelope,
+authenticate through login flow v2, and sync against `/remote.php/dav/files/<user>/`. The discovery,
+capabilities, user and login-flow endpoints, plus two path shapes, did not exist at all.
+
+They exist now, as a compatibility layer rather than an emulation. The DAV handler parses the three
+URL shapes instead of rewriting them, because it derives every PROPFIND `href` from the request's own
+escaped path — a rewrite would answer a client with URLs outside the prefix its discovery code strips.
+The same change closed a latent mismatch: `splitPath`'s comment had claimed the URL's user segment was
+checked against the authenticated actor while the code discarded it, so a PUT addressed to another
+account's namespace would have written the caller's own file and reported success. A mismatched
+namespace is now a 404 in resolution, destinations, PUT and MKCOL. Pinned by
+`TestNextcloudPathNamingAnotherAccountIsRefused`, `TestNextcloudFilesPathAnswersWithItsOwnHrefs` and
+`TestNextcloudMoveAcceptsANextcloudDestination`.
+
+Login flow v2 issues a credential, so its state is the security surface. The client receives two
+independent secrets — a poll token it keeps and a login token it opens in the browser — and only their
+SHA-256 reaches the database. The approval is a conditional UPDATE (one account, unexpired,
+unconsumed), the poll is a `DELETE … RETURNING` (exactly one collection), and the App Password is
+minted by that poll with its audit row in the same transaction, so an abandoned flow leaves no
+credential at all. `internal/storetest` holds both backends to approval, single use, expiry and the
+sweep, and `TestNextcloudLoginFlowV2IssuesAWorkingCredential` runs the whole handshake — including a
+WebDAV request with the credential it returned.
+
+What is not implemented is refused in the capabilities document rather than at the point of failure:
+chunking v1/v2 is reported false, so clients upload in one request and `limits.max_file_bytes` is the
+ceiling; `REPORT` stays 501, so sync discovery is a full PROPFIND walk. The decision and the full
+boundary are ADR-0015; the operator-facing version is
+[docs/guides/nextcloud-clients.md](../guides/nextcloud-clients.md).
+
+The clients also made a latent listing cost visible. Every entry in their PROPFIND asks for about
+twenty non-DAV properties, so `writePropEntry`'s per-entry dead-property lookup opened one
+transaction per child: a 500-entry folder was 500 round trips before the response started. Listing
+now reads the children first and the dead properties of the whole listing in one query
+(`DeadPropsFor`), and a listing failure can be an error response instead of a half-written
+multistatus. Both backends answer the batch read and the single-node read identically, pinned by
+`TestConformance/DeadProps/BulkReadAgreesWithPerNodeRead`.
+
 ### Round 47: A conclusion that did not hold, and the real gap it pointed at
 
 Round 46 claimed that the local hash check reduced the upstream race from "polluted storage" to "failed
@@ -1450,12 +1491,13 @@ today, and the impact column says what that costs.
 | Large-database timing | Implemented — Round 37 | Three scale points (130 KiB, 1.2 MiB, 5.5 MiB) hold seconds per MiB between 6.94 and 9.38 across a 43-fold range, checked by `TestDrillScaleMeasurementsAreConsistent`. The range stops seven orders of magnitude below 40 TiB, so it supports no 40 TiB RTO figure. |
 | Shared and group-owned spaces | Not implemented | Grants attach to a node with one owner, so a space that outlives an account is not expressible; group grants cover access, not ownership. |
 | Shared locks | Not implemented | Locks are exclusive, one principal per lock; the RFC 4918 shared lock scope is absent. |
+| Nextcloud desktop and mobile clients | Implemented — Round 48, as a protocol subset | `status.php`, the OCS capabilities and user endpoints, login flow v2, and the `/remote.php/dav/files/<user>/` plus `/remote.php/webdav/` path shapes let the official clients sign in and sync; `X-OC-Mtime` is stored. The subset is the point: chunked uploads (v1/v2) and `REPORT` are not implemented and are refused in the capabilities document, so clients fall back to single-request uploads (bounded by `limits.max_file_bytes`) and full PROPFIND walks. An actual Nextcloud build has not been run against this tree here, so client-version behaviour is inferred from the protocol and remains on the T-18 list. |
 | REPORT and sync-collection | Not implemented | `REPORT` is absent, so a client wanting incremental DAV synchronization walks the tree with `PROPFIND`. |
 | Real S3 interoperability (AWS, MinIO, R2) | Not tested | The fake and moto verify backend logic and minio-go's framing; signatures, redirects, and consistency semantics need a real endpoint, which `TEST_S3_ENDPOINT` provides and which has not been run for AWS, MinIO, or R2. |
 | Immediate deprovisioning on IdP events | Bounded, not immediate — WC-GAP-001 | `auth.revalidate_minutes` refuses a session or App Password whose last IdP confirmation is older than the window, so a demotion applies within a documented bound rather than "whenever this person next signs in". `0` disables it and startup warns. A real event source (SCIM or a poll) would revoke at the moment of the change; this does not. |
 | Process-level isolation for previews | Implemented — WC-GAP-004 | `limits.thumbnail_isolation` defaults to `process`: the decode runs in a re-executed child, the deadline kills it, input and output are size-capped, and the child gets a minimal environment. `TestAHangingDecodeIsKilledAndTheCallReturns` proves the child is gone. A real OS sandbox (seccomp, cgroup) is still absent. |
 | Windows and macOS client validation | Not tested | T-18 needs real clients (Windows, macOS, Linux, rclone, Cyberduck); name normalization is verified at the byte level, which is not a client that folds case its own way. |
-| Resumable uploads across restarts | Implemented — WC-GAP-002 (reopened by NC-RR-001, now closed) | Each session writes a JSON record beside its staging file, fsynced after the bytes; startup recovers live sessions and truncates bytes the record does not acknowledge. A **graceful** stop now preserves both the bytes and the record (`Manager.Shutdown`), so a deploy or upgrade resumes exactly as a crash does; only `Abort` and the TTL sweep delete. Every append seeks to the acknowledged offset and every failure path truncates **and** seeks, so a retried chunk cannot leave a hole. Covered by `TestASessionResumesAfterARestart`, `TestShutdownPreservesUnfinishedUploads`, `TestShutdownThenRestartSurvivesRepeatedCycles`, `TestARetriedChunkAfterAMidStreamFailureLeavesNoHole` and `TestAnAppendRepositionsTheHandleToTheAcknowledgedOffset`. Cross-node resume is not available: sessions are local to one staging directory. |
+| Resumable uploads across restarts | Implemented — WC-GAP-002 (reopened by NC-RR-001, now closed); parallel/out-of-order chunks added | Each session writes a JSON record beside its staging file, fsynced after the bytes, naming every acknowledged range and the contiguous prefix; startup recovers live sessions, restores the range set, and truncates only bytes past the highest acknowledged range (a leading hole must not delete acknowledged bytes beyond it). A **graceful** stop now preserves both the bytes and the record (`Manager.Shutdown`), so a deploy or upgrade resumes exactly as a crash does; only `Abort` and the TTL sweep delete. Chunks may arrive in parallel or out of order; overlapping ranges are reserved and refused with `409`, and disjoint writes use `WriteAt` rather than a shared cursor. A failed network chunk is simply never acknowledged and the retry overwrites it, so it cannot leave a hole; a failed local write invalidates the session. Covered by `TestOutOfOrderChunksAssembleInPlace`, `TestParallelDisjointChunksAreAllAccepted`, `TestOutOfOrderRangesSurviveARestart`, `TestRecoveryTruncatesOnlyPastTheHighestAcknowledgedRange`, `TestShutdownPreservesUnfinishedUploads`, `TestShutdownThenRestartSurvivesRepeatedCycles` and `TestARetriedChunkAfterAMidStreamFailureLeavesNoHole`. Cross-node resume is not available: sessions are local to one staging directory. |
 | S3 post-write verification | Implemented — WC-GAP-003 (reopened by NC-RR-003/NC-RR-004, now closed) | `verify_after_put` reads the object back and re-hashes it. The **inconclusive** case is now distinct from corruption: a readback that fails (timeout, 5xx, 403, transport reset) is reported as `ErrVerifyUnavailable` and leaves the object in place, because an unverifiable object is not a corrupt one and concurrent deduplicating writers may own it; only a read that SUCCEEDS and disagrees with the address triggers removal. A deduplication hit is verified too when the mode is on, so a pre-existing corrupt object at an address is detected instead of being accepted by the existence check. Covered by `TestAnInconclusiveReadbackDoesNotDeleteAValidObject`, `TestAPostPutReadbackFailureLeavesTheObjectInPlace`, `TestAConfirmedMismatchStillRemovesTheObject` and `TestAVerifyingPutRejectsAnExistingCorruptKey`. Still opt-in: `verify_after_put` is false by default and `verify_max_bytes` can bypass large objects, so WC-GAP-003 is closed for a deployment that enables it, not unconditionally. |
 | Content-origin route boundary | Enforced for the anonymous half — NC-RR-006 / PRG-003 / PRG-004 | With `server.usercontent_addr` set, the content origin gets its own listener. The application listener refuses `/content/*` and answers `/s/{token}/download` and `/s/{token}/thumbnail` with a redirect to the content origin; the content listener serves exactly those three and nothing else, whatever the `Host` header says. The **authenticated** routes that still serve bytes on the application origin (`/api/files/download`, `/api/files/version`, `/api/files/thumbnail`, `/api/shared/{id}/content`, WebDAV `GET`) are a documented, vetted exception rather than a claim of completeness: moving them would hand the content origin session authentication. `internal/server/contentinvariant_test.go` classifies every byte-emitting route and fails when one appears unclassified. `deploy/Caddyfile` refuses `/content/*` on the application vhost, proxies the content vhost to the content port, and strips the upstream request cookie with `header_up -Cookie` — `header { -Cookie }`, which this file previously used, manipulates RESPONSE headers and silently did nothing. |
 | Split-origin share delivery | Implemented — PRG-002 | The landing page and its gate stay on the application origin, because the password and recipient grants are host-only cookies the content host never sees. A gated download is answered with a 302 to the content origin carrying a short-lived (30 min) `share_content` capability minted only after the gate passes, bound to one share id, one child name and one purpose. The capability is inert on any other share or file, cannot be replayed as a cookie, and is re-validated against the share's lifecycle on every request, so revocation takes effect immediately. Covered by `TestAnOpenShareDownloadSurvivesTheOriginSplit`, `TestAPasswordShareDownloadSurvivesTheOriginSplit`, `TestAShareCapabilityIsBoundToItsShareAndFile`, `TestARevokedShareStopsAnOutstandingCapability` and `TestTheShareThumbnailAlsoSurvivesTheOriginSplit`. |

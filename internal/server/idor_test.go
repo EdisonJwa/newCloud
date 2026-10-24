@@ -112,6 +112,18 @@ type idorVictim struct {
 
 	uploadID  string
 	versionID uuid.UUID
+
+	// The social substrate's own ids (core-scope §4, §5, §6): a comment the victim wrote and a tag
+	// the victim defined. Both are id-addressed routes, so both are enumeration surfaces.
+	commentID   uuid.UUID
+	commentBody string
+	tagID       uuid.UUID
+}
+
+// jsonReader encodes a body for a case that needs one.
+func jsonReader(v any) io.Reader {
+	b, _ := json.Marshal(v)
+	return bytes.NewReader(b)
 }
 
 // buildVictim creates a victim account with a file, a share, an app password and an upload
@@ -186,6 +198,28 @@ func buildVictim(t *testing.T, h *harness) *idorVictim {
 		t.Fatalf("victim upload session: %v", err)
 	}
 	v.uploadID = sess.ID
+
+	// A comment the victim wrote on their own file, and a personal tag they defined. Both are
+	// addressed by id like everything else, so the table above must prove the intruder cannot reach
+	// them either.
+	v.commentBody = "victim's private note"
+	if err := h.meta.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+		made, cerr := tx.CreateComment(ctx, store.Comment{
+			NodeID: v.nodeID, AuthorID: v.user.ID, Body: v.commentBody,
+		}, store.CommentLimit{})
+		if cerr != nil {
+			return cerr
+		}
+		v.commentID = made.ID
+		tag, terr := tx.CreateTag(ctx, store.Tag{OwnerID: &v.user.ID, Name: "victim-label"})
+		if terr != nil {
+			return terr
+		}
+		v.tagID = tag.ID
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	return v
 }
@@ -264,6 +298,14 @@ func TestIDORIsRefusedOnEveryRouteThatTakesAnID(t *testing.T) {
 			},
 		},
 
+		{
+			name:   "read another account's upload session status",
+			method: http.MethodGet,
+			path:   func(v *idorVictim) string { return "/api/files/uploads/" + v.uploadID },
+			secrets: func(v *idorVictim) []string {
+				return append(priv, "in-progress.bin")
+			},
+		},
 		{
 			name:   "write a chunk into another account's upload session",
 			method: http.MethodPut,
@@ -375,6 +417,152 @@ func TestIDORIsRefusedOnEveryRouteThatTakesAnID(t *testing.T) {
 				}
 			},
 		},
+
+		// The social substrate (core-scope §4, §5, §6). Every route below takes a node or comment
+		// id, so every one of them is an enumeration surface if the grant check is misplaced.
+		{
+			name:    "star another account's file",
+			method:  http.MethodPut,
+			path:    func(v *idorVictim) string { return "/api/files/favorite?id=" + v.nodeID.String() },
+			secrets: func(v *idorVictim) []string { return priv },
+			stillIntact: func(t *testing.T, h *harness, v *idorVictim) {
+				// The star is the intruder's own row, so the harm is not the victim's data but the
+				// confirmation that the id exists. Assert both: no row was created, and nothing about
+				// the victim's own state changed.
+				var starred bool
+				_ = h.meta.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+					list, lerr := tx.FavoritesAfter(ctx, v.user.ID, "", 50)
+					for _, item := range list {
+						if item.Node.ID == v.nodeID {
+							starred = true
+						}
+					}
+					return lerr
+				})
+				if starred {
+					t.Fatal("the intruder's star landed on the victim's favorite listing")
+				}
+			},
+		},
+		{
+			name:    "tag another account's file",
+			method:  http.MethodPost,
+			path:    func(v *idorVictim) string { return "/api/nodes/" + v.nodeID.String() + "/tags" },
+			body:    func() io.Reader { return jsonReader(map[string]string{"tag_id": uuid.New().String()}) },
+			secrets: func(v *idorVictim) []string { return priv },
+		},
+		{
+			name:    "untag another account's file",
+			method:  http.MethodDelete,
+			path:    func(v *idorVictim) string { return "/api/nodes/" + v.nodeID.String() + "/tags" },
+			body:    func() io.Reader { return jsonReader(map[string]string{"tag_id": uuid.New().String()}) },
+			secrets: func(v *idorVictim) []string { return priv },
+		},
+		{
+			name:    "read another account's discussion thread",
+			method:  http.MethodGet,
+			path:    func(v *idorVictim) string { return "/api/nodes/" + v.nodeID.String() + "/comments" },
+			secrets: func(v *idorVictim) []string { return append(priv, "the secret contents") },
+		},
+		{
+			name:   "post into another account's discussion thread",
+			method: http.MethodPost,
+			path:   func(v *idorVictim) string { return "/api/nodes/" + v.nodeID.String() + "/comments" },
+			body:   func() io.Reader { return jsonReader(map[string]string{"body": "intruder was here"}) },
+			secrets: func(v *idorVictim) []string {
+				return append(priv, "intruder was here")
+			},
+			stillIntact: func(t *testing.T, h *harness, v *idorVictim) {
+				var thread []store.Comment
+				_ = h.meta.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+					got, cerr := tx.CommentsAfter(ctx, v.nodeID, 0, 50)
+					thread = got
+					return cerr
+				})
+				// The victim's own comment is expected; what must not be there is the intruder's.
+				for _, c := range thread {
+					if strings.Contains(c.Body, "intruder was here") {
+						t.Fatal("the intruder posted into the victim's discussion thread")
+					}
+				}
+				if len(thread) != 1 {
+					t.Fatalf("the thread holds %d comment(s), want only the victim's own", len(thread))
+				}
+			},
+		},
+		{
+			name:   "edit another account's comment",
+			method: http.MethodPatch,
+			path:   func(v *idorVictim) string { return "/api/comments/" + v.commentID.String() },
+			body:   func() io.Reader { return jsonReader(map[string]string{"body": "rewritten"}) },
+			secrets: func(v *idorVictim) []string {
+				return append(priv, v.commentBody)
+			},
+			stillIntact: func(t *testing.T, h *harness, v *idorVictim) {
+				var got store.Comment
+				_ = h.meta.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+					c, cerr := tx.CommentByID(ctx, v.commentID)
+					got = c
+					return cerr
+				})
+				if got.Body != v.commentBody {
+					t.Fatalf("the intruder rewrote the victim's comment: %q", got.Body)
+				}
+			},
+		},
+		{
+			name:   "delete another account's comment",
+			method: http.MethodDelete,
+			path:   func(v *idorVictim) string { return "/api/comments/" + v.commentID.String() },
+			secrets: func(v *idorVictim) []string {
+				return append(priv, v.commentBody)
+			},
+			stillIntact: func(t *testing.T, h *harness, v *idorVictim) {
+				var got store.Comment
+				_ = h.meta.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+					c, cerr := tx.CommentByID(ctx, v.commentID)
+					got = c
+					return cerr
+				})
+				if got.Deleted() {
+					t.Fatal("the intruder deleted the victim's comment")
+				}
+			},
+		},
+		{
+			name:    "rename another account's tag",
+			method:  http.MethodPatch,
+			path:    func(v *idorVictim) string { return "/api/tags/" + v.tagID.String() },
+			body:    func() io.Reader { return jsonReader(map[string]string{"name": "hijacked", "color": "red"}) },
+			secrets: func(v *idorVictim) []string { return append(priv, "victim-label") },
+			stillIntact: func(t *testing.T, h *harness, v *idorVictim) {
+				var got store.Tag
+				_ = h.meta.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+					tag, terr := tx.TagByID(ctx, v.tagID)
+					got = tag
+					return terr
+				})
+				if got.Name == "hijacked" {
+					t.Fatal("the intruder renamed another account's tag")
+				}
+			},
+		},
+		{
+			name:   "delete another account's tag",
+			method: http.MethodDelete,
+			path:   func(v *idorVictim) string { return "/api/tags/" + v.tagID.String() },
+			secrets: func(v *idorVictim) []string {
+				return append(priv, "victim-label")
+			},
+			stillIntact: func(t *testing.T, h *harness, v *idorVictim) {
+				if err := h.meta.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+					_, terr := tx.TagByID(ctx, v.tagID)
+					return terr
+				}); err != nil {
+					t.Fatalf("the intruder deleted another account's tag: %v", err)
+				}
+			},
+		},
 	}
 
 	for _, tc := range cases {
@@ -425,6 +613,7 @@ func TestIDORTableCoversEveryIdRoute(t *testing.T) {
 		"DELETE /api/shares/{id}":               true,
 		"PATCH /api/shares/{id}":                true,
 		"DELETE /api/apppasswords/{id}":         true,
+		"GET /api/files/uploads/{id}":           true,
 		"PUT /api/files/uploads/{id}":           true,
 		"POST /api/files/uploads/{id}/complete": true,
 		"DELETE /api/files/uploads/{id}":        true,
@@ -432,6 +621,16 @@ func TestIDORTableCoversEveryIdRoute(t *testing.T) {
 		"POST /api/admin/users/{id}/status":     true,
 		"POST /api/admin/groups/{id}/members":   true,
 		"POST /api/admin/users/{id}/quota":      true,
+		// The social substrate (core-scope §4, §5, §6). Every one of these is id-addressed, so
+		// every one gets a case above rather than an exemption.
+		"POST /api/nodes/{id}/tags":     true,
+		"DELETE /api/nodes/{id}/tags":   true,
+		"GET /api/nodes/{id}/comments":  true,
+		"POST /api/nodes/{id}/comments": true,
+		"PATCH /api/comments/{id}":      true,
+		"DELETE /api/comments/{id}":     true,
+		"PATCH /api/tags/{id}":          true,
+		"DELETE /api/tags/{id}":         true,
 	}
 
 	// Id-addressed routes deliberately not in the table, each with the reason. An exemption has
@@ -450,6 +649,9 @@ func TestIDORTableCoversEveryIdRoute(t *testing.T) {
 			"which checks the admin gate, the 404 for an absent group and the refusal for a non-admin",
 		"DELETE /api/admin/groups/{id}/members/{userID}": "admin-only; the member-add case above " +
 			"proves the gate rejects a non-admin, and the removal runs behind the same check",
+		"DELETE /api/mounts/{id}": "the handler passes the actor to mount.Unmount, which answers " +
+			"ErrNotOwner as 404 for another account's mount; the harness leaves the mount service " +
+			"nil, so a cross-account probe here would test the 503 mounts-disabled path instead",
 	}
 
 	h := newHarness(t)

@@ -17,10 +17,16 @@ import (
 	"github.com/EdisonJwa/newCloud/internal/config"
 )
 
+type uploadRange struct {
+	Start int64 `json:"start"`
+	End   int64 `json:"end"`
+}
+
 type uploadSession struct {
-	ID        string `json:"id"`
-	Offset    int64  `json:"offset"`
-	ChunkSize int64  `json:"chunk_size"`
+	ID        string        `json:"id"`
+	Offset    int64         `json:"offset"`
+	ChunkSize int64         `json:"chunk_size"`
+	Ranges    []uploadRange `json:"ranges"`
 }
 
 func startUpload(t *testing.T, h *harness, dir, name string, size int64) uploadSession {
@@ -95,6 +101,75 @@ func TestResumableUploadRoundTrip(t *testing.T) {
 	}
 }
 
+// TestOutOfOrderChunksAndStatusOverHTTP covers the protocol surface of the parallel feature: a
+// chunk beyond a hole is accepted, the status endpoint reports both the contiguous prefix and the
+// acknowledged ranges, and completion waits for the hole to close.
+func TestOutOfOrderChunksAndStatusOverHTTP(t *testing.T) {
+	h := newHarness(t)
+	session := startUpload(t, h, "", "out-of-order.txt", 12)
+	if len(session.Ranges) != 0 {
+		t.Fatalf("a new session reports ranges %v, want none", session.Ranges)
+	}
+
+	resp, payload := sendChunk(t, h, session.ID, 8, 11, 12, "ijkl")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("out-of-order chunk: %d %v", resp.StatusCode, payload)
+	}
+	if payload["offset"] != float64(0) {
+		t.Fatalf("offset after the out-of-order chunk = %v, want 0 (hole at 0)", payload["offset"])
+	}
+	ranges := payload["ranges"].([]any)
+	if len(ranges) != 1 || ranges[0].(map[string]any)["start"] != float64(8) ||
+		ranges[0].(map[string]any)["end"] != float64(12) {
+		t.Fatalf("ranges after the out-of-order chunk = %v, want [{8,12}]", ranges)
+	}
+
+	// Status is the authoritative half of resume: localStorage cannot know this shape.
+	status := h.do(http.MethodGet, "/api/files/uploads/"+session.ID, nil, nil)
+	defer status.Body.Close()
+	if status.StatusCode != http.StatusOK {
+		t.Fatalf("status: %d %s", status.StatusCode, readBody(status))
+	}
+	var reported uploadSession
+	if err := json.Unmarshal([]byte(readBody(status)), &reported); err != nil {
+		t.Fatalf("decode status: %v", err)
+	}
+	if reported.Offset != 0 || len(reported.Ranges) != 1 ||
+		reported.Ranges[0] != (uploadRange{8, 12}) {
+		t.Fatalf("status = offset %d ranges %v", reported.Offset, reported.Ranges)
+	}
+
+	// The file is still not publishable with a hole.
+	done := h.do(http.MethodPost, "/api/files/uploads/"+session.ID+"/complete", nil, nil)
+	if done.StatusCode != http.StatusConflict {
+		t.Fatalf("complete with a hole: %d, want 409", done.StatusCode)
+	}
+	done.Body.Close()
+
+	if resp, payload := sendChunk(t, h, session.ID, 0, 3, 12, "abcd"); resp.StatusCode != http.StatusOK {
+		t.Fatalf("front chunk: %d %v", resp.StatusCode, payload)
+	} else {
+		resp.Body.Close()
+	}
+	resp, payload = sendChunk(t, h, session.ID, 4, 7, 12, "efgh")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || payload["offset"] != float64(12) {
+		t.Fatalf("middle chunk: %d %v, want offset 12", resp.StatusCode, payload)
+	}
+
+	done = h.do(http.MethodPost, "/api/files/uploads/"+session.ID+"/complete", nil, nil)
+	if done.StatusCode != http.StatusCreated {
+		t.Fatalf("complete: %d %s", done.StatusCode, readBody(done))
+	}
+	done.Body.Close()
+	get := h.do(http.MethodGet, "/api/files/download?path=out-of-order.txt", nil, nil)
+	defer get.Body.Close()
+	if body := readBody(get); body != "abcdefghijkl" {
+		t.Fatalf("content = %q, want abcdefghijkl", body)
+	}
+}
+
 // TestChunkWithWrongOffsetReturnsTheRealOffset is what makes resume possible: the client is
 // told where to continue instead of having to restart.
 func TestChunkWithWrongOffsetReturnsTheRealOffset(t *testing.T) {
@@ -137,9 +212,16 @@ func TestCompleteRejectsIncompleteUpload(t *testing.T) {
 	resp.Body.Close()
 
 	done := h.do(http.MethodPost, "/api/files/uploads/"+session.ID+"/complete", nil, nil)
-	defer done.Body.Close()
 	if done.StatusCode != http.StatusConflict {
+		done.Body.Close()
 		t.Fatalf("want 409 for an incomplete upload, got %d", done.StatusCode)
+	}
+	payload := decode(t, done)
+	if payload["error"] != "offset_mismatch" {
+		t.Fatalf("complete conflict code = %v, want offset_mismatch", payload["error"])
+	}
+	if payload["offset"] != float64(4) {
+		t.Fatalf("complete conflict offset = %v, want 4", payload["offset"])
 	}
 
 	// Nothing may exist under the destination name.

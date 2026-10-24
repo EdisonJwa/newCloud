@@ -105,6 +105,12 @@ func (w *Worker) registerJobs() {
 				if derr == store.ErrNotFound {
 					return nil // already gone, or still referenced: nothing to do
 				}
+				if errors.Is(derr, store.ErrNotImplemented) {
+					// The in-memory backend does not model blob rows — it keeps only a
+					// hash→id map — so there is nothing to collect by construction.
+					// Production is PostgreSQL, where the guarded delete is real.
+					return nil
+				}
 				return derr
 			})
 		},
@@ -140,6 +146,10 @@ func (w *Worker) registerJobs() {
 			})
 		},
 	}
+	// The content-search index job (core-scope §7.2). Registered in its own function because the
+	// handler reads a node, its tags and optionally its bytes — a different dependency set from
+	// everything above, and the one place a nil engine is a legitimate answer rather than a fault.
+	w.registerSearchJobs()
 }
 
 // ProcessJobs runs one claim/execute/finish round.

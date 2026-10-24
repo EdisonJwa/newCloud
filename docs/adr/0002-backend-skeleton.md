@@ -337,13 +337,14 @@ func (h *Handler) resolve(ctx context.Context, a authz.Actor, urlPath string) (a
 The shipped resumable-upload protocol is recorded in [ADR-0008](0008-resumable-uploads.md):
 
 ```text
-POST   /api/files/uploads                -> {id, offset, chunk_size}
+POST   /api/files/uploads                -> {id, offset, chunk_size, ranges}
+GET    /api/files/uploads/{id}           -> {id, offset, chunk_size, ranges}
 PUT    /api/files/uploads/{id}           Content-Range: bytes a-b/total
 POST   /api/files/uploads/{id}/complete
 DELETE /api/files/uploads/{id}
 ```
 
-The server owns the offset; a mismatch returns `409` with the true offset, and a failed chunk truncates the staging file back to the previous offset. Sessions are process-local and do not survive a restart. tus and S3 multipart were evaluated and deliberately not used: both are complete protocols whose state machines exceed the capability needed here.
+The server owns the acknowledged range set. Chunks may arrive in parallel or out of order; an overlap returns `409` with the true contiguous offset and range set, and failed network chunks are simply not acknowledged. Sessions are durable in the staging directory and survive a crash or graceful restart. tus and S3 multipart were evaluated and deliberately not used: both are complete protocols whose state machines exceed the capability needed here.
 
 ---
 

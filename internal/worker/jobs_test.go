@@ -356,6 +356,19 @@ func TestEveryJobKindIsIdempotent(t *testing.T) {
 				return drainQueue(t, m)
 			},
 		},
+		"search.index": {
+			job: func(t *testing.T, m *store.Memory) store.Job {
+				// A node id that does not exist. The handler reads the row rather than trusting the
+				// payload, so a missing row means "delete it from the index" — and running that
+				// twice must be the same as running it once, which is what the second pass below
+				// checks.
+				return store.Job{Kind: "search.index",
+					Payload: map[string]any{"node_id": uuid.New().String()}, MaxAttempts: 2}
+			},
+			after: func(t *testing.T, m *store.Memory, first, second int) error {
+				return drainQueue(t, m)
+			},
+		},
 	}
 
 	kinds := NewForTest().JobKinds()

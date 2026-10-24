@@ -47,11 +47,12 @@ who did what.**
 | **Authentication** | OIDC authorization code flow with PKCE, `state`, and `nonce`; group-to-role mapping; JIT provisioning (`open`, `pending`, `deny`) with a domain allowlist; break-glass local admin restricted by CIDR, with alerts on use |
 | **Accounts and quotas** | Per-account namespace, per-account quota, admin user management, account disable/delete with an auditable tombstone |
 | **Files** | Web UI with list and grid views, search, drag-and-drop upload, resumable chunked uploads, rename, bulk delete, trash, and version history |
-| **WebDAV** | `PROPFIND`, `PROPPATCH`, `PUT`, `DELETE`, `MKCOL`, `COPY`, `MOVE`, `LOCK`, `UNLOCK`, Range, ETags, conditional writes evaluated before the write, and lock checks shared with the JSON API (exclusive locks; `copy`/`move` fencing is still open) |
+| **WebDAV** | `PROPFIND`, `PROPPATCH`, `PUT`, `DELETE`, `MKCOL`, `COPY`, `MOVE`, `LOCK`, `UNLOCK`, Range, ETags, conditional writes evaluated before the write, and lock checks shared with the JSON API (exclusive locks; `copy`/`move` fencing is still open); the official Nextcloud desktop and mobile clients connect and sync through `status.php`, OCS capabilities/user, login flow v2, and the `/remote.php/dav/files/<user>/` path shape |
 | **Sharing** | Link shares with password, expiry, and download limits; email shares with one-time recipient codes; drop-box links; stable links across rename and move |
 | **Previews** | Images, video, audio, PDF, text, and source code in the browser; a type allowlist plus content sniffing; SVG and HTML are never rendered inline; server-side thumbnails with pixel, concurrency, and decode-time limits |
 | **Audit** | Hash-chained event log, external daily anchors, `audit verify`, CSV/JSON export, INSERT-only database role, fail-closed policy |
 | **Storage** | Content-addressed `blob` layout with deduplication or filesystem-mirroring `tree` layout; local disk or S3-compatible object storage; orphan GC, version retention, and periodic integrity scrubbing |
+| **External mounts** | WebDAV, FTP and SFTP remotes mounted as top-level folders and browsed in place — no copy, no sync ([ADR-0014](docs/adr/0014-external-mounts.md)); ordinary ACL grants on the mount point govern who sees them |
 | **Operations** | Single static binary, `/healthz`, `/readyz`, `/metrics`, 20 Prometheus alert rules, a complete runbook, backup scripts, an automated restore drill, and a `newcloud drill` subcommand |
 
 ## Architecture
@@ -169,6 +170,7 @@ capacity planning: [docs/guides/deployment.md](docs/guides/deployment.md).
 | [Deployment](docs/guides/deployment.md) | Production topology and first boot |
 | [Operations](docs/guides/operations.md) | Health, metrics, alerts, backups, audit, key rotation |
 | [Architecture](docs/reference/architecture.md) | How the process, metadata, storage, and audit fit together |
+| [Nextcloud clients](docs/guides/nextcloud-clients.md) | Connecting the official desktop and mobile clients, and what they cannot do |
 | [Limitations](docs/guides/limitations.md) | What is deliberately not implemented, and why |
 
 Design decisions are recorded as ADRs in [docs/adr/](docs/adr/):
@@ -181,6 +183,7 @@ Design decisions are recorded as ADRs in [docs/adr/](docs/adr/):
 - [ADR-0008: Resumable chunked uploads](docs/adr/0008-resumable-uploads.md)
 - [ADR-0012: Cursor pagination contract](docs/adr/0012-cursor-contract.md)
 - [ADR-0013: File-operation consistency](docs/adr/0013-file-operation-consistency.md) (Accepted)
+- [ADR-0015: Nextcloud client compatibility](docs/adr/0015-nextcloud-client-compatibility.md)
 
 The evidence behind the claims in this README — the tests, the manual verification, and the
 remaining gaps — is in [docs/reference/implementation-record.md](docs/reference/implementation-record.md).
@@ -249,6 +252,10 @@ every feature in the requirements document exists. Notable gaps:
 - **`REPORT` and `sync-collection` are not implemented.** Clients receive an explicit `501`, not
   an empty result. Shared locks are absent too, and a `LOCK` asking for one is refused with `403`
   plus a `supportedlock` body rather than silently downgraded to exclusive.
+- **Nextcloud client support is a protocol subset.** The official desktop and mobile clients can sign
+  in and sync, but Nextcloud's chunked uploads and `REPORT` are refused through the capabilities
+  document, so a file is uploaded in one request (bounded by `limits.max_file_bytes`) and sync walks
+  the tree with PROPFIND. See [docs/guides/nextcloud-clients.md](docs/guides/nextcloud-clients.md).
 - **S3 is tested against an in-process fake and a moto server, not real object storage.** The
   backend logic is covered, including multipart behavior and fault injection, but interoperability
   with AWS S3, MinIO, Ceph, and R2 has not been exercised against those services.
