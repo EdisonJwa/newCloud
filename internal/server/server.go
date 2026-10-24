@@ -243,6 +243,12 @@ func (s *Server) Handler() http.Handler {
 				r.Get("/{id}/children", s.handleNodeChildren)
 			})
 
+			// Group spaces: a folder that belongs to a group rather than to a person.
+			r.Route("/spaces", func(r chi.Router) {
+				r.Get("/", s.handleSpacesList)
+				r.Post("/", s.handleSpaceCreate)
+			})
+
 			r.Route("/files", func(r chi.Router) {
 				r.Get("/", s.handleList)
 				r.Get("/recent", s.handleRecent)
