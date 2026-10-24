@@ -96,24 +96,30 @@ func Retire(ctx context.Context, d Deps, n store.Node, parentRel string, trash T
 		}
 		return trash(ctx, tx, moved)
 	}); terr != nil {
-		if errors.Is(terr, store.ErrPrecondition) {
-			// A writer changed this file while its content was being moved, so the delete refused.
-			// Its bytes are at the live path now and they are the ones that matter; moving the
-			// retired bytes back would overwrite exactly the write that was just protected. The
-			// superseded content stays at the reserved name, where it is not addressable.
-			d.Log.Warn("swap: delete refused because the file changed mid-retirement; the "+
-				"superseded content is left at the reserved name and the caller must retry",
+		// The content has already moved but the namespace did not change, so the question that
+		// decides the repair is: is the live path occupied right now?
+		//
+		//   - Empty: the bytes we moved were the only copy, so they go back. This is the ordinary
+		//     failure (a refused trash cap, an audit write that could not commit).
+		//   - Occupied: a writer committed after our move, so what sits there is its content and
+		//     the copy we moved is superseded. Putting ours back would overwrite exactly the write
+		//     that a concurrent request returned success for.
+		//
+		// This is a cheap check and the right one: the alternative was comparing content hashes,
+		// which costs a full read of the file to answer a question the filesystem already knows.
+		live := layout.Node{Owner: n.OwnerID.String(), Path: fromRel, IsDir: n.IsDir()}
+		if _, statErr := d.Content.Stat(ctx, live); errors.Is(statErr, layout.ErrNotFound) {
+			if mvErr := d.Content.Move(ctx,
+				layout.Node{Owner: n.OwnerID.String(), Path: toRel, IsDir: n.IsDir()},
+				live); mvErr != nil {
+				d.Log.Error("swap: the delete failed and its content could not be put back; the "+
+					"bytes are at the reserved name and the row still names the original",
+					"node", n.ID.String(), "reserved", reserved, "error", mvErr)
+			}
+		} else {
+			d.Log.Warn("swap: delete refused while a writer held the live path; the superseded "+
+				"content is left at the reserved name and the caller must retry",
 				"node", n.ID.String(), "reserved", reserved)
-			return terr
-		}
-		// Any other refusal happened before the transaction changed anything, so the content goes
-		// back where the user left it.
-		if mvErr := d.Content.Move(ctx,
-			layout.Node{Owner: n.OwnerID.String(), Path: toRel, IsDir: n.IsDir()},
-			layout.Node{Owner: n.OwnerID.String(), Path: fromRel, IsDir: n.IsDir()}); mvErr != nil {
-			d.Log.Error("swap: the delete failed and its content could not be put back; the bytes "+
-				"are at the reserved name and the row still names the original",
-				"node", n.ID.String(), "reserved", reserved, "error", mvErr)
 		}
 		return terr
 	}
