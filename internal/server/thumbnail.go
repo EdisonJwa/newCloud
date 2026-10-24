@@ -238,5 +238,8 @@ func (s *Server) nodeForThumbnail(r *http.Request, actor authz.Actor, rel string
 	if err != nil {
 		return store.Node{}, "", err
 	}
-	return nodes[len(nodes)-1], rel, nil
+	// The listing hands the grid "/dir/photo.png", and the tree layout refuses an absolute content
+	// path outright. Rebuilding the path from the resolved chain keeps the grid's previews working on
+	// both layouts without loosening what the store accepts.
+	return nodes[len(nodes)-1], relOfChain(nodes), nil
 }

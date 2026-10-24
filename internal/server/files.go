@@ -419,13 +419,15 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	parent, _, err := s.writableParent(r.Context(), actor, dirRel, authz.PermCreate)
+	parent, parentChain, err := s.writableParent(r.Context(), actor, dirRel, authz.PermCreate)
 	if err != nil {
 		s.writeStoreError(w, err)
 		return
 	}
 
-	rel := path.Join(dirRel, name)
+	// The destination directory's content path comes from the resolved chain, so a caller that sends
+	// the listing's own "/docs" writes into "docs" on a path-backed layout instead of being refused.
+	rel := path.Join(relOfChain(parentChain), name)
 
 	// One resolution, used for both the membership and the overwrite decision. Asking twice also
 	// meant asking wrongly: existingFile reports "no such file" for a new name, so a guard written
@@ -543,6 +545,12 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The content path is derived from the node the caller was authorized for, not from the query
+	// string: the file manager sends back "/docs/a.txt" (the form the listing renders) and a
+	// path-backed store refuses an absolute path outright. Inline preview and media playback are
+	// this same handler, so both are covered.
+	rel = relOfChain(nodes)
+
 	rc, err := s.deps.Content.Open(r.Context(), layout.Node{
 		Owner: actor.ID().String(), Path: rel,
 	})
@@ -649,6 +657,12 @@ func (s *Server) handleRename(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Both paths are content paths, built from the resolved identity: the caller sent the listing's
+	// "/docs/a.txt", which a path-backed store would refuse as absolute.
+	fromRel := relOfChain(nodes)
+	parentRel, _ := splitParent(fromRel)
+	toRel := path.Join(parentRel, body.Name)
+
 	cap, err := s.deps.Authz.Authorize(actor, node.ID)
 	if err != nil {
 		s.writeStoreError(w, err)
@@ -685,16 +699,14 @@ func (s *Server) handleRename(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	parentRel, _ := splitParent(body.Path)
 	// The tree layout mirrors names on disk; blob layout treats this as metadata.
 	//
 	// The error used to be discarded, which is the same defect the WebDAV MOVE had: metadata
 	// committed, bytes stayed where they were, and the client was told the rename succeeded. The
 	// metadata is put back if the bytes cannot follow, so the two never disagree silently.
-	if merr := s.moveContentByPath(r.Context(), actor.ID().String(), body.Path,
-		path.Join(parentRel, body.Name), node.IsDir()); merr != nil {
+	if merr := s.moveContentByPath(r.Context(), actor.ID().String(), fromRel, toRel, node.IsDir()); merr != nil {
 		s.deps.Log.Error("rename: content move failed; restoring metadata",
-			"from", body.Path, "to", body.Name, "error", merr)
+			"from", fromRel, "to", toRel, "error", merr)
 		if cerr := s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
 			_, rerr := tx.Rename(ctx, node.ID, node.Name)
 			return rerr
@@ -706,10 +718,14 @@ func (s *Server) handleRename(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, toFileJSON(renamed, path.Join(parentRel, body.Name)))
+	writeJSON(w, http.StatusOK, toFileJSON(renamed, toRel))
 }
 
 // handleMove reparents a file or directory.
+//
+// The semantics live in moveOne, which the batch endpoint shares: one implementation, so a
+// multi-file move and a single-file move cannot end up with different authorization or a different
+// compensation path.
 func (s *Server) handleMove(w http.ResponseWriter, r *http.Request) {
 	actor, _ := actorFrom(r.Context())
 

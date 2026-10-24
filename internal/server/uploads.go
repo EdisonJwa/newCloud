@@ -67,9 +67,14 @@ func (s *Server) handleUploadCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, _, err := s.writableParent(r.Context(), actor, body.Path, authz.PermCreate); err != nil {
+	if _, chain, err := s.writableParent(r.Context(), actor, body.Path, authz.PermCreate); err != nil {
 		s.writeStoreError(w, err)
 		return
+	} else {
+		// The session carries the directory as a CONTENT path. The caller sends the listing's
+		// "/docs", which a path-backed store refuses; canonicalising it once here means the chunks'
+		// eventual Put (and the finish step, hours later) cannot disagree about the spelling.
+		body.Path = relOfChain(chain)
 	}
 
 	// The staging cap is applied here, from the effective setting, rather than baked into the manager
@@ -187,13 +192,13 @@ func (s *Server) handleUploadComplete(w http.ResponseWriter, r *http.Request) {
 	}
 	defer cleanup()
 
-	parent, _, err := s.writableParent(r.Context(), actor, sess.Dir, authz.PermCreate)
+	parent, chain, err := s.writableParent(r.Context(), actor, sess.Dir, authz.PermCreate)
 	if err != nil {
 		s.writeStoreError(w, err)
 		return
 	}
 
-	rel := path.Join(sess.Dir, sess.Name)
+	rel := path.Join(relOfChain(chain), sess.Name)
 	res, err := s.deps.Content.Put(r.Context(), nodeFor(actor, rel), file, sess.Total)
 	if err != nil {
 		s.writeStoreError(w, err)
