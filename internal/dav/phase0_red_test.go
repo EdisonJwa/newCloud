@@ -17,10 +17,8 @@ package dav
 import (
 	"context"
 	"errors"
-	"io"
 	"net/http"
 	"strings"
-	"sync/atomic"
 	"testing"
 
 	"github.com/EdisonJwa/newCloud/internal/storage/layout"
@@ -53,24 +51,6 @@ func TestPhase0TreePutStaleIfMatchKeepsOldBytes(t *testing.T) {
 	}
 }
 
-// phase0InterleavingPut runs a competing request immediately before the COPY
-// delegates a file Put, so the winner's bytes are already committed at the
-// final path when the COPY overwrites them.
-type phase0InterleavingPut struct {
-	layout.ContentStore
-	armed  atomic.Bool
-	fired  atomic.Bool
-	target string
-	run    func()
-}
-
-func (c *phase0InterleavingPut) Put(ctx context.Context, n layout.Node, r io.Reader, size int64) (layout.PutResult, error) {
-	if c.armed.Load() && n.Path == c.target && !n.IsDir && c.fired.CompareAndSwap(false, true) {
-		c.run()
-	}
-	return c.ContentStore.Put(ctx, n, r, size)
-}
-
 // TestPhase0TreeCopyDoesNotOverwriteConcurrentPutBytes reproduces P0-TREE-COPY-001:
 // COPY writes the source bytes to the final path before its metadata insert, so a
 // concurrent PUT that already returned 2xx is overwritten by the losing COPY.
@@ -84,18 +64,18 @@ func TestPhase0TreeCopyDoesNotOverwriteConcurrentPutBytes(t *testing.T) {
 	// path, where copyNode writes the final path before CreateFile. A pre-existing
 	// destination would take the staged overwrite path instead.
 
-	inter := &phase0InterleavingPut{ContentStore: e.h.content, target: "dst.txt"}
+	inter := &interleavingPut{ContentStore: e.h.content, target: "dst.txt"}
 	var bCode int
 	inter.run = func() {
 		rec := e.do(t, http.MethodPut, e.davPath("dst.txt"), strings.NewReader("B WINS"), nil)
 		bCode = rec.Code
 	}
 	e.h.content = inter
-	inter.armed.Store(true)
+	inter.armed = true
 
 	rec := e.do(t, "COPY", e.davPath("src.txt"), nil,
 		map[string]string{"Destination": e.davPath("dst.txt")})
-	if !inter.fired.Load() {
+	if !inter.fired {
 		t.Fatal("the concurrent PUT was never injected; the test would prove nothing")
 	}
 	if bCode != http.StatusCreated && bCode != http.StatusNoContent {

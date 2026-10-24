@@ -668,7 +668,33 @@ func (h *Handler) copyNode(ctx context.Context, a authz.Actor, src store.Node, p
 	}
 	defer rc.Close()
 
-	res, err := h.content.Put(ctx, layout.Node{Owner: a.ID().String(), Path: dstRel}, rc, src.Size)
+	owner := a.ID().String()
+	finalNode := layout.Node{Owner: owner, Path: dstRel, IsDir: false}
+
+	// Where the content address IS the path (the tree layout), the copy must not publish its
+	// bytes at the destination before the metadata row is ours.
+	//
+	// The old order wrote dstRel first and created the row second, so a concurrent PUT that
+	// had already returned 201/204 for that name had its bytes replaced by a copy that then
+	// failed to publish — the winner's success was revoked with no error addressed to it
+	// (2026-10-24 review, C3; internal/dav/phase0_red_test.go still pins it).
+	//
+	// The blob layout needs no staging: its path is a metadata mapping and its bytes are
+	// content-addressed, so a losing copy leaves an orphan blob at worst and can never
+	// displace what the winner serves.
+	pathsFollowContent := !h.content.Capabilities().EfficientRename
+	writeNode := finalNode
+	var stageNode layout.Node
+	if pathsFollowContent {
+		stageNode = layout.Node{
+			Owner: owner,
+			Path:  path.Join(path.Dir(dstRel), swap.StagedName(dstName)),
+			IsDir: false,
+		}
+		writeNode = stageNode
+	}
+
+	res, err := h.content.Put(ctx, writeNode, rc, src.Size)
 	if err != nil {
 		return err
 	}
@@ -698,7 +724,33 @@ func (h *Handler) copyNode(ctx context.Context, a authz.Actor, src store.Node, p
 			ETag: made.ETag, Size: made.Size, ModifiedAt: made.ModifiedAt,
 		})
 	}
-	return err
+	if err != nil {
+		if pathsFollowContent {
+			// Nothing was published, so the staged bytes are ours to remove. Best effort:
+			// the reserved name is invisible to listings, and the sweep collects it.
+			_ = h.content.Delete(ctx, stageNode)
+		}
+		return err
+	}
+	if !pathsFollowContent {
+		return nil
+	}
+
+	// The row is ours, so the bytes may take the name.
+	if mvErr := h.content.Move(ctx, stageNode, finalNode); mvErr != nil {
+		_ = h.content.Delete(ctx, stageNode)
+		// The row is live and its bytes are not where it says. Trashing it is the honest
+		// compensation: the node appears in the bin rather than as a file that answers 500
+		// forever, and a failed compensation is logged rather than silently swallowed.
+		if terr := h.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+			return tx.Trash(ctx, made.ID)
+		}); terr != nil {
+			h.logf("copy: metadata committed but the bytes could not be installed, and the "+
+				"compensation failed; node=%s path=%q err=%v", made.ID, dstRel, terr)
+		}
+		return mvErr
+	}
+	return nil
 }
 
 // copyResolved recreates one directory and, recursively, everything under it from an already

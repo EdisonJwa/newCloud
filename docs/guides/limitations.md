@@ -194,16 +194,18 @@ tests that fail without the fix; the row says what changed, not just that someth
 | `docker compose up -d` SIGKILLed in-flight uploads after 10 s while the server drains for 30 s. | `stop_grace_period: 45s`. |
 | The backup manifest recorded the literal `restic:latest`, the dump was only checked for a readable TOC, and nothing alerted on a stale backup. | The manifest records the real snapshot id (which survives `forget --prune`), the dump must contain the application's tables, and `newcloud_backup_last_success_timestamp_seconds` drives a stale-backup alert (opt in with `BACKUP_METRICS_FILE`). |
 | A lock on a collection did not fence anything: COPY could add a member to a Depth: 0-locked folder, MOVE could remove one, and DELETE of a folder returned 204 with a locked file inside it. A failed COPY's rollback also trashed a file that had been locked and reported as success. | COPY/MOVE consult the destination's collection (Depth: 0 for a new member, Depth: infinity for an existing one), MOVE also consults the source's, and DELETE checks every live lock in the subtree with one recursive query (`LocksInSubtree`). A holder proceeds by submitting its token; everyone else gets `423`. The rollback skips a node that gained a live lock, the same way it already skipped one that gained a dead property. |
+| A COPY to a new name published its bytes at the destination **before** creating the metadata row, so a concurrent `PUT` that won that name had its bytes replaced by a copy that then failed to publish — the winner's success revoked with no error addressed to it. | Where the content address is the path (the `tree` layout) the copy stages beside the destination and installs the bytes only after the row commits; a lost race removes the stage and reports a failure, and a publish that fails after the commit trashes the row rather than leaving a file that answers 500 forever. The `blob` layout writes directly, because there the path is a metadata mapping and a losing copy can only leave an orphan blob. |
 | A full `go test ./...` with `TEST_DATABASE_URL` set was racy: the PostgreSQL suites share one database and reset its schemas, so parallel packages dropped each other's tables. | CI and the Makefile run `-p 1`. |
 
 Two things this table does **not** claim: the ADR-0013 staging machinery is still not wired into the
 DAV request path (COPY/MOVE/`tree`-layout crash windows remain as described above), and no real desktop
 WebDAV client has been run against this build.
 
-One consequence is worth naming because it is a real race rather than a crash window: a **COPY to a new
-name writes its bytes to the destination path before creating the metadata row**, so a concurrent `PUT`
-that wins the name can have its bytes replaced by the copy that then fails to publish. The overwrite path
-already stages, and the create path should use the same primitive; until it does,
+One consequence is worth naming because it is a real race rather than a crash window: a **DELETE is not
+yet fenced against a concurrent writer**. The handler resolves the node, then trashes it by id in a later
+transaction; a `PUT` that updated that row in between is trashed with it, and the writer's success
+disappears. The fix is a precondition on the trash statement itself (the shape `UpdateFile.Expect`
+already has), which is an interface change still to be made;
 `internal/dav/phase0_red_test.go` keeps the reproduction.
 
 ## Where the evidence lives
