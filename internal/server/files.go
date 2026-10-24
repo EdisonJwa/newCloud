@@ -924,10 +924,60 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 		s.writeStoreError(w, err)
 		return
 	}
+
+	// A node displaced by a MOVE overwrite is trashed as "<rand>.newcloud-replaced-<name>", and
+	// tx.Restore brings it back with that name. Handing the user a name they never chose is bad
+	// on its own, and it also blocks the fix for those reserved names being addressable: that
+	// fix is only safe once restore stops producing them.
+	//
+	// The rename has to move the bytes with the metadata. On the tree layout the content path is
+	// derived from parent and name, so a metadata-only rename leaves the bytes behind — which is
+	// what swap.Relocate is for, and it is the same primitive the rename route uses.
+	//
+	// The restore commits first and the relocation second, on purpose: if the relocation fails
+	// the node is live under the reserved name, which is no worse than before this change and is
+	// still recoverable, and the caller gets the error instead of a 200 with a useless name.
+	if restored.ParentID != nil && strings.Contains(restored.Name, ".newcloud-") {
+		moved, merr := s.restoreArtifactName(r, restored)
+		if merr != nil {
+			s.writeStoreError(w, merr)
+			return
+		}
+		restored = moved
+	}
+
 	writeJSON(w, http.StatusOK, toFileJSON(restored, restored.Name))
 }
 
-// handleVersions lists a file's history.
+// restoreArtifactName recovers a usable name for a node restored out of a swap's trash row.
+func (s *Server) restoreArtifactName(r *http.Request, n store.Node) (store.Node, error) {
+	ctx := r.Context()
+	fromRel, err := s.pathOfNode(ctx, n.OwnerID, n.ID)
+	if err != nil {
+		return store.Node{}, err
+	}
+	parentRel, err := s.pathOfNode(ctx, n.OwnerID, *n.ParentID)
+	if err != nil {
+		return store.Node{}, err
+	}
+	target := s.uniqueName(ctx, *n.ParentID, artifactName(n.Name))
+	return s.relocate(ctx, n, fromRel, *n.ParentID, target, path.Join(parentRel, target), nil)
+}
+
+// artifactName strips the reserved marker a swap prefixes onto a sibling name.
+//
+// "<rand>.newcloud-replaced-budget.xlsx" is not a name anybody chose; "budget.xlsx" is the name
+// the file had before it was overwritten.
+func artifactName(name string) string {
+	for _, marker := range []string{".newcloud-replaced-", ".newcloud-staged-"} {
+		if i := strings.Index(name, marker); i >= 0 {
+			if rest := name[i+len(marker):]; rest != "" {
+				return rest
+			}
+		}
+	}
+	return "restored"
+}
 func (s *Server) handleVersions(w http.ResponseWriter, r *http.Request) {
 	actor, _ := actorFrom(r.Context())
 	rel := r.URL.Query().Get("path")
