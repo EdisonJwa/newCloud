@@ -234,6 +234,15 @@ func (s *Server) Handler() http.Handler {
 		r.Group(func(r chi.Router) {
 			r.Use(s.requireSession)
 
+			// Browsing by id rather than by path. A path only names the caller's own tree, so
+			// anything reachable through a grant (a folder shared with a group, a group space) is
+			// unaddressable without this. Authorization is by node, through the same Authorize
+			// used by every other route.
+			r.Route("/nodes", func(r chi.Router) {
+				r.Get("/{id}", s.handleNodeMeta)
+				r.Get("/{id}/children", s.handleNodeChildren)
+			})
+
 			r.Route("/files", func(r chi.Router) {
 				r.Get("/", s.handleList)
 				r.Get("/recent", s.handleRecent)

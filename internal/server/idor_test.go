@@ -441,6 +441,11 @@ func TestIDORTableCoversEveryIdRoute(t *testing.T) {
 		"DELETE /api/admin/users/{id}": "admin-only; the non-admin listing and status cases " +
 			"prove the gate rejects a non-admin, and a second case would test the same gate",
 		"DELETE /api/acl/{id}": "covered by TestACLRevokeRejectsForeignGrant",
+		"GET /api/nodes/{id}": "covered by TestANodeBelongingToSomeoneElseLooksAbsent in " +
+			"nodes_test.go, which checks the same thing for both node routes: a caller with no grant " +
+			"gets the same 404 as for an id that does not exist",
+		"GET /api/nodes/{id}/children": "covered by the same test as GET /api/nodes/{id}; the " +
+			"listing goes through the identical Authorize check before it reads a child",
 		"DELETE /api/admin/groups/{id}/members/{userID}": "admin-only; the member-add case above " +
 			"proves the gate rejects a non-admin, and the removal runs behind the same check",
 	}
