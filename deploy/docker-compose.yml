@@ -34,7 +34,17 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
+      args:
+        # Stamped into the binary so `newcloud --version` names the build. Compose
+        # interpolates it from the environment; unset yields "dev", which is honest
+        # rather than wrong.
+        VERSION: ${NEWCLOUD_VERSION:-dev}
     restart: unless-stopped
+    # Docker's default stop timeout is 10s while the server drains for 30s, so every
+    # `docker compose up -d` SIGKILLed in-flight uploads and skipped the worker's lease
+    # release — the exact failure the graceful-shutdown code exists to prevent
+    # (2026-10-24 review, M13). A longer grace period only applies if it is set here.
+    stop_grace_period: 45s
     environment:
       NEWCLOUD_CONFIG: /etc/newcloud/config.yml
       # The application connects as newcloud_app, NOT as the owner.

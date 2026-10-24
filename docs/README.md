@@ -32,8 +32,9 @@ document was written.
 | [ADR-0013 implementation record](reference/adr-0013-implementation-record.md) | Phase 0 regression evidence and Phase 1 consistency-foundation status |
 | [Interface design](reference/interface-design.md) | The Atlas direction: layout, tokens, components, and interaction rules |
 | [Interface redesign: Atrium](reference/interface-atrium.md) | Why the first two directions failed, and the structure that replaced them |
-| [Browser-only failures](reference/browser-only-failures.md) | Two defects that only appeared in a real browser, and the guards added afterward |
 | [Cirrus 9.1 integration plan](reference/cirrus-9.1-integration-plan.md) | Freeze record, gap matrix, API/database changes, and phased plan for adopting the approved Cirrus 9.1 design |
+| [Browser-only failures](reference/browser-only-failures.md) | Two defects that only appeared in a real browser, and the guards added afterward |
+| [Full review and competitive assessment, 2026-10-24](reference/review-2026-10-24.md) | An independent review of the current tree: verified state, defect register, and how the product compares with Nextcloud, ownCloud/OpenCloud, Seafile, SFTPGo and the single-binary field |
 
 ## Decision records
 

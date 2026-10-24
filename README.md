@@ -22,13 +22,19 @@ who did what.**
 
 - **OIDC is the front door.** Pocket ID and any compliant OpenID Connect provider work. Roles come
   from IdP groups. WebDAV and scripts use scoped App Passwords, never browser cookies.
-- **WebDAV that behaves like a filesystem.** RFC 4918 class 2, real locks enforced on every write
-  path, `If-Match` / `If-None-Match` arbitration shared with the web UI, Range requests, recursive
-  COPY, and correct `Depth` semantics.
+- **WebDAV that behaves like a filesystem.** RFC 4918 class 1 in practice, with a class-2 lock
+  register: `Lock`/`Unlock` are implemented and every write path consults them, but `Lock` is
+  exclusive-only, `supportedlock`/`lockdiscovery` are still to come, and `COPY`/`MOVE`/`DELETE` do
+  not yet fence correctly against a concurrent lock holder. Conditional writes are decided before
+  any byte is written and re-checked inside the statement that changes the row; Range requests,
+  recursive COPY and `Depth` semantics are implemented. See
+  [limitations](docs/guides/limitations.md) for the current lock and `REPORT` gaps.
 - **Sharing with an exit.** Password-protected links, expiry, download caps, email shares with a
   single-use code, and drop-box links that accept uploads into a chosen folder.
 - **An audit log that verifies offline.** Events are hash-chained. `newcloud audit verify` detects
-  edits and mid-chain rewrites, and daily anchors make deletion of the newest events visible.
+  edits and mid-chain rewrites, and daily anchors make deletion of the newest events visible. The
+  chain's length and head age are published as metrics, so a stalled audit path is an alert rather
+  than something noticed at an audit.
 - **Storage that fits the deployment.** Content-addressed `blob` layout for deduplication, or a
   `tree` layout that mirrors the user-visible filesystem. Local disk or S3.
 - **Honest failure modes.** Denials are `404`, not `403`. Audited writes fail closed. A write
@@ -41,12 +47,12 @@ who did what.**
 | **Authentication** | OIDC authorization code flow with PKCE, `state`, and `nonce`; group-to-role mapping; JIT provisioning (`open`, `pending`, `deny`) with a domain allowlist; break-glass local admin restricted by CIDR, with alerts on use |
 | **Accounts and quotas** | Per-account namespace, per-account quota, admin user management, account disable/delete with an auditable tombstone |
 | **Files** | Web UI with list and grid views, search, drag-and-drop upload, resumable chunked uploads, rename, bulk delete, trash, and version history |
-| **WebDAV** | `PROPFIND`, `PROPPATCH`, `PUT`, `DELETE`, `MKCOL`, `COPY`, `MOVE`, `LOCK`, `UNLOCK`, Range, ETags, conditional writes, and lock enforcement shared with the JSON API |
+| **WebDAV** | `PROPFIND`, `PROPPATCH`, `PUT`, `DELETE`, `MKCOL`, `COPY`, `MOVE`, `LOCK`, `UNLOCK`, Range, ETags, conditional writes evaluated before the write, and lock checks shared with the JSON API (exclusive locks; `copy`/`move` fencing is still open) |
 | **Sharing** | Link shares with password, expiry, and download limits; email shares with one-time recipient codes; drop-box links; stable links across rename and move |
 | **Previews** | Images, video, audio, PDF, text, and source code in the browser; a type allowlist plus content sniffing; SVG and HTML are never rendered inline; server-side thumbnails with pixel, concurrency, and decode-time limits |
 | **Audit** | Hash-chained event log, external daily anchors, `audit verify`, CSV/JSON export, INSERT-only database role, fail-closed policy |
 | **Storage** | Content-addressed `blob` layout with deduplication or filesystem-mirroring `tree` layout; local disk or S3-compatible object storage; orphan GC, version retention, and periodic integrity scrubbing |
-| **Operations** | Single static binary, `/healthz`, `/readyz`, `/metrics`, 18 Prometheus alert rules, a complete runbook, backup scripts, an automated restore drill, and a `newcloud drill` subcommand |
+| **Operations** | Single static binary, `/healthz`, `/readyz`, `/metrics`, 20 Prometheus alert rules, a complete runbook, backup scripts, an automated restore drill, and a `newcloud drill` subcommand |
 
 ## Architecture
 

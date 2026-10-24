@@ -26,15 +26,37 @@ Linux | Darwin) RESTIC_EXTRA_FLAGS="--one-file-system" ;;
 esac
 
 # shellcheck disable=SC2086 # the flags are intentionally word-split
+#
+# --json so the snapshot id can be captured. A manifest that records "restic:latest" does
+# not identify anything: the next `forget --prune` invalidates "latest", and a restore then
+# silently picks whatever is newest rather than what the dump was taken against. The id is
+# printed on the last line of the JSON summary and read by backup-all.sh.
 restic backup "$BLOB_ROOT" \
 	--tag newcloud-blob \
 	--exclude "${BLOB_ROOT}/tmp" \
-	$RESTIC_EXTRA_FLAGS
+	$RESTIC_EXTRA_FLAGS \
+	--json >/tmp/newcloud-blob-backup.json
+
+# The snapshot id, for the run manifest. `restic backup --json` emits one summary object;
+# jq is not assumed to exist, so the id is extracted with sed.
+BLOB_SNAPSHOT_ID="$(sed -n 's/.*"snapshot_id":"\([a-f0-9]\{64\}\)".*/\1/p' /tmp/newcloud-blob-backup.json | tail -n 1)"
+if [ -z "$BLOB_SNAPSHOT_ID" ]; then
+	echo "blob-backup: could not read the snapshot id from restic's output" >&2
+	cat /tmp/newcloud-blob-backup.json >&2
+	exit 1
+fi
+echo "$BLOB_SNAPSHOT_ID" >"${BLOB_SNAPSHOT_ID_FILE:-/tmp/newcloud-blob-snapshot-id}"
 
 # Keep a decaying history: 7 daily, 4 weekly, 12 monthly.
 restic forget \
 	--tag newcloud-blob \
 	--keep-daily 7 --keep-weekly 4 --keep-monthly 12 \
 	--prune
+
+# The prune above renumbers what "latest" points at, which is exactly why the id — not the
+# word latest — is what the manifest records. Check that the snapshot still exists after
+# the prune, so a backup that forgets its own newest snapshot is caught now rather than at
+# restore time.
+restic snapshots "$BLOB_SNAPSHOT_ID" >/dev/null
 
 restic check --read-data-subset=1/20

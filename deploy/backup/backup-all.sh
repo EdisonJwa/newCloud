@@ -62,11 +62,41 @@ printf 'database_dump=%s\nstarted_at=%s\n' "$DUMP_FILE" "$STAMP" >"$BACKUP_DIR/s
 # its row, so a window write between the two steps leaves an orphan blob rather than a dangling
 # reference.
 log "step 2/2: blob copy"
+SNAPSHOT_ID_FILE="$BACKUP_DIR/blob-snapshot-$STAMP.id"
 BACKUP_DIR="$BACKUP_DIR" BLOB_ROOT="$BLOB_ROOT" RESTIC_REPOSITORY="$RESTIC_REPOSITORY" \
-	./deploy/backup/blob-backup.sh
+	BLOB_SNAPSHOT_ID_FILE="$SNAPSHOT_ID_FILE" ./deploy/backup/blob-backup.sh
 
-printf 'blob_snapshot=restic:latest\nfinished_at=%s\n' "$(date -u +%Y%m%dT%H%M%SZ)" \
+# The manifest records the ACTUAL restic snapshot id, not the word "latest".
+#
+# "restic:latest" identified nothing: the next `forget --prune` moved what "latest" meant, so a
+# restore that followed the manifest silently restored whichever snapshot happened to be newest
+# rather than the one this dump was taken against — and nothing in the record could tell the
+# difference afterwards (2026-10-24 review, M14).
+BLOB_SNAPSHOT_ID="$(cat "$SNAPSHOT_ID_FILE")"
+printf 'blob_snapshot=%s\nfinished_at=%s\n' "$BLOB_SNAPSHOT_ID" "$(date -u +%Y%m%dT%H%M%SZ)" \
 	>>"$BACKUP_DIR/snapshot-$STAMP.manifest"
 
 log "backup complete: $BACKUP_DIR/snapshot-$STAMP.manifest"
+log "blob snapshot: $BLOB_SNAPSHOT_ID"
+
+# Publish the success as a Prometheus textfile metric, so "the backup stopped running" is an
+# alert rather than something noticed during a restore.
+#
+# A backup failure is the only failure whose signal nobody sees: cron mails the operator,
+# the mail is filtered, and the first evidence is a restore attempt months later. The
+# NewCloudBackupStale alert in deploy/monitoring/alerts.yml reads this file through
+# node_exporter's textfile collector; unset BACKUP_METRICS_FILE disables it for hosts that
+# scrape the backup box some other way.
+if [ -n "${BACKUP_METRICS_FILE:-}" ]; then
+	mkdir -p "$(dirname "$BACKUP_METRICS_FILE")"
+	# Written atomically: the collector must never read a half-written file.
+	{
+		printf '# HELP newcloud_backup_last_success_timestamp_seconds Unix time of the last successful backup run.\n'
+		printf '# TYPE newcloud_backup_last_success_timestamp_seconds gauge\n'
+		printf 'newcloud_backup_last_success_timestamp_seconds %s\n' "$(date -u +%s)"
+	} >"$BACKUP_METRICS_FILE.tmp"
+	mv "$BACKUP_METRICS_FILE.tmp" "$BACKUP_METRICS_FILE"
+	log "backup success published to $BACKUP_METRICS_FILE"
+fi
+
 log "restore with: deploy/backup/restore-drill.md (blobs first, then pg_restore)"

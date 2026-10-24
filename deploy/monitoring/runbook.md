@@ -69,19 +69,47 @@ database problem: a healthy process with a dead database stays alive and fails q
 
 ## audit-stalled
 
-`newcloud_audit_chain_head_age_seconds > 3600` for 15 minutes.
+`newcloud_audit_chain_head_age_seconds > 3600` **and** recent write traffic, for 15 minutes.
 
 The audit chain is the integrity claim. Its head age growing means no new audit event has been
-written.
+written — but that alone does not distinguish a quiet deployment from a broken one, so the rule also
+requires POST/PUT/PATCH/DELETE traffic in the last hour. A quiet instance therefore does not page.
 
-1. **Is the deployment simply idle?** A quiet instance writes no events, and this alert fires. Check
-   the last events before treating it as a fault — this is why the threshold is an hour and not
-   five minutes.
+Until 2026-10-24 the gauge was written with a hard-coded `0` (once a day, and only when anchoring was
+configured), so this rule could not fire at all; see `docs/reference/review-2026-10-24.md`, H6. If you
+run an instance with no write traffic by design, raise the threshold rather than silencing the rule —
+the gauge is now real.
+
+1. **Is there write traffic?** The rule already requires it, so assume yes. Compare
+   `sum(rate(newcloud_http_requests_total{method=~"POST|PUT|PATCH|DELETE"}[1h]))` against the event
+   count.
 2. If there is traffic and no events, audit writes are failing. That is the fail-closed path in
    `deploy/audit-failure-policy.md`: the mutation should have been refused rather than silently
    unrecorded. Look for refusals in the log.
 3. Check the `audit.events` table is writable and that the `audit` schema has not been dropped or
    renamed by a botched restore.
+
+## backup-stale
+
+`time() - newcloud_backup_last_success_timestamp_seconds > 36h`.
+
+The series comes from `deploy/backup/backup-all.sh` through node_exporter's textfile collector
+(`BACKUP_METRICS_FILE`), not from the application: the backup runs from cron and the app never sees
+it. If the series is absent the alert is silent — that is why the collection must be configured
+before the backup is relied on.
+
+1. Run the backup by hand and read the exit code. `pg-backup.sh` exits `3` when the dump is valid but
+   does not contain this application's tables, which is what a dump of the wrong database looks like.
+2. Check the manifest in `$BACKUP_DIR/snapshot-*.manifest`: it records the dump file and the **restic
+   snapshot id**, not the word `latest`. A missing `blob_snapshot` line means the blob copy never ran.
+3. Do not delete old backups to "make room" before the new one succeeds.
+
+## backup-restore-unproven
+
+`time() - newcloud_backup_last_drill_timestamp_seconds > 100d`.
+
+`newcloud drill` publishes this on a PASS when `BACKUP_METRICS_FILE` is set. A quarter without a drill
+means the restore path is a rumour (INV-08). Run it: `deploy/backup/restore-drill.md`.
 
 ## audit-verify-failed
 

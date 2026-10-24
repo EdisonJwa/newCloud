@@ -86,10 +86,23 @@ jobs:
         # The race detector matters here: share download counters and session
         # revocation are the two places where a data race would be silent in
         # production.
-        run: go test -race -count=1 ./...
+        #
+        # -p 1 serialises PACKAGES, and that is load-bearing rather than cautious: the
+        # PostgreSQL suites share one database and reset the public/audit schemas between
+        # runs (resetSchema), so two packages running concurrently drop each other's tables
+        # mid-test. That is why a full `go test ./...` with TEST_DATABASE_URL set failed
+        # intermittently while each package passed alone. Within a package, `go test`
+        # already serialises unless a test asks for parallel execution.
+        run: go test -race -count=1 -p 1 ./...
 
       - name: build
-        run: CGO_ENABLED=0 go build -trimpath -o /tmp/newcloud ./cmd/newcloud
+        run: |
+          CGO_ENABLED=0 go build -trimpath \
+            -ldflags="-X main.version=ci-${GITHUB_SHA::12}" \
+            -o /tmp/newcloud ./cmd/newcloud
+          # Fails the build if the stamp did not land: a version flag that silently
+          # reports "dev" is worse than no flag, because it looks like it worked.
+          /tmp/newcloud --version | grep -q "ci-"
 
       - name: example config parses
         # An example config that fails validation is worse than none: operators copy

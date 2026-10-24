@@ -42,7 +42,11 @@ RUN CGO_ENABLED=0 go vet ./... && \
     CGO_ENABLED=0 go test ./... -count=1 -timeout 300s
 
 ENV CGO_ENABLED=0 GOOS=linux
-RUN go build -trimpath -ldflags="-s -w" -o /out/newcloud ./cmd/newcloud
+# The version is a build argument because the build context carries no usable .git state:
+# without -X the binary reports "dev", and an image whose version is "dev" cannot be matched
+# to a commit during an incident. Pass it from CI or from docker compose.
+ARG VERSION=dev
+RUN go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/newcloud ./cmd/newcloud
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/newcloud /newcloud

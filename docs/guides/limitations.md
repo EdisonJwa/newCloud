@@ -62,7 +62,7 @@ These are capabilities the requirements call for that are not implemented today.
 | **Account deletion** | Deletion moves files to trash, revokes shares and credentials, releases locks, keeps audit events, and leaves an irreversible tombstone. | Restoring a deleted account: an administrator must recover files and create a new account. |
 | **`tree` layout** | Filesystem mirror, inspectable with `ls`, `rsync`-friendly. | No S3 backend, no deduplication, Windows reserved names apply, and `blobs.size` cannot be backfilled because the layout is not content-addressed. **Version history is recorded but not retained**: the layout overwrites the bytes at the path instead of copying the superseded version, so `GET /api/files/version` and `POST /api/files/restore-version` answer `409 no_version_content` rather than reporting a success they cannot perform, and the version list reports `version_content_available: false` so the UI does not offer a Restore action that cannot work. Treat the rows as a record of changes, not as recoverable content. |
 | **Break-glass** | Login endpoint, CIDR restriction, auditing, alerts, and hash generator exist. | No web UI (deliberate) and no terminal no-echo prompt; the password is read from stdin. |
-| **Grafana** | Prometheus endpoint, 18 alert rules, runbook. | No bundled dashboard JSON. Dashboards depend on the Grafana version and go stale. |
+| **Grafana** | Prometheus endpoint, 20 alert rules, runbook. | No bundled dashboard JSON. Dashboards depend on the Grafana version and go stale. |
 | **Job types** | The queue has leases, retries, backoff, and three registered job kinds. | More business job kinds. The infrastructure is complete; the catalog is small. |
 | **Metrics thresholds** | Alerts cover process, errors, database, audit, GC, jobs, uploads, DAV, break-glass, WAL, and blob integrity. | Thresholds are starting values, not measured conclusions. Revisit after two weeks of traffic. |
 
@@ -168,6 +168,36 @@ These are not bugs, but deploying without accounting for them is a mistake.
   is found by a user or by a drill.
 - **Email shares need SMTP.** A half-configured relay is rejected at startup; invitations are not
   accepted and silently dropped.
+
+## Closed since the 2026-10-24 review
+
+The [full review](../reference/review-2026-10-24.md) found defects in this tree. These were fixed with
+tests that fail without the fix; the row says what changed, not just that something did.
+
+| Was | Now |
+| --- | --- |
+| A stale `If-Match` on the `tree` layout answered `412` *after* the content store had replaced the bytes, so a refused write destroyed the file. The precondition was evaluated in the handler after `Put`. | The conditional is evaluated before a byte is written, and re-evaluated inside the `UPDATE` (`UpdateFile.Expect`), so a writer that commits in between fails with `412` and the old bytes are untouched. Chunked bodies are capped by `http.MaxBytesReader`, so `Transfer-Encoding: chunked` can no longer exceed `limits.max_file_bytes`. `If-Match` on a missing resource, a matching `If-None-Match` and a weak `If-Match` are all refused. |
+| The restore drill compared `LIVE_DSN` and `SCRATCH_DSN` as strings, then ran `DROP SCHEMA … CASCADE`. Two spellings of one database (for example with `?sslmode=disable`) passed the check. | The guard asks the server: it compares `current_database()`, `inet_server_addr()` and `inet_server_port()` for both connections and refuses when they match, whichever DSN was used. The `pg_dump`/`pg_restore` connection string reaches the tools through libpq's environment, never through `argv`, and credentials are redacted from tool error output. |
+| `newcloud_audit_chain_head_age_seconds` was written with a hard-coded `0`, once a day, only when anchoring was configured, so the critical "audit chain stalled" rule could never fire — and the scrub alert depended on a counter that stayed zero. | The gauges are published on every anchor tick regardless of anchoring, from the newest event's own timestamp. The stalled rule now also requires recent write traffic, so a quiet deployment is not paged. |
+| `THUMBNAIL` served a 320-pixel rendition to a grantee holding `read` without `download`, while every other content route refused that grant. | The preview requires `download`, like the content paths beside it. The pinned test was corrected rather than the comment. |
+| PostgreSQL could grant two exclusive locks on one node (`INSERT … NOT EXISTS` cannot see an uncommitted row). | `lock_tokens` has a unique index on `node_id` (migration `0017`) and the insert is `ON CONFLICT DO NOTHING`; an expired row is cleared first so it does not block. The shared conformance suite now races eight locks on one node and requires exactly one grant on **both** backends. |
+| `Range: bytes=0-` counted as a continuation, so an exhausted share could still serve the complete file for the session's TTL. | A whole-entity range is a fresh download and is charged; seeks and resumes (non-zero start, bounded window, short suffix) still ride the paid session. |
+| A create-only link listed the directory's names, sizes and ETags even though download refused it. | A share that cannot read does not list. |
+| Share tokens were written to the INFO access log and into audit metadata for refusals. | Both are redacted (`/s/***/download`); the audit log keeps the share id, which is not a credential. |
+| The content-ticket path served bytes with no audit row. | It writes `file.read` with `via=content_ticket`, attributed to the ticket's subject. |
+| A name that collided by case or Unicode folding silently overwrote the differently-named file and then 404'd on the name the client asked for. | It is `ErrConflict`, as ADR-0004 §4 always said. |
+| Retention expiry set `trashed_at` without moving the bytes, so the quota was never released and the later purge subtracted from a counter that was never credited. | Expiry performs the same accounting as `Trash` on both backends, and the purge no longer double-releases. |
+| The trash cap was compared and then charged in a second statement, so concurrent deletes overshot it. | The cap is the `WHERE` clause of the statement that charges; racing deletes cannot exceed it. |
+| The reference Caddyfile proxied everything to the application, publishing `/metrics` and `/readyz` (which echoes dependency errors) to the internet. | The app vhost refuses both and answers `404`; the app listener is loopback-only, so a host-local scraper still works. |
+| `--version` did not exist, `version` was always `"dev"`, and `serve` never checked the schema. | `newcloud --version` prints a stamped build (Makefile, Dockerfile build arg, CI), and `serve` refuses to start when the database is behind the binary, naming the missing migrations. |
+| `limits.max_retained_version_bytes` was documented and had no effect: the worker only read a runtime settings row. | The configured cap is wired into the worker; a runtime setting still overrides it. |
+| `docker compose up -d` SIGKILLed in-flight uploads after 10 s while the server drains for 30 s. | `stop_grace_period: 45s`. |
+| The backup manifest recorded the literal `restic:latest`, the dump was only checked for a readable TOC, and nothing alerted on a stale backup. | The manifest records the real snapshot id (which survives `forget --prune`), the dump must contain the application's tables, and `newcloud_backup_last_success_timestamp_seconds` drives a stale-backup alert (opt in with `BACKUP_METRICS_FILE`). |
+| A full `go test ./...` with `TEST_DATABASE_URL` set was racy: the PostgreSQL suites share one database and reset its schemas, so parallel packages dropped each other's tables. | CI and the Makefile run `-p 1`. |
+
+Two things this table does **not** claim: the ADR-0013 staging machinery is still not wired into the
+DAV request path (COPY/MOVE/`tree`-layout crash windows remain as described above), and no real desktop
+WebDAV client has been run against this build.
 
 ## Where the evidence lives
 

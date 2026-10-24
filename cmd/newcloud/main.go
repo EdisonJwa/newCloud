@@ -101,6 +101,13 @@ func run(args []string) error {
 	case "-h", "--help", "help":
 		fmt.Printf("newcloud %s\n\nusage: newcloud [serve|migrate|healthcheck|audit verify|audit prune|breakglass hash|export|drill]\n", version)
 		return nil
+	case "--version", "-version", "version":
+		// A build nobody can identify is a build nobody can roll back with confidence.
+		// `version` is injected at build time (-X main.version=...) from the git tag or
+		// describe output, and "dev" here means the binary was built without that flag
+		// — which is itself worth knowing during an incident.
+		fmt.Printf("newcloud %s\n", version)
+		return nil
 	default:
 		return fmt.Errorf("unknown command %q (want serve, migrate, healthcheck, audit verify, audit prune, "+
 			"breakglass hash, export or drill; run `newcloud help`)", cmd)
@@ -428,11 +435,17 @@ func serve() error {
 
 	// Metadata first: the content store needs it to resolve paths in blob layout,
 	// and everything else needs it for identity and authorization.
-	meta, closeMeta, err := openMetadata(ctx, log)
+	meta, closeMeta, checkSchema, err := openMetadata(ctx, log)
 	if err != nil {
 		return err
 	}
 	defer closeMeta()
+
+	// Before anything serves: a binary ahead of its schema must refuse to start rather
+	// than answer /readyz and then 500 on the first request that touches a new column.
+	if err := checkSchema(ctx); err != nil {
+		return err
+	}
 
 	runtimeLease, releaseRuntime, err := acquireRuntimeProtection(ctx, cfg, meta, stop, log)
 	if err != nil {
@@ -606,6 +619,23 @@ func serve() error {
 	// anything here; the queries are written to tolerate it.
 	wk := worker.New(meta, log).WithRetention(cfg.Limits.VersionRetention(), cfg.Limits.TrashRetention())
 	wk.WithMetrics(reg)
+
+	// §4.3's retained-history cap is a CONFIGURED limit, not only a runtime setting.
+	//
+	// The worker read `limits.max_retained_version_bytes` from the settings table and fell
+	// back to an in-struct value that nothing ever set, so an operator could configure the
+	// key, see it accepted, and get unlimited history — the cap was decorative while both
+	// the docs and the ratchet test said otherwise (2026-10-24 review, H7). A runtime
+	// setting still overrides this, which is what lets an administrator change it without a
+	// restart.
+	if cfg.Limits.MaxRetainedVersionBytes > 0 {
+		wk.WithVersionByteCap(cfg.Limits.MaxRetainedVersionBytes)
+		log.Info("retained version history is capped",
+			"bytes", cfg.Limits.MaxRetainedVersionBytes)
+	} else {
+		log.Warn("no retained-version cap configured: file history grows without bound; " +
+			"set limits.max_retained_version_bytes")
+	}
 	// §9.3: 清理未完成 Multipart Upload。Partial uploads are not objects, so no listing, no HEAD and
 	// no usage count can see them; without this pass they persist until the bucket is emptied by
 	// hand. Enabled only when the backend supports it — the optional interface exists so a backend
@@ -820,21 +850,22 @@ func acquireRuntimeProtection(ctx context.Context, cfg config.Config, meta store
 	return nil, cleanup, nil
 }
 
-func openMetadata(ctx context.Context, log *slog.Logger) (storepkg.Store, func(), error) {
+func openMetadata(ctx context.Context, log *slog.Logger) (storepkg.Store, func(), func(context.Context) error, error) {
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
 		log.Warn("no DATABASE_URL set: metadata is in memory and will not survive a restart; " +
 			"this is fine for development and unacceptable in production")
-		return storepkg.NewMemory(), func() {}, nil
+		// No schema to check: the in-memory backend has none.
+		return storepkg.NewMemory(), func() {}, func(context.Context) error { return nil }, nil
 	}
 
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
-		return nil, nil, fmt.Errorf("connect to PostgreSQL: %w", err)
+		return nil, nil, nil, fmt.Errorf("connect to PostgreSQL: %w", err)
 	}
 	if err := pool.Ping(ctx); err != nil {
 		pool.Close()
-		return nil, nil, fmt.Errorf("ping PostgreSQL: %w", err)
+		return nil, nil, nil, fmt.Errorf("ping PostgreSQL: %w", err)
 	}
 
 	pg := storepkg.NewPG(pool)
@@ -843,8 +874,35 @@ func openMetadata(ctx context.Context, log *slog.Logger) (storepkg.Store, func()
 	// operation.
 	pg.EnableAudit()
 
+	// The schema check is bound to this pool rather than opening its own connection:
+	// it runs once at startup, and a second pool would exist only to ask one question.
+	checkSchema := func(ctx context.Context) error {
+		behind, ahead, err := storepkg.CheckSchema(ctx, pool)
+		if err != nil {
+			return fmt.Errorf("check schema: %w", err)
+		}
+		if len(behind) > 0 {
+			// Refusing is the whole point: the binary queries columns the database does
+			// not have, so the alternative is a 500 on the first request that touches
+			// one, three hops away from its cause.
+			return fmt.Errorf(
+				"the database schema is behind this binary by %d migration(s): %s; "+
+					"run `newcloud migrate` before serving",
+				len(behind), strings.Join(behind, ", "))
+		}
+		if len(ahead) > 0 {
+			// A rollback in progress. Not fatal — the older binary may serve correctly —
+			// but an operator should see it rather than infer it.
+			log.Warn("the database has migrations this binary does not know; "+
+				"this is what a rollback looks like, and it is only safe if those "+
+				"migrations were backwards-compatible",
+				"migrations", strings.Join(ahead, ", "))
+		}
+		return nil
+	}
+
 	log.Info("metadata store ready", "driver", "postgres")
-	return pg, pool.Close, nil
+	return pg, pool.Close, checkSchema, nil
 }
 
 // openS3Storage builds the content store on top of an S3-compatible bucket.

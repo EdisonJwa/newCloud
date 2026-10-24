@@ -29,6 +29,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -118,6 +119,11 @@ func drillCommand(args []string) error {
 		return fmt.Errorf("drill: set SCRATCH_DSN to a scratch database; " +
 			"the drill never restores over the live one")
 	}
+	// A string comparison is only a fast path: two spellings of the same database
+	// (`.../newcloud` and `.../newcloud?sslmode=disable`) compare unequal and would sail
+	// past it into the DROP below. The check that actually protects the live database is
+	// the server-side identity comparison in runDrill, which runs after both connections
+	// exist and before anything is dropped.
 	if liveDSN == scratchDSN {
 		// Refusing to run is the whole safety property. A drill that can destroy the thing it
 		// is validating is worse than no drill.
@@ -171,7 +177,35 @@ func drillCommand(args []string) error {
 	if !res.OK() {
 		return fmt.Errorf("drill: FAILED (%d problem(s))", len(res.Problems))
 	}
+	// A drill that nobody can see is a maintenance ritual, not evidence. When the metrics
+	// file is configured, a PASS publishes the timestamp the NewCloudBackupRestoreUnproven
+	// alert reads — so "no drill for a quarter" is an alert rather than a surprise during an
+	// incident. A failed drill publishes nothing, which is what keeps the alert meaningful.
+	publishDrillMetric(res)
 	return nil
+}
+
+// publishDrillMetric writes the restore-drill timestamp for the textfile collector.
+//
+// Best effort and silent on failure: the drill's verdict is the result, and a reporting
+// problem must not turn a successful restore into an error. It prints a warning so a
+// misconfigured path is visible rather than silently unpublishing the alert.
+func publishDrillMetric(res drillResult) {
+	path := os.Getenv("BACKUP_METRICS_FILE")
+	if path == "" || !res.OK() {
+		return
+	}
+	var b strings.Builder
+	b.WriteString("# HELP newcloud_backup_last_drill_timestamp_seconds Unix time of the last successful restore drill.\n")
+	b.WriteString("# TYPE newcloud_backup_last_drill_timestamp_seconds gauge\n")
+	fmt.Fprintf(&b, "newcloud_backup_last_drill_timestamp_seconds %d\n", time.Now().Unix())
+	if err := os.WriteFile(path+".tmp", []byte(b.String()), 0o600); err != nil {
+		fmt.Fprintf(os.Stderr, "drill: could not write %s: %v\n", path, err)
+		return
+	}
+	if err := os.Rename(path+".tmp", path); err != nil {
+		fmt.Fprintf(os.Stderr, "drill: could not publish %s: %v\n", path, err)
+	}
 }
 
 // toolDSN returns the DSN to hand to pg_dump/pg_restore.
@@ -197,10 +231,18 @@ func runDrill(ctx context.Context, cfg config.Config, liveDSN, scratchDSN, dir s
 	start := time.Now()
 
 	// ---- 1. Dump ----
+	//
+	// The DSN reaches pg_dump through libpq's environment (PGHOST/PGDATABASE/…), never
+	// through `--dbname=`: an argument is world-readable in `ps` and in the process's
+	// cmdline for the whole duration of a multi-gigabyte dump, and it carries the password.
 	dumpPath := filepath.Join(dir, "newcloud.dump")
-	if err := runTool(ctx, "pg_dump",
+	dumpEnv, perr := pgEnvFromDSN(dumpDSN)
+	if perr != nil {
+		return res, fmt.Errorf("parse the dump DSN: %w", perr)
+	}
+	if err := runToolEnv(ctx, dumpEnv, "pg_dump",
 		"--format=custom", "--compress=9",
-		"--dbname="+dumpDSN, "--file="+dumpPath); err != nil {
+		"--file="+dumpPath); err != nil {
 		return res, fmt.Errorf("pg_dump: %w", err)
 	}
 	res.DumpBytes = fileSize(ctx, dumpPath)
@@ -225,27 +267,45 @@ func runDrill(ctx context.Context, cfg config.Config, liveDSN, scratchDSN, dir s
 		return res, fmt.Errorf("count live rows: %w", err)
 	}
 
-	scratch, err := pgx.Connect(ctx, scratchDSN)
+	// The schema is dropped and restored through restoreDSN, so the guard has to hold for
+	// that connection — not for SCRATCH_DSN, which DRILL_RESTORE_DSN can override. If the
+	// check ran on scratchDSN while pg_restore wrote into a DRILL_RESTORE_DSN pointing at
+	// the live database, the guard would be protecting a database the drill never touches.
+	restore, err := pgx.Connect(ctx, restoreDSN)
 	if err != nil {
 		return res, fmt.Errorf("connect scratch: %w", err)
 	}
-	defer scratch.Close(ctx)
+	defer restore.Close(ctx)
+
+	// The safety property, established by the server rather than by comparing strings.
+	//
+	// Both connections report the address and port of the server they are attached to and
+	// the name of the database — so `.../newcloud` and `.../newcloud?sslmode=disable`,
+	// which are the same database but different strings, are caught here. This is the check
+	// that makes "the drill never restores over the live one" true; the string comparison
+	// in runDrillCommand is only a fast path.
+	if err := refuseIfSameDatabase(ctx, live, restore); err != nil {
+		return res, err
+	}
 
 	// The schema is dropped rather than the database: creating a database requires
 	// CREATEDB, which the drill has no business demanding.
-	if _, err := scratch.Exec(ctx, `DROP SCHEMA IF EXISTS audit CASCADE;
+	if _, err := restore.Exec(ctx, `DROP SCHEMA IF EXISTS audit CASCADE;
 		DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;`); err != nil {
 		return res, fmt.Errorf("reset scratch schema: %w", err)
 	}
 
-	if err := runTool(ctx, "pg_restore",
-		"--no-owner", "--no-privileges", "--no-comments",
-		"--dbname="+restoreDSN, dumpPath); err != nil {
+	restoreEnv, perr := pgEnvFromDSN(restoreDSN)
+	if perr != nil {
+		return res, fmt.Errorf("parse the restore DSN: %w", perr)
+	}
+	if err := runToolEnv(ctx, restoreEnv, "pg_restore",
+		"--no-owner", "--no-privileges", "--no-comments", dumpPath); err != nil {
 		return res, fmt.Errorf("pg_restore: %w", err)
 	}
 
 	// ---- 4. Row counts must match, table by table ----
-	restored, err := tableCounts(ctx, scratch)
+	restored, err := tableCounts(ctx, restore)
 	if err != nil {
 		return res, fmt.Errorf("count restored rows: %w", err)
 	}
@@ -280,7 +340,7 @@ func runDrill(ctx context.Context, cfg config.Config, liveDSN, scratchDSN, dir s
 	// This is the assertion that makes the drill worth running. A restore that loses or
 	// reorders audit rows produces a database that *looks* fine — the tables are there, the
 	// counts match — but whose tamper-evidence is gone.
-	chainOK, chainLen, chainErrs := verifyRestoredChain(ctx, scratchDSN)
+	chainOK, chainLen, chainErrs := verifyRestoredChain(ctx, restoreDSN)
 	res.ChainOK = chainOK
 	res.ChainLength = chainLen
 	res.Problems = append(res.Problems, chainErrs...)
@@ -291,7 +351,7 @@ func runDrill(ctx context.Context, cfg config.Config, liveDSN, scratchDSN, dir s
 	// and a restore that brings back a consistent node tree pointing at blobs that were never
 	// copied produces a deployment that lists every file and opens none of them.
 	if blobs, berr := func() (blobCheck, error) {
-		restoredMeta, merr := openRestoredMetadata(ctx, scratchDSN)
+		restoredMeta, merr := openRestoredMetadata(ctx, restoreDSN)
 		if merr != nil {
 			return blobCheck{}, merr
 		}
@@ -441,6 +501,110 @@ func verifyRestoredChain(ctx context.Context, scratchDSN string) (bool, int64, [
 	return true, int64(len(all)), nil
 }
 
+// refuseIfSameDatabase is the drill's data-loss guard: it refuses to continue when both
+// connections are attached to the same database, whatever the two DSNs looked like.
+//
+// The restore that follows drops the target's `public` and `audit` schemas, so this check is
+// the only thing standing between a stray `?sslmode=disable` in SCRATCH_DSN and the
+// destruction of the production metadata. It deliberately asks the server (address, port,
+// database name) rather than comparing DSN strings, because the dangerous case is precisely
+// two spellings of one database.
+func refuseIfSameDatabase(ctx context.Context, live, restore *pgx.Conn) error {
+	liveID, err := databaseIdentity(ctx, live)
+	if err != nil {
+		return fmt.Errorf("identify live database: %w", err)
+	}
+	restoreID, err := databaseIdentity(ctx, restore)
+	if err != nil {
+		return fmt.Errorf("identify the restore target: %w", err)
+	}
+	if liveID == restoreID {
+		return fmt.Errorf(
+			"drill: the restore target IS the live database (%s); refusing to run. "+
+				"Point SCRATCH_DSN (and DRILL_RESTORE_DSN, if set) at a different database",
+			liveID)
+	}
+	return nil
+}
+
+// databaseIdentity returns a stable identity for the database a connection is attached to:
+// the server's own address and port, plus the database name.
+//
+// Two connections with the same identity are attached to the same database however their
+// DSNs were spelled, which is the property the drill's safety guard needs and a string
+// comparison cannot provide. `postgres://u:p@h/newcloud` and
+// `postgres://u:p@h/newcloud?sslmode=disable` are the same database; this reports them as
+// such because the server says so, not because the strings match.
+func databaseIdentity(ctx context.Context, conn *pgx.Conn) (string, error) {
+	var name, addr string
+	var port int32
+	if err := conn.QueryRow(ctx,
+		`SELECT current_database(), COALESCE(inet_server_addr()::text, 'local'), inet_server_port()`,
+	).Scan(&name, &addr, &port); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%s:%d/%s", addr, port, name), nil
+}
+
+// pgEnvFromDSN turns a connection string into the libpq environment pg_dump and pg_restore
+// already understand (PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD, PGSSLMODE, PGAPPNAME).
+//
+// The point of the exercise is that a connection string carries the database password, and
+// an argv entry is visible to every local user in `ps` for as long as the tool runs — a
+// multi-gigabyte dump is minutes. An environment entry is visible only to the same user and
+// root. Fallback hosts are joined because libpq accepts comma-separated lists in PGHOST and
+// PGPORT, mirroring what a multi-host DSN means.
+func pgEnvFromDSN(dsn string) ([]string, error) {
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return nil, err
+	}
+	hosts := []string{cfg.Host}
+	ports := []string{fmt.Sprintf("%d", cfg.Port)}
+	for _, f := range cfg.Fallbacks {
+		hosts = append(hosts, f.Host)
+		ports = append(ports, fmt.Sprintf("%d", f.Port))
+	}
+	env := []string{
+		"PGHOST=" + strings.Join(hosts, ","),
+		"PGPORT=" + strings.Join(ports, ","),
+		"PGDATABASE=" + cfg.Database,
+	}
+	if cfg.User != "" {
+		env = append(env, "PGUSER="+cfg.User)
+	}
+	if cfg.Password != "" {
+		env = append(env, "PGPASSWORD="+cfg.Password)
+	}
+	// The parser consumes `sslmode` and reports its decision as a *tls.Config, so the mode is
+	// reconstructed rather than copied. disable is exact; the three modes that verify nothing
+	// (allow/prefer/require) collapse to `require`, which never silently downgrades to
+	// plaintext the way `prefer` can; the two that verify (verify-ca/verify-full) collapse to
+	// `verify-full`, the stricter of the pair. Neither collapse can weaken what the DSN asked
+	// for — a tool that cannot meet the stricter mode fails loudly instead.
+	switch {
+	case cfg.TLSConfig == nil:
+		env = append(env, "PGSSLMODE=disable")
+	case cfg.TLSConfig.InsecureSkipVerify:
+		env = append(env, "PGSSLMODE=require")
+	default:
+		env = append(env, "PGSSLMODE=verify-full")
+	}
+	if n := cfg.RuntimeParams["application_name"]; n != "" {
+		env = append(env, "PGAPPNAME="+n)
+	}
+	return env, nil
+}
+
+// dsnPattern matches anything that looks like a DSN with embedded credentials. It exists for
+// one reason: a failure message is the output most likely to be pasted into a ticket while
+// an operator is restoring under pressure, and it must not carry the password with it.
+var dsnPattern = regexp.MustCompile(`(?i)(postgres(?:ql)?|mysql)://[^/@\s:]+:[^/@\s]+@`)
+
+func redactDSNs(s string) string {
+	return dsnPattern.ReplaceAllString(s, "$1://***:***@")
+}
+
 // runTool runs an external command and returns its combined output on failure.
 //
 // The container indirection exists because the deployment this drill targets runs PostgreSQL
@@ -451,21 +615,40 @@ func verifyRestoredChain(ctx context.Context, scratchDSN string) (bool, int64, [
 // DRILL_PG_CONTAINER names the container; when empty the tools are invoked directly, which
 // is what a packaged installation does.
 func runTool(ctx context.Context, name string, args ...string) error {
+	return runToolEnv(ctx, nil, name, args...)
+}
+
+// runToolEnv runs a pg client tool with an environment overlay, which is how the DSN reaches
+// pg_dump and pg_restore (see pgEnvFromDSN). Inside the container the environment is
+// forwarded with `docker exec -e` flags, so the DSN travels the same way in both modes.
+func runToolEnv(ctx context.Context, env []string, name string, args ...string) error {
 	var cmd *exec.Cmd
 	if c := os.Getenv("DRILL_PG_CONTAINER"); c != "" {
-		// docker exec <c> pg_dump ... — the arguments are passed through verbatim.
-		dockerArgs := append([]string{"exec", c, name}, args...)
+		// docker exec [-e K=V]… <c> pg_dump … — the -e flags must precede the container
+		// name, and the tool's arguments are passed through verbatim after it.
+		dockerArgs := []string{"exec"}
+		for _, kv := range env {
+			dockerArgs = append(dockerArgs, "-e", kv)
+		}
+		dockerArgs = append(dockerArgs, c, name)
+		dockerArgs = append(dockerArgs, args...)
 		cmd = exec.CommandContext(ctx, "docker", dockerArgs...)
 	} else {
 		cmd = exec.CommandContext(ctx, name, args...)
+		if len(env) > 0 {
+			cmd.Env = append(os.Environ(), env...)
+		}
 	}
 
 	// Output is captured rather than streamed: a successful pg_restore is silent, and the
 	// interesting case is the failure message.
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err,
-			strings.TrimSpace(string(out)))
+		// The arguments no longer contain a DSN, but a tool's stderr occasionally echoes
+		// one (a connection string inside a libpq error, for example), so both halves are
+		// redacted before they reach an operator's terminal or cron mail.
+		return fmt.Errorf("%s %s: %w: %s", name, redactDSNs(strings.Join(args, " ")), err,
+			redactDSNs(strings.TrimSpace(string(out))))
 	}
 	return nil
 }

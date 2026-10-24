@@ -2,8 +2,15 @@
 
 GO ?= go
 
+# The version a build reports. Without this every binary said "dev", so during an
+# incident nobody could answer "which build is running" — and `newcloud version` is
+# what tells an operator whether a rollback actually landed (2026-10-24 review, H8).
+# A release build overrides it: make build VERSION=v1.2.3
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+LDFLAGS := -s -w -X main.version=$(VERSION)
+
 test:
-	$(GO) test ./...
+	$(GO) test -p 1 ./...
 
 # The race detector requires cgo and a working C compiler. On a Windows
 # workstation without gcc this fails; CI (Linux) runs it unconditionally.
@@ -12,7 +19,7 @@ test:
 race:
 	@$(GO) env CGO_ENABLED >/dev/null 2>&1 || true
 	@if command -v gcc >/dev/null 2>&1 || command -v clang >/dev/null 2>&1 || command -v cl >/dev/null 2>&1; then \
-		CGO_ENABLED=1 $(GO) test -race ./...; \
+		CGO_ENABLED=1 $(GO) test -race -p 1 ./...; \
 	else \
 		echo "race: no C compiler found; skipping -race (CI runs this on Linux)"; \
 		echo "race: install gcc (e.g. via MSYS2) to enable it locally"; \
@@ -36,7 +43,7 @@ webcheck:
 	cd web && pnpm gen:api:check
 
 build: web
-	CGO_ENABLED=0 $(GO) build -trimpath -ldflags="-s -w" -o bin/newcloud ./cmd/newcloud
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags="$(LDFLAGS)" -o bin/newcloud ./cmd/newcloud
 
 fmt:
 	gofmt -w .

@@ -61,6 +61,20 @@
 			respond "Not Found" 404
 		}
 
+		# Operational endpoints are NOT public.
+		#
+		# The application registers /metrics without authentication (a scraper cannot use a
+		# session cookie) and /readyz echoes dependency errors. This file used to proxy
+		# everything else to the app, which published request volumes, upload failure rates,
+		# break-glass attempts, WAL state and scrub corruption counts to the internet — while
+		# prometheus.example.yml in the same directory warned not to do exactly that
+		# (2026-10-24 review, H4). The app listener is bound to 127.0.0.1, so a scraper on the
+		# host can still reach both; anything else must be a deliberate decision to add a vhost.
+		@ops path /metrics /readyz
+		handle @ops {
+			respond "Not Found" 404
+		}
+
 		# Both branches are `handle` blocks so they stay mutually exclusive. A bare
 		# `reverse_proxy` beside a `handle` is ordered by directive priority and can run
 		# for the refused path too, which would defeat the refusal.

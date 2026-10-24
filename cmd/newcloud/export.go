@@ -109,7 +109,10 @@ func exportCommand(args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
 	defer cancel()
 
-	meta, closeMeta, err := openMetadata(ctx, log)
+	// The schema check is not needed here: export reads through the store interface, and
+	// a read-only command that refuses because a LATER migration is missing would be
+	// unable to export the very data an operator is trying to save before an upgrade.
+	meta, closeMeta, _, err := openMetadata(ctx, log)
 	if err != nil {
 		return err
 	}

@@ -69,21 +69,31 @@ groups:
   - name: newcloud-integrity
     interval: 30s
     rules:
-      # The audit chain is the product's integrity claim. If the head stops advancing, either
-      # nothing is happening (fine, in a quiet deployment) or writes are being lost (not fine).
-      # The age gauge distinguishes those: it grows when no new event lands.
+      # The audit chain is the product's integrity claim. A head that stops advancing has two
+      # causes with opposite responses: nothing is being written (a quiet deployment, fine), or
+      # writes are happening and their audit events are not landing (not fine — that is the
+      # fail-closed path in deploy/audit-failure-policy.md behaving as data loss).
+      #
+      # The rule therefore requires BOTH a stale head and recent write-method traffic. Head age
+      # alone fires on every quiet night, which is how an integrity alert becomes noise and then
+      # gets silenced. (The gauge itself was a hard-coded 0 until 2026-10-24, so this rule could
+      # never fire at all; see docs/reference/review-2026-10-24.md, H6.)
       - alert: NewCloudAuditChainStalled
-        expr: newcloud_audit_chain_head_age_seconds > 3600
+        expr: |
+          newcloud_audit_chain_head_age_seconds > 3600
+          and on()
+          sum(rate(newcloud_http_requests_total{method=~"POST|PUT|PATCH|DELETE"}[1h])) > 0
         for: 15m
         labels:
           severity: critical
         annotations:
-          summary: "no audit event has been written for over an hour"
+          summary: "writes are reaching the server but no audit event has been written for an hour"
           description: >-
-            The newest event in the hash chain is {{ $value | humanizeDuration }} old. Either the
-            deployment is genuinely idle, or audit writes are failing and being swallowed — which
-            is the fail-closed path in deploy/audit-failure-policy.md. Check the logs for
-            "audit" before dismissing this as a quiet night.
+            The newest event in the hash chain is {{ $value | humanizeDuration }} old while the
+            server is still answering POST/PUT/PATCH/DELETE. Every audited write fails closed, so
+            either those requests are all being refused (check the 5xx rate) or events are being
+            written somewhere the chain does not see. Check the logs for "audit", then run
+            `newcloud audit verify`.
           runbook: "deploy/monitoring/runbook.md#audit-stalled"
 
       - alert: NewCloudAuditVerificationFailed
@@ -313,3 +323,30 @@ groups:
             is failing. Both mean nothing is checking that stored bytes still match their
             addresses — which is the one thing that catches silent corruption before a user does.
           runbook: "deploy/monitoring/runbook.md#blob-corruption"
+
+      # The backup is the one thing whose failure is invisible until it is needed. backup-all.sh
+      # writes a textfile-collector metric (deploy/backup/README note) so this rule can see it;
+      # without the file the series is absent and the rule stays silent rather than firing on
+      # every deployment that has not opted in.
+      - alert: NewCloudBackupStale
+        expr: time() - newcloud_backup_last_success_timestamp_seconds > 36 * 3600
+        labels:
+          severity: critical
+        annotations:
+          summary: "no successful backup has been recorded for over 36 hours"
+          description: >-
+            The nightly backup has not reported success. A backup that fails quietly is worse than
+            one that was never configured, because the restore plan assumes it exists. Check the
+            cron output and run deploy/backup/restore-drill.md before the next change window.
+          runbook: "deploy/backup/restore-drill.md"
+
+      - alert: NewCloudBackupRestoreUnproven
+        expr: time() - newcloud_backup_last_drill_timestamp_seconds > 100 * 24 * 3600
+        labels:
+          severity: warning
+        annotations:
+          summary: "the restore drill has not been run in over 100 days"
+          description: >-
+            The drill is what turns a backup into evidence (INV-08). A quarterly cadence is what
+            restore-drill.md asks for; this fires when one has been skipped by more than a week.
+          runbook: "deploy/backup/restore-drill.md"
