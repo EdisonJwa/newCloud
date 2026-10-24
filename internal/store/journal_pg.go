@@ -93,3 +93,28 @@ func (t *pgTx) OpenOps(ctx context.Context, limit int) ([]Op, error) {
 	}
 	return out, translate(rows.Err())
 }
+
+// OpsForNode lists the operations recorded against a node, newest first.
+//
+// The journal has one node reference, staged_root, which an install uses for its staged subtree and a
+// delete uses for the node it is about. Recovery is the consumer: "this node looks wrong, was
+// somebody in the middle of something?" is answered here.
+func (t *pgTx) OpsForNode(ctx context.Context, nodeID uuid.UUID) ([]Op, error) {
+	rows, err := t.tx.Query(ctx, `SELECT `+opColumns+` FROM operations
+		WHERE staged_root = $1
+		ORDER BY created_at DESC`, nodeID)
+	if err != nil {
+		return nil, translate(err)
+	}
+	defer rows.Close()
+
+	var out []Op
+	for rows.Next() {
+		op, serr := scanOp(rows)
+		if serr != nil {
+			return nil, serr
+		}
+		out = append(out, op)
+	}
+	return out, translate(rows.Err())
+}

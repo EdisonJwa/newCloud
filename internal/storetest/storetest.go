@@ -267,6 +267,21 @@ func Run(t *testing.T, factory Factory, opts Options) {
 			t.Fatalf("the staged root did not round-trip: %+v", op.StagedRoot)
 		}
 
+		// OpsForNode is what recovery asks when a node looks wrong: was somebody in the middle of
+		// something?
+		var byNode []store.Op
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			list, lerr := tx.OpsForNode(ctx, f.ID)
+			byNode = list
+			return lerr
+		}); err != nil {
+			t.Fatalf("OpsForNode: %v", err)
+		}
+		if len(byNode) != 1 || byNode[0].ID != op.ID {
+			t.Fatalf("OpsForNode returned %d operation(s) for the node, want the one just started",
+				len(byNode))
+		}
+
 		var open []store.Op
 		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
 			list, lerr := tx.OpenOps(ctx, 10)

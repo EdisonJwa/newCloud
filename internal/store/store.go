@@ -232,6 +232,10 @@ type Tx interface {
 	AdvanceOp(ctx context.Context, id uuid.UUID, from, to string) error
 	OpByID(ctx context.Context, id uuid.UUID) (Op, error)
 	OpenOps(ctx context.Context, limit int) ([]Op, error)
+	// OpsForNode lists the operations recorded against a node, newest first. Recovery asks this to
+	// find out what was being done to a node whose row is present but whose content is not where the
+	// metadata expects.
+	OpsForNode(ctx context.Context, nodeID uuid.UUID) ([]Op, error)
 
 	// Versions lists kept versions of a file, newest first.
 	Versions(ctx context.Context, nodeID uuid.UUID, limit int) ([]Version, error)

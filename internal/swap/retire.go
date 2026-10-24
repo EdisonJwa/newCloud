@@ -23,6 +23,8 @@ import (
 	"log/slog"
 	"path"
 
+	"github.com/google/uuid"
+
 	"github.com/EdisonJwa/newCloud/internal/storage/layout"
 	"github.com/EdisonJwa/newCloud/internal/store"
 )
@@ -62,15 +64,45 @@ func Retire(ctx context.Context, d Deps, n store.Node, parentRel string, trash T
 	}
 
 	// Where the content path does not follow the name, the row is the only thing to move.
+	//
+	// The bytes never move here, so there is no window between content and metadata to compensate
+	// for — but every delete is still recorded, so that a crash between the namespace switch and its
+	// audit row is explained, and so that the journal means the same thing on both layouts. Recording
+	// it only on one would make "is this node mid-delete?" unanswerable on the other.
 	if d.Content.Capabilities().EfficientRename {
-		return d.Meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		op, jerr := startDeleteOp(ctx, d, n)
+		if jerr != nil {
+			d.Log.Warn("could not record the delete in the operation journal; continuing, because a "+
+				"delete that fails over bookkeeping is worse than a delete with no record",
+				"node", n.ID.String(), "error", jerr)
+		}
+		if terr := d.Meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
 			return trash(ctx, tx, n)
-		})
+		}); terr != nil {
+			finishDeleteOp(ctx, d, op, store.OpAborted)
+			return terr
+		}
+		finishDeleteOp(ctx, d, op, store.OpCommitted)
+		return nil
 	}
 
 	reserved := BackupName(n.Name)
 	fromRel := path.Join(parentRel, n.Name)
 	toRel := path.Join(parentRel, reserved)
+
+	// Durable intent, before anything moves (ADR-0013 4.1).
+	//
+	// The row is what makes a crash in the middle repairable rather than mysterious: it says a
+	// delete of this node was in progress when the process stopped, and the recovery pass can find
+	// it. Recorded best effort on purpose - a delete must not fail because the journal could not be
+	// written - and the compensation below stays the first line of repair. The journal records what
+	// was attempted; it does not replace the check that decides what to do about it.
+	op, jerr := startDeleteOp(ctx, d, n)
+	if jerr != nil {
+		d.Log.Warn("could not record the delete in the operation journal; continuing, because a "+
+			"delete that fails over bookkeeping is worse than a delete with no record",
+			"node", n.ID.String(), "error", jerr)
+	}
 
 	// Step 1: the content leaves the live path.
 	if err := d.Content.Move(ctx,
@@ -123,5 +155,42 @@ func Retire(ctx context.Context, d Deps, n store.Node, parentRel string, trash T
 		}
 		return terr
 	}
+	finishDeleteOp(ctx, d, op, store.OpCommitted)
 	return nil
+}
+
+// startDeleteOp records the intent to delete a node.
+//
+// The node id goes in staged_root, which is the only node reference the journal table has: it was
+// added for the staged subtree of an install, and a delete has no staged subtree - so the field is
+// used for "the node this operation is about", which is what the recovery pass needs to resolve and
+// re-check.
+func startDeleteOp(ctx context.Context, d Deps, n store.Node) (store.Op, error) {
+	nodeID := n.ID
+	var op store.Op
+	err := d.Meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		got, serr := tx.StartOp(ctx, store.Op{
+			Kind: "delete", OwnerID: n.OwnerID, StagedRoot: &nodeID,
+		})
+		op = got
+		return serr
+	})
+	return op, err
+}
+
+// finishDeleteOp closes the operation, best effort.
+//
+// A journal row left open by a failure here is safe: the recovery pass will look at it and find the
+// node either gone (the delete finished) or present (it did not), which is a decision it can make.
+// That is the point of recording intent rather than a completion flag.
+func finishDeleteOp(ctx context.Context, d Deps, op store.Op, state string) {
+	if op.ID == uuid.Nil {
+		return
+	}
+	if err := d.Meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		return tx.AdvanceOp(ctx, op.ID, op.State, state)
+	}); err != nil {
+		d.Log.Warn("could not close the delete in the operation journal; the recovery pass will "+
+			"find it and decide from the node's state", "op", op.ID.String(), "error", err)
+	}
 }

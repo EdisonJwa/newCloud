@@ -88,3 +88,17 @@ func validOpState(state string) bool {
 	}
 	return false
 }
+
+// OpsForNode lists the operations recorded against a node, newest first, matching the SQL ordering.
+func (t *memTx) OpsForNode(ctx context.Context, nodeID uuid.UUID) ([]Op, error) {
+	var out []Op
+	for _, op := range t.m.opMap() {
+		if op.StagedRoot != nil && *op.StagedRoot == nodeID {
+			out = append(out, op)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	return out, nil
+}
