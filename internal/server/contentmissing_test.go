@@ -41,3 +41,31 @@ type missingOpenContent struct{ layout.ContentStore }
 func (m missingOpenContent) Open(ctx context.Context, n layout.Node) (io.ReadSeekCloser, error) {
 	return nil, layout.ErrNotFound
 }
+
+// The same condition on a route that opens content on its own.
+//
+// The mapping in writeStoreError was the reason this mattered for every route: layout.ErrNotFound
+// meant "bytes missing", and it was answered 404 — the failure table's forbidden answer — so the
+// archive, thumbnail, share and content-ticket routes all said "no such file" for a file the
+// caller could see in a listing. This drives the thumbnail route, which is one of them.
+func TestAMissingContentFileIsNotReportedAsAbsentOnOtherRoutes(t *testing.T) {
+	h := newHarnessTuned(t, nil, func(d *server.Deps) {
+		d.Content = missingOpenContent{ContentStore: d.Content}
+	})
+	h.uploadFile(t, "ghost.png", "not really a png")
+
+	resp := h.do(http.MethodGet, "/api/files/thumbnail?path=ghost.png", nil, nil)
+	code := resp.StatusCode
+	body := readBody(resp)
+	if code == http.StatusNotFound {
+		t.Fatalf("the thumbnail route answered 404 for a file whose metadata exists: that is the " +
+			"answer the failure table forbids, and it sends the user looking for a file that is " +
+			"right there in their listing")
+	}
+	if code != http.StatusInternalServerError {
+		t.Fatalf("thumbnail of a file with missing content answered %d, want 500 (%s)", code, body)
+	}
+	if !strings.Contains(body, "content_missing") {
+		t.Fatalf("the error did not name the condition: %s", body)
+	}
+}

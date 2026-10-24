@@ -1196,8 +1196,18 @@ func (s *Server) maxVersions() int {
 func (s *Server) writeStoreError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, authz.ErrDenied), errors.Is(err, authz.ErrNotFound),
-		errors.Is(err, store.ErrNotFound), errors.Is(err, layout.ErrNotFound):
+		errors.Is(err, store.ErrNotFound):
 		writeError(w, http.StatusNotFound, "not_found", "no such file or directory")
+	case errors.Is(err, layout.ErrNotFound):
+		// The storage layer was asked for bytes that the metadata says exist. That is damage, not an
+		// absence, and answering 404 is the confusion this project's own failure table forbids:
+		// "blob missing but row present → error, never 404". It was mapped to 404 here, so every
+		// route that opens content without its own handling — archive, thumbnail, share download,
+		// content ticket — reported a file people can see in a listing as a file that does not exist.
+		s.deps.Log.Error("content missing for a file whose metadata exists", "error", err)
+		writeError(w, http.StatusInternalServerError, "content_missing",
+			"this file's metadata exists but its content is missing on the storage backend; an "+
+				"operator needs to check the storage")
 	case errors.Is(err, store.ErrConflict):
 		writeError(w, http.StatusConflict, "conflict", "something with that name already exists")
 	case errors.Is(err, store.ErrPrecondition):
