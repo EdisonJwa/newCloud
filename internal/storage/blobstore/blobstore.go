@@ -20,8 +20,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/EdisonJwa/newCloud/internal/blob"
+	"github.com/EdisonJwa/newCloud/internal/consistency"
 	"github.com/EdisonJwa/newCloud/internal/storage/layout"
 )
 
@@ -40,6 +42,12 @@ type Store struct {
 	// development setups: a container often has a read-only /tmp, and staging on a
 	// different filesystem turns the publish into a full copy.
 	spoolDir string
+	// ADR-0013 Phase 1 staging. The bytes are immutable and content-addressed;
+	// this map only carries the operation's staged descriptors until the metadata
+	// publisher commits them.
+	stageMu   sync.Mutex
+	staged    map[stageKey]stagedContent
+	publisher consistency.BlobPublisher
 }
 
 // NodeResolver looks up the content address for a node. It is the metadata
@@ -71,7 +79,7 @@ func New(blobs blob.Store, resolve NodeResolver) (*Store, error) {
 	if resolve == nil {
 		return nil, errors.New("blobstore: nil node resolver")
 	}
-	return &Store{blobs: blobs, resolve: resolve}, nil
+	return &Store{blobs: blobs, resolve: resolve, staged: make(map[stageKey]stagedContent)}, nil
 }
 
 // WithSpoolDir sets the staging directory for uploads.

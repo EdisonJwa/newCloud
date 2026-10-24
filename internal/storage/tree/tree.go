@@ -34,6 +34,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/EdisonJwa/newCloud/internal/storage/layout"
@@ -175,7 +176,7 @@ func (s *Store) Open(ctx context.Context, n layout.Node) (io.ReadSeekCloser, err
 	}
 	f, err := s.root.Open(rel)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
+		if isNotFound(err) {
 			return nil, layout.ErrNotFound
 		}
 		return nil, err
@@ -190,7 +191,7 @@ func (s *Store) Stat(ctx context.Context, n layout.Node) (layout.Node, error) {
 	}
 	fi, err := s.root.Stat(rel)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
+		if isNotFound(err) {
 			return layout.Node{}, layout.ErrNotFound
 		}
 		return layout.Node{}, err
@@ -273,7 +274,7 @@ func (s *Store) List(ctx context.Context, dir layout.Node, limit int) ([]layout.
 	}
 	f, err := s.root.Open(rel)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
+		if isNotFound(err) {
 			return nil, layout.ErrNotFound
 		}
 		return nil, err
@@ -403,3 +404,10 @@ func randomSuffix() string {
 }
 
 var _ layout.ContentStore = (*Store)(nil)
+
+// isNotFound treats a non-directory path component as "not found", not as a
+// server error. Linux returns ENOTDIR for stat("file/child"); mapping only ENOENT
+// made the same request 404 on Windows and 500 on Linux.
+func isNotFound(err error) bool {
+	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR)
+}
