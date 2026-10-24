@@ -73,7 +73,14 @@ func (h *Handler) handleLock(w http.ResponseWriter, r *http.Request, a authz.Act
 			writeXMLError(w, http.StatusPreconditionFailed, "lock-token-matches-request-uri")
 			return
 		}
-		h.writeLockResponse(w, http.StatusOK, tok, node, expires)
+		// A refresh reports the depth the lock already has: the Depth header on a refresh does
+		// not change it (RFC 4918 §9.10.2), so echoing the request's default would tell the
+		// client something untrue about the lock it holds.
+		heldDepth := "infinity"
+		if l, ok := h.activeLock(ctx, node.ID); ok && l.Depth != "" {
+			heldDepth = l.Depth
+		}
+		h.writeLockResponse(w, http.StatusOK, tok, node, expires, heldDepth)
 		return
 	}
 
@@ -129,7 +136,7 @@ func (h *Handler) handleLock(w http.ResponseWriter, r *http.Request, a authz.Act
 		return
 	}
 
-	h.writeLockResponse(w, http.StatusOK, token, node, expires)
+	h.writeLockResponse(w, http.StatusOK, token, node, expires, depth)
 }
 
 // handleUnlock removes a lock.
@@ -197,7 +204,17 @@ func (h *Handler) writeUnsupportedLockScope(w http.ResponseWriter) {
 </D:error>`))
 }
 
-func (h *Handler) writeLockResponse(w http.ResponseWriter, status int, token string, n store.Node, expires time.Time) {
+// writeLockResponse answers a LOCK with a DAV:prop carrying the active lock.
+//
+// The depth reported is the one the client asked for. It used to be the literal "infinity",
+// so a client that locked a collection with Depth: 0 was told it had locked the whole
+// subtree — and a client that trusts the response then skips re-locking its children
+// (2026-10-24 review).
+func (h *Handler) writeLockResponse(w http.ResponseWriter, status int, token string,
+	n store.Node, expires time.Time, depth string) {
+	if depth == "" {
+		depth = "infinity"
+	}
 	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 	w.Header().Set("Lock-Token", "<"+token+">")
 	w.WriteHeader(status)
@@ -206,6 +223,9 @@ func (h *Handler) writeLockResponse(w http.ResponseWriter, status int, token str
 	if secs < 0 {
 		secs = 0
 	}
+	// The depth is the one the client asked for. It used to be the literal "infinity", so a
+	// client that locked a collection with Depth: 0 was told it had locked the whole subtree
+	// — and clients that trust the response then skip re-locking children (2026-10-24 review).
 	_, _ = fmt.Fprintf(w, `<?xml version="1.0" encoding="utf-8"?>
 <D:prop xmlns:D="DAV:"><D:lockdiscovery><D:activelock>
 <D:locktype><D:write/></D:locktype>
@@ -214,7 +234,7 @@ func (h *Handler) writeLockResponse(w http.ResponseWriter, status int, token str
 <D:timeout>Second-%d</D:timeout>
 <D:locktoken><D:href>%s</D:href></D:locktoken>
 </D:activelock></D:lockdiscovery></D:prop>`,
-		"infinity", secs, xmlEscape(token))
+		xmlEscape(depth), secs, xmlEscape(token))
 }
 
 // requestedTimeout parses the client's Timeout header.

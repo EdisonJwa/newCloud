@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/EdisonJwa/newCloud/internal/authz"
 	"github.com/EdisonJwa/newCloud/internal/store"
 )
@@ -71,6 +73,28 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request, a authz
 	w.Header().Set("DAV", daClasses(h.cfg))
 	w.WriteHeader(http.StatusMultiStatus)
 
+	// One query for every live lock at or below the address, indexed by node.
+	//
+	// lockdiscovery is a property of every entry, and asking the store per entry would be N+1
+	// on a folder with a thousand children. LocksInSubtree already exists for the DELETE fence
+	// and answers exactly this shape.
+	locks := map[uuid.UUID][]store.Lock{}
+	if lerr := h.meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
+		held, err := tx.LocksInSubtree(ctx, node.ID)
+		if err != nil {
+			return err
+		}
+		for _, l := range held {
+			locks[l.NodeID] = append(locks[l.NodeID], l)
+		}
+		return nil
+	}); lerr != nil {
+		// A listing is not worth failing over lock state, and the property then says "no locks",
+		// which is wrong in the safe direction: a client that tries to write is still refused by
+		// the write path, which checks the store directly.
+		h.logf("propfind: could not read locks for %q: %v", r.URL.Path, lerr)
+	}
+
 	bw := bufio.NewWriterSize(w, 32<<10)
 	defer bw.Flush()
 
@@ -78,7 +102,7 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request, a authz
 	_, _ = bw.WriteString(`<D:multistatus xmlns:D="DAV:" xmlns:oc="http://owncloud.org/ns" xmlns:nc="http://nextcloud.org/ns">` + "\n")
 
 	writeEntry := func(n store.Node, href string, isRoot bool) {
-		h.writePropEntry(bw, req, n, href, cap, isRoot)
+		h.writePropEntry(r.Context(), bw, req, n, href, cap, isRoot, locks)
 	}
 
 	href := resourceHref(h, r, node)
@@ -123,8 +147,8 @@ func (h *Handler) listChildren(ctx context.Context, dir store.Node) ([]store.Nod
 // The oc:/nc: ones are included because several third-party clients (rclone,
 // some mobile apps) look for them even against a non-Nextcloud server; they cost
 // little and avoid a support ticket.
-func (h *Handler) writePropEntry(w io.Writer, req propfindRequest, n store.Node,
-	href string, cap authz.Cap, isRoot bool) {
+func (h *Handler) writePropEntry(ctx context.Context, w io.Writer, req propfindRequest, n store.Node,
+	href string, cap authz.Cap, isRoot bool, locks map[uuid.UUID][]store.Lock) {
 
 	// A blank displayname is for the NAMESPACE ROOT, which genuinely has no name. Using the
 	// "is this the addressee" flag for it blanked the name of whatever was asked about, so a
@@ -217,10 +241,152 @@ func (h *Handler) writePropEntry(w io.Writer, req propfindRequest, n store.Node,
 		}
 	}
 
+	// Class 2 requires both of these (RFC 4918 §6.2, §15).
+	//
+	// supportedlock is what lets a client know a lock is even possible; without it Windows and
+	// Office fall back to their least informative error. lockdiscovery reports the locks
+	// actually held, and an empty element is the correct answer for "none" — omitting the
+	// property instead makes "not locked" indistinguishable from "server does not support
+	// locks", which is the state this server was in before the 2026-10-24 review.
+	if req.AllProp || hasProp(req.Props, "DAV:", "supportedlock") {
+		b.WriteString("<D:supportedlock><D:lockentry>" +
+			"<D:lockscope><D:exclusive/></D:lockscope>" +
+			"<D:locktype><D:write/></D:locktype></D:lockentry></D:supportedlock>")
+	}
+	if req.AllProp || hasProp(req.Props, "DAV:", "lockdiscovery") {
+		b.WriteString("<D:lockdiscovery>")
+		for _, l := range locks[n.ID] {
+			b.WriteString(activeLockXML(l))
+		}
+		b.WriteString("</D:lockdiscovery>")
+	}
+
+	// Dead properties come back, because otherwise PROPPATCH is write-only.
+	//
+	// The store has kept them (Windows Explorer and macOS Finder write per-file metadata there
+	// and misbehave when it does not survive a reconnect), but PROPFIND never returned one, so
+	// a client that set a property and re-read it saw nothing and concluded the server had
+	// ignored it. Fetched only when the request could care — the query is per entry, and a
+	// plain live-property listing must not pay for it.
+	var dead []store.DeadProp
+	if h.propfindWantsDead(req) {
+		if props, derr := h.deadPropsOf(ctx, n.ID); derr == nil {
+			dead = props
+		}
+	}
+	for _, p := range dead {
+		b.WriteString("<")
+		b.WriteString(xmlEscape(p.Name))
+		b.WriteString(` xmlns="`)
+		b.WriteString(xmlEscape(p.Space))
+		b.WriteString(`">`)
+		b.WriteString(xmlEscape(p.Value))
+		b.WriteString("</")
+		b.WriteString(xmlEscape(p.Name))
+		b.WriteString(">")
+	}
+
 	b.WriteString("</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>")
+
+	// Every property the client named must be answered in one propstat or the other
+	// (RFC 4918 §9.1). Omitting the ones this server does not have left the client unable to
+	// tell "not set" from "the server ignored that part of the request".
+	if !req.AllProp {
+		var missing []propName
+		for _, p := range req.Props {
+			if !h.propIsEmitted(p, dead) {
+				missing = append(missing, p)
+			}
+		}
+		if len(missing) > 0 {
+			b.WriteString("<D:propstat><D:prop>")
+			for _, p := range missing {
+				b.WriteString(emptyPropXML(p))
+			}
+			b.WriteString("</D:prop><D:status>HTTP/1.1 404 Not Found</D:status></D:propstat>")
+		}
+	}
+
 	b.WriteString("</D:response>\n")
 
 	_, _ = io.WriteString(w, b.String())
+}
+
+// propIsEmitted reports whether this handler answers a named property with a value.
+//
+// It must match the branches above exactly: a property listed here but not emitted disappears
+// from the response entirely, which is the failure this function exists to prevent. A non-DAV
+// property is only emitted when the node actually HAS it, so "never set" lands in the 404
+// bucket where a client can see it.
+func (h *Handler) propIsEmitted(p propName, dead []store.DeadProp) bool {
+	if !strings.EqualFold(p.Space, "DAV:") {
+		for _, d := range dead {
+			if strings.EqualFold(d.Name, p.Name) && strings.EqualFold(d.Space, p.Space) {
+				return true
+			}
+		}
+		return false
+	}
+	switch p.Name {
+	case "resourcetype", "displayname", "getcontentlength", "getcontenttype", "getetag",
+		"getlastmodified", "creationdate", "supportedlock", "lockdiscovery",
+		"quota-used-bytes", "quota-available-bytes":
+		return true
+	}
+	return false
+}
+
+// propfindWantsDead reports whether a request could be asking for dead properties.
+func (h *Handler) propfindWantsDead(req propfindRequest) bool {
+	if req.AllProp {
+		return true
+	}
+	for _, p := range req.Props {
+		if !strings.EqualFold(p.Space, "DAV:") {
+			return true
+		}
+	}
+	return false
+}
+
+// deadPropsOf reads a node's dead properties.
+func (h *Handler) deadPropsOf(ctx context.Context, nodeID uuid.UUID) ([]store.DeadProp, error) {
+	var out []store.DeadProp
+	err := h.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		props, err := tx.DeadProps(ctx, nodeID)
+		out = props
+		return err
+	})
+	return out, err
+}
+
+// activeLockXML renders one <D:activelock> for lockdiscovery.
+func activeLockXML(l store.Lock) string {
+	scope := "<D:exclusive/>"
+	depth := l.Depth
+	if depth == "" {
+		depth = "infinity"
+	}
+	secs := int(time.Until(l.ExpiresAt).Seconds())
+	if secs < 0 {
+		secs = 0
+	}
+	return fmt.Sprintf("<D:activelock><D:locktype><D:write/></D:locktype>"+
+		"<D:lockscope>%s</D:lockscope><D:depth>%s</D:depth>"+
+		"<D:timeout>Second-%d</D:timeout><D:locktoken><D:href>%s</D:href></D:locktoken>",
+		scope, xmlEscape(depth), secs, xmlEscape(l.Token))
+}
+
+// emptyPropXML renders a property element with no value, for the 404 propstat.
+//
+// DAV: names reuse the document's D: prefix; anything else gets a local declaration, because
+// the multistatus cannot know which prefixes a client will use and a wrong prefix would make
+// the response unparseable rather than merely empty.
+func emptyPropXML(p propName) string {
+	if strings.EqualFold(p.Space, "DAV:") {
+		return "<D:" + xmlEscape(p.Name) + "/>"
+	}
+	return `<X:` + xmlEscape(p.Name) + ` xmlns:X="` + xmlEscape(p.Space) + `"/>`
 }
 
 func (h *Handler) quota(userID [16]byte) (used, total int64) {
