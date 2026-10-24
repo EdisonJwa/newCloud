@@ -109,3 +109,12 @@ release:
 	$(GO) run ./tools/release -dist "$(DIST)" -version "$(VERSION)" \
 		-platforms "$(PLATFORMS)" -ldflags '$(LDFLAGS)'
 	@echo "release artifacts in $(DIST)/ for $(VERSION)"
+# Fuzzing the parsers that stand between user input and the filesystem.
+#
+# Not part of `test`: fuzzing wants minutes, and a suite that takes minutes on every push is a suite
+# people disable. The seed corpus runs as an ordinary test, so CI covers the examples; this target is
+# for the exploration.
+fuzz:
+	go test ./internal/storage/layout -run '^$$' -fuzz FuzzValidatePath -fuzztime 60s
+	go test ./internal/storage/layout -run '^$$' -fuzz FuzzValidateSegment -fuzztime 60s
+	go test ./internal/server -run '^$$' -fuzz FuzzParseContentRange -fuzztime 60s
