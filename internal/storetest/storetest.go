@@ -3246,6 +3246,114 @@ func Run(t *testing.T, factory Factory, opts Options) {
 				t.Fatalf("keep-last-2 must leave 2 versions, got %d", len(versions))
 			}
 		})
+
+		// A version number must not be handed out twice, and trimming is what makes that
+		// possible: once the oldest versions are gone, `len+1` names a number that is still in
+		// use. PostgreSQL allocates from the current maximum, so only the in-memory backend can
+		// get this wrong — which means a deployment that switched backends inherits a history
+		// whose numbers no longer identify anything (2026-10-24 review, M19).
+		t.Run("VersionNumbersAreNotReusedAfterTrimming", func(t *testing.T) {
+			s, owner := factory(t)
+			r := rootOf(t, s, owner)
+			file := mkfile(t, s, owner, r.ID, "reuse.txt", 10)
+
+			for i := 0; i < 5; i++ {
+				if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+					_, err := tx.UpdateFile(ctx, store.UpdateFile{
+						NodeID: file.ID, Size: 20, BlobID: newBlobHook(t),
+						ETag: "e", KeepVersion: true, MaxVersions: 2,
+					})
+					return err
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			var versions []store.Version
+			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				v, err := tx.Versions(ctx, file.ID, 0)
+				versions = v
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if len(versions) == 0 {
+				t.Fatal("no versions to check after five updates with KeepVersion")
+			}
+			seen := map[int]bool{}
+			for _, v := range versions {
+				if v.VersionNo <= 0 {
+					t.Fatalf("version number %d is not positive", v.VersionNo)
+				}
+				if seen[v.VersionNo] {
+					t.Fatalf("version number %d appears twice in the history: trimming made the "+
+						"next allocation collide with a number still in use", v.VersionNo)
+				}
+				seen[v.VersionNo] = true
+			}
+		})
+
+		// A missing node has no history and no children. Both are "empty", not "not found":
+		// every caller resolves the node before asking, and the two backends disagreeing here
+		// means a switch changes behaviour in a case no test covered (M19).
+		t.Run("AnEnqueueThatRollsBackQueuesNothing", func(t *testing.T) {
+			s, owner := factory(t)
+			rootOf(t, s, owner)
+
+			err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				if eerr := tx.Enqueue(ctx, store.Job{Kind: "doomed"}); eerr != nil {
+					return eerr
+				}
+				// The point of Enqueue being part of the transaction: the job must not exist if
+				// the change it belongs to did not commit. A backend that appends to a shared queue
+				// keeps it, and the worker then runs work for an operation that reported failure
+				// (2026-10-24 review, M19).
+				return errors.New("deliberate rollback")
+			})
+			if err == nil {
+				t.Fatal("the transaction was supposed to fail")
+			}
+
+			pending := -1
+			if cerr := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				p, _, _, jerr := tx.JobCounts(ctx)
+				pending = p
+				return jerr
+			}); cerr != nil {
+				t.Fatal(cerr)
+			}
+			if pending != 0 {
+				t.Fatalf("%d job(s) remained queued after the transaction rolled back; the worker "+
+					"would run work for an operation that reported failure", pending)
+			}
+		})
+		t.Run("AMissingNodeHasNoHistoryAndNoChildren", func(t *testing.T) {
+			s, owner := factory(t)
+			rootOf(t, s, owner)
+			missing := uuid.New()
+
+			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				kids, cerr := tx.Children(ctx, missing, 0)
+				if cerr != nil {
+					t.Fatalf("Children of a missing node returned an error (%v); PostgreSQL "+
+						"answers with no rows, so the two backends disagree", cerr)
+				}
+				if len(kids) != 0 {
+					t.Fatalf("Children of a missing node returned %d rows", len(kids))
+				}
+				vers, verr := tx.Versions(ctx, missing, 0)
+				if verr != nil {
+					t.Fatalf("Versions of a missing node returned an error (%v); PostgreSQL "+
+						"answers with no rows", verr)
+				}
+				if len(vers) != 0 {
+					t.Fatalf("Versions of a missing node returned %d rows", len(vers))
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 
 	// Identity provisioning.

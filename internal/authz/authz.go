@@ -96,12 +96,12 @@ func NewAnonymousActor(scope Scope) Actor {
 	return Actor{kind: KindAnonymous, scopes: scope}
 }
 
-// NewServiceActor is used by background workers that act on behalf of the
-// system itself. It gets no implicit file access: workers must resolve the node
-// through a system-owned context and are audited like anything else.
-func NewServiceActor() Actor {
-	return Actor{kind: KindService, scopes: ScopeRead | ScopeWrite}
-}
+// There was a NewServiceActor here, returning an actor with read and write scope and no id.
+// It had no caller — the workers do not go through authz at all; they act on the store directly
+// and are audited as "system". An exported constructor that hands out universal read/write is
+// the last thing that should be lying around for a future caller to reach for when a permission
+// check gets inconvenient, so it was removed rather than kept with a comment (2026-10-24 review,
+// low severity findings).
 
 func (a Actor) Kind() Kind        { return a.kind }
 func (a Actor) ID() uuid.UUID     { return a.id }

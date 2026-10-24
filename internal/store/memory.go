@@ -419,7 +419,10 @@ func (t *memTx) NodeIncludingTrashed(ctx context.Context, id uuid.UUID) (Node, e
 
 func (t *memTx) Children(ctx context.Context, parentID uuid.UUID, limit int) ([]Node, error) {
 	if _, ok := t.m.nodes[parentID]; !ok {
-		return nil, ErrNotFound
+		// No such collection, therefore no children — which is what PostgreSQL answers (no
+		// rows). Returning ErrNotFound here made the two backends disagree on a case every
+		// listing resolves before it gets this far (M19).
+		return nil, nil
 	}
 	out := make([]Node, 0, len(t.m.children[parentID]))
 	for _, childID := range t.m.children[parentID] {
@@ -557,7 +560,7 @@ func (t *memTx) UpdateFile(ctx context.Context, u UpdateFile) (Node, error) {
 	if u.KeepVersion && rec.node.BlobID != nil && *rec.node.BlobID != u.BlobID {
 		rec.versions = append(rec.versions, Version{
 			ID: newID(), NodeID: rec.node.ID,
-			VersionNo: len(rec.versions) + 1,
+			VersionNo: nextVersionNo(rec.versions),
 			BlobID:    *rec.node.BlobID,
 			Size:      rec.node.Size,
 			// The checksum travels with the version (§8.1 内容校验信息). PostgreSQL joins it
@@ -883,10 +886,30 @@ func (t *memTx) restoreRecursive(id uuid.UUID, depth int) error {
 	return nil
 }
 
+// nextVersionNo returns the number the next version should carry.
+//
+// It is the current maximum plus one, NOT len+1. The two agree until a version is trimmed:
+// after MaxVersions has dropped the oldest, len is smaller than the highest number in use, so
+// len+1 reuses a number that is still taken. PostgreSQL allocates from max, and the two
+// backends disagreeing here leaves a history with duplicate version numbers after a backend
+// switch — which defeats the only thing a version number is for (2026-10-24 review, M19).
+func nextVersionNo(versions []Version) int {
+	next := 1
+	for _, v := range versions {
+		if v.VersionNo >= next {
+			next = v.VersionNo + 1
+		}
+	}
+	return next
+}
+
 func (t *memTx) Versions(ctx context.Context, nodeID uuid.UUID, limit int) ([]Version, error) {
 	rec, ok := t.m.nodes[nodeID]
 	if !ok {
-		return nil, ErrNotFound
+		// A missing node has no history. That is what PostgreSQL answers (no rows) and what
+		// the callers already handle; returning ErrNotFound made the backends disagree on a
+		// case no listing exercises, so only a backend switch would have revealed it (M19).
+		return nil, nil
 	}
 	out := append([]Version(nil), rec.versions...)
 	sort.Slice(out, func(i, j int) bool { return out[i].VersionNo > out[j].VersionNo })
@@ -929,7 +952,7 @@ func (t *memTx) RestoreVersion(ctx context.Context, nodeID uuid.UUID, versionNo 
 	if rec.node.BlobID != nil {
 		rec.versions = append(rec.versions, Version{
 			ID: newID(), NodeID: rec.node.ID,
-			VersionNo: len(rec.versions) + 1,
+			VersionNo: nextVersionNo(rec.versions),
 			BlobID:    *rec.node.BlobID,
 			Size:      rec.node.Size,
 			SHA256:    append([]byte(nil), rec.blob[:]...),
