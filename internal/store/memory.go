@@ -644,6 +644,9 @@ func (t *memTx) CreateDir(ctx context.Context, n NewNode) (Node, error) {
 	}
 	t.m.nodes[node.ID] = &memNode{node: node}
 	t.attach(n.ParentID, node)
+	if err := t.bumpDirAndUp(ctx, n.ParentID); err != nil {
+		return Node{}, err
+	}
 	return node, nil
 }
 
@@ -669,6 +672,9 @@ func (t *memTx) CreateFile(ctx context.Context, n NewFile) (Node, error) {
 	t.m.nodes[node.ID] = &memNode{node: node, blob: n.BlobHash}
 	t.attach(n.ParentID, node)
 	t.m.usage[n.OwnerID] += n.Size
+	if err := t.bumpDirAndUp(ctx, n.ParentID); err != nil {
+		return Node{}, err
+	}
 	return node, nil
 }
 
@@ -725,6 +731,11 @@ func (t *memTx) UpdateFile(ctx context.Context, u UpdateFile) (Node, error) {
 	}
 	rec.blob = u.BlobHash
 	t.m.usage[rec.node.OwnerID] += delta
+	if rec.node.ParentID != nil {
+		if err := t.bumpDirAndUp(ctx, *rec.node.ParentID); err != nil {
+			return Node{}, err
+		}
+	}
 	return rec.node, nil
 }
 
@@ -801,6 +812,9 @@ func (t *memTx) Rename(ctx context.Context, id uuid.UUID, name string) (Node, er
 	rec.node.Name = name
 	rec.node.ModifiedAt = t.m.now()
 	t.m.children[parentID][nameKey(name)] = id
+	if err := t.bumpDirAndUp(ctx, parentID); err != nil {
+		return Node{}, err
+	}
 	return rec.node, nil
 }
 
@@ -835,17 +849,33 @@ func (t *memTx) Move(ctx context.Context, id, newParent uuid.UUID) (Node, error)
 		return Node{}, err
 	}
 
+	oldParent := *rec.node.ParentID
 	delete(t.m.children[*rec.node.ParentID], nameKey(rec.node.Name))
 	parent := newParent
 	rec.node.ParentID = &parent
 	rec.node.ModifiedAt = t.m.now()
 	t.attach(newParent, rec.node)
+	// Both chains change (M1): the directory that lost the entry, the one that gained it.
+	if err := t.bumpDirAndUp(ctx, oldParent); err != nil {
+		return Node{}, err
+	}
+	if err := t.bumpDirAndUp(ctx, newParent); err != nil {
+		return Node{}, err
+	}
 	return rec.node, nil
 }
 
 func (t *memTx) Trash(ctx context.Context, id uuid.UUID) error {
 	if _, ok := t.m.nodes[id]; !ok {
 		return ErrNotFound
+	}
+	// The chain the entry leaves behind gets its token (M1) before the marking: after
+	// trashRecursive, walking up from id still reaches the live parent, but capturing
+	// first mirrors the PostgreSQL hook's shape.
+	if rec, ok := t.m.nodes[id]; ok && rec.node.TrashedAt == nil && rec.node.ParentID != nil {
+		if err := t.bumpDirAndUp(ctx, *rec.node.ParentID); err != nil {
+			return err
+		}
 	}
 	return t.trashRecursive(id, 0)
 }
@@ -1003,6 +1033,12 @@ func (t *memTx) Restore(ctx context.Context, id uuid.UUID) (Node, error) {
 	// making them unreachable forever.
 	if err := t.restoreRecursive(id, 0); err != nil {
 		return Node{}, err
+	}
+	// The entry returned to its parent directory (M1).
+	if rec.node.ParentID != nil {
+		if err := t.bumpDirAndUp(ctx, *rec.node.ParentID); err != nil {
+			return Node{}, err
+		}
 	}
 	return t.m.nodes[id].node, nil
 }
@@ -1180,6 +1216,12 @@ func (t *memTx) RestoreVersion(ctx context.Context, nodeID uuid.UUID, versionNo 
 		t.m.usage[rec.node.OwnerID] += delta
 	} else {
 		t.m.usage[rec.node.OwnerID] += delta
+	}
+	// The restored content changes the containing directory too (M1).
+	if rec.node.ParentID != nil {
+		if err := t.bumpDirAndUp(ctx, *rec.node.ParentID); err != nil {
+			return Node{}, err
+		}
 	}
 
 	return rec.node, nil

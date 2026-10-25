@@ -3951,6 +3951,8 @@ func Run(t *testing.T, factory Factory, opts Options) {
 	// Notifications (M4): same shared-suite reason as the social block above — SQL and a Go loop
 	// must keep the same answers, including the unread dedupe and the cursor tiebreak.
 	t.Run("Notifications", NotificationCases(factory))
+	// Directory ETag propagation (M1): every mutation path stamps the chain, on both backends.
+	t.Run("DirETagPropagation", DirETagPropagationCases(factory))
 	t.Run("Tags", func(t *testing.T) { tagSuite(t, factory) })
 	t.Run("Comments", func(t *testing.T) { commentSuite(t, factory) })
 	t.Run("FilteredSearch", func(t *testing.T) { filteredSearchSuite(t, factory) })

@@ -280,6 +280,11 @@ func (t *pgTx) CreateDir(ctx context.Context, n NewNode) (Node, error) {
 	if err := validateName(n.Name); err != nil {
 		return Node{}, err
 	}
+	// The containing directory changed (M1): same transaction as the insert, so a
+	// client comparing ETags never sees the child without the parent's new token.
+	if err := t.bumpDirAndUp(ctx, n.ParentID); err != nil {
+		return Node{}, err
+	}
 	const q = `INSERT INTO nodes (parent_id, owner_id, owner_group_id, name, name_key, kind, size, mime, etag)
 		VALUES ($1, $2, $3, $4, $5, 'dir', 0, '', '')
 		RETURNING ` + nodeColumns
@@ -327,6 +332,13 @@ func (t *pgTx) UpdateFile(ctx context.Context, u UpdateFile) (Node, error) {
 	}
 	if current.Kind != KindFile {
 		return Node{}, fmt.Errorf("%w: not a file", ErrInvalidName)
+	}
+	// The overwrite changes the containing directory (M1): stamped before the write,
+	// in this transaction, so the token and the content land together or not at all.
+	if current.ParentID != nil {
+		if err := t.bumpDirAndUp(ctx, *current.ParentID); err != nil {
+			return Node{}, err
+		}
 	}
 	if t.s.stallBeforeLockForTest != nil {
 		t.s.stallBeforeLockForTest(ctx)
@@ -423,6 +435,11 @@ func (t *pgTx) WriteFile(ctx context.Context, w WriteFile) (Node, bool, error) {
 	// the same directory then serialise here instead of racing into the unique
 	// index, which turns a retryable conflict into a hard error for one client.
 	if err := t.lockNode(ctx, w.ParentID); err != nil {
+		return Node{}, false, err
+	}
+	// A create or an overwrite both change the containing directory (M1). Inside the
+	// same transaction as the write, so a failed write rolls the token back with it.
+	if err := t.bumpDirAndUp(ctx, w.ParentID); err != nil {
 		return Node{}, false, err
 	}
 
@@ -593,10 +610,28 @@ func (t *pgTx) Rename(ctx context.Context, id uuid.UUID, name string) (Node, err
 	const q = `UPDATE nodes SET name = $2, name_key = $3, modified_at = now()
 		WHERE id = $1 AND trashed_at IS NULL AND parent_id IS NOT NULL
 		RETURNING ` + nodeColumns
-	return scanNode(t.tx.QueryRow(ctx, q, id, name, nameKey(name)))
+	node, err := scanNode(t.tx.QueryRow(ctx, q, id, name, nameKey(name)))
+	if err != nil {
+		return Node{}, err
+	}
+	// The directory holding the renamed entry changed (M1).
+	if node.ParentID != nil {
+		if err := t.bumpDirAndUp(ctx, *node.ParentID); err != nil {
+			return Node{}, err
+		}
+	}
+	return node, nil
 }
 
 func (t *pgTx) Move(ctx context.Context, id, newParent uuid.UUID) (Node, error) {
+	// The old parent is captured BEFORE the update (M1): after it, the row only knows
+	// the new chain, and a move changes two directories — the one that lost the entry
+	// and the one that gained it. A read raced by a concurrent move can under-stamp by
+	// one directory; that costs a client one extra subtree walk, never a wrong answer.
+	var oldParent *uuid.UUID
+	_ = t.tx.QueryRow(ctx,
+		`SELECT parent_id FROM nodes WHERE id = $1 AND trashed_at IS NULL`, id).Scan(&oldParent)
+
 	// The cycle check is a recursive CTE: walking up from the new parent, the
 	// move is invalid if we meet the node being moved. Doing it in SQL keeps it
 	// atomic with the UPDATE; doing it in Go would race with a concurrent move.
@@ -623,6 +658,15 @@ func (t *pgTx) Move(ctx context.Context, id, newParent uuid.UUID) (Node, error) 
 				return Node{}, ErrCycle
 			}
 		}
+		return Node{}, err
+	}
+	// Both chains, stamped now that the move itself committed inside this transaction.
+	if oldParent != nil {
+		if err := t.bumpDirAndUp(ctx, *oldParent); err != nil {
+			return Node{}, err
+		}
+	}
+	if err := t.bumpDirAndUp(ctx, newParent); err != nil {
 		return Node{}, err
 	}
 	return node, nil
@@ -751,6 +795,12 @@ func (t *pgTx) creditBytesFromTrash(ctx context.Context, usage []ownerBytes) err
 // It returns the number of rows it marked, which is what a caller reporting "how much
 // entered the trash" counts instead of guessing from its own bookkeeping.
 func (t *pgTx) markTrashed(ctx context.Context, id uuid.UUID, expect *Precondition) (int, error) {
+	// The parent chain is captured BEFORE the subtree is marked (M1): after it, the
+	// walk would still find the parent (trashing does not reparent), but capturing
+	// first states the intent plainly — the chain changed because this entry left it.
+	var trashedParent *uuid.UUID
+	_ = t.tx.QueryRow(ctx,
+		`SELECT parent_id FROM nodes WHERE id = $1 AND trashed_at IS NULL`, id).Scan(&trashedParent)
 	const q = `
 		WITH RECURSIVE subtree AS (
 		    SELECT id FROM nodes WHERE id = $1 AND trashed_at IS NULL
@@ -795,6 +845,11 @@ func (t *pgTx) markTrashed(ctx context.Context, id uuid.UUID, expect *Preconditi
 			}
 		}
 		return 0, ErrNotFound
+	}
+	if trashedParent != nil {
+		if err := t.bumpDirAndUp(ctx, *trashedParent); err != nil {
+			return 0, err
+		}
 	}
 	return int(tag.RowsAffected()), nil
 }
@@ -922,7 +977,17 @@ func (t *pgTx) Restore(ctx context.Context, id uuid.UUID) (Node, error) {
 	if err := t.creditBytesFromTrash(ctx, usage); err != nil {
 		return Node{}, err
 	}
-	return t.Node(ctx, id)
+	node, err := t.Node(ctx, id)
+	if err != nil {
+		return Node{}, err
+	}
+	// The entry came back into its parent directory (M1).
+	if node.ParentID != nil {
+		if err := t.bumpDirAndUp(ctx, *node.ParentID); err != nil {
+			return Node{}, err
+		}
+	}
+	return node, nil
 }
 
 func (t *pgTx) Versions(ctx context.Context, nodeID uuid.UUID, limit int) ([]Version, error) {
@@ -982,6 +1047,12 @@ func (t *pgTx) RestoreVersion(ctx context.Context, nodeID uuid.UUID, versionNo i
 	current, err := t.Node(ctx, nodeID)
 	if err != nil {
 		return Node{}, err
+	}
+	// The restored content changes the file AND its containing directory (M1).
+	if current.ParentID != nil {
+		if err := t.bumpDirAndUp(ctx, *current.ParentID); err != nil {
+			return Node{}, err
+		}
 	}
 
 	// Restoring an old version keeps the current one: otherwise "undo" is

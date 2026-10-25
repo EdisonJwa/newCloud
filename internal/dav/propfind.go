@@ -262,10 +262,20 @@ func (h *Handler) writePropEntry(w io.Writer, req propfindRequest, n store.Node,
 
 	if req.AllProp || hasProp(req.Props, "DAV:", "getetag") {
 		b.WriteString("<D:getetag>")
-		// Directories get a synthetic etag derived from their modification time:
-		// clients use it to detect "something changed in here" without listing.
+		// A directory's etag is its CHANGE TOKEN (M1): every mutation under it stamps a
+		// fresh one on it and every directory above it, so a walking sync client compares
+		// the token and skips a subtree it already listed — that walk is what makes generic
+		// WebDAV sync slow, and this is the server's half of pruning it.
+		//
+		// The mtime fallback serves rows written before tokens existed: they carry an empty
+		// etag until the next mutation under them stamps one, and answering them with no etag
+		// at all would be a regression for clients mid-upgrade.
 		if n.IsDir() {
-			b.WriteString(xmlEscape(fmt.Sprintf(`"%x"`, n.ModifiedAt.UnixNano())))
+			if n.ETag != "" {
+				b.WriteString(xmlEscape(n.ETag))
+			} else {
+				b.WriteString(xmlEscape(fmt.Sprintf(`"%x"`, n.ModifiedAt.UnixNano())))
+			}
 		} else {
 			b.WriteString(xmlEscape(n.ETag))
 		}
