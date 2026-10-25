@@ -12,7 +12,10 @@
     "gen:api": "openapi-typescript openapi.yaml -o src/api-types.ts",
     "contrast": "node scripts/contrast.mjs",
     "i18n": "node scripts/i18n-check.mjs",
-    "gen:api:check": "openapi-typescript openapi.yaml -o src/api-types.ts && git diff --ignore-cr-at-eol --exit-code -- src/api-types.ts"
+    "vendor": "node scripts/vendor-check.mjs",
+    "ui:verify": "node scripts/ui-verify.mjs",
+    "gen:api:check": "openapi-typescript openapi.yaml -o src/api-types.ts && git diff --ignore-cr-at-eol --exit-code -- src/api-types.ts",
+    "check": "pnpm typecheck && pnpm contrast && pnpm i18n && pnpm vendor"
   },
   "dependencies": {
     "openapi-fetch": "^0.17.0",

@@ -1,0 +1,200 @@
+/*
+ * Sharing.
+ *
+ * Serein ships the sharing row (`serein-share-row`), the tabs and the link box. This file adds
+ * the column header above the outbound list, the received-row overrides (the framework's row
+ * has an owner column but no expander) and the smaller type the outbound list needs to hold
+ * four facts in one row.
+ */
+
+.wc-share-tabs {
+  margin-bottom: var(--serein-space-6);
+}
+
+/* The tab strip keeps its three-word labels at 320px. Serein already gives each tab a 44px
+   target and horizontal overflow at phone widths; this stops a long translation from being
+   clipped to an ellipsis that reads as a different word. */
+.wc-share-tabs .serein-tab {
+  white-space: nowrap;
+}
+
+@supports (width: max-content) {
+  .wc-share-tabs .serein-tabs__list {
+    width: max-content;
+    max-width: 100%;
+  }
+}
+
+/* ------------------------------------------------------------- outbound list -- */
+
+/*
+ * The column header.
+ *
+ * The approved design shows LINK / ACCESS / USAGE / EXPIRY above the outbound list, and the
+ * four facts are otherwise unlabelled numbers. It is aligned to the row grid by repeating it,
+ * because the row's columns are a framework property and a header that guessed would drift.
+ */
+.wc-sharehead {
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr) 132px 120px 92px 28px;
+  align-items: center;
+  gap: 12px;
+  height: 32px;
+  padding: 0 14px;
+  border-bottom: 1px solid var(--serein-divider);
+  color: var(--serein-text-tertiary);
+  font: var(--serein-type-label);
+  letter-spacing: var(--serein-tracking-label);
+  text-transform: uppercase;
+}
+
+@media (max-width: 820px) {
+  .wc-sharehead {
+    display: none;
+  }
+}
+
+@container serein-share-list (max-width: 760px) {
+  .wc-sharehead {
+    grid-template-columns: 38px minmax(0, 1fr) 120px 28px;
+  }
+  .wc-sharehead > :nth-child(3),
+  .wc-sharehead > :nth-child(5) {
+    display: none;
+  }
+}
+
+.wc-share-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--serein-space-4);
+  margin-bottom: var(--serein-space-5);
+  flex-wrap: wrap;
+}
+
+.wc-share-toolbar .serein-hint {
+  flex: 1;
+  min-width: 200px;
+}
+
+.wc-share-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  justify-self: end;
+}
+
+/* The outbound row is a button-like surface: a pointer cursor and a hover that matches the
+   framework's own row hover. */
+.serein-share-row {
+  cursor: pointer;
+}
+
+.wc-share-subhead {
+  margin: var(--serein-space-8) 0 var(--serein-space-3);
+  color: var(--serein-text-secondary);
+  font: var(--serein-type-section);
+  letter-spacing: var(--serein-tracking-title);
+}
+
+.wc-spent-icon {
+  background: var(--serein-warning-soft);
+  color: var(--serein-warning);
+}
+
+.wc-share-note {
+  margin-top: var(--serein-space-5);
+}
+
+/* ------------------------------------------------------------- received rows -- */
+
+/*
+ * The received row reuses the outbound grid but drops the usage and expiry cells, which a
+ * recipient has no values for. The owner column carries the sender's identifier and the
+ * action cluster is an expander plus a download.
+ */
+.wc-received-row {
+  grid-template-columns: 34px minmax(0, 1fr) 120px 132px 0 112px;
+  cursor: pointer;
+}
+
+.wc-received-row:hover {
+  background: var(--serein-hover-bg);
+}
+
+.wc-received-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  justify-self: end;
+}
+
+@media (max-width: 820px) {
+  /*
+   * The phone row keeps the filename, the sender and the permission — the three facts that
+   * were hidden in the version this replaces. Only the type and size line gives up its space,
+   * and it does so by moving under the name rather than disappearing.
+   */
+  .wc-received-row {
+    grid-template-columns: 34px minmax(0, 1fr) auto;
+    grid-template-areas:
+      "tile main actions"
+      "tile who actions";
+    row-gap: 1px;
+    min-height: 62px;
+    padding: 7px 10px;
+  }
+  .wc-received-row > .serein-file-icon {
+    grid-area: tile;
+  }
+  .wc-received-row > .serein-share-row__main {
+    grid-area: main;
+  }
+  .wc-received-row > .serein-share-row__owner {
+    grid-area: who;
+  }
+  .wc-received-row > .wc-received-actions {
+    grid-area: actions;
+  }
+  /* Access is not dropped on a phone: it moves beside the sender. It is the fact a recipient
+     needs before they try to edit something. */
+  .wc-received-row > .serein-share-row__access {
+    display: block;
+    grid-area: who;
+    justify-self: end;
+    font-size: calc(11px * var(--serein-text-scale));
+  }
+  .wc-received-row > .serein-share-row__expiry {
+    display: none;
+  }
+  .wc-received-row .serein-share-row__owner {
+    max-width: 45%;
+  }
+}
+
+@container serein-share-list (max-width: 760px) {
+  .wc-received-row {
+    grid-template-columns: 34px minmax(0, 1fr) 120px 0 104px;
+  }
+  .wc-received-row > .serein-share-row__owner {
+    display: none;
+  }
+}
+
+.wc-received-empty {
+  padding-block: var(--serein-space-3);
+}
+
+/* --------------------------------------------------------- row typography ---- */
+
+/* The outbound row carries four facts; at 12px the expiry date is the first thing to wrap in a
+   200px column. Tabular figures keep the usage meters aligned down the list. */
+.serein-share-row__usage,
+.serein-share-row__expiry,
+.serein-share-row__access {
+  font-variant-numeric: tabular-nums;
+}
+
+.serein-share-row__title .serein-badge {
+  margin-inline-start: 6px;
+}

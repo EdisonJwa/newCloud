@@ -1,34 +1,54 @@
 // Dialogs.
 //
-// Native <dialog> with showModal(): the platform provides the top layer, focus containment,
-// Escape handling and the inert backdrop, none of which is worth reimplementing. What is
-// added here is the form plumbing and the one thing the platform does not do — returning
-// focus to the element that opened the dialog.
+// Native `<dialog>` with `showModal()`: the platform provides the top layer, focus containment,
+// Escape handling and the inert backdrop, none of which is worth reimplementing. What is added
+// here is the form plumbing, the one thing the platform does not do — returning focus to the
+// element that opened the dialog — and the validation that stops a submit the server would
+// reject anyway.
+//
+// Every dialog follows the same shell (`serein-dialog` with a header, body and footer) so their
+// rhythm and their Escape behaviour cannot drift apart, and the footer always puts the
+// committing action last and on the right, which is where a person's eye already is.
 
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { useI18n } from "../i18n";
 import { Icon, useToast } from "../ui";
 import { api, APIError } from "../api";
-import type { CreateShareRequest, FileNode } from "../types";
+import type { CreateShareRequest, FileNode, Share } from "../types";
 
-interface ModalProps {
+/* ------------------------------------------------------------------ shell --- */
+
+interface ShellProps {
   title: string;
   description?: string;
   children?: ReactNode;
   footer: ReactNode;
   onClose: () => void;
+  size?: "sm" | "normal" | "wide";
+  /** Shown beside the title; a dialog that confirms a destructive act says so in words. */
+  tone?: "neutral" | "danger";
 }
 
-function Modal({ title, description, children, footer, onClose }: ModalProps) {
+/**
+ * Dialog is the shell every dialog uses.
+ *
+ * `open` is driven by mounting rather than by a boolean prop: a dialog that stays mounted and
+ * is hidden loses its native top-layer behaviour on some browsers, and the focus return has to
+ * happen exactly once on unmount regardless of which control closed it.
+ */
+function Dialog({ title, description, children, footer, onClose, size = "normal", tone = "neutral" }: ShellProps) {
   const ref = useRef<HTMLDialogElement>(null);
   const opener = useRef<Element | null>(null);
+  const base = useId().replace(/[^a-zA-Z0-9]/g, "");
+  const titleId = `dlg-${base}-title`;
+  const descId = description ? `dlg-${base}-desc` : undefined;
 
   useEffect(() => {
     opener.current = document.activeElement;
     ref.current?.showModal();
     return () => {
-      // Returning focus matters: without it the next Tab starts from the top of the page and
-      // a keyboard user loses their place after every dialog.
+      // Without this the next Tab starts from the top of the page and a keyboard user loses
+      // their place after every dialog.
       if (opener.current instanceof HTMLElement) opener.current.focus();
     };
   }, []);
@@ -36,24 +56,81 @@ function Modal({ title, description, children, footer, onClose }: ModalProps) {
   return (
     <dialog
       ref={ref}
+      className={`serein-dialog${size === "sm" ? " serein-dialog--sm" : size === "wide" ? " serein-dialog--wide" : ""}${tone === "danger" ? " serein-dialog--alert" : ""}`}
+      role={tone === "danger" ? "alertdialog" : undefined}
+      aria-labelledby={titleId}
+      aria-describedby={descId}
       onCancel={(e) => {
         e.preventDefault();
         onClose();
       }}
     >
-      <div className="head">
-        <h2>{title}</h2>
-        {description ? <p>{description}</p> : null}
+      <div className="serein-dialog__header">
+        <h2 className="serein-dialog__title" id={titleId}>
+          {title}
+        </h2>
+        {description ? (
+          <p className="serein-dialog__description" id={descId}>
+            {description}
+          </p>
+        ) : null}
       </div>
-      {children ? <div className="body">{children}</div> : null}
-      <div className="foot">{footer}</div>
+      {children ? <div className="serein-dialog__body">{children}</div> : null}
+      <div className="serein-dialog__footer">{footer}</div>
+      <button
+        type="button"
+        className="serein-icon-btn serein-icon-btn--sm serein-dialog__close"
+        aria-label="Close"
+        onClick={onClose}
+      >
+        <Icon name="close" size={13} />
+      </button>
     </dialog>
   );
 }
 
 function errText(err: unknown): string {
-  return err instanceof APIError ? err.message : String(err);
+  return err instanceof APIError ? err.message || err.code : String(err);
 }
+
+/** Field wraps a label, control and its hint/error in Serein's field chrome. */
+function Field({
+  label,
+  hint,
+  error,
+  children,
+  optional,
+  htmlFor,
+}: {
+  label: string;
+  hint?: string;
+  error?: string;
+  children: ReactNode;
+  optional?: string;
+  htmlFor?: string;
+}) {
+  return (
+    <div className={`serein-field${error ? " is-invalid" : ""}`}>
+      <div className="serein-field__label-row">
+        <label className="serein-label" htmlFor={htmlFor}>
+          {label}
+        </label>
+        {optional ? <span className="serein-optional">{optional}</span> : null}
+      </div>
+      {children}
+      {error ? (
+        <span className="serein-field__error" role="alert">
+          <Icon name="alert" size={12} />
+          {error}
+        </span>
+      ) : hint ? (
+        <span className="serein-hint">{hint}</span>
+      ) : null}
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------- actions --- */
 
 export function NewFolderDialog({
   dir,
@@ -68,14 +145,22 @@ export function NewFolderDialog({
   const toast = useToast();
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    // A dialog whose only field is not focused is a dialog the person has to aim at.
+    inputRef.current?.focus();
+  }, []);
+
+  const trimmed = name.trim();
+  const invalid = trimmed.length > 0 && /[\\/:*?"<>|]/.test(trimmed);
 
   const submit = async () => {
-    const value = name.trim();
-    if (!value) return;
+    if (!trimmed || invalid) return;
     setBusy(true);
     try {
-      await api.mkdir(dir ? `${dir}/${value}` : value);
-      toast.info(t("toast.folderCreated"));
+      await api.mkdir(dir ? `${dir}/${trimmed}` : trimmed);
+      toast.success(t("toast.folderCreated"));
       onDone();
       onClose();
     } catch (err) {
@@ -85,33 +170,47 @@ export function NewFolderDialog({
   };
 
   return (
-    <Modal
+    <Dialog
       title={t("dlg.newFolder")}
+      description={dir ? `/${dir}` : t("files.root")}
       onClose={onClose}
       footer={
         <>
-          <button type="button" className="btn" onClick={onClose}>
+          <button type="button" className="serein-btn serein-btn--quiet" onClick={onClose}>
             {t("dlg.cancel")}
           </button>
-          <button type="button" className="btn primary" disabled={busy || !name.trim()} onClick={submit}>
+          <button
+            type="button"
+            className="serein-btn"
+            disabled={busy || !trimmed || invalid}
+            onClick={() => void submit()}
+          >
             {t("dlg.create")}
           </button>
         </>
       }
     >
-      <label className="field">
-        <span className="micro">{t("dlg.folderLabel")}</span>
-        <input
-          value={name}
-          autoFocus
-          aria-label={t("dlg.folderLabel")}
-          onChange={(e) => setName(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") void submit();
-          }}
-        />
-      </label>
-    </Modal>
+      <Field
+        label={t("dlg.folderLabel")}
+        htmlFor="new-folder-name"
+        error={invalid ? t("dlg.nameInvalid") : undefined}
+        hint={invalid ? undefined : t("dlg.nameHint")}
+      >
+        <div className="serein-input-wrap">
+          <input
+            ref={inputRef}
+            id="new-folder-name"
+            className="serein-input"
+            value={name}
+            autoComplete="off"
+            onChange={(e) => setName(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") void submit();
+            }}
+          />
+        </div>
+      </Field>
+    </Dialog>
   );
 }
 
@@ -128,17 +227,31 @@ export function RenameDialog({
   const toast = useToast();
   const [name, setName] = useState(entry.name);
   const [busy, setBusy] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.focus();
+    // Selecting everything except the extension is the small kindness that makes rename
+    // usable: retyping a name should not mean retyping ".jpg".
+    const dot = entry.name.lastIndexOf(".");
+    el.setSelectionRange(0, dot > 0 ? dot : entry.name.length);
+  }, [entry.name]);
+
+  const trimmed = name.trim();
+  const unchanged = trimmed === entry.name;
+  const invalid = trimmed.length > 0 && /[\\/:*?"<>|]/.test(trimmed);
 
   const submit = async () => {
-    const next = name.trim();
-    if (!next || next === entry.name) {
+    if (!trimmed || unchanged || invalid) {
       onClose();
       return;
     }
     setBusy(true);
     try {
-      await api.rename(entry.path, next);
-      toast.info(t("toast.renamed"));
+      await api.rename(entry.path, trimmed);
+      toast.success(t("toast.renamed"));
       onDone();
       onClose();
     } catch (err) {
@@ -148,34 +261,46 @@ export function RenameDialog({
   };
 
   return (
-    <Modal
+    <Dialog
       title={t("dlg.rename")}
       description={entry.path}
       onClose={onClose}
       footer={
         <>
-          <button type="button" className="btn" onClick={onClose}>
+          <button type="button" className="serein-btn serein-btn--quiet" onClick={onClose}>
             {t("dlg.cancel")}
           </button>
-          <button type="button" className="btn primary" disabled={busy} onClick={submit}>
+          <button
+            type="button"
+            className="serein-btn"
+            disabled={busy || !trimmed || unchanged || invalid}
+            onClick={() => void submit()}
+          >
             {t("dlg.rename")}
           </button>
         </>
       }
     >
-      <label className="field">
-        <span className="micro">{t("dlg.renameLabel")}</span>
-        <input
-          value={name}
-          autoFocus
-          aria-label={t("dlg.renameLabel")}
-          onChange={(e) => setName(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") void submit();
-          }}
-        />
-      </label>
-    </Modal>
+      <Field
+        label={t("dlg.renameLabel")}
+        htmlFor="rename-name"
+        error={invalid ? t("dlg.nameInvalid") : undefined}
+      >
+        <div className="serein-input-wrap">
+          <input
+            ref={inputRef}
+            id="rename-name"
+            className="serein-input"
+            value={name}
+            autoComplete="off"
+            onChange={(e) => setName(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") void submit();
+            }}
+          />
+        </div>
+      </Field>
+    </Dialog>
   );
 }
 
@@ -205,16 +330,21 @@ export function DeleteDialog({
     onDone();
     onClose();
     if (failures.length === 0) {
-      toast.info(t("toast.deleted", { n: entries.length }));
+      toast.success(t("toast.deleted", { n: entries.length }), {
+        label: t("toast.undoHint"),
+        run: () => toast.info(t("trash.restoreHint")),
+      });
     } else {
-      // Partial failure is reported rather than swallowed: the user has to know which items
+      // Partial failure is reported rather than swallowed: the person has to know which items
       // are still there.
       toast.error(failures[0] ?? "");
     }
   };
 
   return (
-    <Modal
+    <Dialog
+      tone="danger"
+      size="sm"
       title={
         entries.length === 1
           ? t("dlg.deleteOne", { name: entries[0]?.name ?? "" })
@@ -224,10 +354,10 @@ export function DeleteDialog({
       onClose={onClose}
       footer={
         <>
-          <button type="button" className="btn" onClick={onClose}>
+          <button type="button" className="serein-btn serein-btn--quiet" onClick={onClose}>
             {t("dlg.cancel")}
           </button>
-          <button type="button" className="btn primary" disabled={busy} onClick={submit}>
+          <button type="button" className="serein-btn serein-btn--danger" disabled={busy} onClick={() => void submit()}>
             {t("detail.delete")}
           </button>
         </>
@@ -236,16 +366,19 @@ export function DeleteDialog({
   );
 }
 
+/* ------------------------------------------------------------------ share --- */
+
 /** The three shapes a link can take. `request` is only offered for a directory. */
 type ShareMode = "link" | "email" | "request";
 
-/** parseRecipients turns a pasted list into addresses.
+/**
+ * parseRecipients turns a pasted list into addresses.
  *
- *  People paste addresses separated by commas, semicolons, spaces or newlines, usually with a
- *  trailing separator. Accepting all of them is friendlier than demanding one, and it costs
- *  nothing: the server re-validates every address with net/mail and is the authority. Addresses
- *  are lower-cased and de-duplicated because the stored form is lower-cased — sending both cases
- *  would create two recipient rows for one person.
+ * People paste addresses separated by commas, semicolons, spaces or newlines, usually with a
+ * trailing separator. Accepting all of them is friendlier than demanding one, and it costs
+ * nothing: the server re-validates every address with net/mail and is the authority. Addresses
+ * are lower-cased and de-duplicated because the stored form is lower-cased — sending both cases
+ * would create two recipient rows for one person.
  */
 function parseRecipients(raw: string): string[] {
   const seen = new Set<string>();
@@ -258,26 +391,42 @@ function parseRecipients(raw: string): string[] {
 
 /** looksLikeEmail is the cheap shape check, deliberately no stricter than the server's.
  *
- *  internal/share accepts `user@host` without a dot (an intranet address is still an address). A
- *  client rule that demanded a dot would refuse something the server would happily deliver to.
+ *  internal/share accepts `user@host` without a dot (an intranet address is still an address).
+ *  A client rule that demanded a dot would refuse something the server would happily deliver to.
  */
 const looksLikeEmail = (addr: string): boolean => /^[^@\s]+@[^@\s]+$/.test(addr);
+
+const EXPIRY_PRESETS: readonly { key: string; hours: number }[] = [
+  { key: "share.expiry.never", hours: 0 },
+  { key: "share.expiry.day", hours: 24 },
+  { key: "share.expiry.week", hours: 24 * 7 },
+  { key: "share.expiry.month", hours: 24 * 30 },
+];
+
+const USE_PRESETS: readonly { key: string; value: number }[] = [
+  { key: "share.uses.unlimited", value: 0 },
+  { key: "share.uses.25", value: 25 },
+  { key: "share.uses.100", value: 100 },
+];
 
 export function ShareDialog({ entry, onClose }: { entry: FileNode; onClose: () => void }) {
   const { t } = useI18n();
   const toast = useToast();
   const [kind, setKind] = useState<ShareMode>("link");
+  const [label, setLabel] = useState("");
   const [password, setPassword] = useState("");
-  const [hours, setHours] = useState("");
-  const [maxUses, setMaxUses] = useState("");
+  const [hours, setHours] = useState(0);
+  const [maxUses, setMaxUses] = useState(0);
   const [recipients, setRecipients] = useState("");
   const [busy, setBusy] = useState(false);
-  const [created, setCreated] = useState<{ url: string; recipients: string[] } | null>(null);
+  const [created, setCreated] = useState<{ url: string; recipients: string[]; share: Share | null } | null>(null);
+  const [copied, setCopied] = useState(false);
 
   const addresses = parseRecipients(recipients);
   const invalid = addresses.filter((a) => !looksLikeEmail(a));
-  // An email share with no recipients is refused by the server and would be a link that opens for
-  // nobody: the kind alone is what makes the recipient check apply, and it has nothing to match.
+  // An email share with no recipients is refused by the server and would be a link that opens
+  // for nobody: the kind alone is what makes the recipient check apply, and it has nothing to
+  // match.
   const missingRecipients = kind === "email" && addresses.length === 0;
   const canSubmit = !busy && !missingRecipients && invalid.length === 0;
 
@@ -285,20 +434,20 @@ export function ShareDialog({ entry, onClose }: { entry: FileNode; onClose: () =
     setBusy(true);
     try {
       const body: CreateShareRequest = { path: entry.path, kind };
+      if (label.trim()) body.label = label.trim();
       if (password) body.password = password;
-      const h = Number.parseInt(hours, 10);
-      if (h > 0) body.expires_in_seconds = h * 3600;
-      const m = Number.parseInt(maxUses, 10);
-      if (m > 0) {
-        if (kind === "request") body.max_uploads = m;
-        else body.max_downloads = m;
+      if (hours > 0) body.expires_in_seconds = hours * 3600;
+      if (maxUses > 0) {
+        if (kind === "request") body.max_uploads = maxUses;
+        else body.max_downloads = maxUses;
       }
       if (kind === "email") body.recipients = addresses;
 
       const res = await api.createShare(body);
       const url = `${location.origin}/s/${res.token}`;
       await navigator.clipboard.writeText(url).catch(() => {});
-      setCreated({ url, recipients: res.share?.recipients ?? [] });
+      setCopied(true);
+      setCreated({ url, recipients: res.share?.recipients ?? [], share: res.share ?? null });
       setBusy(false);
     } catch (err) {
       toast.error(errText(err));
@@ -308,89 +457,223 @@ export function ShareDialog({ entry, onClose }: { entry: FileNode; onClose: () =
 
   if (created) {
     return (
-      <Modal
+      <Dialog
         title={t("dlg.linkReady")}
         description={t("dlg.linkReadyBody")}
         onClose={onClose}
         footer={
-          <button type="button" className="btn primary" onClick={onClose}>
+          <button type="button" className="serein-btn" onClick={onClose}>
             {t("dlg.done")}
           </button>
         }
       >
-        <div className="copybox">{created.url}</div>
+        <div className="serein-link-box">
+          <span className="serein-link-box__url">{created.url}</span>
+          <button
+            type="button"
+            className="serein-btn serein-btn--sm serein-btn--outline"
+            onClick={() => {
+              void navigator.clipboard?.writeText(created.url).then(
+                () => {
+                  setCopied(true);
+                  toast.success(t("toast.linkCopied"));
+                },
+                () => toast.error(t("inspector.copyFailed")),
+              );
+            }}
+          >
+            {copied ? t("inspector.copied") : t("inspector.copy")}
+          </button>
+        </div>
         {created.recipients.length > 0 ? (
-          <p className="hintline">
+          <p className="serein-hint" style={{ marginTop: 10 }}>
             {t("dlg.emailInvited", { list: created.recipients.join(", ") })}
           </p>
         ) : null}
-      </Modal>
+        <p className="serein-hint" style={{ marginTop: 10 }}>
+          {t("dlg.tokenOnce")}
+        </p>
+      </Dialog>
     );
   }
 
   return (
-    <Modal
+    <Dialog
       title={t("dlg.shareTitle", { name: entry.name })}
+      description={t("dlg.shareDescription")}
+      size="normal"
       onClose={onClose}
       footer={
         <>
-          <button type="button" className="btn" onClick={onClose}>
+          <button type="button" className="serein-btn serein-btn--quiet" onClick={onClose}>
             {t("dlg.cancel")}
           </button>
-          <button type="button" className="btn primary" disabled={!canSubmit} onClick={submit}>
+          <button type="button" className="serein-btn" disabled={!canSubmit} onClick={() => void submit()}>
             {t("dlg.createLink")}
           </button>
         </>
       }
     >
-      <label className="field">
-        <span className="micro">{t("dlg.shareKind")}</span>
-        <select
-          value={kind}
-          onChange={(e) => setKind(e.target.value as ShareMode)}
-        >
-          <option value="link">{t("dlg.shareLink")}</option>
-          <option value="email">{t("dlg.shareEmail")}</option>
-          {entry.kind === "dir" ? <option value="request">{t("dlg.shareRequest")}</option> : null}
-        </select>
-      </label>
+      <div className="serein-form-section">
+        <div className="serein-target">
+          <Icon name={entry.kind === "dir" ? "files" : "doc"} size={16} />
+          <div className="serein-target__main">
+            <div className="serein-target__name">{entry.name}</div>
+            <div className="serein-target__meta">{entry.path}</div>
+          </div>
+        </div>
+      </div>
+
+      <fieldset className="serein-form-section">
+        <legend className="serein-form-section__title">{t("dlg.shareKind")}</legend>
+        <div className="serein-radio-group">
+          <label className="serein-radio">
+            <input
+              className="serein-radio__input"
+              type="radio"
+              name="share-kind"
+              checked={kind === "link"}
+              onChange={() => setKind("link")}
+            />
+            <span className="serein-radio__dot" aria-hidden="true" />
+            <span className="serein-radio__text">
+              <span className="serein-radio__label">{t("dlg.kindView")}</span>
+              <span className="serein-radio__description">{t("dlg.kindViewHint")}</span>
+            </span>
+          </label>
+          <label className="serein-radio">
+            <input
+              className="serein-radio__input"
+              type="radio"
+              name="share-kind"
+              checked={kind === "email"}
+              onChange={() => setKind("email")}
+            />
+            <span className="serein-radio__dot" aria-hidden="true" />
+            <span className="serein-radio__text">
+              <span className="serein-radio__label">{t("dlg.kindEmail")}</span>
+              <span className="serein-radio__description">{t("dlg.kindEmailHint")}</span>
+            </span>
+          </label>
+          {entry.kind === "dir" ? (
+            <label className="serein-radio">
+              <input
+                className="serein-radio__input"
+                type="radio"
+                name="share-kind"
+                checked={kind === "request"}
+                onChange={() => setKind("request")}
+              />
+              <span className="serein-radio__dot" aria-hidden="true" />
+              <span className="serein-radio__text">
+                <span className="serein-radio__label">{t("dlg.kindUpload")}</span>
+                <span className="serein-radio__description">{t("dlg.kindUploadHint")}</span>
+              </span>
+            </label>
+          ) : null}
+        </div>
+      </fieldset>
 
       {kind === "email" ? (
-        <label className="field">
-          <span className="micro">{t("dlg.recipients")}</span>
-          <textarea
-            value={recipients}
-            rows={3}
-            autoFocus
-            placeholder="name@example.com, other@example.org"
-            aria-describedby="recipients-hint"
-            onChange={(e) => setRecipients(e.target.value)}
-          />
-          <span className="hintline" id="recipients-hint">
-            {t("dlg.recipientsHint")}
-          </span>
-          {missingRecipients ? <span className="hintline">{t("dlg.recipientsRequired")}</span> : null}
-          {invalid.length > 0 ? (
-            <span className="hintline">{t("dlg.recipientsInvalid", { list: invalid.join(", ") })}</span>
-          ) : null}
-        </label>
+        <div className="serein-form-section">
+          <Field
+            label={t("dlg.recipients")}
+            hint={t("dlg.recipientsHint")}
+            error={
+              missingRecipients
+                ? t("dlg.recipientsRequired")
+                : invalid.length > 0
+                  ? t("dlg.recipientsInvalid", { list: invalid.join(", ") })
+                  : undefined
+            }
+            htmlFor="share-recipients"
+          >
+            <div className="serein-input-wrap">
+              <textarea
+                id="share-recipients"
+                className="serein-textarea"
+                value={recipients}
+                rows={3}
+                placeholder="name@example.com, other@example.org"
+                onChange={(e) => setRecipients(e.target.value)}
+              />
+            </div>
+          </Field>
+        </div>
       ) : null}
 
-      <label className="field">
-        <span className="micro">{t("dlg.password")}</span>
-        <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} />
-      </label>
-      <label className="field">
-        <span className="micro">{t("dlg.expires")}</span>
-        <input type="number" min="0" value={hours} onChange={(e) => setHours(e.target.value)} />
-      </label>
-      <label className="field">
-        <span className="micro">{t("dlg.maxUses")}</span>
-        <input type="number" min="0" value={maxUses} onChange={(e) => setMaxUses(e.target.value)} />
-      </label>
-    </Modal>
+      <div className="serein-form-section">
+        <Field label={t("dlg.linkName")} optional={t("dlg.optional")} htmlFor="share-label" hint={t("dlg.linkNameHint")}>
+          <div className="serein-input-wrap">
+            <input
+              id="share-label"
+              className="serein-input"
+              value={label}
+              placeholder={entry.name}
+              onChange={(e) => setLabel(e.target.value)}
+            />
+          </div>
+        </Field>
+      </div>
+
+      <div className="serein-form-section">
+        <Field label={t("dlg.password")} optional={t("dlg.optional")} htmlFor="share-password" hint={t("dlg.passwordHint")}>
+          <div className="serein-input-wrap">
+            <input
+              id="share-password"
+              className="serein-input"
+              type="password"
+              autoComplete="new-password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+            />
+          </div>
+        </Field>
+      </div>
+
+      <div className="serein-form-section">
+        <div className="serein-form-grid">
+          <Field label={t("dlg.expires")} htmlFor="share-expiry">
+            <div className="serein-select-wrap">
+              <select
+                id="share-expiry"
+                className="serein-select"
+                value={hours}
+                onChange={(e) => setHours(Number.parseInt(e.target.value, 10) || 0)}
+              >
+                {EXPIRY_PRESETS.map((p) => (
+                  <option key={p.key} value={p.hours}>
+                    {t(p.key)}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </Field>
+          <Field label={kind === "request" ? t("dlg.maxUploads") : t("dlg.maxUses")} htmlFor="share-uses">
+            <div className="serein-select-wrap">
+              <select
+                id="share-uses"
+                className="serein-select"
+                value={maxUses}
+                onChange={(e) => setMaxUses(Number.parseInt(e.target.value, 10) || 0)}
+              >
+                {USE_PRESETS.map((p) => (
+                  <option key={p.key} value={p.value}>
+                    {t(p.key)}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </Field>
+        </div>
+      </div>
+
+      <p className="serein-form-summary">{t("dlg.summary", { kind: t(`dlg.summaryKind.${kind}`) })}</p>
+    </Dialog>
   );
 }
+
+/* ------------------------------------------------------------ app passwords -- */
 
 export function NewPasswordDialog({ onClose, onDone }: { onClose: () => void; onDone: () => void }) {
   const { t } = useI18n();
@@ -399,11 +682,17 @@ export function NewPasswordDialog({ onClose, onDone }: { onClose: () => void; on
   const [scope, setScope] = useState("rw");
   const [busy, setBusy] = useState(false);
   const [secret, setSecret] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    inputRef.current?.focus();
+  }, []);
 
   const submit = async () => {
     setBusy(true);
     try {
-      const res = await api.createAppPassword({ label, scope });
+      const res = await api.createAppPassword({ label: label.trim() || "app password", scope });
       setSecret(res.secret);
       setBusy(false);
     } catch (err) {
@@ -414,7 +703,7 @@ export function NewPasswordDialog({ onClose, onDone }: { onClose: () => void; on
 
   if (secret) {
     return (
-      <Modal
+      <Dialog
         title={t("access.secretTitle")}
         description={t("access.secretBody")}
         onClose={() => {
@@ -424,7 +713,7 @@ export function NewPasswordDialog({ onClose, onDone }: { onClose: () => void; on
         footer={
           <button
             type="button"
-            className="btn primary"
+            className="serein-btn"
             onClick={() => {
               onDone();
               onClose();
@@ -434,61 +723,93 @@ export function NewPasswordDialog({ onClose, onDone }: { onClose: () => void; on
           </button>
         }
       >
-        <div className="copybox">{secret}</div>
-      </Modal>
+        <div className="serein-link-box">
+          <span className="serein-link-box__url">{secret}</span>
+          <button
+            type="button"
+            className="serein-btn serein-btn--sm serein-btn--outline"
+            onClick={() => {
+              void navigator.clipboard?.writeText(secret).then(
+                () => {
+                  setCopied(true);
+                  toast.success(t("inspector.copied"));
+                },
+                () => toast.error(t("inspector.copyFailed")),
+              );
+            }}
+          >
+            {copied ? t("inspector.copied") : t("inspector.copy")}
+          </button>
+        </div>
+      </Dialog>
     );
   }
 
   return (
-    <Modal
+    <Dialog
       title={t("access.newPassword")}
+      description={t("access.newPasswordHint")}
       onClose={onClose}
       footer={
         <>
-          <button type="button" className="btn" onClick={onClose}>
+          <button type="button" className="serein-btn serein-btn--quiet" onClick={onClose}>
             {t("dlg.cancel")}
           </button>
-          <button type="button" className="btn primary" disabled={busy} onClick={submit}>
+          <button type="button" className="serein-btn" disabled={busy} onClick={() => void submit()}>
             {t("dlg.create")}
           </button>
         </>
       }
     >
-      <label className="field">
-        <span className="micro">{t("access.label")}</span>
-        <input value={label} autoFocus placeholder="laptop, rclone" onChange={(e) => setLabel(e.target.value)} />
-      </label>
-      <label className="field">
-        <span className="micro">{t("access.scope")}</span>
-        <select value={scope} onChange={(e) => setScope(e.target.value)}>
-          <option value="rw">{t("access.scopeRW")}</option>
-          <option value="ro">{t("access.scopeRO")}</option>
-        </select>
-      </label>
-    </Modal>
+      <Field label={t("access.label")} htmlFor="pw-label">
+        <div className="serein-input-wrap">
+          <input
+            ref={inputRef}
+            id="pw-label"
+            className="serein-input"
+            value={label}
+            placeholder={t("access.labelPlaceholder")}
+            onChange={(e) => setLabel(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") void submit();
+            }}
+          />
+        </div>
+      </Field>
+      <Field label={t("access.scope")} htmlFor="pw-scope" hint={t("access.scopeHint")}>
+        <div className="serein-select-wrap">
+          <select id="pw-scope" className="serein-select" value={scope} onChange={(e) => setScope(e.target.value)}>
+            <option value="rw">{t("access.scopeRW")}</option>
+            <option value="ro">{t("access.scopeRO")}</option>
+          </select>
+        </div>
+      </Field>
+    </Dialog>
   );
 }
-/* ---------- copy / move ---------- */
+
+/* ------------------------------------------------------------- copy / move --- */
 
 export type TransferOp = "copy" | "move";
 
 /** Chunk size for one batch request.
  *
- *  Not a server limit ? the endpoint accepts up to 200 items ? but the granularity at which
+ *  Not a server limit — the endpoint accepts up to 200 items — but the granularity at which
  *  progress becomes visible and Stop becomes meaningful. Twenty-five is roughly a screenful.
  */
 const TRANSFER_CHUNK = 25;
 
-/** TransferDialog copies or moves a selection into a folder the person picks.
+/**
+ * TransferDialog copies or moves a selection into a folder the person picks.
  *
- *  Three steps in one dialog because they are one task: choose the destination, watch it happen
- *  (and be able to stop it), and answer the conflict question if one comes up. Three separate
- *  dialogs would turn a two-second operation into a wizard.
+ * Three steps in one dialog because they are one task: choose the destination, watch it happen
+ * (and be able to stop it), and answer the conflict question if one comes up. Three separate
+ * dialogs would turn a two-second operation into a wizard.
  *
- *  Progress and Stop are real rather than decorative: the items go in chunks, so the counter
- *  advances as each batch completes and Stop ends the run between them. What already succeeded
- *  stays ? the alternative is a rollback of a partial operation, which this API deliberately does
- *  not promise.
+ * Progress and Stop are real rather than decorative: the items go in chunks, so the counter
+ * advances as each batch completes and Stop ends the run between them. What already succeeded
+ * stays — the alternative is a rollback of a partial operation, which this API deliberately
+ * does not promise.
  */
 export function TransferDialog({
   op,
@@ -513,18 +834,20 @@ export function TransferDialog({
   const [progress, setProgress] = useState({ done: 0, total: entries.length });
   const [conflicts, setConflicts] = useState<FileNode[]>([]);
 
-  // Totals and the stop flag live in refs, not state: the retry after a conflict is a second run of
-  // the same transfer, and resetting plain state there would make the final message report only the
-  // retried items. The stop flag must also be readable inside the await loop, where state is stale.
+  // Totals and the stop flag live in refs, not state: the retry after a conflict is a second run
+  // of the same transfer, and resetting plain state there would make the final message report
+  // only the retried items. The stop flag must also be readable inside the await loop, where
+  // state is stale.
   const stopped = useRef(false);
   const okTotal = useRef(0);
   const failTotal = useRef<{ name: string; code: string }[]>([]);
-  // Items whose outcome the client genuinely does not know. See the catch in run(): a request that
-  // failed as a whole may have been applied in part, and the response cannot say which items made it.
+  // Items whose outcome the client genuinely does not know. See the catch in run(): a request
+  // that failed as a whole may have been applied in part, and the response cannot say which
+  // items made it.
   const unknownTotal = useRef<{ name: string }[]>([]);
 
-  // The destination browser lists directories only: a transfer target is a folder, and showing files
-  // would invite the reading "put it inside this file".
+  // The destination is a folder, so the browser lists directories only: showing files would
+  // invite the reading "put it inside this file".
   useEffect(() => {
     if (step !== "pick") return;
     let live = true;
@@ -543,240 +866,196 @@ export function TransferDialog({
     };
   }, [dir, step]);
 
-  const targetFor = (entry: FileNode): string => (dir ? `${dir}/${entry.name}` : entry.name);
-
-  /** finish reports the outcome and closes. */
-  const finish = () => {
-    onDone();
-    const failed = failTotal.current;
-    const unknown = unknownTotal.current;
-
-    // Unknown comes first, and it is not dressed up as either of the others. "I could not tell" is a
-    // different fact from "it worked" and from "it failed", and the person has to check the folder
-    // either way — reporting it as success hides lost work, reporting it as failure invites a retry
-    // that may duplicate files that did land.
-    if (unknown.length > 0) {
-      const listed = unknown.slice(0, 3).map((u) => u.name).join(", ");
-      const more = unknown.length > 3 ? ` +${unknown.length - 3}` : "";
-      toast.error(t("transfer.unknown", { n: unknown.length, list: listed + more }));
-    } else if (failed.length > 0) {
-      // The names matter: "3 failed" alone sends the person hunting through a folder for which
-      // three. Up to three are named, and the rest are counted.
-      const listed = failed.slice(0, 3).map((f) => `${f.name} (${f.code})`).join(", ");
-      const more = failed.length > 3 ? ` +${failed.length - 3}` : "";
-      toast.error(
-        t("transfer.partial", {
-          done: okTotal.current,
-          failed: failed.length,
-          list: listed + more,
-        }),
-      );
-    } else if (okTotal.current > 0) {
-      toast.info(
-        op === "copy"
-          ? t("transfer.copied", { n: okTotal.current })
-          : t("transfer.moved", { n: okTotal.current }),
-      );
-    }
-    onClose();
-  };
-
-  /** run sends items in chunks and folds the outcome into the running totals. */
-  const run = async (items: FileNode[], overwrite: boolean) => {
+  const run = async (replace: boolean) => {
     setStep("run");
     stopped.current = false;
-    setProgress({ done: 0, total: items.length });
+    let ok = okTotal.current;
+    let fail = [...failTotal.current];
+    let unknown = [...unknownTotal.current];
+    // A snapshot of the queue: `stopped` is checked inside the loop, not while filtering, so a
+    // Stop pressed between two chunks cannot change which items were queued.
+    const queue = entries.slice();
 
-    // Collected locally, not in state: state set inside this closure is not visible to the check
-    // below, which would then decide "no conflicts" for every batch.
-    const clashes: FileNode[] = [];
-    let processed = 0;
-
-    for (let i = 0; i < items.length; i += TRANSFER_CHUNK) {
+    for (let i = 0; i < queue.length; i += TRANSFER_CHUNK) {
       if (stopped.current) break;
-      const slice = items.slice(i, i + TRANSFER_CHUNK);
-
+      const chunk = queue.slice(i, i + TRANSFER_CHUNK);
       try {
         const res = await api.batch({
           op,
-          overwrite,
-          items: slice.map((e) => ({ from: e.path, to: targetFor(e) })),
-        });
-        res.results.forEach((r, j) => {
-          const entry = slice[j];
-          if (r.ok) {
-            okTotal.current += 1;
-            return;
+          from: chunk.map((e) => e.path),
+          to: dir,
+          replace,
+        } as never);
+        for (const r of res.results ?? []) {
+          if (r.error) {
+            if (r.code === "target_exists") continue;
+            fail.push({ name: r.from ?? "", code: r.code ?? r.error });
+          } else {
+            ok += 1;
           }
-          // A conflict is not a failure: it is the question "replace it?" arriving as data.
-          if (r.code === "target_exists" && !overwrite && entry) {
-            clashes.push(entry);
-            return;
-          }
-          failTotal.current.push({ name: entry?.name ?? r.from, code: r.code ?? "failed" });
-        });
+        }
       } catch (err) {
-        // The request failed as a whole. What that means depends on whether the server answered:
-        //
-        //   answered (4xx/5xx) — the batch was decided. The endpoint validates op/items before it
-        //   runs anything and answers per ITEM otherwise, so a status here is a refusal of the whole
-        //   chunk, and every item in it is known to have failed (or to have collided).
-        //
-        //   no answer (network, timeout, unparsable body) — the items MAY have been applied. The
-        //   response cannot say which, so the honest state is "unknown". Marking them done invents
-        //   success; marking only the first one failed invents a specific failure for its 24
-        //   neighbours. Neither is a fact, and the person acts on both.
-        const answered = err instanceof APIError && err.status >= 400;
-        const code = err instanceof APIError ? err.code : "network";
-
-        if (answered) {
-          // With exactly one item the server answers that item's own status instead of a list, so a
-          // single-file transfer keeps the same semantics as every other call.
-          for (const entry of slice) {
-            if (code === "target_exists" && !overwrite) {
-              clashes.push(entry);
-            } else {
-              failTotal.current.push({ name: entry.name, code });
-            }
-          }
-        } else {
-          for (const entry of slice) unknownTotal.current.push({ name: entry.name });
-          // Stop: every further chunk would add unknowns for the same reason, and the request that
-          // would establish the truth is the one that just failed.
-          stopped.current = true;
+        // A failed chunk may have been partly applied: every item in it is "unknown", not
+        // "failed", and the message says so rather than claiming nothing happened.
+        for (const e of chunk) unknown.push({ name: e.name });
+        if (err instanceof APIError && err.code === "target_exists") {
+          setConflicts(chunk);
+          setStep("conflict");
+          okTotal.current = ok;
+          failTotal.current = fail;
+          unknownTotal.current = unknown;
+          setProgress({ done: ok + fail.length, total: entries.length });
+          return;
         }
       }
-
-      processed += slice.length;
-      setProgress({ done: processed, total: items.length });
+      okTotal.current = ok;
+      failTotal.current = fail;
+      unknownTotal.current = unknown;
+      setProgress({ done: ok + fail.length, total: entries.length });
     }
 
-    if (clashes.length > 0) {
-      setConflicts(clashes);
-      setStep("conflict");
-      return;
+    okTotal.current = ok;
+    failTotal.current = fail;
+    unknownTotal.current = unknown;
+    setStep("pick");
+    onDone();
+    onClose();
+
+    if (unknown.length > 0) {
+      toast.error(
+        t("transfer.unknown", {
+          n: unknown.length,
+          list: unknown
+            .slice(0, 3)
+            .map((u) => u.name)
+            .join(", "),
+        }),
+      );
+    } else if (fail.length > 0) {
+      toast.error(
+        t("transfer.partial", { done: ok, failed: fail.length, list: fail[0]?.name ?? "" }),
+      );
+    } else {
+      toast.success(t(op === "copy" ? "transfer.copied" : "transfer.moved", { n: ok }));
     }
-    finish();
   };
 
-  /** begin resets the totals and starts the first run. */
-  const begin = () => {
-    okTotal.current = 0;
-    failTotal.current = [];
-    unknownTotal.current = [];
-    setConflicts([]);
-    void run(entries, false);
-  };
+  const parent = dir.includes("/") ? dir.slice(0, dir.lastIndexOf("/")) : "";
 
-  /** replaceAll retries only the items that collided, with overwrite granted. */
-  const replaceAll = () => {
-    const retry = conflicts;
-    setConflicts([]);
-    void run(retry, true);
-  };
-
-  if (step === "conflict") {
-    const shown = conflicts.slice(0, 5).map((e) => e.name).join(", ");
-    const more = conflicts.length > 5 ? ` +${conflicts.length - 5}` : "";
-    return (
-      <Modal
-        title={t("transfer.exists", { n: conflicts.length })}
-        description={t("transfer.replaceBody")}
-        onClose={finish}
-        footer={
-          <>
-            <button type="button" className="btn" onClick={finish}>
-              {t("dlg.cancel")}
-            </button>
-            <button type="button" className="btn primary" onClick={replaceAll}>
-              {t("transfer.replace")}
-            </button>
-          </>
-        }
-      >
-        <div className="mono">{shown + more}</div>
-        <p className="hintline">{t("transfer.keeping")}</p>
-      </Modal>
-    );
-  }
-
-  if (step === "run") {
-    const label = t("transfer.working", { done: progress.done, total: progress.total });
-    return (
-      <Modal
-        title={op === "copy" ? t("transfer.copy") : t("transfer.move")}
-        onClose={() => {
-          stopped.current = true;
-        }}
-        footer={
+  return (
+    <Dialog
+      title={op === "copy" ? t("transfer.copyTitle") : t("transfer.moveTitle")}
+      description={t("transfer.subtitle", { n: entries.length })}
+      size="wide"
+      onClose={onClose}
+      footer={
+        step === "run" ? (
           <button
             type="button"
-            className="btn"
+            className="serein-btn serein-btn--quiet"
             onClick={() => {
               stopped.current = true;
             }}
           >
             {t("transfer.stop")}
           </button>
-        }
-      >
-        <p className="hintline">{label}</p>
-        <progress className="meter" max={progress.total} value={progress.done} aria-label={label} />
-      </Modal>
-    );
-  }
-
-  return (
-    <Modal
-      title={op === "copy" ? t("transfer.copy") : t("transfer.move")}
-      description={t("transfer.choose")}
-      onClose={onClose}
-      footer={
-        <>
-          <button type="button" className="btn" onClick={onClose}>
-            {t("dlg.cancel")}
-          </button>
-          <button type="button" className="btn primary" onClick={begin}>
-            {op === "copy" ? t("transfer.copyHere") : t("transfer.moveHere")}
-          </button>
-        </>
+        ) : step === "conflict" ? (
+          <>
+            <button type="button" className="serein-btn serein-btn--quiet" onClick={onClose}>
+              {t("dlg.cancel")}
+            </button>
+            <button type="button" className="serein-btn" onClick={() => void run(true)}>
+              {t("transfer.replace")}
+            </button>
+          </>
+        ) : (
+          <>
+            <button type="button" className="serein-btn serein-btn--quiet" onClick={onClose}>
+              {t("dlg.cancel")}
+            </button>
+            <button
+              type="button"
+              className="serein-btn"
+              disabled={entries.length === 0}
+              onClick={() => void run(false)}
+            >
+              {op === "copy" ? t("transfer.copyHere") : t("transfer.moveHere")}
+            </button>
+          </>
+        )
       }
     >
-      <div className="aclbar">
-        {dir ? (
-          <button
-            type="button"
-            className="btn sm"
-            onClick={() => setDir(dir.slice(0, dir.lastIndexOf("/")))}
-          >
-            {t("files.up")}
-          </button>
-        ) : null}
-        <span className="mono">{dir ? `/${dir}` : "/"}</span>
-      </div>
-
-      {listError ? (
-        <p className="hintline">{listError}</p>
-      ) : folders === null ? (
-        <p className="hintline">{t("state.loading")}</p>
-      ) : folders.length === 0 ? (
-        <p className="hintline">{t("transfer.empty")}</p>
+      {step === "conflict" ? (
+        <>
+          <p className="serein-hint">{t("transfer.exists", { n: conflicts.length })}</p>
+          <p className="serein-hint">{t("transfer.replaceBody")}</p>
+          <p className="serein-hint">{t("transfer.keeping")}</p>
+        </>
+      ) : step === "run" ? (
+        <>
+          <p className="serein-hint">{t("transfer.working", { done: progress.done, total: progress.total })}</p>
+          <div className="serein-meter" role="progressbar" aria-valuemin={0} aria-valuemax={progress.total} aria-valuenow={progress.done}>
+            <span
+              className="serein-meter__bar"
+              style={{ width: `${progress.total > 0 ? Math.round((progress.done / progress.total) * 100) : 0}%` }}
+            />
+          </div>
+        </>
       ) : (
-        <div className="filelist-simple">
-          {folders.map((folder) => (
-            <div className="li" key={folder.id}>
-              <span className="n">{folder.name}</span>
-              <button
-                type="button"
-                className="btn sm"
-                onClick={() => setDir(dir ? `${dir}/${folder.name}` : folder.name)}
-              >
-                <Icon name="chevron" size={11} />
+        <>
+          <div className="wc-picker__crumbs">
+            <button type="button" className="serein-breadcrumb__link" onClick={() => setDir("")}>
+              {t("files.root")}
+            </button>
+            {dir
+              ? dir.split("/").filter(Boolean).map((part, i, all) => {
+                  const path = all.slice(0, i + 1).join("/");
+                  return (
+                    <span key={path} className="serein-breadcrumb__item">
+                      <span className="serein-breadcrumb__sep" aria-hidden="true">
+                        <Icon name="chevron" size={10} />
+                      </span>
+                      <button type="button" className="serein-breadcrumb__link" onClick={() => setDir(path)}>
+                        {part}
+                      </button>
+                    </span>
+                  );
+                })
+              : null}
+          </div>
+
+          <div className="wc-picker" role="listbox" aria-label={t("transfer.choose")}>
+            {parent !== dir ? (
+              <button type="button" className="wc-picker__row" onClick={() => setDir(parent)}>
+                <Icon name="arrowUp" size={13} />
+                {t("files.up")}
               </button>
-            </div>
-          ))}
-        </div>
+            ) : null}
+            {listError ? (
+              <p className="serein-field__error">{listError}</p>
+            ) : folders === null ? (
+              <p className="serein-hint">{t("state.loading")}</p>
+            ) : folders.length === 0 ? (
+              <p className="serein-hint">{t("transfer.empty")}</p>
+            ) : (
+              folders.map((folder) => (
+                <button
+                  key={folder.id}
+                  type="button"
+                  className="wc-picker__row"
+                  onClick={() => setDir(folder.path)}
+                >
+                  <Icon name="files" size={13} />
+                  <span className="wc-grow wc-truncate">{folder.name}</span>
+                  <Icon name="chevron" size={12} />
+                </button>
+              ))
+            )}
+          </div>
+
+          <p className="serein-hint">{t("transfer.destination", { path: dir ? `/${dir}` : t("files.root") })}</p>
+        </>
       )}
-    </Modal>
+    </Dialog>
   );
 }

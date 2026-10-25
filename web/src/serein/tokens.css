@@ -1,0 +1,796 @@
+/* ============================================================================
+   Serein UI — design tokens
+   ----------------------------------------------------------------------------
+   The framework's semantic token layer. Every value is scoped to `.serein-root`;
+   nothing is declared on `:root`, `html`, `body` or any host selector.
+
+   Naming model: a token names a ROLE (canvas, surface, text-secondary,
+   border-strong, selection) rather than a hue or a component. Component CSS
+   modules consume only these semantic names, never raw HEX values.
+
+   The palette values are the approved Cloud Blue 8.2 assignments used by the
+   frozen Serein 9.1 reference. Four appearances are four assignments of the
+   same role set:
+
+     default / [data-theme="light"]                          Light
+     [data-theme="dark"]                                     Dark
+     [data-theme="light"][data-contrast="more"]              Light Increased Contrast
+     [data-theme="dark"][data-contrast="more"]               Dark Increased Contrast
+
+   System preferences are honoured without overriding an explicit choice:
+     prefers-color-scheme (only when data-theme is absent)
+     prefers-contrast     (only when data-contrast is absent)
+     prefers-reduced-motion, prefers-reduced-transparency
+   ========================================================================== */
+
+/* ------------------------------------------------------- primitive layer ---
+   Raw scales. Components may use these for geometry, but colour decisions are
+   made with semantic tokens below. */
+.serein-root {
+  /* Type: system-first, so Apple platforms keep their native text face; other
+     platforms get the bundled Inter, which reproduces the reference rhythm. */
+  --serein-font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Serein Inter",
+    "Segoe UI Variable Text", "Segoe UI", Roboto, "Helvetica Neue", Arial,
+    "Noto Sans", "Noto Sans JP", "Noto Sans Arabic", sans-serif;
+  --serein-font-mono: "Serein Mono", ui-monospace, SFMono-Regular, Menlo, Consolas,
+    monospace;
+
+  /* One user-facing scale. Type scales; control boxes, imagery and spacing do
+     not, exactly as in the approved Serein Large Text appearance. */
+  --serein-text-scale: 1;
+
+  --serein-type-display: 690 calc(44px * var(--serein-text-scale)) / 1.06
+    var(--serein-font-ui);
+  --serein-type-page: 660 calc(32px * var(--serein-text-scale)) / 1.14
+    var(--serein-font-ui);
+  --serein-type-page-compact: 650 calc(26px * var(--serein-text-scale)) / 1.18
+    var(--serein-font-ui);
+  --serein-type-modal: 650 calc(21px * var(--serein-text-scale)) / 1.25
+    var(--serein-font-ui);
+  --serein-type-title: 640 calc(19px * var(--serein-text-scale)) / 1.3
+    var(--serein-font-ui);
+  --serein-type-section: 640 calc(16px * var(--serein-text-scale)) / 1.3
+    var(--serein-font-ui);
+  --serein-type-row: 590 calc(14px * var(--serein-text-scale)) / 1.35
+    var(--serein-font-ui);
+  --serein-type-body: 400 calc(14px * var(--serein-text-scale)) / 1.55
+    var(--serein-font-ui);
+  --serein-type-body-strong: 560 calc(14px * var(--serein-text-scale)) / 1.5
+    var(--serein-font-ui);
+  --serein-type-small: 400 calc(12.5px * var(--serein-text-scale)) / 1.45
+    var(--serein-font-ui);
+  --serein-type-small-strong: 580 calc(12.5px * var(--serein-text-scale)) / 1.45
+    var(--serein-font-ui);
+  --serein-type-meta: 400 calc(12px * var(--serein-text-scale)) / 1.4
+    var(--serein-font-ui);
+  --serein-type-label: 630 calc(11px * var(--serein-text-scale)) / 1.2
+    var(--serein-font-ui);
+  --serein-type-number: 500 calc(12.5px * var(--serein-text-scale)) / 1.4
+    var(--serein-font-ui);
+  --serein-type-item-title: 520 calc(13.5px * var(--serein-text-scale)) / 1.3
+    var(--serein-font-ui);
+  --serein-type-item-meta: 400 calc(11.5px * var(--serein-text-scale)) / 1.25
+    var(--serein-font-ui);
+  --serein-type-nav: 520 calc(13px * var(--serein-text-scale)) / 1 var(--serein-font-ui);
+  --serein-type-button: 600 calc(13.5px * var(--serein-text-scale)) / 1
+    var(--serein-font-ui);
+
+  --serein-tracking-display: -0.034em;
+  --serein-tracking-page: -0.028em;
+  --serein-tracking-title: -0.017em;
+  --serein-tracking-body: -0.006em;
+  --serein-tracking-label: 0.055em;
+
+  /* Space: a 4px rhythm with 2px half-steps for optical alignment. */
+  --serein-space-1: 2px;
+  --serein-space-2: 4px;
+  --serein-space-3: 6px;
+  --serein-space-4: 8px;
+  --serein-space-5: 10px;
+  --serein-space-6: 12px;
+  --serein-space-7: 16px;
+  --serein-space-8: 20px;
+  --serein-space-9: 24px;
+  --serein-space-10: 32px;
+  --serein-space-11: 40px;
+  --serein-space-12: 48px;
+  --serein-space-13: 64px;
+  --serein-space-14: 80px;
+
+  /* Shape: tight, concentric radii. */
+  --serein-radius-xs: 4px;
+  --serein-radius-sm: 6px;
+  --serein-radius-control: 9px;
+  --serein-radius-md: 11px;
+  --serein-radius-lg: 14px;
+  --serein-radius-card: 16px;
+  --serein-radius-panel: 18px;
+  --serein-radius-sheet: 22px;
+  --serein-radius-pill: 999px;
+
+  /* Motion: short, weighted, spring-like on entry. */
+  --serein-duration-1: 90ms;
+  --serein-duration-2: 160ms;
+  --serein-duration-3: 240ms;
+  --serein-duration-4: 340ms;
+  --serein-duration-5: 520ms;
+  --serein-ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --serein-ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
+  --serein-ease-spring: cubic-bezier(0.32, 0.72, 0, 1);
+
+  /* Layout and hit areas. Breakpoints are mirrored in src/tokens/breakpoints.ts;
+     media queries cannot read custom properties, so CSS uses those literal
+     values and the TS module is the single source consumed by behaviour. */
+  --serein-bp-phone: 600px;
+  --serein-bp-tablet: 820px;
+  --serein-bp-compact: 960px;
+  --serein-bp-wide: 1181px;
+  --serein-topbar-height: 52px;
+  --serein-statusbar-height: 34px;
+  --serein-tabbar-height: 58px;
+  --serein-inspector-width: 340px;
+  --serein-inspector-gap: 14px;
+  --serein-content-max: 1312px;
+  --serein-home-max: 1180px;
+  --serein-gutter: clamp(18px, 2.6vw, 40px);
+  --serein-hit-min: 28px;
+  --serein-touch-min: 44px;
+  --serein-control-height: 34px;
+
+  /* Material blur is the only visual effect that reduced-transparency disables. */
+  --serein-material-blur: blur(24px) saturate(1.7);
+  --serein-material-blur-panel: blur(30px) saturate(1.7);
+
+  /* ------------------------------------------------------ semantic: light */
+  color-scheme: light;
+
+  --serein-canvas: #f3f6f9;
+  --serein-canvas-deep: #e7ecf1;
+  --serein-surface: #ffffff;
+  --serein-surface-raised: #ffffff;
+  --serein-fill-subtle: #f6f8fb;
+  --serein-fill: #edf1f5;
+  --serein-fill-strong: #e3e9ef;
+
+  --serein-text: #13181d;
+  --serein-text-secondary: #4f5860;
+  --serein-text-tertiary: #545c64;
+  --serein-text-disabled: #8a949c;
+  --serein-text-inverse: #ffffff;
+
+  --serein-border: #ccd6e0;
+  --serein-border-strong: #8395a6;
+
+  --serein-accent: #1a5fb0;
+  --serein-accent-hover: #154e92;
+  --serein-accent-ink: #ffffff;
+  --serein-accent-soft: #e6eff9;
+  --serein-accent-soft-hover: #d5e5f6;
+  --serein-accent-line: #b6d1ec;
+  --serein-accent-wash: rgba(26, 95, 176, 0.08);
+
+  --serein-brand-from: #2b7ad1;
+  --serein-brand-to: #134a8c;
+  --serein-brand-ink: #ffffff;
+
+  --serein-success: #1a6b45;
+  --serein-success-soft: #e6f3ea;
+  --serein-success-line: #b8d9c5;
+  --serein-warning: #8a5200;
+  --serein-warning-soft: #fbf1da;
+  --serein-warning-line: #eed9a8;
+  --serein-danger: #b3261e;
+  --serein-danger-soft: #fdecea;
+  --serein-danger-line: #f3c4bf;
+  --serein-info: #0d6b86;
+  --serein-info-soft: #e2f1f5;
+  --serein-info-line: #b0d7e2;
+
+  --serein-selection: #e3e9f0;
+  --serein-selection-strong: #d2dbe6;
+  --serein-selection-edge: #1a5fb0;
+  --serein-selected-line: #a9b6c6;
+  --serein-row-hover: #f2f5f8;
+  --serein-hover-bg: color-mix(in srgb, var(--serein-text) 4%, transparent);
+  --serein-press-bg: color-mix(in srgb, var(--serein-text) 8%, transparent);
+  --serein-focus-ring: #1a5fb0;
+
+  --serein-chrome-bg: rgba(247, 249, 251, 0.8);
+  --serein-chrome-bg-solid: #f7f9fb;
+  --serein-chrome-border: rgba(20, 26, 32, 0.08);
+  --serein-popover-bg: rgba(252, 253, 254, 0.88);
+  --serein-popover-bg-solid: #fcfdfe;
+  --serein-scrim: rgba(16, 20, 24, 0.42);
+  --serein-scrim-strong: rgba(12, 16, 19, 0.64);
+  --serein-glass-highlight: rgba(255, 255, 255, 0.55);
+  --serein-thumb-border: rgba(20, 26, 32, 0.08);
+  --serein-line-translucent: rgba(20, 26, 32, 0.09);
+  --serein-meter-track: #e3e9ef;
+
+  /* The toast is a dark material in every appearance, as approved. */
+  --serein-toast-bg: rgba(17, 22, 27, 0.94);
+  --serein-toast-text: #f4f6f8;
+  --serein-toast-action: #9fc8f5;
+  --serein-toast-icon: #b8c2ca;
+  --serein-toast-success: #8fe0b0;
+  --serein-toast-warning: #f2c681;
+  --serein-toast-danger: #ff9d92;
+  --serein-toast-muted: rgba(255, 255, 255, 0.55);
+  --serein-toast-border: rgba(255, 255, 255, 0.08);
+
+  --serein-shadow-1: 0 1px 1px rgba(18, 26, 34, 0.05),
+    0 1px 3px rgba(18, 26, 34, 0.06);
+  --serein-shadow-2: 0 2px 4px rgba(18, 26, 34, 0.05),
+    0 8px 20px -6px rgba(18, 26, 34, 0.14);
+  --serein-shadow-3: 0 6px 16px rgba(18, 26, 34, 0.1),
+    0 28px 60px -16px rgba(18, 26, 34, 0.26);
+  --serein-shadow-print: 0 1px 2px rgba(15, 23, 32, 0.06),
+    0 12px 28px -12px rgba(15, 23, 32, 0.28);
+  --serein-shadow-float: 0 2px 5px rgba(15, 23, 32, 0.06),
+    0 16px 40px -12px rgba(15, 23, 32, 0.24);
+  --serein-shadow-sheet: 0 8px 24px rgba(15, 23, 32, 0.12),
+    0 40px 90px -20px rgba(15, 23, 32, 0.36);
+  --serein-shadow-control: inset 0 1px 0 rgba(255, 255, 255, 0.18),
+    0 1px 2px rgba(15, 23, 32, 0.08);
+  --serein-shadow-inset-line: inset 0 0 0 1px rgba(18, 26, 34, 0.06);
+
+  /* The viewer is its own plane — deliberately darker than the app canvas. */
+  --serein-viewer-bg: #e8edf2;
+  --serein-viewer-bg-deep: #dfe6ee;
+  --serein-viewer-ink: #13181d;
+  --serein-viewer-ink-secondary: #4f5860;
+  --serein-viewer-hairline: rgba(15, 23, 32, 0.1);
+  --serein-viewer-bar: rgba(247, 250, 252, 0.78);
+
+  /* Nine file-kind tints, confined to a tile. */
+  --serein-kind-image-bg: #c7f7f0;
+  --serein-kind-image-fg: #005049;
+  --serein-kind-pdf-bg: #ffdfe5;
+  --serein-kind-pdf-fg: #672d3c;
+  --serein-kind-design-bg: #f5e5ff;
+  --serein-kind-design-fg: #523462;
+  --serein-kind-video-bg: #d7e9ff;
+  --serein-kind-video-fg: #1e436e;
+  --serein-kind-audio-bg: #ffdfd1;
+  --serein-kind-audio-fg: #663117;
+  --serein-kind-code-bg: #dbf9dc;
+  --serein-kind-code-fg: #1f4e25;
+  --serein-kind-sheet-bg: #e5ecc6;
+  --serein-kind-sheet-fg: #414703;
+  --serein-kind-archive-bg: #cdf5ff;
+  --serein-kind-archive-fg: #004d5e;
+  --serein-kind-folder-bg: #fae7c4;
+  --serein-kind-folder-fg: #583d00;
+
+  /* Derived separators and interactive surfaces. */
+  --serein-divider: color-mix(in srgb, var(--serein-border) 62%, transparent);
+  --serein-divider-strong: color-mix(in srgb, var(--serein-border) 92%, transparent);
+  --serein-field-bg: var(--serein-fill-subtle);
+  --serein-field-bg-hover: var(--serein-fill);
+  --serein-field-bg-focus: var(--serein-surface);
+  --serein-field-border: var(--serein-divider-strong);
+  --serein-control-bg: var(--serein-fill-subtle);
+  --serein-control-bg-hover: var(--serein-fill);
+  --serein-disabled-bg: var(--serein-fill);
+  --serein-disabled-border: var(--serein-divider);
+  --serein-overlay-selected: color-mix(in srgb, var(--serein-accent) 10%, var(--serein-surface));
+  --serein-overlay-selected-strong: color-mix(
+    in srgb,
+    var(--serein-accent) 15%,
+    var(--serein-surface)
+  );
+  --serein-danger-ink: #ffffff;
+  --serein-success-ink: #ffffff;
+  --serein-warning-ink: #ffffff;
+
+  --serein-segmented-bg: var(--serein-fill);
+  --serein-segmented-selected-bg: var(--serein-surface);
+  --serein-segmented-selected-shadow: 0 1px 2px rgba(15, 23, 32, 0.1);
+
+  /* Controlled density for text inputs and rows. */
+  --serein-field-height: 38px;
+  --serein-field-height-sm: 30px;
+  --serein-row-height: 52px;
+  --serein-row-height-phone: 60px;
+  --serein-tab-height: 32px;
+}
+
+/* --------------------------------------------------------------- dark ----- */
+.serein-root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --serein-canvas: #131619;
+  --serein-canvas-deep: #0d1012;
+  --serein-surface: #1b1f23;
+  --serein-surface-raised: #22272c;
+  --serein-fill-subtle: #20252a;
+  --serein-fill: #272d33;
+  --serein-fill-strong: #2e353b;
+
+  --serein-text: #edf1f4;
+  --serein-text-secondary: #b0b8bf;
+  --serein-text-tertiary: #aeb5bd;
+  --serein-text-disabled: #6f7a82;
+  --serein-text-inverse: #0b0e10;
+
+  --serein-border: #333b42;
+  --serein-border-strong: #76838f;
+
+  --serein-accent: #74b0ee;
+  --serein-accent-hover: #93c4f4;
+  --serein-accent-ink: #06131f;
+  --serein-accent-soft: #152a3e;
+  --serein-accent-soft-hover: #1c354c;
+  --serein-accent-line: #2b4a68;
+  --serein-accent-wash: rgba(116, 176, 238, 0.12);
+
+  --serein-brand-from: #8fc0f5;
+  --serein-brand-to: #4d8ed4;
+  --serein-brand-ink: #05121f;
+
+  --serein-success: #7ed4a4;
+  --serein-success-soft: #152e20;
+  --serein-success-line: #2c5340;
+  --serein-warning: #ecc07c;
+  --serein-warning-soft: #332812;
+  --serein-warning-line: #5c4a25;
+  --serein-danger: #ff9d92;
+  --serein-danger-soft: #3a1e1b;
+  --serein-danger-line: #6b332d;
+  --serein-info: #7fd2e8;
+  --serein-info-soft: #102c34;
+  --serein-info-line: #28525f;
+
+  --serein-selection: #303a3d;
+  --serein-selection-strong: #242e30;
+  --serein-selection-edge: #74b0ee;
+  --serein-selected-line: #474d56;
+  --serein-row-hover: #242e30;
+  --serein-hover-bg: color-mix(in srgb, var(--serein-text) 6%, transparent);
+  --serein-press-bg: color-mix(in srgb, var(--serein-text) 10%, transparent);
+  --serein-focus-ring: #74b0ee;
+
+  --serein-chrome-bg: rgba(21, 25, 29, 0.74);
+  --serein-chrome-bg-solid: #15191d;
+  --serein-chrome-border: rgba(255, 255, 255, 0.08);
+  --serein-popover-bg: rgba(36, 41, 47, 0.88);
+  --serein-popover-bg-solid: #24292f;
+  --serein-scrim: rgba(0, 0, 0, 0.52);
+  --serein-scrim-strong: rgba(7, 9, 10, 0.7);
+  --serein-glass-highlight: rgba(255, 255, 255, 0.08);
+  --serein-thumb-border: rgba(255, 255, 255, 0.1);
+  --serein-line-translucent: rgba(255, 255, 255, 0.09);
+  --serein-meter-track: #2e353b;
+
+  --serein-shadow-1: 0 1px 1px rgba(0, 0, 0, 0.32), 0 1px 3px rgba(0, 0, 0, 0.26);
+  --serein-shadow-2: 0 2px 4px rgba(0, 0, 0, 0.32),
+    0 10px 24px -8px rgba(0, 0, 0, 0.56);
+  --serein-shadow-3: 0 8px 20px rgba(0, 0, 0, 0.42),
+    0 32px 70px -18px rgba(0, 0, 0, 0.72);
+  --serein-shadow-print: 0 1px 2px rgba(0, 0, 0, 0.4),
+    0 18px 40px -14px rgba(0, 0, 0, 0.7);
+  --serein-shadow-float: 0 2px 6px rgba(0, 0, 0, 0.36),
+    0 22px 50px -14px rgba(0, 0, 0, 0.62);
+  --serein-shadow-sheet: 0 10px 28px rgba(0, 0, 0, 0.44),
+    0 50px 100px -24px rgba(0, 0, 0, 0.8);
+  --serein-shadow-control: inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 1px 2px rgba(0, 0, 0, 0.3);
+  --serein-shadow-inset-line: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+
+  --serein-viewer-bg: #090c0f;
+  --serein-viewer-bg-deep: #050709;
+  --serein-viewer-ink: #eef2f5;
+  --serein-viewer-ink-secondary: #a7b0b8;
+  --serein-viewer-hairline: rgba(255, 255, 255, 0.12);
+  --serein-viewer-bar: rgba(15, 19, 23, 0.7);
+
+  --serein-kind-image-bg: #002725;
+  --serein-kind-image-fg: #86ddd6;
+  --serein-kind-pdf-bg: #35141a;
+  --serein-kind-pdf-fg: #fcb4bd;
+  --serein-kind-design-bg: #271934;
+  --serein-kind-design-fg: #d9bcf7;
+  --serein-kind-video-bg: #0f1d36;
+  --serein-kind-video-fg: #acccff;
+  --serein-kind-audio-bg: #321508;
+  --serein-kind-audio-fg: #fbb99e;
+  --serein-kind-code-bg: #062918;
+  --serein-kind-code-fg: #9bdcb6;
+  --serein-kind-sheet-bg: #1b1f00;
+  --serein-kind-sheet-fg: #c7d292;
+  --serein-kind-archive-bg: #002535;
+  --serein-kind-archive-fg: #90d5f9;
+  --serein-kind-folder-bg: #291b00;
+  --serein-kind-folder-fg: #e7c68a;
+
+  --serein-divider: color-mix(in srgb, var(--serein-border) 72%, transparent);
+  --serein-divider-strong: var(--serein-border);
+  --serein-overlay-selected: color-mix(in srgb, var(--serein-accent) 13%, var(--serein-surface));
+  --serein-overlay-selected-strong: color-mix(
+    in srgb,
+    var(--serein-accent) 19%,
+    var(--serein-surface)
+  );
+  --serein-danger-ink: #1c0b08;
+  --serein-success-ink: #04150c;
+  --serein-warning-ink: #1b1204;
+  --serein-segmented-selected-bg: var(--serein-fill-strong);
+  --serein-segmented-selected-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --serein-hairline-soft: rgba(255, 255, 255, 0.08);
+}
+
+/* ------------------------------------------- light — increased contrast ---- */
+.serein-root[data-theme="light"][data-contrast="more"] {
+  color-scheme: light;
+
+  --serein-canvas: #eceff3;
+  --serein-canvas-deep: #dde3ea;
+  --serein-surface: #ffffff;
+  --serein-surface-raised: #ffffff;
+  --serein-fill-subtle: #f1f5f9;
+  --serein-fill: #e6ecf2;
+  --serein-fill-strong: #dae2ea;
+
+  --serein-text: #0a0e12;
+  --serein-text-secondary: #333b42;
+  --serein-text-tertiary: #3d454c;
+  --serein-text-disabled: #5f6b74;
+
+  --serein-border: #7f90a2;
+  --serein-border-strong: #5f6f7d;
+
+  --serein-accent: #0d4a90;
+  --serein-accent-hover: #0a3c76;
+  --serein-accent-ink: #ffffff;
+  --serein-accent-soft: #d8e7f8;
+  --serein-accent-soft-hover: #c2d9f3;
+  --serein-accent-line: #7faede;
+  --serein-accent-wash: rgba(13, 74, 144, 0.12);
+
+  --serein-brand-from: #1f6cc0;
+  --serein-brand-to: #0c3f79;
+  --serein-brand-ink: #ffffff;
+
+  --serein-success: #0f5433;
+  --serein-success-soft: #d6ebdd;
+  --serein-success-line: #7fb494;
+  --serein-warning: #6b3f00;
+  --serein-warning-soft: #f8e9c8;
+  --serein-warning-line: #c9a75e;
+  --serein-danger: #8f1c16;
+  --serein-danger-soft: #fbdcd9;
+  --serein-danger-line: #d98a83;
+  --serein-info: #0a5a73;
+  --serein-info-soft: #d3ebf1;
+  --serein-info-line: #7fbdd0;
+
+  --serein-selection: #d9e0e7;
+  --serein-selection-strong: #c6cfd9;
+  --serein-selection-edge: #0d4a90;
+  --serein-selected-line: #98a3af;
+  --serein-row-hover: #eaf0f6;
+  --serein-hover-bg: color-mix(in srgb, var(--serein-text) 7%, transparent);
+  --serein-press-bg: color-mix(in srgb, var(--serein-text) 12%, transparent);
+  --serein-focus-ring: #0d4a90;
+
+  --serein-chrome-bg: #f7f9fb;
+  --serein-chrome-bg-solid: #f7f9fb;
+  --serein-chrome-border: rgba(20, 26, 32, 0.22);
+  --serein-popover-bg: #ffffff;
+  --serein-popover-bg-solid: #ffffff;
+  --serein-scrim: rgba(16, 20, 24, 0.58);
+  --serein-scrim-strong: rgba(12, 16, 19, 0.78);
+  --serein-glass-highlight: rgba(255, 255, 255, 0.7);
+  --serein-thumb-border: rgba(20, 26, 32, 0.24);
+  --serein-line-translucent: rgba(20, 26, 32, 0.22);
+  --serein-meter-track: #dee5ec;
+
+  --serein-toast-bg: #11161b;
+  --serein-toast-border: rgba(255, 255, 255, 0.24);
+
+  --serein-kind-image-bg: #b4f1e9;
+  --serein-kind-image-fg: #005049;
+  --serein-kind-pdf-bg: #ffd5d0;
+  --serein-kind-pdf-fg: #682e2a;
+  --serein-kind-design-bg: #efdbff;
+  --serein-kind-design-fg: #503464;
+  --serein-kind-video-bg: #cae1ff;
+  --serein-kind-video-fg: #20436e;
+  --serein-kind-audio-bg: #ffd7bb;
+  --serein-kind-audio-fg: #63350a;
+  --serein-kind-code-bg: #c5f4d7;
+  --serein-kind-code-fg: #085030;
+  --serein-kind-sheet-bg: #dbe5b7;
+  --serein-kind-sheet-fg: #3f4805;
+  --serein-kind-archive-bg: #bdeeff;
+  --serein-kind-archive-fg: #004c62;
+  --serein-kind-folder-bg: #f3dfb2;
+  --serein-kind-folder-fg: #563e00;
+
+  --serein-viewer-bg: #e2e8ee;
+  --serein-viewer-bg-deep: #d7dfe8;
+  --serein-viewer-ink: #0a0e12;
+  --serein-viewer-ink-secondary: #333b42;
+  --serein-viewer-hairline: rgba(10, 14, 18, 0.18);
+  --serein-viewer-bar: #f7f9fb;
+}
+
+/* -------------------------------------------- dark — increased contrast ---- */
+.serein-root[data-theme="dark"][data-contrast="more"] {
+  color-scheme: dark;
+
+  --serein-canvas: #0c1015;
+  --serein-canvas-deep: #06080b;
+  --serein-surface: #1c222a;
+  --serein-surface-raised: #252c35;
+  --serein-fill-subtle: #202730;
+  --serein-fill: #262d35;
+  --serein-fill-strong: #313943;
+
+  --serein-text: #f7f9fb;
+  --serein-text-secondary: #ccd3d9;
+  --serein-text-tertiary: #c2c9d0;
+  --serein-text-disabled: #8b969f;
+
+  --serein-border: #7e8b98;
+  --serein-border-strong: #9fabb6;
+
+  --serein-accent: #8cc3f7;
+  --serein-accent-hover: #a9d3fa;
+  --serein-accent-ink: #04121f;
+  --serein-accent-soft: #1a3247;
+  --serein-accent-soft-hover: #213e58;
+  --serein-accent-line: #4a7ba6;
+  --serein-accent-wash: rgba(140, 195, 247, 0.16);
+
+  --serein-brand-from: #aed6fa;
+  --serein-brand-to: #6ba6e2;
+  --serein-brand-ink: #04101b;
+
+  --serein-success: #9ce5b8;
+  --serein-success-soft: #183a27;
+  --serein-success-line: #3d6b50;
+  --serein-warning: #f5d197;
+  --serein-warning-soft: #3f3216;
+  --serein-warning-line: #7a6231;
+  --serein-danger: #ffb8ae;
+  --serein-danger-soft: #48221e;
+  --serein-danger-line: #8f453d;
+  --serein-info: #9adcf0;
+  --serein-info-soft: #123641;
+  --serein-info-line: #3d7182;
+
+  --serein-selection: #353a43;
+  --serein-selection-strong: #40464f;
+  --serein-selection-edge: #9ccaf8;
+  --serein-selected-line: #4f555f;
+  --serein-row-hover: #2b3239;
+  --serein-hover-bg: color-mix(in srgb, var(--serein-text) 8%, transparent);
+  --serein-press-bg: color-mix(in srgb, var(--serein-text) 13%, transparent);
+  --serein-focus-ring: #9ccaf8;
+
+  --serein-chrome-bg: #15191d;
+  --serein-chrome-bg-solid: #15191d;
+  --serein-chrome-border: rgba(255, 255, 255, 0.24);
+  --serein-popover-bg: #20252a;
+  --serein-popover-bg-solid: #20252a;
+  --serein-scrim: rgba(0, 0, 0, 0.68);
+  --serein-scrim-strong: rgba(7, 9, 10, 0.82);
+  --serein-glass-highlight: rgba(255, 255, 255, 0.12);
+  --serein-thumb-border: rgba(255, 255, 255, 0.26);
+  --serein-line-translucent: rgba(255, 255, 255, 0.24);
+  --serein-meter-track: #313840;
+
+  --serein-kind-image-bg: #002d31;
+  --serein-kind-image-fg: #84dbe4;
+  --serein-kind-pdf-bg: #3e171e;
+  --serein-kind-pdf-fg: #fcb4bd;
+  --serein-kind-design-bg: #2d1d3e;
+  --serein-kind-design-fg: #d7bdf8;
+  --serein-kind-video-bg: #112240;
+  --serein-kind-video-fg: #abccff;
+  --serein-kind-audio-bg: #3c170a;
+  --serein-kind-audio-fg: #fcb8a1;
+  --serein-kind-code-bg: #02301b;
+  --serein-kind-code-fg: #9bdcb5;
+  --serein-kind-sheet-bg: #202500;
+  --serein-kind-sheet-fg: #c6d293;
+  --serein-kind-archive-bg: #002b3f;
+  --serein-kind-archive-fg: #93d4fa;
+  --serein-kind-folder-bg: #312000;
+  --serein-kind-folder-fg: #e8c58b;
+
+  --serein-viewer-bg: #05080a;
+  --serein-viewer-bg-deep: #020405;
+  --serein-viewer-ink: #f7f9fb;
+  --serein-viewer-ink-secondary: #ccd3d9;
+  --serein-viewer-hairline: rgba(255, 255, 255, 0.22);
+  --serein-viewer-bar: #15191d;
+}
+
+/* ------------------------------------- system preference: dark (default) --- */
+@media (prefers-color-scheme: dark) {
+  .serein-root:not([data-theme]) {
+    color-scheme: dark;
+
+    --serein-canvas: #131619;
+    --serein-canvas-deep: #0d1012;
+    --serein-surface: #1b1f23;
+    --serein-surface-raised: #22272c;
+    --serein-fill-subtle: #20252a;
+    --serein-fill: #272d33;
+    --serein-fill-strong: #2e353b;
+
+    --serein-text: #edf1f4;
+    --serein-text-secondary: #b0b8bf;
+    --serein-text-tertiary: #aeb5bd;
+    --serein-text-disabled: #6f7a82;
+    --serein-text-inverse: #0b0e10;
+
+    --serein-border: #333b42;
+    --serein-border-strong: #76838f;
+
+    --serein-accent: #74b0ee;
+    --serein-accent-hover: #93c4f4;
+    --serein-accent-ink: #06131f;
+    --serein-accent-soft: #152a3e;
+    --serein-accent-soft-hover: #1c354c;
+    --serein-accent-line: #2b4a68;
+    --serein-accent-wash: rgba(116, 176, 238, 0.12);
+
+    --serein-brand-from: #8fc0f5;
+    --serein-brand-to: #4d8ed4;
+    --serein-brand-ink: #05121f;
+
+    --serein-success: #7ed4a4;
+    --serein-success-soft: #152e20;
+    --serein-success-line: #2c5340;
+    --serein-warning: #ecc07c;
+    --serein-warning-soft: #332812;
+    --serein-warning-line: #5c4a25;
+    --serein-danger: #ff9d92;
+    --serein-danger-soft: #3a1e1b;
+    --serein-danger-line: #6b332d;
+    --serein-info: #7fd2e8;
+    --serein-info-soft: #102c34;
+    --serein-info-line: #28525f;
+
+    --serein-selection: #303a3d;
+    --serein-selection-strong: #242e30;
+    --serein-selection-edge: #74b0ee;
+    --serein-selected-line: #474d56;
+    --serein-row-hover: #242e30;
+    --serein-hover-bg: color-mix(in srgb, var(--serein-text) 6%, transparent);
+    --serein-press-bg: color-mix(in srgb, var(--serein-text) 10%, transparent);
+    --serein-focus-ring: #74b0ee;
+
+    --serein-chrome-bg: rgba(21, 25, 29, 0.74);
+    --serein-chrome-bg-solid: #15191d;
+    --serein-chrome-border: rgba(255, 255, 255, 0.08);
+    --serein-popover-bg: rgba(36, 41, 47, 0.88);
+    --serein-popover-bg-solid: #24292f;
+    --serein-scrim: rgba(0, 0, 0, 0.52);
+    --serein-scrim-strong: rgba(7, 9, 10, 0.7);
+    --serein-glass-highlight: rgba(255, 255, 255, 0.08);
+    --serein-thumb-border: rgba(255, 255, 255, 0.1);
+    --serein-line-translucent: rgba(255, 255, 255, 0.09);
+    --serein-meter-track: #2e353b;
+
+    --serein-shadow-1: 0 1px 1px rgba(0, 0, 0, 0.32),
+      0 1px 3px rgba(0, 0, 0, 0.26);
+    --serein-shadow-2: 0 2px 4px rgba(0, 0, 0, 0.32),
+      0 10px 24px -8px rgba(0, 0, 0, 0.56);
+    --serein-shadow-3: 0 8px 20px rgba(0, 0, 0, 0.42),
+      0 32px 70px -18px rgba(0, 0, 0, 0.72);
+    --serein-shadow-print: 0 1px 2px rgba(0, 0, 0, 0.4),
+      0 18px 40px -14px rgba(0, 0, 0, 0.7);
+    --serein-shadow-float: 0 2px 6px rgba(0, 0, 0, 0.36),
+      0 22px 50px -14px rgba(0, 0, 0, 0.62);
+    --serein-shadow-sheet: 0 10px 28px rgba(0, 0, 0, 0.44),
+      0 50px 100px -24px rgba(0, 0, 0, 0.8);
+    --serein-shadow-control: inset 0 1px 0 rgba(255, 255, 255, 0.08),
+      0 1px 2px rgba(0, 0, 0, 0.3);
+    --serein-shadow-inset-line: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+
+    --serein-viewer-bg: #090c0f;
+    --serein-viewer-bg-deep: #050709;
+    --serein-viewer-ink: #eef2f5;
+    --serein-viewer-ink-secondary: #a7b0b8;
+    --serein-viewer-hairline: rgba(255, 255, 255, 0.12);
+    --serein-viewer-bar: rgba(15, 19, 23, 0.7);
+
+    --serein-kind-image-bg: #002725;
+    --serein-kind-image-fg: #86ddd6;
+    --serein-kind-pdf-bg: #35141a;
+    --serein-kind-pdf-fg: #fcb4bd;
+    --serein-kind-design-bg: #271934;
+    --serein-kind-design-fg: #d9bcf7;
+    --serein-kind-video-bg: #0f1d36;
+    --serein-kind-video-fg: #acccff;
+    --serein-kind-audio-bg: #321508;
+    --serein-kind-audio-fg: #fbb99e;
+    --serein-kind-code-bg: #062918;
+    --serein-kind-code-fg: #9bdcb6;
+    --serein-kind-sheet-bg: #1b1f00;
+    --serein-kind-sheet-fg: #c7d292;
+    --serein-kind-archive-bg: #002535;
+    --serein-kind-archive-fg: #90d5f9;
+    --serein-kind-folder-bg: #291b00;
+    --serein-kind-folder-fg: #e7c68a;
+
+    --serein-divider: color-mix(in srgb, var(--serein-border) 72%, transparent);
+    --serein-divider-strong: var(--serein-border);
+    --serein-overlay-selected: color-mix(
+      in srgb,
+      var(--serein-accent) 13%,
+      var(--serein-surface)
+    );
+    --serein-overlay-selected-strong: color-mix(
+      in srgb,
+      var(--serein-accent) 19%,
+      var(--serein-surface)
+    );
+    --serein-danger-ink: #1c0b08;
+    --serein-success-ink: #04150c;
+    --serein-warning-ink: #1b1204;
+  }
+}
+
+/* --------------------------------- system preference: more contrast --------- */
+@media (prefers-contrast: more) {
+  .serein-root:not([data-contrast]) {
+    --serein-divider: color-mix(in srgb, var(--serein-border) 92%, transparent);
+    --serein-divider-strong: var(--serein-border-strong);
+    --serein-hover-bg: color-mix(in srgb, var(--serein-text) 9%, transparent);
+    --serein-press-bg: color-mix(in srgb, var(--serein-text) 15%, transparent);
+    --serein-focus-ring: var(--serein-accent);
+    --serein-material-blur: none;
+    --serein-material-blur-panel: none;
+    --serein-chrome-bg: var(--serein-chrome-bg-solid);
+    --serein-popover-bg: var(--serein-popover-bg-solid);
+  }
+}
+
+/* ------------------------------------------------- accessibility prefs ----- */
+/* Enlarged text is an explicit user choice, separate from browser zoom. */
+.serein-root[data-textsize="large"] {
+  --serein-text-scale: 1.18;
+}
+.serein-root[data-textsize="x-large"] {
+  --serein-text-scale: 1.3;
+}
+
+/* Opaque fallbacks for every translucent material. */
+@media (prefers-reduced-transparency: reduce) {
+  .serein-root {
+    --serein-chrome-bg: var(--serein-chrome-bg-solid);
+    --serein-popover-bg: var(--serein-popover-bg-solid);
+    --serein-material-blur: none;
+    --serein-material-blur-panel: none;
+    --serein-viewer-bar: var(--serein-chrome-bg-solid);
+  }
+}
+.serein-root[data-transparency="solid"] {
+  --serein-chrome-bg: var(--serein-chrome-bg-solid);
+  --serein-popover-bg: var(--serein-popover-bg-solid);
+  --serein-material-blur: none;
+  --serein-material-blur-panel: none;
+  --serein-viewer-bar: var(--serein-chrome-bg-solid);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .serein-root {
+    --serein-duration-1: 0ms;
+    --serein-duration-2: 0ms;
+    --serein-duration-3: 0ms;
+    --serein-duration-4: 0ms;
+    --serein-duration-5: 0ms;
+  }
+}
+.serein-root[data-motion="reduced"] {
+  --serein-duration-1: 0ms;
+  --serein-duration-2: 0ms;
+  --serein-duration-3: 0ms;
+  --serein-duration-4: 0ms;
+  --serein-duration-5: 0ms;
+}

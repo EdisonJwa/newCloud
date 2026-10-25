@@ -1,17 +1,18 @@
 // Administration: accounts, groups, and the runtime settings.
 //
-// Why this exists at all: several deployment policies (including the default `pending` JIT policy)
-// create accounts that cannot sign in until an administrator approves them, and the API for that was
-// built and tested while nothing in the browser could reach it. The policy therefore had a state it
-// could put a person into with no way out except curl. The same shape applied twice more: groups and
-// runtime settings were fully implemented endpoints with no screen, which made group sharing
-// unreachable and an override invisible.
+// Why this exists at all: several deployment policies (including the default `pending` JIT
+// policy) create accounts that cannot sign in until an administrator approves them, and the API
+// for that was built and tested while nothing in the browser could reach it. The policy
+// therefore had a state it could put a person into with no way out except curl. The same shape
+// applied twice more: groups and runtime settings were fully implemented endpoints with no
+// screen, which made group sharing unreachable and an override invisible.
 //
 // Three panels rather than one long page, because they answer different questions at different
 // times: "who is waiting", "who shares what with whom", and "what are the limits right now".
 //
-// The view is gated on the caller's own role. Gating is presentation only: the API answers 404 to a
-// non-admin, so a user who forces this section to render gets an empty table, not a privilege.
+// The view is gated on the caller's own role. Gating is presentation only: the API answers 404
+// to a non-admin, so a user who forces this section to render gets an empty table, not a
+// privilege.
 
 import { useEffect, useState } from "react";
 import { api, APIError } from "../api";
@@ -39,33 +40,37 @@ export function AccountAdmin() {
   const [panel, setPanel] = useState<Panel>("accounts");
 
   return (
-    <>
-      <div className="viewhead">
-        <h1>{t("admin.title")}</h1>
+    <div className="wc-stack" style={{ gap: "var(--serein-space-6)" }}>
+      <div className="serein-tabs serein-tabs--segmented">
+        <div className="serein-tabs__list" role="tablist" aria-label={t("admin.tabs")}>
+          {(["accounts", "groups", "settings"] as const).map((p) => (
+            <button
+              key={p}
+              type="button"
+              className="serein-tab"
+              role="tab"
+              id={`admin-tab-${p}`}
+              aria-controls={`admin-panel-${p}`}
+              aria-selected={panel === p}
+              tabIndex={panel === p ? 0 : -1}
+              onClick={() => setPanel(p)}
+            >
+              {p === "accounts" ? t("admin.tabAccounts") : p === "groups" ? t("admin.tabGroups") : t("admin.tabSettings")}
+            </button>
+          ))}
+        </div>
       </div>
 
-      <div className="adminfilters" role="group" aria-label={t("admin.tabs")}>
-        {(["accounts", "groups", "settings"] as const).map((p) => (
-          <button
-            key={p}
-            type="button"
-            className={panel === p ? "btn primary" : "btn"}
-            aria-pressed={panel === p}
-            onClick={() => setPanel(p)}
-          >
-            {p === "accounts" ? t("admin.tabAccounts") : p === "groups" ? t("admin.tabGroups") : t("admin.tabSettings")}
-          </button>
-        ))}
+      <div role="tabpanel" id={`admin-panel-${panel}`} aria-labelledby={`admin-tab-${panel}`} tabIndex={0}>
+        {panel === "accounts" ? <Accounts /> : null}
+        {panel === "groups" ? <Groups /> : null}
+        {panel === "settings" ? <RuntimeSettings /> : null}
       </div>
-
-      {panel === "accounts" ? <Accounts /> : null}
-      {panel === "groups" ? <Groups /> : null}
-      {panel === "settings" ? <Settings /> : null}
-    </>
+    </div>
   );
 }
 
-/* ---------- accounts ---------- */
+/* ---------------------------------------------------------------- accounts --- */
 
 function Accounts() {
   const { t, fmt } = useI18n();
@@ -95,7 +100,7 @@ function Accounts() {
     setBusy(u.id);
     try {
       await api.setUserStatus(u.id, status);
-      toast.info(t("admin.statusChanged", { name: u.username, status: t(`admin.status.${status}`) }));
+      toast.success(t("admin.statusChanged", { name: u.username, status: t(`admin.status.${status}`) }));
       load(filter);
     } catch (err) {
       toast.error(errText(err));
@@ -113,7 +118,7 @@ function Accounts() {
     setBusy(u.id);
     try {
       await api.setUserQuota(u.id, bytes);
-      toast.info(t("admin.quotaSaved", { name: u.username }));
+      toast.success(t("admin.quotaSaved", { name: u.username }));
       setEditing(null);
       load(filter);
     } catch (err) {
@@ -124,25 +129,29 @@ function Accounts() {
   };
 
   return (
-    <>
-      <p className="hintline">{t("admin.hint")}</p>
+    <div className="wc-stack" style={{ gap: "var(--serein-space-5)" }}>
+      <p className="serein-hint">{t("admin.hint")}</p>
 
-      <div className="adminfilters" role="group" aria-label={t("admin.filter")}>
-        {(["pending", "active", "disabled", "all"] as const).map((f) => (
-          <button
-            key={f}
-            type="button"
-            className={filter === f ? "btn primary" : "btn"}
-            aria-pressed={filter === f}
-            onClick={() => setFilter(f)}
-          >
-            {f === "all" ? t("admin.filterAll") : t(`admin.status.${f}`)}
+      <div className="serein-actionbar">
+        <div className="serein-actionbar__filters" role="group" aria-label={t("admin.filter")}>
+          {(["pending", "active", "disabled", "all"] as const).map((f) => (
+            <button
+              key={f}
+              type="button"
+              className="serein-filter"
+              aria-pressed={filter === f}
+              onClick={() => setFilter(f)}
+            >
+              {f === "all" ? t("admin.filterAll") : t(`admin.status.${f}`)}
+            </button>
+          ))}
+        </div>
+        <div className="serein-actionbar__tools">
+          <button type="button" className="serein-btn serein-btn--sm serein-btn--outline" onClick={() => load(filter)}>
+            <Icon name="refresh" size={12} />
+            {t("admin.reload")}
           </button>
-        ))}
-        <button type="button" className="btn" onClick={() => load(filter)}>
-          <Icon name="refresh" size={13} />
-          {t("admin.reload")}
-        </button>
+        </div>
       </div>
 
       {error ? (
@@ -156,94 +165,96 @@ function Accounts() {
           hint={filter === "pending" ? t("admin.emptyPendingHint") : t("admin.emptyHint")}
         />
       ) : (
-        <div className="tablewrap">
-          <table className="table">
-            <thead>
-              <tr>
-                <th>{t("admin.account")}</th>
-                <th>{t("admin.role")}</th>
-                <th>{t("admin.status")}</th>
-                <th className="end">{t("admin.quota")}</th>
-                <th />
-              </tr>
-            </thead>
-            <tbody>
-              {users.map((u) => (
-                <tr key={u.id}>
-                  <td>
+        <div className="wc-card">
+          <div className="wc-list">
+            {users.map((u) => (
+              <div className="wc-list__row" key={u.id}>
+                <span className="serein-avatar" aria-hidden="true">
+                  {(u.display_name || u.username).slice(0, 2).toUpperCase()}
+                </span>
+                <span className="wc-list__main">
+                  <span className="wc-list__title">
                     {u.display_name || u.username}
-                    {u.is_breakglass ? <span className="tag">{t("admin.breakglass")}</span> : null}
-                    <br />
-                    <span className="sub">{u.email}</span>
-                  </td>
-                  <td>{u.role}</td>
-                  <td>
-                    <span className={`status status-${u.status}`}>
-                      {t(`admin.status.${u.status}`)}
-                    </span>
-                  </td>
-                  <td className="end mono">
-                    {editing === u.id ? (
-                      <span className="quota-edit">
+                    {u.is_breakglass ? (
+                      <span className="serein-badge serein-badge--warning">{t("admin.breakglass")}</span>
+                    ) : null}
+                  </span>
+                  <span className="wc-list__meta">
+                    {u.email} · {t("admin.roleNamed", { role: u.role })}
+                  </span>
+                </span>
+
+                <span
+                  className={`serein-badge serein-badge--${u.status === "active" ? "success" : u.status === "pending" ? "warning" : "outline"}`}
+                >
+                  {t(`admin.status.${u.status}`)}
+                </span>
+
+                <span className="wc-list__end wc-list__end--secondary wc-numeric">
+                  {editing === u.id ? (
+                    <span className="wc-quota-edit">
+                      <span className="serein-input-wrap serein-input-wrap--sm">
                         <input
+                          className="serein-input"
                           type="number"
                           min="0"
                           value={quotaDraft}
                           aria-label={t("admin.quotaBytes")}
                           onChange={(e) => setQuotaDraft(e.target.value)}
-                        />
-                        <button
-                          type="button"
-                          className="btn sm primary"
-                          disabled={busy === u.id}
-                          onClick={() => void saveQuota(u)}
-                        >
-                          {t("admin.save")}
-                        </button>
-                        <button type="button" className="btn sm ghost" onClick={() => setEditing(null)}>
-                          {t("dlg.cancel")}
-                        </button>
-                      </span>
-                    ) : (
-                      <>
-                        {fmt.size(u.used_bytes ?? 0)} / {u.quota_bytes ? fmt.size(u.quota_bytes) : "∞"}
-                        <button
-                          type="button"
-                          className="btn sm ghost"
-                          onClick={() => {
-                            setEditing(u.id);
-                            setQuotaDraft(String(u.quota_bytes ?? 0));
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") void saveQuota(u);
+                            if (e.key === "Escape") setEditing(null);
                           }}
-                        >
-                          {t("admin.setQuota")}
-                        </button>
-                      </>
-                    )}
-                  </td>
-                  <td className="end">
-                    {TARGETS[u.status].map((target) => (
+                        />
+                      </span>
                       <button
-                        key={target}
                         type="button"
-                        className="btn ghost"
+                        className="serein-btn serein-btn--sm"
                         disabled={busy === u.id}
-                        onClick={() => setStatus(u, target)}
+                        onClick={() => void saveQuota(u)}
                       >
-                        {t(`admin.action.${target}`)}
+                        {t("admin.save")}
                       </button>
-                    ))}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+                    </span>
+                  ) : (
+                    <button
+                      type="button"
+                      className="serein-breadcrumb__link"
+                      title={t("admin.setQuota")}
+                      onClick={() => {
+                        setEditing(u.id);
+                        setQuotaDraft(String(u.quota_bytes ?? 0));
+                      }}
+                    >
+                      {fmt.size(u.used_bytes ?? 0)}
+                      {u.quota_bytes ? ` / ${fmt.size(u.quota_bytes)}` : ` / ${t("home.unlimited")}`}
+                    </button>
+                  )}
+                </span>
+
+                <span className="wc-admin-actions">
+                  {TARGETS[u.status as Status]?.map((target) => (
+                    <button
+                      key={target}
+                      type="button"
+                      className={`serein-btn serein-btn--sm ${target === "disabled" ? "serein-btn--quiet" : "serein-btn--outline"}`}
+                      disabled={busy === u.id}
+                      onClick={() => void setStatus(u, target)}
+                    >
+                      {t(`admin.action.${target}`)}
+                    </button>
+                  ))}
+                </span>
+              </div>
+            ))}
+          </div>
         </div>
       )}
-    </>
+    </div>
   );
 }
 
-/* ---------- groups ---------- */
+/* ------------------------------------------------------------------ groups --- */
 
 function Groups() {
   const { t } = useI18n();
@@ -273,7 +284,7 @@ function Groups() {
     setBusy(true);
     try {
       await api.createGroup({ name: name.trim(), display_name: display.trim() || undefined });
-      toast.info(t("admin.groupCreated", { name: name.trim() }));
+      toast.success(t("admin.groupCreated", { name: name.trim() }));
       setName("");
       setDisplay("");
       load();
@@ -289,7 +300,7 @@ function Groups() {
     if (!username) return;
     try {
       await api.addGroupMember(group.id, { username, role: "viewer" });
-      toast.info(t("admin.memberAdded", { name: username }));
+      toast.success(t("admin.memberAdded", { name: username }));
       setAddTo((prev) => ({ ...prev, [group.id]: "" }));
       load();
     } catch (err) {
@@ -300,7 +311,7 @@ function Groups() {
   const removeMember = async (group: Group, userID: string, username: string) => {
     try {
       await api.removeGroupMember(group.id, userID);
-      toast.info(t("admin.memberRemoved", { name: username }));
+      toast.success(t("admin.memberRemoved", { name: username }));
       load();
     } catch (err) {
       toast.error(errText(err));
@@ -308,27 +319,47 @@ function Groups() {
   };
 
   return (
-    <>
-      <p className="hintline">{t("admin.groupsHint")}</p>
+    <div className="wc-stack" style={{ gap: "var(--serein-space-5)" }}>
+      <p className="serein-hint">{t("admin.groupsHint")}</p>
 
-      <div className="aclbar">
-        <input
-          value={name}
-          placeholder={t("admin.groupName")}
-          aria-label={t("admin.groupName")}
-          onChange={(e) => setName(e.target.value)}
-        />
-        <input
-          value={display}
-          placeholder={t("admin.groupDisplay")}
-          aria-label={t("admin.groupDisplay")}
-          onChange={(e) => setDisplay(e.target.value)}
-        />
-        <button type="button" className="btn primary" disabled={busy || !name.trim()} onClick={create}>
+      <form
+        className="wc-inlineform"
+        onSubmit={(e) => {
+          e.preventDefault();
+          void create();
+        }}
+      >
+        <div className="serein-field">
+          <label className="serein-label" htmlFor="group-name">
+            {t("admin.groupName")}
+          </label>
+          <div className="serein-input-wrap serein-input-wrap--sm">
+            <input
+              id="group-name"
+              className="serein-input"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+            />
+          </div>
+        </div>
+        <div className="serein-field">
+          <label className="serein-label" htmlFor="group-display">
+            {t("admin.groupDisplay")}
+          </label>
+          <div className="serein-input-wrap serein-input-wrap--sm">
+            <input
+              id="group-display"
+              className="serein-input"
+              value={display}
+              onChange={(e) => setDisplay(e.target.value)}
+            />
+          </div>
+        </div>
+        <button type="submit" className="serein-btn" disabled={busy || !name.trim()}>
           <Icon name="folderPlus" size={13} />
           {t("admin.createGroup")}
         </button>
-      </div>
+      </form>
 
       {error ? (
         <ErrorState message={error} onRetry={load} />
@@ -337,47 +368,54 @@ function Groups() {
       ) : groups.length === 0 ? (
         <EmptyState icon="shares" title={t("admin.groupsEmpty")} hint={t("admin.groupsHint")} />
       ) : (
-        <div className="groups">
+        <div className="wc-stack" style={{ gap: "var(--serein-space-5)" }}>
           {groups.map((group) => (
-            <section className="block groupcard" key={group.id}>
-              <h2>
-                <span>{group.display_name || group.name}</span>
-                <span className="spacer" />
-                <span className="mono sub">{group.name}</span>
-              </h2>
+            <section className="wc-card wc-card__padding" key={group.id}>
+              <div className="wc-row" style={{ marginBottom: 10 }}>
+                <h3 className="wc-section__title">{group.display_name || group.name}</h3>
+                <span className="serein-hint wc-mono">{group.name}</span>
+                <span className="wc-grow" />
+                <span className="serein-hint wc-numeric">
+                  {t("count.members", { n: (group.members ?? []).length })}
+                </span>
+              </div>
 
-              <div className="chips">
+              <div className="wc-chips">
                 {(group.members ?? []).length === 0 ? (
-                  <span className="hintline">{t("admin.noMembers")}</span>
+                  <span className="serein-hint">{t("admin.noMembers")}</span>
                 ) : (
                   (group.members ?? []).map((m) => (
-                    <span className="chip" key={m.id}>
+                    <span className="serein-chip" key={m.id}>
                       {m.username}
                       <button
                         type="button"
+                        className="serein-chip__remove"
                         aria-label={t("admin.memberRemoved", { name: m.username })}
                         onClick={() => void removeMember(group, m.id, m.username)}
                       >
-                        <Icon name="close" size={9} />
+                        <Icon name="close" size={10} />
                       </button>
                     </span>
                   ))
                 )}
               </div>
 
-              <div className="aclbar">
-                <input
-                  value={addTo[group.id] ?? ""}
-                  placeholder={t("admin.member")}
-                  aria-label={t("admin.member")}
-                  onChange={(e) => setAddTo((prev) => ({ ...prev, [group.id]: e.target.value }))}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") void addMember(group);
-                  }}
-                />
+              <div className="wc-row" style={{ marginTop: 12 }}>
+                <span className="serein-input-wrap serein-input-wrap--sm wc-grow">
+                  <input
+                    className="serein-input"
+                    value={addTo[group.id] ?? ""}
+                    placeholder={t("admin.member")}
+                    aria-label={t("admin.member")}
+                    onChange={(e) => setAddTo((prev) => ({ ...prev, [group.id]: e.target.value }))}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") void addMember(group);
+                    }}
+                  />
+                </span>
                 <button
                   type="button"
-                  className="btn sm"
+                  className="serein-btn serein-btn--sm serein-btn--outline"
                   disabled={!(addTo[group.id] ?? "").trim()}
                   onClick={() => void addMember(group)}
                 >
@@ -388,13 +426,13 @@ function Groups() {
           ))}
         </div>
       )}
-    </>
+    </div>
   );
 }
 
-/* ---------- runtime settings ---------- */
+/* -------------------------------------------------------- runtime settings --- */
 
-function Settings() {
+function RuntimeSettings() {
   const { t } = useI18n();
   const toast = useToast();
 
@@ -422,7 +460,7 @@ function Settings() {
     }
     try {
       await api.setAdminSetting(key, value);
-      toast.info(t("admin.settingSaved", { key, value }));
+      toast.success(t("admin.settingSaved", { key, value }));
       setEditing(null);
       load();
     } catch (err) {
@@ -433,7 +471,7 @@ function Settings() {
   const reset = async (key: string) => {
     try {
       await api.resetAdminSetting(key);
-      toast.info(t("admin.settingReset", { key }));
+      toast.success(t("admin.settingReset", { key }));
       load();
     } catch (err) {
       toast.error(errText(err));
@@ -441,8 +479,8 @@ function Settings() {
   };
 
   return (
-    <>
-      <p className="hintline">{t("admin.settingsHint")}</p>
+    <div className="wc-stack" style={{ gap: "var(--serein-space-5)" }}>
+      <p className="serein-hint">{t("admin.settingsHint")}</p>
 
       {error ? (
         <ErrorState message={error} onRetry={load} />
@@ -451,75 +489,85 @@ function Settings() {
       ) : items.length === 0 ? (
         <EmptyState icon="grid" title={t("admin.empty")} />
       ) : (
-        <div className="tablewrap">
-          <table className="table">
-            <thead>
-              <tr>
-                <th>{t("admin.settingKey")}</th>
-                <th className="end">{t("admin.settingValue")}</th>
-                <th>{t("admin.settingSource")}</th>
-                <th />
-              </tr>
-            </thead>
-            <tbody>
-              {items.map((s) => (
-                <tr key={s.key}>
-                  <td className="mono">{s.key}</td>
-                  <td className="end mono">
-                    {editing === s.key ? (
-                      <input
-                        type="number"
-                        value={draft}
-                        aria-label={t("admin.settingValue")}
-                        onChange={(e) => setDraft(e.target.value)}
-                      />
-                    ) : (
-                      s.value
-                    )}
-                  </td>
-                  <td>
-                    {/* The source is shown, not inferred: a value that happens to equal the default
-                        is a different fact from one that is pinned by an override. */}
-                    <span className={`pill${s.source === "override" ? " accent" : ""}`}>
-                      {s.source === "override" ? t("admin.sourceOverride") : t("admin.sourceConfig")}
+        <div className="wc-card">
+          <div className="wc-list">
+            {items.map((s) => (
+              <div className="wc-list__row" key={s.key}>
+                <span className="wc-list__main">
+                  <span className="wc-list__title wc-mono">{s.key}</span>
+                  <span className="wc-list__meta">{t("admin.settingSourceHint")}</span>
+                </span>
+
+                {/* The source is shown, not inferred: a value that happens to equal the default
+                    is a different fact from one that is pinned by an override. */}
+                <span
+                  className={`serein-badge ${s.source === "override" ? "serein-badge--accent" : "serein-badge--outline"}`}
+                >
+                  {s.source === "override" ? t("admin.sourceOverride") : t("admin.sourceConfig")}
+                </span>
+
+                <span className="wc-list__end wc-numeric">
+                  {editing === s.key ? (
+                    <span className="wc-quota-edit">
+                      <span className="serein-input-wrap serein-input-wrap--sm">
+                        <input
+                          className="serein-input"
+                          type="number"
+                          value={draft}
+                          aria-label={t("admin.settingValue")}
+                          onChange={(e) => setDraft(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") void save(s.key);
+                            if (e.key === "Escape") setEditing(null);
+                          }}
+                        />
+                      </span>
+                      <button type="button" className="serein-btn serein-btn--sm" onClick={() => void save(s.key)}>
+                        {t("admin.save")}
+                      </button>
+                      <button
+                        type="button"
+                        className="serein-btn serein-btn--sm serein-btn--quiet"
+                        onClick={() => setEditing(null)}
+                      >
+                        {t("dlg.cancel")}
+                      </button>
                     </span>
-                  </td>
-                  <td className="end">
-                    {editing === s.key ? (
-                      <>
-                        <button type="button" className="btn sm primary" onClick={() => void save(s.key)}>
-                          {t("admin.save")}
-                        </button>
-                        <button type="button" className="btn sm ghost" onClick={() => setEditing(null)}>
-                          {t("dlg.cancel")}
-                        </button>
-                      </>
-                    ) : (
-                      <>
+                  ) : (
+                    <span className="wc-mono">{s.value}</span>
+                  )}
+                </span>
+
+                <span className="wc-admin-actions">
+                  {editing === s.key ? null : (
+                    <>
+                      <button
+                        type="button"
+                        className="serein-btn serein-btn--sm serein-btn--quiet"
+                        onClick={() => {
+                          setEditing(s.key);
+                          setDraft(String(s.value));
+                        }}
+                      >
+                        {t("admin.edit")}
+                      </button>
+                      {s.source === "override" ? (
                         <button
                           type="button"
-                          className="btn sm ghost"
-                          onClick={() => {
-                            setEditing(s.key);
-                            setDraft(String(s.value));
-                          }}
+                          className="serein-btn serein-btn--sm serein-btn--quiet"
+                          onClick={() => void reset(s.key)}
                         >
-                          {t("admin.edit")}
+                          {t("admin.reset")}
                         </button>
-                        {s.source === "override" ? (
-                          <button type="button" className="btn sm ghost" onClick={() => void reset(s.key)}>
-                            {t("admin.reset")}
-                          </button>
-                        ) : null}
-                      </>
-                    )}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+                      ) : null}
+                    </>
+                  )}
+                </span>
+              </div>
+            ))}
+          </div>
         </div>
       )}
-    </>
+    </div>
   );
 }

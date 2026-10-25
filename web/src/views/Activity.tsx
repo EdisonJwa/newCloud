@@ -3,10 +3,14 @@
 // This is the product's distinguishing claim made readable. Two decisions matter:
 //
 //  * The default is chronological, grouped by day, with denied attempts marked. An audit log
-//    whose refusals are hidden is not an audit log; the interesting rows are the ones that
-//    did not succeed.
+//    whose refusals are hidden is not an audit log; the interesting rows are the ones that did
+//    not succeed.
 //  * Export is a plain link to the server's CSV, not a client-side serialisation. The client
 //    must never be the thing that decides what the authoritative record contained.
+//
+// The timeline is a rail with dots rather than a table because an audit record is read in
+// order: what happened, then what happened next. A table invites scanning by column, which is
+// the wrong question for a log.
 
 import { useCallback, useEffect, useState } from "react";
 import { api, APIError } from "../api";
@@ -49,55 +53,75 @@ export function Activity({ reloadKey }: { reloadKey: number }) {
   }, [load, reloadKey]);
 
   const groups = groupByDay(events, fmt.day);
+  const filtered = Boolean(action || result || since);
 
   return (
-    <>
-      <div className="viewhead">
-        <h1>{t("activity.title")}</h1>
-        <span className="spacer" />
-        <a className="btn sm" href={`/api/audit?format=csv${since ? `&since=${since}` : ""}`} download>
+    <div className="wc-stack" style={{ gap: "var(--serein-space-6)" }}>
+      <div className="wc-activity-filters">
+        <label className="serein-field wc-activity-filter">
+          <span className="serein-label">{t("activity.action")}</span>
+          <span className="serein-select-wrap">
+            <select
+              className="serein-select serein-select--sm"
+              value={action}
+              onChange={(e) => setAction(e.target.value)}
+            >
+              <option value="">{t("activity.allActions")}</option>
+              {(page?.actions ?? []).map((a) => (
+                <option key={a} value={a}>
+                  {a}
+                </option>
+              ))}
+            </select>
+          </span>
+        </label>
+
+        <label className="serein-field wc-activity-filter">
+          <span className="serein-label">{t("activity.result")}</span>
+          <span className="serein-select-wrap">
+            <select
+              className="serein-select serein-select--sm"
+              value={result}
+              onChange={(e) => setResult(e.target.value)}
+            >
+              <option value="">{t("activity.anyResult")}</option>
+              <option value="ok">{t("activity.allowed")}</option>
+              <option value="denied">{t("activity.refused")}</option>
+            </select>
+          </span>
+        </label>
+
+        <label className="serein-field wc-activity-filter">
+          <span className="serein-label">{t("activity.since")}</span>
+          <span className="serein-select-wrap">
+            <select
+              className="serein-select serein-select--sm"
+              value={since}
+              onChange={(e) => setSince(e.target.value)}
+            >
+              <option value="">{t("activity.allTime")}</option>
+              <option value="1h">{t("activity.lastHour")}</option>
+              <option value="24h">{t("activity.last24")}</option>
+              <option value="7d">{t("activity.last7")}</option>
+              <option value="30d">{t("activity.last30")}</option>
+            </select>
+          </span>
+        </label>
+
+        <span className="wc-grow" />
+
+        {page ? (
+          <span className="serein-hint wc-numeric">{t("count.events", { n: page.total })}</span>
+        ) : null}
+
+        <a
+          className="serein-btn serein-btn--sm serein-btn--outline"
+          href={`/api/audit?format=csv${since ? `&since=${since}` : ""}`}
+          download
+        >
           <Icon name="download" size={12} />
           {t("activity.export")}
         </a>
-      </div>
-
-      <div className="filters">
-        <label className="sr-only" htmlFor="f-action">
-          {t("activity.action")}
-        </label>
-        <select id="f-action" value={action} onChange={(e) => setAction(e.target.value)}>
-          <option value="">{t("activity.allActions")}</option>
-          {(page?.actions ?? []).map((a) => (
-            <option key={a} value={a}>
-              {a}
-            </option>
-          ))}
-        </select>
-
-        <label className="sr-only" htmlFor="f-result">
-          {t("activity.result")}
-        </label>
-        <select id="f-result" value={result} onChange={(e) => setResult(e.target.value)}>
-          <option value="">{t("activity.anyResult")}</option>
-          <option value="ok">{t("activity.allowed")}</option>
-          <option value="denied">{t("activity.refused")}</option>
-        </select>
-
-        <label className="sr-only" htmlFor="f-since">
-          {t("activity.since")}
-        </label>
-        <select id="f-since" value={since} onChange={(e) => setSince(e.target.value)}>
-          <option value="">{t("activity.allTime")}</option>
-          <option value="1h">{t("activity.lastHour")}</option>
-          <option value="24h">{t("activity.last24")}</option>
-          <option value="7d">{t("activity.last7")}</option>
-          <option value="30d">{t("activity.last30")}</option>
-        </select>
-
-        <span className="spacer" />
-        {page ? (
-          <span className="mono upload-count">{t("count.events", { n: page.total })}</span>
-        ) : null}
       </div>
 
       {error ? (
@@ -107,45 +131,53 @@ export function Activity({ reloadKey }: { reloadKey: number }) {
       ) : events.length === 0 ? (
         <EmptyState
           icon="pulse"
-          title={action || result || since ? t("activity.filtered") : t("activity.empty")}
+          title={filtered ? t("activity.filtered") : t("activity.empty")}
+          hint={filtered ? t("activity.filteredHint") : t("activity.emptyHint")}
         />
       ) : (
-        <div className="timeline">
+        <div className="wc-timeline">
           {groups.map(([day, rows]) => (
-            <div key={day}>
-              <div className="daymark">{day}</div>
+            <div key={day} className="wc-timeline__group">
+              <h3 className="wc-timeline__day">{day}</h3>
               {rows.map((event) => (
-                <div key={event.id} className={`ev${event.result === "denied" ? " denied" : ""}`}>
-                  <div className="when">
-                    <span className="c">{fmt.clock(event.ts)}</span>
-                    {fmt.relative(event.ts)}
-                  </div>
-                  <div className="rail">
-                    <span className="dot" />
-                  </div>
-                  <div className="body">
-                    <div className="head">
-                      <span className="act">{event.action}</span>
-                      <span className="target">{targetOf(event)}</span>
-                      <span className="who">· {whoOf(event, t)}</span>
-                    </div>
-                    <div className="meta">
-                      {event.result !== "ok" ? <span>{event.result}</span> : null}
+                <div
+                  key={event.id}
+                  className={`wc-timeline__row${event.result === "denied" ? " wc-timeline__row--denied" : ""}`}
+                >
+                  <span className="wc-timeline__when">
+                    <span className="wc-mono">{fmt.clock(event.ts)}</span>
+                    <span>{fmt.relative(event.ts)}</span>
+                  </span>
+                  <span className="wc-timeline__rail" aria-hidden="true">
+                    <span
+                      className={`serein-status-dot${event.result === "denied" ? " serein-status-dot--danger" : ""}`}
+                    />
+                  </span>
+                  <span className="wc-timeline__body">
+                    <span className="wc-timeline__head">
+                      <span className="wc-timeline__action">{event.action}</span>
+                      <span className="wc-timeline__target">{targetOf(event)}</span>
+                    </span>
+                    <span className="wc-timeline__meta">
+                      <span>{whoOf(event, t)}</span>
+                      {event.result !== "ok" ? (
+                        <span className="serein-badge serein-badge--danger">{event.result}</span>
+                      ) : null}
                       {event.bytes ? <span>{fmt.size(event.bytes)}</span> : null}
-                      {event.actor_ip ? <span>{event.actor_ip}</span> : null}
+                      {event.actor_ip ? <span className="wc-mono">{event.actor_ip}</span> : null}
                       {event.share_id ? <span>{t("activity.viaLink")}</span> : null}
-                    </div>
-                  </div>
+                    </span>
+                  </span>
                 </div>
               ))}
             </div>
           ))}
 
-          <div className="loadmore">
+          <div className="wc-timeline__more">
             {page?.has_more ? (
               <button
                 type="button"
-                className="btn"
+                className="serein-btn serein-btn--sm serein-btn--outline"
                 disabled={loadingMore}
                 onClick={async () => {
                   setLoadingMore(true);
@@ -153,15 +185,16 @@ export function Activity({ reloadKey }: { reloadKey: number }) {
                   setLoadingMore(false);
                 }}
               >
+                {loadingMore ? <span className="serein-spinner" aria-hidden="true" /> : null}
                 {t("activity.loadOlder")}
               </button>
             ) : (
-              <span className="hintline">{t("activity.end")}</span>
+              <span className="serein-hint">{t("activity.end")}</span>
             )}
           </div>
         </div>
       )}
-    </>
+    </div>
   );
 }
 

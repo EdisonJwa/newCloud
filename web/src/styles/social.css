@@ -1,0 +1,502 @@
+/*
+ * Social surfaces: stars, labels, discussions, and the empty-trash action.
+ *
+ * These come from core-scope §4, §5, §6 and §3, and they are one file for the same reason the
+ * components are one file: they appear together in the inspector and on a row, and three files of
+ * four rules each would hide the fact that they share a chip, a row rhythm and an action cluster.
+ *
+ * Colours come from tokens, never from literals. The tag palette is the one the SERVER validates
+ * against (store.TagColors), and each of those ten names maps to a hue token here. That mapping is
+ * the only place a colour name becomes a colour, so adding a colour is two edits rather than a hunt
+ * through components.
+ */
+
+/* ------------------------------------------------------------------ stars --- */
+
+.wc-star {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--serein-space-1);
+  border: 1px solid transparent;
+  background: none;
+  border-radius: var(--serein-radius-sm);
+  padding: 2px var(--serein-space-2);
+  font: var(--serein-type-label);
+  color: var(--serein-text-tertiary);
+  cursor: pointer;
+}
+
+.wc-star:hover {
+  background: var(--serein-fill-subtle);
+  color: var(--serein-text);
+}
+
+.wc-star:focus-visible {
+  outline: 2px solid var(--serein-focus-ring);
+  outline-offset: 1px;
+}
+
+/* The filled state uses the amber "attention" token rather than a literal gold: amber is the
+   palette's warm accent, and a hand-picked #f5b301 would be the one colour in the interface that
+   does not follow the theme in dark mode. */
+.wc-star--on {
+  color: var(--serein-warning);
+}
+
+.wc-star--on svg {
+  fill: currentColor;
+}
+
+.wc-star--compact {
+  padding: 1px 2px;
+  gap: 0;
+}
+
+/* ------------------------------------------------------------------- tags --- */
+
+.wc-tagchips {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--serein-space-1);
+  min-width: 0;
+}
+
+.wc-tagchip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--serein-space-1);
+  border: 1px solid var(--serein-border);
+  border-radius: 999px;
+  padding: 1px var(--serein-space-2);
+  font: var(--serein-type-label);
+  line-height: 1.6;
+  white-space: nowrap;
+  max-width: 14ch;
+  background: var(--serein-surface);
+  color: var(--serein-text);
+}
+
+.wc-tagchip__body {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--serein-space-1);
+  border: 0;
+  background: none;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  cursor: inherit;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+button.wc-tagchip__body {
+  cursor: pointer;
+}
+
+.wc-tagchip__x {
+  display: inline-flex;
+  align-items: center;
+  border: 0;
+  background: none;
+  padding: 0 1px;
+  color: inherit;
+  opacity: 0.6;
+  cursor: pointer;
+}
+
+.wc-tagchip__x:hover {
+  opacity: 1;
+}
+
+.wc-tagchip__x:focus-visible,
+button.wc-tagchip__body:focus-visible {
+  outline: 2px solid var(--serein-focus-ring);
+  outline-offset: 1px;
+  border-radius: 999px;
+}
+
+/* The dot is the colour; the text stays the default foreground. Colouring the LABEL would make a
+   chip unreadable at the palette's lighter end and would put ten extra contrast pairs to audit. */
+.wc-tagchip__dot {
+  inline-size: 6px;
+  block-size: 6px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--serein-text-tertiary);
+}
+
+.wc-tagchip--gray .wc-tagchip__dot {
+  background: var(--serein-text-tertiary);
+}
+.wc-tagchip--red .wc-tagchip__dot {
+  background: var(--serein-danger);
+}
+.wc-tagchip--orange .wc-tagchip__dot {
+  background: var(--serein-warning);
+}
+.wc-tagchip--yellow .wc-tagchip__dot {
+  background: var(--serein-warning);
+}
+.wc-tagchip--green .wc-tagchip__dot {
+  background: var(--serein-success);
+}
+.wc-tagchip--teal .wc-tagchip__dot {
+  background: var(--serein-success);
+}
+.wc-tagchip--blue .wc-tagchip__dot {
+  background: var(--serein-accent);
+}
+.wc-tagchip--indigo .wc-tagchip__dot {
+  background: var(--serein-accent);
+}
+.wc-tagchip--purple .wc-tagchip__dot {
+  background: var(--serein-accent);
+}
+.wc-tagchip--pink .wc-tagchip__dot {
+  background: var(--serein-danger);
+}
+
+.wc-tagchip--pick {
+  cursor: pointer;
+}
+
+.wc-tagchip--pick:hover {
+  border-color: var(--serein-border-strong);
+  background: var(--serein-fill-subtle);
+}
+
+.wc-tagchip--more {
+  color: var(--serein-text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.wc-tagchip__count {
+  color: var(--serein-text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* --------------------------------------------------------------- tag editor --- */
+
+.wc-tageditor {
+  display: flex;
+  flex-direction: column;
+  gap: var(--serein-space-2);
+}
+
+.wc-tageditor__row {
+  display: flex;
+  align-items: center;
+  gap: var(--serein-space-2);
+  flex-wrap: wrap;
+}
+
+.wc-tageditor__add {
+  flex: none;
+}
+
+.wc-tageditor__panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--serein-space-2);
+  padding: var(--serein-space-2);
+  border: 1px solid var(--serein-border);
+  border-radius: var(--serein-radius-sm);
+  background: var(--serein-fill-subtle);
+}
+
+.wc-tageditor__new {
+  display: flex;
+  gap: var(--serein-space-2);
+}
+
+.wc-tageditor__new .serein-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.wc-tageditor__error {
+  color: var(--serein-danger);
+}
+
+/* ---------------------------------------------------------------- comments --- */
+
+.wc-comments {
+  display: flex;
+  flex-direction: column;
+  gap: var(--serein-space-3);
+}
+
+.wc-comments__error {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--serein-space-2);
+}
+
+.wc-comments__list,
+.wc-comments__replies {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--serein-space-2);
+}
+
+/* Replies are indented by a border rather than by a large padding: in a 340px panel a 24px indent
+   leaves the reply text in a column too narrow to read, and a rule says "this answers that" just as
+   clearly. */
+.wc-comments__replies {
+  margin-left: var(--serein-space-3);
+  padding-left: var(--serein-space-2);
+  border-left: 2px solid var(--serein-border);
+}
+
+.wc-comment__body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.wc-comment__head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--serein-space-2);
+  flex-wrap: wrap;
+}
+
+.wc-comment__author {
+  font: var(--serein-type-label);
+  font-weight: 600;
+  color: var(--serein-text);
+}
+
+.wc-comment__time {
+  font: var(--serein-type-label);
+  color: var(--serein-text-tertiary);
+}
+
+/* `pre-line` because a comment is prose the author formatted. Whitespace is collapsed horizontally
+   (an indent in a comment is not a code block) and preserved vertically (a paragraph break is). */
+.wc-comment__text {
+  margin: 0;
+  font: var(--serein-type-body);
+  color: var(--serein-text);
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+}
+
+.wc-comment__actions {
+  display: flex;
+  gap: var(--serein-space-1);
+  flex-wrap: wrap;
+}
+
+.wc-comment__body--gone {
+  flex-direction: row;
+  align-items: center;
+  gap: var(--serein-space-2);
+  color: var(--serein-text-tertiary);
+  font-style: italic;
+}
+
+.wc-comment__edit {
+  display: flex;
+  flex-direction: column;
+  gap: var(--serein-space-2);
+}
+
+.wc-comment__edit-actions {
+  display: flex;
+  gap: var(--serein-space-2);
+}
+
+.wc-comments__compose {
+  display: flex;
+  flex-direction: column;
+  gap: var(--serein-space-2);
+  border-top: 1px solid var(--serein-border);
+  padding-top: var(--serein-space-3);
+}
+
+.wc-comments__input {
+  resize: vertical;
+  font: var(--serein-type-body);
+  min-height: 64px;
+}
+
+.wc-comments__compose-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--serein-space-2);
+}
+
+/* Tabular figures: the counter jumps from 8 to 10 and a proportional digit makes the line twitch on
+   every keystroke. */
+.wc-comments__compose-actions .serein-hint {
+  font-variant-numeric: tabular-nums;
+}
+
+.wc-comments__replying {
+  display: flex;
+  align-items: center;
+  gap: var(--serein-space-2);
+  font: var(--serein-type-label);
+  color: var(--serein-text-tertiary);
+}
+
+/* A badge on a row. It sits in the metadata line rather than beside the name, because the name is
+   the one thing that must not be truncated further. */
+.wc-commentbadge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font: var(--serein-type-label);
+  font-variant-numeric: tabular-nums;
+  color: var(--serein-text-tertiary);
+}
+
+/* --------------------------------------------------------------- row chips --- */
+
+/* The row's tag cluster: it may shrink, but it must not push the row's actions off the edge. */
+.wc-row-tags {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--serein-space-1);
+  min-width: 0;
+  flex: 0 1 auto;
+  overflow: hidden;
+}
+
+/* --------------------------------------------------------------- empty trash --- */
+
+.wc-trash-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--serein-space-3);
+  flex-wrap: wrap;
+  margin-bottom: var(--serein-space-3);
+}
+
+.wc-trash-actions__note {
+  font: var(--serein-type-label);
+  color: var(--serein-text-tertiary);
+}
+
+/* --------------------------------------------------------------- favorites --- */
+
+.wc-favorites__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--serein-space-2);
+  margin-bottom: var(--serein-space-2);
+}
+
+/* -------------------------------------------------------------- search filters --- */
+
+/* The palette's filter row. It sits under the input rather than beside it: a 480px dialog has no
+   room for an inline picker next to a combobox, and stacking keeps the input full width, which is
+   the control every user touches. */
+.wc-search__filters {
+  display: flex;
+  align-items: center;
+  gap: var(--serein-space-2);
+  flex-wrap: wrap;
+  padding: 0 var(--serein-space-3) var(--serein-space-2);
+}
+
+.wc-filterchip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--serein-space-1);
+  border: 1px solid var(--serein-border);
+  background: var(--serein-surface);
+  color: var(--serein-text-secondary);
+  border-radius: 999px;
+  padding: 2px var(--serein-space-2);
+  font: var(--serein-type-label);
+  cursor: pointer;
+}
+
+.wc-filterchip:hover {
+  background: var(--serein-fill-subtle);
+}
+
+.wc-filterchip:focus-visible {
+  outline: 2px solid var(--serein-focus-ring);
+  outline-offset: 1px;
+}
+
+.wc-filterchip--on {
+  border-color: var(--serein-accent-line);
+  background: var(--serein-accent-soft);
+  color: var(--serein-text);
+}
+
+.wc-filterchip--on svg {
+  fill: var(--serein-warning);
+  stroke: var(--serein-warning);
+}
+
+.wc-search__tagpick {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--serein-space-1);
+  color: var(--serein-text-tertiary);
+  min-width: 0;
+}
+
+.wc-search__tagpick .serein-select {
+  max-width: 16ch;
+}
+
+/* -------------------------------------------------------------- checksum block --- */
+
+/* The hash is monospace and WRAPS rather than truncating: its only use is comparison, and an
+   ellipsis makes it incomparable. `overflow-wrap: anywhere` is what lets a 64-character hex string
+   wrap inside a 340px panel without introducing a horizontal scrollbar on the whole inspector. */
+.wc-checksum {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--serein-space-2);
+}
+
+.wc-checksum__value {
+  /* --serein-font-mono is the framework's monospace stack, and the size is pinned rather than
+     inherited: 64 hex characters at the body size wraps to three lines in a 340px panel, and the
+     point of showing a hash is that it is readable at a glance. */
+  font-family: var(--serein-font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--serein-text-secondary);
+  overflow-wrap: anywhere;
+  user-select: all;
+  flex: 1;
+  min-width: 0;
+}
+
+/* ------------------------------------------------------------- trash confirmation --- */
+
+.wc-trash-actions__confirm {
+  display: flex;
+  align-items: center;
+  gap: var(--serein-space-2);
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+@media (max-width: 700px) {
+  .wc-trash-actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .wc-trash-actions__confirm {
+    justify-content: flex-start;
+  }
+}

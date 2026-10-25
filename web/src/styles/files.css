@@ -1,0 +1,237 @@
+/*
+ * Files.
+ *
+ * The listing itself is Serein's: the row grid, the container queries that fold columns, the
+ * phone two-column layout and the selection edge all come from `files.css`. What is added here
+ * is the page scaffolding around it — the scroll container, the selection bar's placement, the
+ * resume strip, the drag affordances — and the handful of rules without which the framework's
+ * row cannot carry this product's data.
+ */
+
+/* The listing is the scroll container, not the window: the breadcrumb, the title and the
+   action bar stay put while a 2,000-row folder scrolls under them. */
+.wc-files-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/*
+ * The `role="rowgroup"` element is the focus target, so it needs a visible focus ring of its
+ * own — the browser's default on a div that has no text is a 1px dotted outline that is
+ * invisible against a row. Focus is drawn on the row instead, which is where the person is.
+ */
+.serein-filelist__body:focus {
+  outline: none;
+}
+
+.serein-filelist__body:focus-visible {
+  outline: 2px solid var(--serein-focus-ring);
+  outline-offset: 4px;
+  border-radius: 10px;
+}
+
+/*
+ * The focused row.
+ *
+ * `aria-activedescendant` moves the active row without moving DOM focus, so there is no
+ * `:focus-visible` on it. This is the visible position marker the listbox pattern needs, and
+ * it is deliberately different from selection: a keyboard user can move the cursor without
+ * changing what is selected.
+ */
+.serein-filelist__body:focus-visible .serein-file-row[aria-selected="true"],
+.serein-file-row:focus-within {
+  box-shadow: inset 2.5px 0 0 var(--serein-accent);
+}
+
+/* The row's own open control is a button for keyboard reachability, but a row is not a form:
+   it should not look like one. */
+.serein-file-row__title {
+  text-align: start;
+  max-width: 100%;
+}
+
+/* --------------------------------------------------------------- selection -- */
+
+.wc-selection {
+  margin-bottom: var(--serein-space-4);
+}
+
+@media (max-width: 700px) {
+  /* A full-width bar at the top of a phone listing would push the first row off the fold; it
+     floats at the bottom instead, above the tab bar. */
+  .wc-selection {
+    position: fixed;
+    inset-inline: var(--serein-space-4);
+    bottom: calc(var(--serein-tabbar-height) + env(safe-area-inset-bottom) + var(--serein-space-4));
+    z-index: 90;
+    margin: 0;
+  }
+  .wc-selection .serein-selectionbar__actions {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+}
+
+/* ------------------------------------------------------------- resume strip -- */
+
+.wc-resumebar {
+  display: flex;
+  align-items: center;
+  gap: var(--serein-space-3);
+  flex-wrap: wrap;
+  margin-bottom: var(--serein-space-4);
+  padding: var(--serein-space-3) var(--serein-space-4);
+  border-radius: 10px;
+  background: var(--serein-warning-soft);
+  color: var(--serein-warning);
+  font: var(--serein-type-meta);
+}
+
+/* ---------------------------------------------------------------- toolbar ---- */
+
+/* The filter field sits in the action bar's tool cluster. It is a filter, not the global
+   search, and the two must not look interchangeable: same chrome, different width and no
+   shortcut badge. */
+.wc-filesearch {
+  width: 168px;
+  min-width: 0;
+}
+
+@media (max-width: 1080px) {
+  .wc-filesearch {
+    width: 132px;
+  }
+}
+
+/*
+ * Below 700px the tool cluster is one row of four controls and the filter moves to its own
+ * line. `flex-basis: 100%` on a nowrap flex parent overflows at 320 — the parent has to be
+ * allowed to wrap for the field to get a full line of its own.
+ */
+@media (max-width: 700px) {
+  .serein-actionbar__tools {
+    flex-wrap: wrap;
+    width: 100%;
+  }
+  .wc-filesearch {
+    order: 3;
+    width: 100%;
+    flex: 1 1 100%;
+  }
+  .wc-filesearch .serein-input-wrap {
+    width: 100%;
+  }
+}
+
+/*
+ * At 320px the four sort/view controls plus the filter cannot share a row with the heading.
+ * The sort control loses its words (the column headers already sort, and the menu is a
+ * convenience there) and the view switch keeps its two 44px buttons.
+ */
+@media (max-width: 380px) {
+  .serein-actionbar .serein-sort .serein-sort__label {
+    display: none;
+  }
+  .serein-actionbar .serein-sort {
+    padding: 0 6px;
+  }
+}
+
+.wc-filterline {
+  margin-top: var(--serein-space-4);
+  color: var(--serein-text-tertiary);
+  font: var(--serein-type-meta);
+}
+
+/* -------------------------------------------------------------- row details -- */
+
+/* A folder's size cell is a dash, which must not look like a loading skeleton. */
+.serein-file-row__dash {
+  color: var(--serein-text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The trailing menu is a `details`, so its summary needs the icon-button geometry without
+   inheriting a button's padding. */
+.serein-file-row__actions summary {
+  list-style: none;
+  cursor: pointer;
+}
+
+.serein-file-row__actions summary::-webkit-details-marker {
+  display: none;
+}
+
+/* --------------------------------------------------------------- grid view --- */
+
+/*
+ * A grid tile's preview is a 16/11 box. The framework draws its own tile art inside; this
+ * product puts a content-adaptive diagram there, which has to fill the box exactly.
+ */
+.serein-file-tile__preview {
+  display: grid;
+  place-items: stretch;
+}
+
+.serein-file-tile__preview > .serein-file-icon {
+  width: 100%;
+  height: 100%;
+  border-radius: 0;
+}
+
+.serein-file-tile__preview > .serein-file-icon svg {
+  width: 26%;
+  height: 26%;
+}
+
+.serein-file-tile__meta {
+  min-height: 16px;
+}
+
+/* ------------------------------------------------------------- drag & drop --- */
+
+/* The row a dragged file is hovering. */
+.serein-file-row.wc-drop-target {
+  background: var(--serein-accent-soft) !important;
+  box-shadow: inset 0 0 0 2px var(--serein-accent);
+}
+
+/* A dragged row must not select text under the pointer while the ghost follows it. */
+.wc-dragghost ~ * {
+  user-select: none;
+}
+
+/* ------------------------------------------------------------ responsive ---- */
+
+@media (max-width: 820px) {
+  /* The phone page header is one row: title and its two actions. Serein stacks them at 820,
+     which is right for a marketing page and wrong here — it costs 44px before the listing. */
+  .serein-page--files .serein-page-header {
+    flex-direction: row;
+    align-items: center;
+    gap: var(--serein-space-4);
+    flex-wrap: nowrap;
+    margin-bottom: var(--serein-space-4);
+  }
+  .serein-page--files .serein-page-header__title {
+    font: var(--serein-type-page-compact);
+    letter-spacing: var(--serein-tracking-page);
+  }
+  .serein-page--files .serein-page-header__description {
+    display: none;
+  }
+  .serein-page--files .serein-page-header__actions {
+    flex-wrap: nowrap;
+    gap: var(--serein-space-2);
+  }
+  /* One labelled action, one icon action: both keep a 44px target. */
+  .serein-page--files .serein-page-header__actions .serein-btn--outline .serein-btn__label {
+    display: none;
+  }
+  .serein-page--files .serein-page-header__actions .serein-btn--outline {
+    width: 44px;
+    padding: 0;
+    justify-content: center;
+  }
+}

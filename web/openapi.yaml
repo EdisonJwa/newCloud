@@ -74,13 +74,20 @@ paths:
 
   /api/files/uploads:
     post:
-      summary: Start a resumable upload
+      summary: Start a resumable upload (DEPRECATED)
+      deprecated: true
       description: |
-        Returns a session id and the offset the server is at. Chunks are appended with
-        Content-Range, and the response to a conflicting chunk carries the true offset so the
-        client resumes rather than restarts.
+        DEPRECATED — use the tus endpoints at `/api/files/tus`. Responses carry `Deprecation`,
+        `Sunset` and a `Link: rel="successor-version"` header; the endpoints stay for one release
+        (core-scope §1) and are then removed.
 
-        Sessions live in memory: an upload survives a dropped connection, not a server restart.
+        Returns a session id, the contiguous offset the server has acknowledged, and the full set
+        of acknowledged ranges. Chunks are sent with Content-Range and may be sent in any order,
+        including several at once. A chunk that overlaps bytes the server already holds is refused
+        with 409 and the acknowledged set, so a retrying client knows exactly what is missing.
+
+        Sessions are durable: the staging bytes and a metadata record survive a dropped connection,
+        a crash, and a graceful restart. They expire after the configured session TTL.
       requestBody:
         required: true
         content:
@@ -102,8 +109,30 @@ paths:
         "429": { description: too many unfinished uploads for this account }
 
   /api/files/uploads/{id}:
+    get:
+      summary: Read an upload's acknowledged ranges
+      description: |
+        The authoritative resume state. `offset` is the contiguous prefix; `ranges` lists every
+        acknowledged interval, including ranges beyond a hole, which is what a parallel client
+        needs in order to send only what is missing.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: the session's progress
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UploadSession" }
+        "404": { $ref: "#/components/responses/NotFoundResult" }
     put:
       summary: Append one chunk
+      description: |
+        The chunk may start anywhere inside the declared size, so chunks may be sent in parallel
+        or out of order. It must not overlap bytes already acknowledged (or another chunk currently
+        being written); that refusal is 409 with the acknowledged ranges.
       parameters:
         - name: id
           in: path
@@ -124,13 +153,9 @@ paths:
           description: chunk accepted
           content:
             application/json:
-              schema:
-                type: object
-                required: [offset]
-                properties:
-                  offset: { type: integer }
+              schema: { $ref: "#/components/schemas/UploadProgress" }
         "409":
-          description: the chunk did not start at the server's offset
+          description: the chunk overlaps bytes the server already has
           content:
             application/json:
               schema: { $ref: "#/components/schemas/UploadConflict" }
@@ -160,10 +185,53 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/FileNode" }
         "409":
-          description: the upload is not complete yet; the offset says where the server is
+          description: the upload is not complete yet; offset and ranges say what the server has
           content:
             application/json:
               schema: { $ref: "#/components/schemas/UploadConflict" }
+
+  /api/files/tus/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+    head:
+      summary: Report the server's offset for a tus upload
+      description: |
+        Returns `Upload-Offset`, `Upload-Length` (omitted while the length is deferred) and
+        `Upload-Expires`. A session the caller does not own is indistinguishable from one that does
+        not exist: 404 either way.
+      responses:
+        "200":
+          description: ok
+          headers:
+            Upload-Offset: { schema: { type: integer } }
+            Upload-Length: { schema: { type: integer } }
+            Upload-Expires: { schema: { type: string } }
+        "404": { $ref: "#/components/responses/NotFoundResult" }
+    patch:
+      summary: Append a chunk at an offset
+      description: |
+        `Upload-Offset` must equal the server's current offset. A stale one is 409 and CHANGES
+        NOTHING — the response carries the true offset, which is what lets a client resume.
+        `Upload-Checksum: sha256 <base64>` verifies the chunk; a mismatch is 460 and the chunk is
+        not acknowledged, so the retry sends the same range.
+      responses:
+        "204":
+          description: appended
+          headers:
+            Upload-Offset: { schema: { type: integer } }
+        "409":
+          description: The offset does not match; Upload-Offset carries the server's true position.
+        "460":
+          description: The chunk does not match Upload-Checksum. Not acknowledged.
+        "404": { $ref: "#/components/responses/NotFoundResult" }
+    delete:
+      summary: Terminate a tus upload
+      responses:
+        "204": { description: discarded }
+        "404": { $ref: "#/components/responses/NotFoundResult" }
 
   /api/files/recent:
     get:
@@ -185,14 +253,67 @@ paths:
 
   /api/files/search:
     get:
-      summary: Name search across the tree
+      summary: Search across the tree, with filters
       description: |
-        Matches node names only, not contents. Queries shorter than two characters return
-        nothing rather than the whole library.
+        Name matching plus the filter, sort and cursor vocabulary of core-scope §7.1.
+
+        An empty `q` with at least one filter is a LISTING, not an error — that is what the file
+        manager's filter bar produces when the search box is cleared. An empty `q` with no filter
+        still returns nothing, because a box that dumps the library while you type is noise.
+
+        `mode` selects what is searched:
+          - `name` (default) matches filenames only and needs no engine;
+          - `content` looks inside document bodies and needs `search.engine: elasticsearch`;
+          - `all` is the union of the two.
+
+        When a content mode is requested and no engine is configured, the response comes back with
+        `mode: name` and `degraded: true`. That is deliberate (ADR-0016): a search that silently
+        looked in fewer places than asked would let a user conclude a document does not exist.
       parameters:
         - name: q
           in: query
-          required: true
+          schema: { type: string }
+        - name: kind
+          in: query
+          description: Restrict to files or directories.
+          schema: { type: string, enum: [file, dir] }
+        - name: mime
+          in: query
+          description: Content-type PREFIX, e.g. "image/" or "text/".
+          schema: { type: string }
+        - name: size_min
+          in: query
+          schema: { type: integer, minimum: 0 }
+        - name: size_max
+          in: query
+          schema: { type: integer, minimum: 0 }
+        - name: modified_after
+          in: query
+          description: RFC 3339 timestamp or a YYYY-MM-DD date (midnight UTC).
+          schema: { type: string }
+        - name: modified_before
+          in: query
+          schema: { type: string }
+        - name: tag
+          in: query
+          description: A tag id; restricts to nodes carrying it.
+          schema: { type: string, format: uuid }
+        - name: favorite
+          in: query
+          description: "1/true restricts to the caller's starred nodes."
+          schema: { type: string }
+        - name: sort
+          in: query
+          schema: { type: string, enum: [modified, name, size], default: modified }
+        - name: mode
+          in: query
+          schema: { type: string, enum: [name, content, all], default: name }
+        - name: cursor
+          in: query
+          description: |
+            The `cursor` from the previous page. It is bound to the sort it was issued for: a
+            cursor from a name sort used against a size sort is refused with 400, because page 2
+            of one ordering means nothing in another.
           schema: { type: string }
         - name: limit
           in: query
@@ -202,15 +323,133 @@ paths:
           description: ok
           content:
             application/json:
-              schema:
-                type: object
-                required: [items, query]
-                properties:
-                  query: { type: string }
-                  items: { type: array, items: { $ref: "#/components/schemas/FileNode" } }
+              schema: { $ref: "#/components/schemas/SearchResults" }
+        "400":
+          description: |
+            An invalid cursor, or a filter combination that cannot mean anything (e.g. kind=dir
+            with a mime prefix). Answered rather than returning an empty set, because "no matches"
+            for an impossible question sends the user looking for the wrong problem.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
   /api/files/trash:
     get:
       summary: Trashed nodes
+      parameters:
+        - name: cursor
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1 }
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, truncated]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/FileNode" } }
+                  truncated: { type: boolean }
+                  cursor: { type: string }
+                  retention_days: { type: integer }
+
+  /api/files/trash/empty:
+    post:
+      summary: Permanently delete the caller's own trash
+      description: |
+        Core-scope §3. Runs the same purge routine the retention sweep runs, scoped to the caller
+        and ignoring the retention window — the user has decided, so the window that protects them
+        from an accident is exactly what they are overriding.
+
+        Bounded and idempotent: `more` means the bin may still hold items and the call should be
+        repeated. A timeout therefore means "call me again", never "unknown state".
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EmptyTrashResult" }
+
+  /api/files/favorite:
+    put:
+      summary: Star a node for the caller
+      description: |
+        Idempotent: starring twice is one row and no error, so a client that retries after a
+        dropped response does not have to ask "is it starred now?".
+
+        Addressed by `id` or `path`. The id form exists because a file in somebody else's namespace
+        has no path the caller can spell — that is what a grant is for — so starring a shared file
+        would otherwise be impossible.
+      parameters:
+        - name: id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: path
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FavoriteToggle" }
+        "404": { $ref: "#/components/responses/NotFoundResult" }
+    delete:
+      summary: Un-star a node for the caller
+      description: Idempotent, like the PUT.
+      parameters:
+        - name: id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: path
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FavoriteToggle" }
+        "404": { $ref: "#/components/responses/NotFoundResult" }
+
+  /api/favorites:
+    get:
+      summary: The caller's starred nodes, newest first
+      description: |
+        Each row's grant is re-checked as it is rendered, so revoking access removes the node from
+        the list rather than leaking that it exists under the old grant. Favorites on trashed nodes
+        are hidden, not deleted: restoring the node brings the star back.
+      parameters:
+        - name: cursor
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200 }
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, truncated]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/FileNode" } }
+                  truncated: { type: boolean }
+                  cursor: { type: string }
+
+  /api/tags/:
+    get:
+      summary: Tags visible to the caller
+      description: |
+        The deployment's system tags plus the caller's own. `count` is how many nodes the CALLER can
+        see carry the tag — a count over every node would leak the existence of files they have no
+        access to.
       responses:
         "200":
           description: ok
@@ -220,7 +459,281 @@ paths:
                 type: object
                 required: [items]
                 properties:
-                  items: { type: array, items: { $ref: "#/components/schemas/FileNode" } }
+                  items: { type: array, items: { $ref: "#/components/schemas/Tag" } }
+    post:
+      summary: Define a tag
+      description: |
+        A personal tag is created by any signed-in account. `system: true` creates the deployment's
+        shared vocabulary and is an administrator action; a non-admin asking for one is refused
+        rather than silently given a personal tag, because the two are different objects.
+
+        Names are unique case-insensitively within their scope (§5). Colours come from a fixed
+        palette, because the value ends up in a CSS class.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateTagRequest" }
+      responses:
+        "201":
+          description: created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Tag" }
+        "403":
+          description: A non-admin asked for a system tag.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: A tag with that name already exists, ignoring case.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422":
+          description: The name or colour is invalid.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/tags/{id}:
+    patch:
+      summary: Rename or recolour a tag
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                color: { type: string }
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Tag" }
+        "404": { $ref: "#/components/responses/NotFoundResult" }
+    delete:
+      summary: Delete a tag and every assignment of it
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "204": { description: deleted }
+        "404": { $ref: "#/components/responses/NotFoundResult" }
+
+  /api/nodes/{id}/tags:
+    post:
+      summary: Apply a tag to a node
+      description: |
+        Assignment is a METADATA WRITE, so it requires `write` on the node (§5). Reading tags only
+        requires `read`, which the listing enforces by only annotating rows the caller can see.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tag_id]
+              properties:
+                tag_id: { type: string, format: uuid }
+      responses:
+        "200":
+          description: The node's resulting tag set.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NodeTags" }
+        "404": { $ref: "#/components/responses/NotFoundResult" }
+        "409":
+          description: The node already carries the maximum number of tags.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    delete:
+      summary: Remove a tag from a node
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tag_id]
+              properties:
+                tag_id: { type: string, format: uuid }
+      responses:
+        "200":
+          description: The node's resulting tag set.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NodeTags" }
+        "404": { $ref: "#/components/responses/NotFoundResult" }
+
+  /api/nodes/{id}/comments:
+    get:
+      summary: A node's discussion, oldest first
+      description: |
+        Reading a thread requires `read` on the node, checked with the same call `/api/nodes/{id}`
+        uses — so a node the caller cannot read is indistinguishable from one that does not exist.
+
+        Deleted comments come back as tombstones with an EMPTY body: the row stays so the replies
+        keep their place, but the text it is hiding is not handed to the client.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - name: cursor
+          in: query
+          description: The `cursor` from the previous page (a posting-order sequence).
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200 }
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CommentThread" }
+        "404": { $ref: "#/components/responses/NotFoundResult" }
+    post:
+      summary: Post a comment
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateCommentRequest" }
+      responses:
+        "201":
+          description: created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Comment" }
+        "404":
+          description: No such node, or the caller cannot read it — including a parent_id that is not a live top-level comment on this node.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422":
+          description: The body is empty, over 2 000 characters, or carries control characters.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429":
+          description: The caller's hourly comment allowance is used up (code comment_rate_limited).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/comments/{id}:
+    patch:
+      summary: Edit the caller's own comment
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [body]
+              properties:
+                body: { type: string }
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Comment" }
+        "404": { $ref: "#/components/responses/NotFoundResult" }
+        "422":
+          description: The body is invalid, or the comment is already deleted.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    delete:
+      summary: Soft-delete a comment
+      description: |
+        Three parties may do it: the author, an administrator, or a holder of `manage_permissions`
+        on the node. Deleting somebody ELSE's comment is a moderation action and is hash-chained
+        (`comment.moderate`, core-scope §8); deleting your own is not.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, deleted]
+                properties:
+                  id: { type: string }
+                  deleted: { type: boolean }
+        "404": { $ref: "#/components/responses/NotFoundResult" }
+
+  /api/files/tus:
+    options:
+      summary: tus capability probe
+      description: |
+        Core-scope §1. Answered without a session: a client discovers the endpoint before it has any
+        reason to authenticate, and the answer says nothing about the caller's data.
+      responses:
+        "204":
+          description: ok
+          headers:
+            Tus-Version: { schema: { type: string } }
+            Tus-Extension: { schema: { type: string } }
+            Tus-Max-Size: { schema: { type: integer } }
+    post:
+      summary: Create a tus upload (creation, creation-with-upload, creation-defer-length, final concat)
+      description: |
+        The wire protocol is tus 1.0.0; the durability machinery is the same session manager the
+        deprecated `/api/files/uploads` endpoints use. The refusals happen before a byte is
+        accepted — destination authorization, the folded-name conflict check and the quota — and
+        finalization re-runs every guard inside the statement that changes the row.
+
+        `Upload-Metadata` carries `filename` and `destination`, base64-encoded per the spec.
+      responses:
+        "201":
+          description: created
+          headers:
+            Location: { schema: { type: string } }
+            Tus-Resumable: { schema: { type: string } }
+        "400":
+          description: Bad metadata, a missing filename or an unusable name.
+        "413":
+          description: The declared length exceeds limits.max_file_bytes.
 
   /api/files/versions:
     get:
@@ -1092,14 +1605,182 @@ components:
           $ref: "#/components/schemas/PreviewKind"
         share_count: { type: integer, description: Omitted when zero. }
         has_versions: { type: boolean, description: Omitted when false. }
+        sha256:
+          type: string
+          description: |
+            The file's content address, hex (core-scope §2). The blob address IS the SHA-256 of the
+            bytes, so this is the same value on both storage layouts. Omitted for directories and
+            when the address is unknown — "absent" and "a row of zeroes" must stay distinguishable,
+            or a client verifies against a hash nobody computed.
+        starred:
+          type: boolean
+          description: The VIEWER's own star (core-scope §4). Omitted when false.
+        favorite_at:
+          type: string
+          description: When the viewer starred it. Only set on the favorites listing, where it is the sort key.
+        tags:
+          type: array
+          description: Labels on this node that the viewer may see (core-scope §5). Omitted when none.
+          items: { $ref: "#/components/schemas/Tag" }
+
+    Tag:
+      type: object
+      required: [id, name, color]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        color:
+          type: string
+          description: |
+            One of gray, red, orange, yellow, green, teal, blue, indigo, purple, pink. A fixed
+            palette rather than a free-form value, because the colour reaches a CSS class.
+        system:
+          type: boolean
+          description: Admin-managed shared vocabulary. Omitted for a personal tag.
+        count:
+          type: integer
+          description: How many nodes THIS VIEWER can see carry it. Only set on the tag listing.
+
+    CreateTagRequest:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, maxLength: 64 }
+        color: { type: string }
+        system:
+          type: boolean
+          description: Administrators only. A non-admin request is refused, not downgraded.
+
+    NodeTags:
+      type: object
+      required: [id, tags]
+      properties:
+        id: { type: string }
+        tags: { type: array, items: { $ref: "#/components/schemas/Tag" } }
+
+    Comment:
+      type: object
+      required: [id, node_id, author_id, body, created_at]
+      properties:
+        id: { type: string }
+        node_id: { type: string }
+        author: { type: string, description: Display name, or the username when none is set. }
+        author_id: { type: string }
+        parent_id: { type: string, description: Names a top-level comment. Replies are single-level. }
+        body:
+          type: string
+          description: |
+            Plain text, at most 2 000 characters, no control characters. EMPTY on a tombstone: the
+            row stays so replies keep their place, but the text it is hiding is not handed out.
+        created_at: { type: string }
+        edited_at: { type: string, description: Set once the author has corrected the body. }
+        deleted: { type: boolean, description: A tombstone. Omitted when false. }
+
+    CreateCommentRequest:
+      type: object
+      required: [body]
+      properties:
+        body: { type: string, maxLength: 2000 }
+        parent_id:
+          type: string
+          description: |
+            A live top-level comment on the SAME node. A deeper reply, or a parent on another
+            node, is refused — the data model is single-level and a cross-node parent would put a
+            comment in a thread about a file the author may not be able to see.
+
+    CommentThread:
+      type: object
+      required: [items, truncated, can_moderate]
+      properties:
+        items: { type: array, items: { $ref: "#/components/schemas/Comment" } }
+        truncated: { type: boolean }
+        cursor: { type: string }
+        can_moderate:
+          type: boolean
+          description: |
+            Whether this caller may remove somebody else's comment on this node, so the UI can show
+            the action rather than offering a button that answers 404.
+
+    EmptyTrashResult:
+      type: object
+      required: [purged, nodes, bytes_freed, more]
+      properties:
+        purged:
+          type: integer
+          description: How many top-level trash entries went away, which is what the user sees disappear.
+        nodes:
+          type: integer
+          description: How many node rows were deleted, counting every row of each subtree.
+        bytes_freed:
+          type: integer
+          description: Storage released from the RETAINED counter, so the account is no longer told it is full.
+        more:
+          type: boolean
+          description: |
+            True when the batch bound was reached and the bin may still hold items: call again.
+            False means it is empty. This is the whole contract for a client, and it is what makes
+            "call me again" an answer rather than "unknown state".
+
+    FavoriteToggle:
+      type: object
+      required: [id, starred]
+      properties:
+        id: { type: string }
+        starred: { type: boolean }
+
+    SearchResults:
+      type: object
+      required: [items, query, truncated, mode]
+      properties:
+        items: { type: array, items: { $ref: "#/components/schemas/FileNode" } }
+        query: { type: string }
+        truncated: { type: boolean }
+        cursor: { type: string, description: The page position; bound to the sort it was issued for. }
+        mode:
+          type: string
+          enum: [name, content, all]
+          description: The mode that ACTUALLY answered, which is not always the one asked for.
+        degraded:
+          type: boolean
+          description: Set when a content mode was requested and no engine is configured.
+        degraded_reason:
+          type: string
+          description: Human-readable explanation of the degradation.
+
+    UploadRange:
+      type: object
+      required: [start, end]
+      properties:
+        start: { type: integer, description: First byte in the range. }
+        end: { type: integer, description: First byte AFTER the range; start + length. }
 
     UploadSession:
       type: object
-      required: [id, offset, chunk_size]
+      required: [id, offset, chunk_size, ranges]
       properties:
         id: { type: string }
-        offset: { type: integer }
+        offset:
+          type: integer
+          description: Contiguous acknowledged prefix. Every byte below this is present.
         chunk_size: { type: integer, description: The size the server suggests for each chunk. }
+        ranges:
+          type: array
+          description: |
+            Every acknowledged half-open byte interval, sorted and merged. A hole between two
+            ranges is still missing even when it lies below the highest acknowledged byte.
+          items: { $ref: "#/components/schemas/UploadRange" }
+
+    UploadProgress:
+      type: object
+      required: [offset, ranges]
+      properties:
+        offset:
+          type: integer
+          description: Contiguous acknowledged prefix. Every byte below this is present.
+        ranges:
+          type: array
+          description: Every acknowledged half-open byte interval, sorted and merged.
+          items: { $ref: "#/components/schemas/UploadRange" }
 
     MoveRequest:
       type: object
@@ -1152,11 +1833,15 @@ components:
 
     UploadConflict:
       type: object
-      required: [error, offset]
+      required: [error, offset, ranges]
       properties:
         error: { type: string }
         message: { type: string }
-        offset: { type: integer, description: The offset the client must resume from. }
+        offset: { type: integer, description: Contiguous acknowledged prefix. }
+        ranges:
+          type: array
+          description: Every acknowledged interval; anything not covered is still missing.
+          items: { $ref: "#/components/schemas/UploadRange" }
 
     PreviewKind:
       type: string

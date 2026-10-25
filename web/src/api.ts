@@ -14,7 +14,7 @@
 // Both are marked below. Everything else is one line per endpoint, which is the point.
 
 import createClient from "openapi-fetch";
-import type { paths } from "./api-types";
+import type { paths, components } from "./api-types";
 import type {
   AdminSetting,
   AppPassword,
@@ -33,14 +33,78 @@ import type {
   VersionsResponse,
 } from "./types";
 
+/* --------------------------------------------------------------- social types --- */
+
+/**
+ * The social shapes come straight from the generated document, so a field the server adds shows up
+ * here and a field it removes breaks the build rather than reading `undefined` at runtime.
+ */
+type Schemas = components["schemas"];
+export type Tag = Schemas["Tag"];
+export type Comment = Schemas["Comment"];
+export type CommentThread = Schemas["CommentThread"];
+export type EmptyTrashResult = Schemas["EmptyTrashResult"];
+export type FavoriteToggle = Schemas["FavoriteToggle"];
+export type SearchResults = Schemas["SearchResults"];
+export type SearchResultNode = Schemas["FileNode"];
+
+/** NodeRef names a node for the social endpoints: by path when the caller can spell one, by id
+ *  otherwise. A file inside another account's namespace has no path in this caller's terms, so the
+ *  id form is what makes starring a shared file possible. */
+export interface NodeRef {
+  id?: string;
+  path?: string;
+}
+
+/** SearchParams is the §7.1 vocabulary. Every field is optional: an empty query with one filter is
+ *  a listing, which is what the filter bar produces when the search box is cleared. */
+export interface SearchParams {
+  q?: string;
+  kind?: "file" | "dir";
+  mime?: string;
+  size_min?: number;
+  size_max?: number;
+  modified_after?: string;
+  modified_before?: string;
+  tag?: string;
+  favorite?: boolean;
+  sort?: "modified" | "name" | "size";
+  mode?: "name" | "content" | "all";
+  cursor?: string;
+  limit?: number;
+}
+
+/** A half-open byte interval, [start, end), as the upload endpoints report it. */
+export interface UploadRange {
+  start: number;
+  end: number;
+}
+
+export interface UploadStatus {
+  id: string;
+  offset: number;
+  chunk_size: number;
+  ranges: UploadRange[];
+}
+
+export interface ChunkResult {
+  offset: number;
+  /** True on 409: the server already holds part of the range; `ranges` is authoritative. */
+  conflict: boolean;
+  ranges: UploadRange[];
+}
+
 export class APIError extends Error {
   readonly status: number;
   readonly code: string;
+  /** Present on a 409 from the upload endpoints: the server's acknowledged ranges. */
+  readonly ranges?: UploadRange[];
 
-  constructor(status: number, code: string, message: string) {
+  constructor(status: number, code: string, message: string, ranges?: UploadRange[]) {
     super(message || code || `HTTP ${status}`);
     this.status = status;
     this.code = code;
+    this.ranges = ranges;
   }
 
   /** A denial is the same shape as a miss: the server never reveals whether an object exists. */
@@ -104,8 +168,12 @@ async function callJson<T>(url: string, init: RequestInit): Promise<T> {
     }
   }
   if (!resp.ok) {
-    const body = (payload ?? {}) as { error?: string; message?: string };
-    throw new APIError(resp.status, body.error ?? "", body.message ?? "");
+    const body = (payload ?? {}) as {
+      error?: string;
+      message?: string;
+      ranges?: UploadRange[];
+    };
+    throw new APIError(resp.status, body.error ?? "", body.message ?? "", body.ranges);
   }
   return payload as T;
 }
@@ -117,11 +185,84 @@ export const api = {
   list: (path: string) => call<Listing>(client.GET("/api/files/", { params: { query: { path } } })),
   recent: (limit = 12) =>
     call<{ items: FileNode[] }>(client.GET("/api/files/recent", { params: { query: { limit } } })),
-  search: (q: string, limit = 12) =>
-    call<{ items: FileNode[]; query: string }>(
-      client.GET("/api/files/search", { params: { query: { q, limit } } }),
-    ),
+  search: (params: SearchParams) =>
+    call<SearchResults>(client.GET("/api/files/search", { params: { query: params as never } })),
   trash: () => call<{ items: FileNode[] }>(client.GET("/api/files/trash")),
+  // Empty trash (core-scope §3).
+  //
+  // `more` is the whole client contract: the server purges in batches so a huge bin cannot time out,
+  // and a client that sees it calls again. That is why this returns the result rather than a void —
+  // "call me again" is an answer, not a failure to report.
+  emptyTrash: () => call<EmptyTrashResult>(client.POST("/api/files/trash/empty")),
+
+  /* ---------------------------------------------------------------- social --- */
+
+  // Favorites (core-scope §4).
+  //
+  // Addressed by id OR path. Both are exposed because a file inside somebody else's namespace has no
+  // path this caller can spell, so starring a shared file would otherwise be impossible. Idempotent
+  // in both directions: a retried click is not an error.
+  star: (node: NodeRef) => call<FavoriteToggle>(client.PUT("/api/files/favorite", { params: { query: node } })),
+  unstar: (node: NodeRef) =>
+    call<FavoriteToggle>(client.DELETE("/api/files/favorite", { params: { query: node } })),
+  favorites: (limit = 50) =>
+    call<{ items: FileNode[]; truncated: boolean; cursor?: string }>(
+      client.GET("/api/favorites", { params: { query: { limit } } }),
+    ),
+
+  // Tags (core-scope §5).
+  //
+  // The listing carries `count` per tag, computed over nodes THIS caller can see — a count over every
+  // node would tell them how many files they cannot reach carry a label.
+  tags: () => call<{ items: Tag[] }>(client.GET("/api/tags/")),
+  createTag: (body: { name: string; color?: string; system?: boolean }) =>
+    call<Tag>(client.POST("/api/tags/", { body: body as never })),
+  updateTag: (id: string, body: { name?: string; color?: string }) =>
+    call<Tag>(client.PATCH("/api/tags/{id}", { params: { path: { id } }, body: body as never })),
+  deleteTag: (id: string) => call<void>(client.DELETE("/api/tags/{id}", { params: { path: { id } } })),
+  // Assignment is a metadata write, so it needs write on the node. The response is the node's
+  // resulting tag set, which saves a refetch on every toggle.
+  assignTag: (nodeID: string, tagID: string) =>
+    call<{ id: string; tags: Tag[] }>(
+      client.POST("/api/nodes/{id}/tags", {
+        params: { path: { id: nodeID } },
+        body: { tag_id: tagID } as never,
+      }),
+    ),
+  unassignTag: (nodeID: string, tagID: string) =>
+    call<{ id: string; tags: Tag[] }>(
+      client.DELETE("/api/nodes/{id}/tags", {
+        params: { path: { id: nodeID } },
+        body: { tag_id: tagID } as never,
+      }),
+    ),
+
+  // Comments (core-scope §6).
+  //
+  // `can_moderate` comes with the thread rather than being inferred from the file's permissions on
+  // the client: the server is the only thing that knows, and a button that answers 404 is worse than
+  // no button.
+  comments: (nodeID: string, cursor?: string) =>
+    call<CommentThread>(
+      client.GET("/api/nodes/{id}/comments", {
+        params: { path: { id: nodeID }, query: cursor ? { cursor } : {} },
+      }),
+    ),
+  comment: (nodeID: string, body: string, parentID?: string) =>
+    call<Comment>(
+      client.POST("/api/nodes/{id}/comments", {
+        params: { path: { id: nodeID } },
+        body: { body, parent_id: parentID } as never,
+      }),
+    ),
+  editComment: (id: string, body: string) =>
+    call<Comment>(client.PATCH("/api/comments/{id}", {
+      params: { path: { id } },
+      body: { body } as never,
+    })),
+  deleteComment: (id: string) =>
+    call<{ id: string; deleted: boolean }>(client.DELETE("/api/comments/{id}", { params: { path: { id } } })),
+
   versions: (path: string) =>
     call<VersionsResponse>(client.GET("/api/files/versions", { params: { query: { path } } })),
   // The server answers with the restored node (200), not 204: the caller can use it to refresh the
@@ -148,31 +289,49 @@ export const api = {
   // shaped by the schema. The interesting case is 409: it carries the offset to resume from,
   // so it is returned rather than thrown.
   startUpload: (dir: string, name: string, size: number) =>
-    callJson<{ id: string; offset: number; chunk_size: number }>("/api/files/uploads", {
+    callJson<UploadStatus>("/api/files/uploads", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ path: dir, name, size }),
     }),
 
-  putChunk: async (id: string, start: number, end: number, total: number, body: Blob) => {
+  // uploadStatus is the authoritative resume state. The local pending record is only a hint; with
+  // out-of-order chunks the highest accepted byte says nothing about which holes remain.
+  uploadStatus: (id: string) =>
+    callJson<UploadStatus>(`/api/files/uploads/${encodeURIComponent(id)}`, { method: "GET" }),
+
+  putChunk: async (id: string, start: number, end: number, total: number, body: Blob): Promise<ChunkResult> => {
     const resp = await fetch(`/api/files/uploads/${encodeURIComponent(id)}`, {
       method: "PUT",
       credentials: "same-origin",
       headers: { "Content-Range": `bytes ${start}-${end}/${total}` },
       body,
     });
-    const payload = (await resp.json().catch(() => ({}))) as { offset?: number; message?: string };
+    const payload = (await resp.json().catch(() => ({}))) as {
+      offset?: number;
+      message?: string;
+      ranges?: UploadRange[];
+    };
     if (resp.status === 409) {
-      // Not an error: the server is telling the client where to continue.
-      return { offset: payload.offset ?? 0, conflict: true };
+      // Not an error: the server is telling the client which bytes it already holds.
+      return {
+        offset: payload.offset ?? 0,
+        conflict: true,
+        ranges: payload.ranges ?? [],
+      };
     }
     if (!resp.ok) {
-      throw new APIError(resp.status, "chunk_failed", payload.message ?? "");
+      throw new APIError(resp.status, "chunk_failed", payload.message ?? "", payload.ranges);
     }
-    return { offset: payload.offset ?? end + 1, conflict: false };
+    return {
+      offset: payload.offset ?? end + 1,
+      conflict: false,
+      ranges: payload.ranges ?? [{ start, end: end + 1 }],
+    };
   },
 
-  completeUpload: (id: string) => callJson<FileNode>(`/api/files/uploads/${encodeURIComponent(id)}/complete`, { method: "POST" }),
+  completeUpload: (id: string) =>
+    callJson<FileNode>(`/api/files/uploads/${encodeURIComponent(id)}/complete`, { method: "POST" }),
 
   abortUpload: async (id: string) => {
     await fetch(`/api/files/uploads/${encodeURIComponent(id)}`, {

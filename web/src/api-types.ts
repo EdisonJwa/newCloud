@@ -155,12 +155,19 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Start a resumable upload
-         * @description Returns a session id and the offset the server is at. Chunks are appended with
-         *     Content-Range, and the response to a conflicting chunk carries the true offset so the
-         *     client resumes rather than restarts.
+         * Start a resumable upload (DEPRECATED)
+         * @deprecated
+         * @description DEPRECATED — use the tus endpoints at `/api/files/tus`. Responses carry `Deprecation`,
+         *     `Sunset` and a `Link: rel="successor-version"` header; the endpoints stay for one release
+         *     (core-scope §1) and are then removed.
          *
-         *     Sessions live in memory: an upload survives a dropped connection, not a server restart.
+         *     Returns a session id, the contiguous offset the server has acknowledged, and the full set
+         *     of acknowledged ranges. Chunks are sent with Content-Range and may be sent in any order,
+         *     including several at once. A chunk that overlaps bytes the server already holds is refused
+         *     with 409 and the acknowledged set, so a retrying client knows exactly what is missing.
+         *
+         *     Sessions are durable: the staging bytes and a metadata record survive a dropped connection,
+         *     a crash, and a graceful restart. They expire after the configured session TTL.
          */
         post: {
             parameters: {
@@ -218,8 +225,41 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
-        /** Append one chunk */
+        /**
+         * Read an upload's acknowledged ranges
+         * @description The authoritative resume state. `offset` is the contiguous prefix; `ranges` lists every
+         *     acknowledged interval, including ranges beyond a hole, which is what a parallel client
+         *     needs in order to send only what is missing.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description the session's progress */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["UploadSession"];
+                    };
+                };
+                404: components["responses"]["NotFoundResult"];
+            };
+        };
+        /**
+         * Append one chunk
+         * @description The chunk may start anywhere inside the declared size, so chunks may be sent in parallel
+         *     or out of order. It must not overlap bytes already acknowledged (or another chunk currently
+         *     being written); that refusal is 409 with the acknowledged ranges.
+         */
         put: {
             parameters: {
                 query?: never;
@@ -244,12 +284,10 @@ export interface paths {
                         [name: string]: unknown;
                     };
                     content: {
-                        "application/json": {
-                            offset: number;
-                        };
+                        "application/json": components["schemas"]["UploadProgress"];
                     };
                 };
-                /** @description the chunk did not start at the server's offset */
+                /** @description the chunk overlaps bytes the server already has */
                 409: {
                     headers: {
                         [name: string]: unknown;
@@ -318,7 +356,7 @@ export interface paths {
                         "application/json": components["schemas"]["FileNode"];
                     };
                 };
-                /** @description the upload is not complete yet; the offset says where the server is */
+                /** @description the upload is not complete yet; offset and ranges say what the server has */
                 409: {
                     headers: {
                         [name: string]: unknown;
@@ -333,6 +371,116 @@ export interface paths {
         options?: never;
         head?: never;
         patch?: never;
+        trace?: never;
+    };
+    "/api/files/tus/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Terminate a tus upload */
+        delete: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description discarded */
+                204: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                404: components["responses"]["NotFoundResult"];
+            };
+        };
+        options?: never;
+        /**
+         * Report the server's offset for a tus upload
+         * @description Returns `Upload-Offset`, `Upload-Length` (omitted while the length is deferred) and
+         *     `Upload-Expires`. A session the caller does not own is indistinguishable from one that does
+         *     not exist: 404 either way.
+         */
+        head: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description ok */
+                200: {
+                    headers: {
+                        "Upload-Offset"?: number;
+                        "Upload-Length"?: number;
+                        "Upload-Expires"?: string;
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                404: components["responses"]["NotFoundResult"];
+            };
+        };
+        /**
+         * Append a chunk at an offset
+         * @description `Upload-Offset` must equal the server's current offset. A stale one is 409 and CHANGES
+         *     NOTHING — the response carries the true offset, which is what lets a client resume.
+         *     `Upload-Checksum: sha256 <base64>` verifies the chunk; a mismatch is 460 and the chunk is
+         *     not acknowledged, so the retry sends the same range.
+         */
+        patch: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description appended */
+                204: {
+                    headers: {
+                        "Upload-Offset"?: number;
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                404: components["responses"]["NotFoundResult"];
+                /** @description The offset does not match; Upload-Offset carries the server's true position. */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description The chunk does not match Upload-Checksum. Not acknowledged. */
+                460: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
         trace?: never;
     };
     "/api/files/recent": {
@@ -383,14 +531,47 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Name search across the tree
-         * @description Matches node names only, not contents. Queries shorter than two characters return
-         *     nothing rather than the whole library.
+         * Search across the tree, with filters
+         * @description Name matching plus the filter, sort and cursor vocabulary of core-scope §7.1.
+         *
+         *     An empty `q` with at least one filter is a LISTING, not an error — that is what the file
+         *     manager's filter bar produces when the search box is cleared. An empty `q` with no filter
+         *     still returns nothing, because a box that dumps the library while you type is noise.
+         *
+         *     `mode` selects what is searched:
+         *       - `name` (default) matches filenames only and needs no engine;
+         *       - `content` looks inside document bodies and needs `search.engine: elasticsearch`;
+         *       - `all` is the union of the two.
+         *
+         *     When a content mode is requested and no engine is configured, the response comes back with
+         *     `mode: name` and `degraded: true`. That is deliberate (ADR-0016): a search that silently
+         *     looked in fewer places than asked would let a user conclude a document does not exist.
          */
         get: {
             parameters: {
-                query: {
-                    q: string;
+                query?: {
+                    q?: string;
+                    /** @description Restrict to files or directories. */
+                    kind?: "file" | "dir";
+                    /** @description Content-type PREFIX, e.g. "image/" or "text/". */
+                    mime?: string;
+                    size_min?: number;
+                    size_max?: number;
+                    /** @description RFC 3339 timestamp or a YYYY-MM-DD date (midnight UTC). */
+                    modified_after?: string;
+                    modified_before?: string;
+                    /** @description A tag id; restricts to nodes carrying it. */
+                    tag?: string;
+                    /** @description 1/true restricts to the caller's starred nodes. */
+                    favorite?: string;
+                    sort?: "modified" | "name" | "size";
+                    mode?: "name" | "content" | "all";
+                    /**
+                     * @description The `cursor` from the previous page. It is bound to the sort it was issued for: a
+                     *     cursor from a name sort used against a size sort is refused with 400, because page 2
+                     *     of one ordering means nothing in another.
+                     */
+                    cursor?: string;
                     limit?: number;
                 };
                 header?: never;
@@ -405,10 +586,20 @@ export interface paths {
                         [name: string]: unknown;
                     };
                     content: {
-                        "application/json": {
-                            query: string;
-                            items: components["schemas"]["FileNode"][];
-                        };
+                        "application/json": components["schemas"]["SearchResults"];
+                    };
+                };
+                /**
+                 * @description An invalid cursor, or a filter combination that cannot mean anything (e.g. kind=dir
+                 *     with a mime prefix). Answered rather than returning an empty set, because "no matches"
+                 *     for an impossible question sends the user looking for the wrong problem.
+                 */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
                     };
                 };
             };
@@ -431,7 +622,10 @@ export interface paths {
         /** Trashed nodes */
         get: {
             parameters: {
-                query?: never;
+                query?: {
+                    cursor?: string;
+                    limit?: number;
+                };
                 header?: never;
                 path?: never;
                 cookie?: never;
@@ -446,6 +640,9 @@ export interface paths {
                     content: {
                         "application/json": {
                             items: components["schemas"]["FileNode"][];
+                            truncated: boolean;
+                            cursor?: string;
+                            retention_days?: number;
                         };
                     };
                 };
@@ -455,6 +652,702 @@ export interface paths {
         post?: never;
         delete?: never;
         options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/files/trash/empty": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Permanently delete the caller's own trash
+         * @description Core-scope §3. Runs the same purge routine the retention sweep runs, scoped to the caller
+         *     and ignoring the retention window — the user has decided, so the window that protects them
+         *     from an accident is exactly what they are overriding.
+         *
+         *     Bounded and idempotent: `more` means the bin may still hold items and the call should be
+         *     repeated. A timeout therefore means "call me again", never "unknown state".
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description ok */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["EmptyTrashResult"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/files/favorite": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Star a node for the caller
+         * @description Idempotent: starring twice is one row and no error, so a client that retries after a
+         *     dropped response does not have to ask "is it starred now?".
+         *
+         *     Addressed by `id` or `path`. The id form exists because a file in somebody else's namespace
+         *     has no path the caller can spell — that is what a grant is for — so starring a shared file
+         *     would otherwise be impossible.
+         */
+        put: {
+            parameters: {
+                query?: {
+                    id?: string;
+                    path?: string;
+                };
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description ok */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["FavoriteToggle"];
+                    };
+                };
+                404: components["responses"]["NotFoundResult"];
+            };
+        };
+        post?: never;
+        /**
+         * Un-star a node for the caller
+         * @description Idempotent, like the PUT.
+         */
+        delete: {
+            parameters: {
+                query?: {
+                    id?: string;
+                    path?: string;
+                };
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description ok */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["FavoriteToggle"];
+                    };
+                };
+                404: components["responses"]["NotFoundResult"];
+            };
+        };
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/favorites": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The caller's starred nodes, newest first
+         * @description Each row's grant is re-checked as it is rendered, so revoking access removes the node from
+         *     the list rather than leaking that it exists under the old grant. Favorites on trashed nodes
+         *     are hidden, not deleted: restoring the node brings the star back.
+         */
+        get: {
+            parameters: {
+                query?: {
+                    cursor?: string;
+                    limit?: number;
+                };
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description ok */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            items: components["schemas"]["FileNode"][];
+                            truncated: boolean;
+                            cursor?: string;
+                        };
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tags/": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Tags visible to the caller
+         * @description The deployment's system tags plus the caller's own. `count` is how many nodes the CALLER can
+         *     see carry the tag — a count over every node would leak the existence of files they have no
+         *     access to.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description ok */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            items: components["schemas"]["Tag"][];
+                        };
+                    };
+                };
+            };
+        };
+        put?: never;
+        /**
+         * Define a tag
+         * @description A personal tag is created by any signed-in account. `system: true` creates the deployment's
+         *     shared vocabulary and is an administrator action; a non-admin asking for one is refused
+         *     rather than silently given a personal tag, because the two are different objects.
+         *
+         *     Names are unique case-insensitively within their scope (§5). Colours come from a fixed
+         *     palette, because the value ends up in a CSS class.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["CreateTagRequest"];
+                };
+            };
+            responses: {
+                /** @description created */
+                201: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Tag"];
+                    };
+                };
+                /** @description A non-admin asked for a system tag. */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
+                /** @description A tag with that name already exists, ignoring case. */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
+                /** @description The name or colour is invalid. */
+                422: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tags/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Delete a tag and every assignment of it */
+        delete: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description deleted */
+                204: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                404: components["responses"]["NotFoundResult"];
+            };
+        };
+        options?: never;
+        head?: never;
+        /** Rename or recolour a tag */
+        patch: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": {
+                        name?: string;
+                        color?: string;
+                    };
+                };
+            };
+            responses: {
+                /** @description ok */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Tag"];
+                    };
+                };
+                404: components["responses"]["NotFoundResult"];
+            };
+        };
+        trace?: never;
+    };
+    "/api/nodes/{id}/tags": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Apply a tag to a node
+         * @description Assignment is a METADATA WRITE, so it requires `write` on the node (§5). Reading tags only
+         *     requires `read`, which the listing enforces by only annotating rows the caller can see.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": {
+                        /** Format: uuid */
+                        tag_id: string;
+                    };
+                };
+            };
+            responses: {
+                /** @description The node's resulting tag set. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["NodeTags"];
+                    };
+                };
+                404: components["responses"]["NotFoundResult"];
+                /** @description The node already carries the maximum number of tags. */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
+            };
+        };
+        /** Remove a tag from a node */
+        delete: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": {
+                        /** Format: uuid */
+                        tag_id: string;
+                    };
+                };
+            };
+            responses: {
+                /** @description The node's resulting tag set. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["NodeTags"];
+                    };
+                };
+                404: components["responses"]["NotFoundResult"];
+            };
+        };
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/nodes/{id}/comments": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * A node's discussion, oldest first
+         * @description Reading a thread requires `read` on the node, checked with the same call `/api/nodes/{id}`
+         *     uses — so a node the caller cannot read is indistinguishable from one that does not exist.
+         *
+         *     Deleted comments come back as tombstones with an EMPTY body: the row stays so the replies
+         *     keep their place, but the text it is hiding is not handed to the client.
+         */
+        get: {
+            parameters: {
+                query?: {
+                    /** @description The `cursor` from the previous page (a posting-order sequence). */
+                    cursor?: string;
+                    limit?: number;
+                };
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description ok */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["CommentThread"];
+                    };
+                };
+                404: components["responses"]["NotFoundResult"];
+            };
+        };
+        put?: never;
+        /** Post a comment */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["CreateCommentRequest"];
+                };
+            };
+            responses: {
+                /** @description created */
+                201: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Comment"];
+                    };
+                };
+                /** @description No such node, or the caller cannot read it — including a parent_id that is not a live top-level comment on this node. */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
+                /** @description The body is empty, over 2 000 characters, or carries control characters. */
+                422: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
+                /** @description The caller's hourly comment allowance is used up (code comment_rate_limited). */
+                429: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/comments/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Soft-delete a comment
+         * @description Three parties may do it: the author, an administrator, or a holder of `manage_permissions`
+         *     on the node. Deleting somebody ELSE's comment is a moderation action and is hash-chained
+         *     (`comment.moderate`, core-scope §8); deleting your own is not.
+         */
+        delete: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description ok */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            id: string;
+                            deleted: boolean;
+                        };
+                    };
+                };
+                404: components["responses"]["NotFoundResult"];
+            };
+        };
+        options?: never;
+        head?: never;
+        /** Edit the caller's own comment */
+        patch: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": {
+                        body: string;
+                    };
+                };
+            };
+            responses: {
+                /** @description ok */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Comment"];
+                    };
+                };
+                404: components["responses"]["NotFoundResult"];
+                /** @description The body is invalid, or the comment is already deleted. */
+                422: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
+            };
+        };
+        trace?: never;
+    };
+    "/api/files/tus": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create a tus upload (creation, creation-with-upload, creation-defer-length, final concat)
+         * @description The wire protocol is tus 1.0.0; the durability machinery is the same session manager the
+         *     deprecated `/api/files/uploads` endpoints use. The refusals happen before a byte is
+         *     accepted — destination authorization, the folded-name conflict check and the quota — and
+         *     finalization re-runs every guard inside the statement that changes the row.
+         *
+         *     `Upload-Metadata` carries `filename` and `destination`, base64-encoded per the spec.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description created */
+                201: {
+                    headers: {
+                        Location?: string;
+                        "Tus-Resumable"?: string;
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Bad metadata, a missing filename or an unusable name. */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description The declared length exceeds limits.max_file_bytes. */
+                413: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        delete?: never;
+        /**
+         * tus capability probe
+         * @description Core-scope §1. Answered without a session: a client discovers the endpoint before it has any
+         *     reason to authenticate, and the answer says nothing about the caller's data.
+         */
+        options: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description ok */
+                204: {
+                    headers: {
+                        "Tus-Version"?: string;
+                        "Tus-Extension"?: string;
+                        "Tus-Max-Size"?: number;
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
         head?: never;
         patch?: never;
         trace?: never;
@@ -2136,12 +3029,138 @@ export interface components {
             share_count?: number;
             /** @description Omitted when false. */
             has_versions?: boolean;
+            /**
+             * @description The file's content address, hex (core-scope §2). The blob address IS the SHA-256 of the
+             *     bytes, so this is the same value on both storage layouts. Omitted for directories and
+             *     when the address is unknown — "absent" and "a row of zeroes" must stay distinguishable,
+             *     or a client verifies against a hash nobody computed.
+             */
+            sha256?: string;
+            /** @description The VIEWER's own star (core-scope §4). Omitted when false. */
+            starred?: boolean;
+            /** @description When the viewer starred it. Only set on the favorites listing, where it is the sort key. */
+            favorite_at?: string;
+            /** @description Labels on this node that the viewer may see (core-scope §5). Omitted when none. */
+            tags?: components["schemas"]["Tag"][];
+        };
+        Tag: {
+            id: string;
+            name: string;
+            /**
+             * @description One of gray, red, orange, yellow, green, teal, blue, indigo, purple, pink. A fixed
+             *     palette rather than a free-form value, because the colour reaches a CSS class.
+             */
+            color: string;
+            /** @description Admin-managed shared vocabulary. Omitted for a personal tag. */
+            system?: boolean;
+            /** @description How many nodes THIS VIEWER can see carry it. Only set on the tag listing. */
+            count?: number;
+        };
+        CreateTagRequest: {
+            name: string;
+            color?: string;
+            /** @description Administrators only. A non-admin request is refused, not downgraded. */
+            system?: boolean;
+        };
+        NodeTags: {
+            id: string;
+            tags: components["schemas"]["Tag"][];
+        };
+        Comment: {
+            id: string;
+            node_id: string;
+            /** @description Display name */
+            author?: string;
+            author_id: string;
+            /** @description Names a top-level comment. Replies are single-level. */
+            parent_id?: string;
+            /**
+             * @description Plain text, at most 2 000 characters, no control characters. EMPTY on a tombstone: the
+             *     row stays so replies keep their place, but the text it is hiding is not handed out.
+             */
+            body: string;
+            created_at: string;
+            /** @description Set once the author has corrected the body. */
+            edited_at?: string;
+            /** @description A tombstone. Omitted when false. */
+            deleted?: boolean;
+        };
+        CreateCommentRequest: {
+            body: string;
+            /**
+             * @description A live top-level comment on the SAME node. A deeper reply, or a parent on another
+             *     node, is refused — the data model is single-level and a cross-node parent would put a
+             *     comment in a thread about a file the author may not be able to see.
+             */
+            parent_id?: string;
+        };
+        CommentThread: {
+            items: components["schemas"]["Comment"][];
+            truncated: boolean;
+            cursor?: string;
+            /**
+             * @description Whether this caller may remove somebody else's comment on this node, so the UI can show
+             *     the action rather than offering a button that answers 404.
+             */
+            can_moderate: boolean;
+        };
+        EmptyTrashResult: {
+            /** @description How many top-level trash entries went away, which is what the user sees disappear. */
+            purged: number;
+            /** @description How many node rows were deleted, counting every row of each subtree. */
+            nodes: number;
+            /** @description Storage released from the RETAINED counter, so the account is no longer told it is full. */
+            bytes_freed: number;
+            /**
+             * @description True when the batch bound was reached and the bin may still hold items: call again.
+             *     False means it is empty. This is the whole contract for a client, and it is what makes
+             *     "call me again" an answer rather than "unknown state".
+             */
+            more: boolean;
+        };
+        FavoriteToggle: {
+            id: string;
+            starred: boolean;
+        };
+        SearchResults: {
+            items: components["schemas"]["FileNode"][];
+            query: string;
+            truncated: boolean;
+            /** @description The page position; bound to the sort it was issued for. */
+            cursor?: string;
+            /**
+             * @description The mode that ACTUALLY answered, which is not always the one asked for.
+             * @enum {string}
+             */
+            mode: "name" | "content" | "all";
+            /** @description Set when a content mode was requested and no engine is configured. */
+            degraded?: boolean;
+            /** @description Human-readable explanation of the degradation. */
+            degraded_reason?: string;
+        };
+        UploadRange: {
+            /** @description First byte in the range. */
+            start: number;
+            /** @description First byte AFTER the range; start + length. */
+            end: number;
         };
         UploadSession: {
             id: string;
+            /** @description Contiguous acknowledged prefix. Every byte below this is present. */
             offset: number;
             /** @description The size the server suggests for each chunk. */
             chunk_size: number;
+            /**
+             * @description Every acknowledged half-open byte interval, sorted and merged. A hole between two
+             *     ranges is still missing even when it lies below the highest acknowledged byte.
+             */
+            ranges: components["schemas"]["UploadRange"][];
+        };
+        UploadProgress: {
+            /** @description Contiguous acknowledged prefix. Every byte below this is present. */
+            offset: number;
+            /** @description Every acknowledged half-open byte interval, sorted and merged. */
+            ranges: components["schemas"]["UploadRange"][];
         };
         MoveRequest: {
             /** @description Existing path inside the caller's own namespace. */
@@ -2180,8 +3199,10 @@ export interface components {
         UploadConflict: {
             error: string;
             message?: string;
-            /** @description The offset the client must resume from. */
+            /** @description Contiguous acknowledged prefix. */
             offset: number;
+            /** @description Every acknowledged interval; anything not covered is still missing. */
+            ranges: components["schemas"]["UploadRange"][];
         };
         /** @enum {string} */
         PreviewKind: "image" | "video" | "audio" | "pdf" | "text";

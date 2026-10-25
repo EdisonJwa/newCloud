@@ -1,0 +1,295 @@
+/*
+ * The File Viewer's content.
+ *
+ * Serein owns the chrome: the bar, the stage, the filmstrip footer and the honest fallback. The
+ * framework deliberately does not render formats — "put the consumer's renderer inside the
+ * canvas" — so this file is that renderer's styling: the document measure for text, the
+ * spreadsheet table, the audio card and the inline frame.
+ */
+
+/* The viewer replaces the page; it is a dialog in behaviour, so the host pins it. */
+.wc-viewer-host {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: flex;
+  flex-direction: column;
+  background: var(--serein-viewer-bg);
+}
+
+.wc-viewer-host .serein-viewer {
+  flex: 1;
+  min-height: 0;
+  height: 100dvh;
+}
+
+/* The canvas owns its scroll, so a long document does not move the footer. */
+.wc-viewer-host .serein-viewer__canvas {
+  overscroll-behavior: contain;
+}
+
+/* --------------------------------------------------------------- text pane --- */
+
+/*
+ * A text file is read, so it gets a measure. `data-layout="document"` centres the column at
+ * Serein's 960px cap; 76ch inside that is the reading width, and source code gets the full
+ * measure because a line of code has no line-break opportunity.
+ */
+.wc-text {
+  display: flex;
+  flex-direction: column;
+  gap: var(--serein-space-3);
+  width: min(100%, 960px);
+  margin: 0;
+}
+
+.wc-text__pre {
+  margin: 0;
+  padding: var(--serein-space-6);
+  border-radius: var(--serein-radius-card);
+  background: var(--serein-surface);
+  color: var(--serein-text);
+  box-shadow: var(--serein-shadow-1), var(--serein-shadow-inset-line);
+  font: 400 calc(13px * var(--serein-text-scale)) / 1.65 var(--serein-font-ui);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  tab-size: 4;
+}
+
+.wc-text__pre--code {
+  font-family: var(--serein-font-mono);
+  font-size: calc(12.5px * var(--serein-text-scale));
+  line-height: 1.6;
+  letter-spacing: 0;
+  /* A code line is a line: wrapping it invents structure that is not in the file. */
+  white-space: pre;
+  overflow-x: auto;
+  font-variant-ligatures: none;
+}
+
+.wc-text__caption {
+  color: var(--serein-text-tertiary);
+  font: var(--serein-type-meta);
+  text-align: end;
+}
+
+/* ------------------------------------------------------------ spreadsheet --- */
+
+/*
+ * A 200-row table is wider than any screen. The scroll is on the table's own wrapper so the
+ * sticky first column keeps its position — putting it on the canvas would move the row numbers
+ * with the horizontal scroll.
+ */
+.wc-sheet {
+  width: min(100%, 1100px);
+  display: flex;
+  flex-direction: column;
+  gap: var(--serein-space-3);
+}
+
+.wc-sheet__scroll {
+  overflow: auto;
+  max-height: calc(100dvh - 56px - 82px - 70px);
+  border-radius: var(--serein-radius-card);
+  background: var(--serein-surface);
+  box-shadow: var(--serein-shadow-2), var(--serein-shadow-inset-line);
+}
+
+.wc-sheet .serein-table {
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: calc(12px * var(--serein-text-scale));
+}
+
+.wc-sheet .serein-table td {
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The row number is a label, not data, and it stays put while the columns scroll. */
+.wc-sheet__num {
+  position: sticky;
+  inset-inline-start: 0;
+  z-index: 2;
+  width: 44px;
+  background: var(--serein-fill-subtle);
+  color: var(--serein-text-tertiary);
+  font: var(--serein-type-meta);
+  font-variant-numeric: tabular-nums;
+  text-align: end !important;
+}
+
+/* The first data row is the header the file happens to have. It is emphasised as a header, but
+   it is still a row: a quoted first line of data is not a column name and must not be promoted
+   to one. */
+.wc-sheet__head {
+  color: var(--serein-text);
+  font-weight: 620;
+  background: var(--serein-fill-subtle);
+  position: sticky;
+  top: 0;
+}
+
+.wc-sheet .serein-table thead {
+  display: none;
+}
+
+.wc-sheet__note {
+  padding-inline: var(--serein-space-3);
+}
+
+/* ------------------------------------------------------------------ audio --- */
+
+.wc-audio {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--serein-space-3);
+  padding: var(--serein-space-9) var(--serein-space-8);
+  border-radius: var(--serein-radius-card);
+  background: var(--serein-viewer-bar);
+  box-shadow: var(--serein-shadow-sheet);
+  width: min(440px, 100%);
+}
+
+.wc-audio__art {
+  display: grid;
+  place-items: center;
+  width: 96px;
+  height: 96px;
+  border-radius: 18px;
+  background: var(--serein-kind-audio-bg);
+  color: var(--serein-kind-audio-fg);
+}
+
+.wc-audio__name {
+  color: var(--serein-viewer-ink);
+  font: 620 calc(14px * var(--serein-text-scale)) / 1.4 var(--serein-font-ui);
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+
+.wc-audio__meta {
+  color: var(--serein-viewer-ink-secondary);
+  font: var(--serein-type-meta);
+  margin-bottom: var(--serein-space-3);
+}
+
+.wc-audio audio {
+  width: 100%;
+  max-width: 360px;
+}
+
+/* -------------------------------------------------------------------- pdf --- */
+
+/*
+ * The browser's own PDF viewer is better than anything this client could draw, so the document
+ * gets a frame and the client gets out of the way. The explicit height is required: an iframe's
+ * default 150px is a strip.
+ */
+.wc-pdf {
+  width: min(100%, 1100px);
+  height: calc(100dvh - 56px - 82px - 40px);
+  border: 0;
+  border-radius: 6px;
+  background: var(--serein-surface);
+  box-shadow: var(--serein-shadow-float);
+}
+
+@media (max-width: 820px) {
+  .wc-pdf {
+    height: calc(100dvh - 52px - 74px - 32px);
+  }
+}
+
+/* ------------------------------------------------------------------ shared ---- */
+
+/* A received image can only be shown as the server's thumbnail: the content route is
+   attachment-only, so there is no inline URL for it. */
+.wc-shared-thumb {
+  width: 96px;
+  height: 96px;
+  object-fit: cover;
+  border-radius: 10px;
+}
+
+.serein-viewer__fallback-icon:has(.wc-shared-thumb) {
+  width: auto;
+  height: auto;
+  background: none;
+}
+
+.wc-fallback-meta {
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+/* A loading line inside the stage, vertically centred like the content it will become. */
+.wc-stage-loading {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--serein-space-3);
+  color: var(--serein-viewer-ink-secondary);
+  font: var(--serein-type-small);
+}
+
+/* ---------------------------------------------------------------- chrome ----- */
+
+/*
+ * `F` hides the chrome to see the whole picture. The footer stays: it holds Previous/Next and
+ * the position, which a keyboard user needs precisely when the picture fills the screen. Only
+ * the bar goes.
+ */
+.wc-viewer-host[data-chrome] .serein-viewer__bar {
+  /* The bar is a flex child; hiding it must not leave its gap. */
+  display: flex;
+}
+
+/* The zoomed image must not be clipped by the canvas's padding box when scaled. */
+.serein-viewer__canvas[data-layout="media"] {
+  overflow: hidden;
+  touch-action: none;
+}
+
+.serein-viewer__canvas[data-layout="media"] .serein-viewer__image {
+  max-width: min(100%, 1400px);
+  max-height: calc(100dvh - 56px - 82px - 40px);
+}
+
+@media (max-width: 820px) {
+  .serein-viewer__canvas[data-layout="media"] .serein-viewer__image {
+    max-height: calc(100dvh - 52px - 74px - 32px);
+  }
+  /* On a phone the step buttons are the primary control, so they keep their words. */
+  .serein-viewer__step {
+    min-width: 44px;
+    min-height: 44px;
+    padding: 0 8px;
+  }
+  .wc-step-label {
+    display: none;
+  }
+  .serein-viewer__footer {
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+}
+
+/* The film is a `FileTile` at 48px; the framework's own icon sizing must not fight it. */
+.serein-viewer__film .serein-file-icon,
+.serein-viewer__film .serein-file-icon--thumb img {
+  width: 48px;
+  height: 48px;
+  border-radius: 0;
+}
+
+@media (max-width: 820px) {
+  .serein-viewer__film,
+  .serein-viewer__film .serein-file-icon,
+  .serein-viewer__film .serein-file-icon--thumb img {
+    width: 44px;
+    height: 44px;
+  }
+}

@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
@@ -6,10 +6,27 @@
     <meta name="referrer" content="same-origin" />
     <meta name="robots" content="noindex, nofollow, noarchive" />
     <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#f3f6f9" />
     <title>newCloud</title>
   </head>
-  <body>
+  <!--
+    `serein-root` is the design system's scope. Nothing in Serein writes to `:root`, `html` or an
+    unmarked `body`, so marking the body is what makes every token and base rule apply without
+    leaking into a host page. It has to be in the markup, not added by a script: a class added
+    after the stylesheet is parsed arrives one frame late.
+
+    No `data-theme` here on purpose: its absence is "follow the system", which the token layer
+    resolves from `prefers-color-scheme` and `prefers-contrast` on its own. Writing a resolved
+    value into the markup would freeze the page at whichever appearance was current at build
+    time, and would disable the live system-change behaviour.
+  -->
+  <body class="serein-root">
     <div id="root"></div>
+    <noscript>
+      <p style="padding: 24px; font: 400 14px/1.6 system-ui">
+        This application needs JavaScript.
+      </p>
+    </noscript>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

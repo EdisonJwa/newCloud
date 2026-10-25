@@ -1,0 +1,412 @@
+/*
+ * Settings, the Inspector and the public recipient page.
+ *
+ * Three surfaces with one thing in common: they are read rather than worked in, so they lean
+ * on the framework's list, metadata and dialog components and add only what is specific —
+ * the audit timeline, the settings column measure, and the public page's own measure.
+ */
+
+/* ---------------------------------------------------------------- settings --- */
+
+.wc-settings-tabs {
+  margin-bottom: var(--serein-space-5);
+}
+
+.wc-settings-panel {
+  min-width: 0;
+}
+
+/* A settings section is a heading, a sentence of explanation, then the list. The sentence is
+   not optional: "Trash" alone does not tell anybody that deleted files keep their content. */
+.wc-settings-note {
+  margin: var(--serein-space-3) 0 var(--serein-space-4);
+  max-width: 72ch;
+}
+
+/* Name and display name side by side with the commit on the end. */
+.wc-inlineform {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--serein-space-4);
+  flex-wrap: wrap;
+  margin-bottom: var(--serein-space-5);
+}
+
+.wc-inlineform > .serein-field {
+  min-width: 160px;
+}
+
+@media (max-width: 700px) {
+  .wc-inlineform > .serein-field {
+    min-width: 0;
+    flex-basis: 100%;
+  }
+  .wc-inlineform > .serein-btn {
+    width: 100%;
+  }
+}
+
+.wc-fieldset {
+  margin-top: var(--serein-space-4);
+  border: 0;
+  padding: 0;
+}
+
+.wc-fieldset legend {
+  padding: 0;
+  margin-bottom: var(--serein-space-3);
+}
+
+.wc-checkgrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: var(--serein-space-3);
+  margin-bottom: var(--serein-space-3);
+}
+
+.wc-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--serein-space-2);
+  min-height: 26px;
+}
+
+.wc-quota-edit {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--serein-space-2);
+}
+
+.wc-quota-edit .serein-input-wrap {
+  width: 120px;
+}
+
+/* The per-row actions cluster. On a narrow row two buttons plus a badge would overflow, so
+   the cluster wraps under the row instead of truncating the account's name. */
+.wc-admin-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--serein-space-2);
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+@media (max-width: 700px) {
+  .wc-admin-actions {
+    flex-basis: 100%;
+    justify-content: flex-start;
+    padding-top: var(--serein-space-2);
+  }
+}
+
+/* ---------------------------------------------------------------- activity --- */
+
+.wc-activity-filters {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--serein-space-4);
+  flex-wrap: wrap;
+}
+
+.wc-activity-filter {
+  min-width: 140px;
+}
+
+@media (max-width: 700px) {
+  .wc-activity-filter {
+    flex-basis: calc(50% - var(--serein-space-2));
+    min-width: 0;
+  }
+}
+
+/*
+ * The timeline is a rail with dots rather than a table: an audit record is read in order, and a
+ * table invites scanning a column, which is the wrong question for a log. The rail is a pseudo
+ * element on the group so it is continuous across a day and breaks between days, which is what
+ * makes the grouping legible.
+ */
+.wc-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: var(--serein-space-6);
+}
+
+.wc-timeline__group {
+  position: relative;
+}
+
+.wc-timeline__day {
+  position: sticky;
+  top: calc(var(--wc-topbar) + var(--serein-space-2));
+  z-index: 2;
+  width: max-content;
+  margin-bottom: var(--serein-space-3);
+  padding: 3px 9px;
+  border-radius: var(--serein-radius-pill);
+  background: var(--serein-fill);
+  color: var(--serein-text-secondary);
+  font: var(--serein-type-label);
+  letter-spacing: var(--serein-tracking-label);
+  text-transform: uppercase;
+}
+
+.wc-timeline__row {
+  display: grid;
+  grid-template-columns: 92px 22px minmax(0, 1fr);
+  gap: var(--serein-space-3);
+  align-items: start;
+  min-height: 46px;
+  padding-block: var(--serein-space-2);
+}
+
+.wc-timeline__when {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  color: var(--serein-text-tertiary);
+  font: var(--serein-type-meta);
+  text-align: end;
+  font-variant-numeric: tabular-nums;
+}
+
+.wc-timeline__when .wc-mono {
+  color: var(--serein-text-secondary);
+}
+
+/* The rail: a hairline behind the dot, so the day reads as a sequence. */
+.wc-timeline__rail {
+  position: relative;
+  display: grid;
+  place-items: start center;
+  padding-top: 5px;
+  align-self: stretch;
+}
+
+.wc-timeline__rail::before {
+  content: "";
+  position: absolute;
+  inset-block: 0;
+  left: 50%;
+  width: 1px;
+  background: var(--serein-divider);
+  translate: -50% 0;
+}
+
+.wc-timeline__rail .serein-status-dot {
+  position: relative;
+  z-index: 1;
+  box-shadow: 0 0 0 3px var(--serein-canvas);
+}
+
+.wc-timeline__body {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  padding-bottom: var(--serein-space-3);
+  border-bottom: 1px solid var(--serein-divider);
+}
+
+.wc-timeline__head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--serein-space-3);
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.wc-timeline__action {
+  color: var(--serein-text);
+  font: var(--serein-type-small-strong);
+}
+
+.wc-timeline__target {
+  min-width: 0;
+  color: var(--serein-text-secondary);
+  font: var(--serein-type-meta);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wc-timeline__meta {
+  display: flex;
+  align-items: center;
+  gap: var(--serein-space-3);
+  flex-wrap: wrap;
+  color: var(--serein-text-tertiary);
+  font: var(--serein-type-meta);
+}
+
+.wc-timeline__row--denied .wc-timeline__action {
+  color: var(--serein-danger);
+}
+
+.wc-timeline__more {
+  display: flex;
+  justify-content: center;
+  padding-top: var(--serein-space-3);
+}
+
+@media (max-width: 700px) {
+  /* The time column collapses to one line above the event: 92px is a third of a phone. */
+  .wc-timeline__row {
+    grid-template-columns: 18px minmax(0, 1fr);
+    gap: var(--serein-space-3);
+  }
+  .wc-timeline__when {
+    grid-column: 2;
+    flex-direction: row;
+    gap: 6px;
+    text-align: start;
+  }
+  .wc-timeline__rail {
+    grid-row: 1 / span 2;
+    grid-column: 1;
+  }
+  .wc-timeline__body {
+    grid-column: 2;
+  }
+}
+
+/* --------------------------------------------------------------- inspector --- */
+
+/* Two meta rows in a 300px panel need a narrower label column than the framework's 80px
+   minimum, or the value is pushed to two lines and the panel doubles in height. */
+.wc-inspector-aside .serein-meta {
+  grid-template-columns: minmax(64px, 0.6fr) minmax(0, 1fr);
+  gap: 8px 12px;
+}
+
+.wc-inspector-aside .serein-meta dd {
+  font-size: calc(11px * var(--serein-text-scale));
+  overflow-wrap: anywhere;
+}
+
+.wc-inspector-multi {
+  display: flex;
+  flex-direction: column;
+  gap: var(--serein-space-4);
+}
+
+.wc-versions-note {
+  margin-top: var(--serein-space-4);
+}
+
+.wc-activity-result {
+  margin-inline-start: 6px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--serein-danger-soft);
+  color: var(--serein-danger);
+  font: var(--serein-type-label);
+}
+
+/* The inspector's hero preview is 4:3 for a photograph. A document has no aspect ratio, so the
+   diagram fills the box and the box is what constrains it. */
+.wc-inspector-aside .serein-inspector__hero > .serein-file-icon {
+  width: 100%;
+  height: 100%;
+  border-radius: 0;
+}
+
+.wc-inspector-aside .serein-inspector__hero > .serein-file-icon svg {
+  width: 44px;
+  height: 44px;
+}
+
+/* The link inspector's copy field: a URL is one unbroken string, so it must scroll rather than
+   force the panel wider. */
+.wc-inspector-aside .serein-link-box__url {
+  direction: ltr;
+  text-align: start;
+}
+
+/* ------------------------------------------------------------ picked folder --- */
+
+/* The transfer dialog's destination browser. */
+.wc-picker__crumbs {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 2px;
+  padding-bottom: var(--serein-space-3);
+  border-bottom: 1px solid var(--serein-divider);
+  margin-bottom: var(--serein-space-3);
+}
+
+.wc-picker {
+  display: flex;
+  flex-direction: column;
+  max-height: 260px;
+  overflow-y: auto;
+  border-radius: 10px;
+  background: var(--serein-fill-subtle);
+  padding: var(--serein-space-2);
+}
+
+.wc-picker__row {
+  display: flex;
+  align-items: center;
+  gap: var(--serein-space-3);
+  min-height: 40px;
+  padding: 0 var(--serein-space-3);
+  border-radius: 7px;
+  color: var(--serein-text);
+  font: var(--serein-type-small);
+  text-align: start;
+  cursor: pointer;
+}
+
+.wc-picker__row:hover {
+  background: var(--serein-hover-bg);
+}
+
+/* ----------------------------------------------------------------- public --- */
+
+/*
+ * The recipient page keeps the framework's own measure (980px) because it is the one page a
+ * person sees without context: a narrow column reads as a form, and this is a file. What is
+ * added is the vertical rhythm under the hero and the file list's alignment with it.
+ */
+.wc-public {
+  width: 100%;
+  min-width: 0;
+}
+
+.serein-public__main > .serein-password,
+.serein-public__main > .serein-upload-card {
+  margin-inline: auto;
+}
+
+/* The gate's own footer control. Serein stacks the field and button at 820px, which is right:
+   a 44px button beside a 38px field on a phone leaves the field unusable. */
+.serein-password__row .serein-btn {
+  align-self: flex-end;
+}
+
+.wc-upload-slots {
+  margin-top: var(--serein-space-4);
+  text-align: center;
+}
+
+/* The footer's appearance switch is a link-shaped button, and it must not look disabled. */
+.serein-public__footer-links button {
+  cursor: pointer;
+}
+
+/* -------------------------------------------------------------- responsive --- */
+
+@media (max-width: 820px) {
+  /* The settings page header loses its description on a phone: the tab strip already says
+     which panel you are in, and the description repeats it. */
+  .serein-page--narrow .serein-page-header__description {
+    display: none;
+  }
+  .serein-page--narrow .serein-page-header {
+    margin-bottom: var(--serein-space-3);
+  }
+  .serein-page--narrow .serein-page-header__title {
+    font: var(--serein-type-page-compact);
+  }
+}

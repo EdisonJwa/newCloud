@@ -1,0 +1,757 @@
+/*
+ * WebCloud appearance layer.
+ *
+ * Serein UI ships four complete appearances and exposes them as attributes on `.serein-root`
+ * rather than on `:root`, so that nothing leaks into a host page. This file is the bridge
+ * between that contract and WebCloud's own preferences, and it holds the handful of decisions
+ * a generic framework cannot make for a particular product.
+ *
+ * Three rules decide what is allowed in here:
+ *
+ *  1. **No raw colours.** Every value is a `--serein-*` semantic token or a
+ *     `color-mix()` of one. `serein/tokens.css` is the only place a hex value may appear, so
+ *     light, dark and both increased-contrast appearances stay correct without a second
+ *     stylesheet. The contrast script enforces the pairs the interface relies on.
+ *  2. **No new type sizes.** The ladder in `tokens.css` scales with `--serein-text-scale`, and
+ *     Large Text is a supported state. A hand-written `font-size: 13px` would be the one string
+ *     on the page that does not grow.
+ *  3. **Product-specific composition only.** Serein owns components; this file owns the few
+ *     arrangements that are specific to a file manager with an inspector — the docked split,
+ *     the phone sheet, the drop overlay, the resume preview diagrams. If a rule would be useful
+ *     to any application, it belongs upstream instead.
+ */
+
+/* ------------------------------------------------------------------ root --- */
+
+/*
+ * The application root carries the appearance attributes, so the framework's own
+ * `[data-theme]`/`[data-contrast]`/`[data-textsize]` selectors apply. `--wc-topbar` and the
+ * other locals are the geometry the fixed chrome needs in order to reserve space.
+ */
+.wc-root {
+  --wc-topbar: var(--serein-topbar-height);
+  --wc-statusbar: var(--serein-statusbar-height);
+  --wc-tabbar: 0px;
+  --wc-viewer-rail: 0px;
+}
+
+@media (max-width: 820px) {
+  .wc-root {
+    --wc-topbar: 48px;
+    --wc-statusbar: 0px;
+    --wc-tabbar: calc(var(--serein-tabbar-height) + env(safe-area-inset-bottom));
+  }
+}
+
+/* A page that owns the whole viewport (the file viewer) hides the status strip's neighbour
+   padding so the filmstrip is not pushed off the bottom. */
+.wc-root[data-view="viewer"] {
+  --wc-statusbar: 0px;
+}
+
+/* --------------------------------------------------------------- utilities -- */
+
+.wc-stack {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.wc-row {
+  display: flex;
+  align-items: center;
+  gap: var(--serein-space-3);
+  min-width: 0;
+}
+
+.wc-grow {
+  flex: 1;
+  min-width: 0;
+}
+
+.wc-mono {
+  font-family: var(--serein-font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.005em;
+}
+
+.wc-numeric {
+  font-variant-numeric: tabular-nums;
+}
+
+.wc-truncate {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The visible label on a control that collapses to an icon at a breakpoint. */
+.wc-label {
+  display: inline;
+}
+
+@media (max-width: 960px) {
+  .wc-label--collapse {
+    display: none;
+  }
+}
+
+/*
+ * A polite live region that is present in the DOM from first paint.
+ *
+ * Regions created at the same moment their text changes are frequently not announced at all:
+ * assistive technology has to be observing the node before the mutation. Every milestone
+ * announcement in the app renders into these two elements.
+ */
+.wc-live {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0 !important;
+  margin: -1px !important;
+  overflow: hidden !important;
+  clip: rect(0, 0, 0, 0) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
+}
+
+/* --------------------------------------------------------- page furniture --- */
+
+/*
+ * The files page needs the listing to be the scroll container, not the window: the breadcrumb
+ * and the page header stay put while a 2,000-row folder scrolls under them. `position: sticky`
+ * on the chrome and a min-height chain keeps the honest outcome — one scrollbar, on the
+ * listing — without a fixed height that breaks when the browser UI resizes.
+ */
+.wc-page--fill {
+  display: flex;
+  flex-direction: column;
+  min-height: calc(100dvh - var(--wc-topbar) - var(--wc-statusbar) - var(--wc-tabbar));
+  padding-bottom: calc(var(--wc-statusbar) + var(--serein-space-8));
+}
+
+@media (max-width: 820px) {
+  .wc-page--fill {
+    /* The tab bar is fixed, so the page must reserve its height *plus* one gutter: reserving
+       exactly the bar height leaves the last row's action menu flush against the bar's top
+       edge, which measured 63px of overlap at 390px. */
+    padding-bottom: calc(var(--wc-tabbar) + var(--serein-space-7));
+  }
+}
+
+.wc-pagehead {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--serein-space-6);
+  flex-wrap: wrap;
+}
+
+.wc-pagehead__actions {
+  display: flex;
+  align-items: center;
+  gap: var(--serein-space-3);
+  margin-inline-start: auto;
+  flex-wrap: wrap;
+}
+
+/* Section headings on Home and in Settings, aligned with the reference rhythm. */
+.wc-section__title {
+  color: var(--serein-text);
+  font: var(--serein-type-section);
+  letter-spacing: var(--serein-tracking-title);
+}
+
+.wc-section__link {
+  margin-inline-start: auto;
+  color: var(--serein-text-secondary);
+  font: var(--serein-type-small-strong);
+  border-radius: 5px;
+  padding: 2px 4px;
+}
+
+.wc-section__link:hover {
+  background: var(--serein-hover-bg);
+  color: var(--serein-text);
+}
+
+/* --------------------------------------------------------------- surfaces --- */
+
+/*
+ * The surface the listing, the sharing lists and the home blocks sit on.
+ *
+ * Serein's own components are borderless and rely on the canvas behind them; a long list of
+ * rows on a canvas reads as text floating in space. One hairline card fixes that, and it is
+ * used for every list so they cannot drift apart.
+ */
+.wc-card {
+  border-radius: var(--serein-radius-card);
+  background: var(--serein-surface);
+  box-shadow: var(--serein-shadow-1), var(--serein-shadow-inset-line);
+  overflow: hidden;
+}
+
+.wc-card--flush {
+  border-radius: 0;
+  box-shadow: none;
+  background: none;
+}
+
+.wc-card__padding {
+  padding: var(--serein-space-6);
+}
+
+/* Row-level list used where Serein's file rows would imply file semantics (shares, versions,
+   activity). `min-height` rather than a fixed height so Large Text reflows instead of clipping. */
+.wc-list {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.wc-list__row {
+  display: flex;
+  align-items: center;
+  gap: var(--serein-space-5);
+  min-height: 56px;
+  padding: var(--serein-space-4) var(--serein-space-6);
+  border-bottom: 1px solid var(--serein-divider);
+  color: inherit;
+  text-align: start;
+  min-width: 0;
+}
+
+.wc-list__row:last-child {
+  border-bottom: 0;
+}
+
+.wc-list__row:hover {
+  background: var(--serein-hover-bg);
+}
+
+.wc-list__main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
+.wc-list__title {
+  color: var(--serein-text);
+  font: var(--serein-type-item-title);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wc-list__meta {
+  color: var(--serein-text-tertiary);
+  font: var(--serein-type-item-meta);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wc-list__end {
+  display: flex;
+  align-items: center;
+  gap: var(--serein-space-3);
+  flex: none;
+  color: var(--serein-text-tertiary);
+  font: var(--serein-type-meta);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+@media (max-width: 700px) {
+  .wc-list__row {
+    padding-inline: var(--serein-space-4);
+    gap: var(--serein-space-4);
+  }
+  /* The trailing metadata is the first thing to go: a filename is never truncated so that a
+     timestamp can survive at 320px. */
+  .wc-list__end--secondary {
+    display: none;
+  }
+}
+
+/* -------------------------------------------------------------- file kinds -- */
+
+/*
+ * Content-adaptive preview diagrams.
+ *
+ * A tinted square holding one generic glyph tells a person nothing they could not read from
+ * the filename. These draw a small truthful diagram of the format instead: a page with a title
+ * rule for a document, a cell grid for a spreadsheet, a code block, a waveform. They are pure
+ * CSS so they scale with `--serein-text-scale` inside the resume band and need no asset.
+ */
+.wc-diagram {
+  --wc-diagram-ink: var(--serein-text-tertiary);
+  position: relative;
+  display: block;
+  width: 100%;
+  height: 100%;
+  background: var(--serein-fill-subtle);
+  overflow: hidden;
+}
+
+.wc-diagram svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.wc-diagram[data-kind="image"] {
+  background: var(--serein-kind-image-bg);
+  color: var(--serein-kind-image-fg);
+}
+.wc-diagram[data-kind="pdf"] {
+  background: var(--serein-kind-pdf-bg);
+  color: var(--serein-kind-pdf-fg);
+}
+.wc-diagram[data-kind="video"] {
+  background: var(--serein-kind-video-bg);
+  color: var(--serein-kind-video-fg);
+}
+.wc-diagram[data-kind="audio"] {
+  background: var(--serein-kind-audio-bg);
+  color: var(--serein-kind-audio-fg);
+}
+.wc-diagram[data-kind="text"] {
+  background: var(--serein-kind-code-bg);
+  color: var(--serein-kind-code-fg);
+}
+.wc-diagram[data-kind="sheet"] {
+  background: var(--serein-kind-sheet-bg);
+  color: var(--serein-kind-sheet-fg);
+}
+.wc-diagram[data-kind="archive"] {
+  background: var(--serein-kind-archive-bg);
+  color: var(--serein-kind-archive-fg);
+}
+.wc-diagram[data-kind="design"] {
+  background: var(--serein-kind-design-bg);
+  color: var(--serein-kind-design-fg);
+}
+
+/* A real thumbnail is always better than a diagram when the server can produce one. */
+.wc-diagram img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.wc-diagram__label {
+  position: absolute;
+  left: 5px;
+  bottom: 4px;
+  padding: 1px 3px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--serein-surface) 82%, transparent);
+  color: var(--serein-text-secondary);
+  font-family: var(--serein-font-mono);
+  font-size: calc(7px * var(--serein-text-scale));
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+/* --------------------------------------------------------------- inspector -- */
+
+/*
+ * The docked inspector is a grid column of the page, not a floating panel: it pushes the
+ * listing narrower instead of covering the right-hand columns of every row.
+ *
+ * ## Why the listing's columns fold when the inspector opens
+ *
+ * Serein's file list is a container query: below 1180px of *its own* width it drops Location
+ * and Access, and below 960px it drops Modified too. Docking a 340px panel genuinely leaves
+ * less room, so the fold is the framework's correct answer rather than a regression — the row
+ * keeps the columns that fit and moves the location into the subtitle, which is what the
+ * container query exists for.
+ *
+ * An earlier version of this file tried to hold all six columns open by overriding
+ * `--serein-file-cols` from the split. That cannot work: the container query sets the variable
+ * on `.serein-file-row` and the header themselves, so an ancestor's value is never consulted,
+ * and the mismatch between the grid template and the visible cells stacked the row into two
+ * lines. The rule was removed rather than repaired — the framework was right.
+ */
+.wc-split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--serein-space-6);
+  align-items: start;
+  min-width: 0;
+}
+
+.wc-split[data-inspector="docked"] {
+  grid-template-columns: minmax(0, 1fr) var(--serein-inspector-width);
+}
+
+@media (max-width: 1180px) {
+  .wc-split[data-inspector="docked"] {
+    grid-template-columns: minmax(0, 1fr) 300px;
+  }
+}
+
+@media (max-width: 960px) {
+  /* Below this the listing is already folding columns; a second one would leave 300px of
+     filename. The inspector becomes an overlay, which is Serein's own phone treatment. */
+  .wc-split[data-inspector="docked"] {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .wc-split[data-inspector="docked"] > .wc-inspector-aside {
+    position: fixed;
+    z-index: 60;
+    inset-inline-end: 0;
+    bottom: 0;
+    top: auto;
+    width: min(380px, 100vw);
+    max-height: 82dvh;
+    padding: 0;
+  }
+  .wc-split[data-inspector="docked"] > .wc-inspector-aside .serein-inspector {
+    border-radius: var(--serein-radius-sheet) var(--serein-radius-sheet) 0 0;
+    box-shadow: var(--serein-shadow-sheet);
+  }
+}
+
+.wc-inspector-aside {
+  position: sticky;
+  top: calc(var(--wc-topbar) + var(--serein-space-6));
+  min-width: 0;
+  max-height: calc(100dvh - var(--wc-topbar) - var(--wc-statusbar) - var(--serein-space-12));
+  display: flex;
+}
+
+.wc-inspector-aside > .serein-inspector {
+  width: 100%;
+  max-height: inherit;
+}
+
+@media (max-width: 960px) {
+  .wc-inspector-aside {
+    position: static;
+    max-height: none;
+    display: none;
+  }
+}
+
+/* ------------------------------------------------------------ empty states -- */
+
+.wc-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--serein-space-3);
+  padding: var(--serein-space-13) var(--serein-space-6);
+  text-align: center;
+}
+
+.wc-state__title {
+  color: var(--serein-text);
+  font: var(--serein-type-title);
+  letter-spacing: var(--serein-tracking-title);
+}
+
+.wc-state__hint {
+  max-width: 46ch;
+  color: var(--serein-text-secondary);
+  font: var(--serein-type-small);
+}
+
+.wc-state__actions {
+  display: flex;
+  gap: var(--serein-space-3);
+  margin-top: var(--serein-space-3);
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+/* -------------------------------------------------------------- skeletons --- */
+
+.wc-skeleton-rows {
+  display: flex;
+  flex-direction: column;
+}
+
+.wc-skeleton-row {
+  display: flex;
+  align-items: center;
+  gap: var(--serein-space-5);
+  min-height: 52px;
+  padding: 0 var(--serein-space-5);
+}
+
+.wc-skeleton-row__stack {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  flex: 1;
+  min-width: 0;
+}
+
+/* ------------------------------------------------------------------ upload -- */
+
+/*
+ * The OS drop target.
+ *
+ * A full-viewport overlay rather than a highlighted row, because the destination can be a
+ * folder row rather than the current directory, and a person dragging a file toward a 52px row
+ * should see the whole page accept it rather than hunt for a target.
+ */
+.wc-drop {
+  position: fixed;
+  inset: 0;
+  z-index: 320;
+  display: grid;
+  place-items: center;
+  padding: var(--serein-space-9);
+  background: color-mix(in srgb, var(--serein-canvas) 72%, transparent);
+  -webkit-backdrop-filter: var(--serein-material-blur);
+  backdrop-filter: var(--serein-material-blur);
+  pointer-events: none;
+}
+
+.wc-drop__box {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--serein-space-3);
+  width: min(460px, 100%);
+  padding: var(--serein-space-11) var(--serein-space-9);
+  border-radius: var(--serein-radius-sheet);
+  border: 2px dashed var(--serein-accent);
+  background: var(--serein-surface);
+  box-shadow: var(--serein-shadow-sheet);
+  text-align: center;
+}
+
+.wc-drop__title {
+  color: var(--serein-text);
+  font: var(--serein-type-title);
+}
+
+.wc-drop__where {
+  color: var(--serein-text-secondary);
+  font: var(--serein-type-small);
+  overflow-wrap: anywhere;
+}
+
+.wc-drop__badge {
+  color: var(--serein-accent);
+}
+
+/* A folder row that will receive a dragged file. */
+.wc-drop-target {
+  outline: 2px solid var(--serein-accent);
+  outline-offset: -2px;
+  background: var(--serein-accent-soft) !important;
+}
+
+/* The element that follows the pointer while dragging a row onto a folder. */
+.wc-dragghost {
+  position: fixed;
+  z-index: 340;
+  top: 0;
+  left: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 260px;
+  padding: 5px 9px;
+  border-radius: 8px;
+  background: var(--serein-text);
+  color: var(--serein-text-inverse);
+  font: var(--serein-type-item-meta);
+  box-shadow: var(--serein-shadow-float);
+  pointer-events: none;
+  translate: -50% -50%;
+  opacity: 0.94;
+}
+
+/* --------------------------------------------------------------- progress --- */
+
+.wc-progress-inline {
+  display: flex;
+  align-items: center;
+  gap: var(--serein-space-3);
+  color: var(--serein-text-secondary);
+  font: var(--serein-type-meta);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ------------------------------------------------------------- breadcrumb ---- */
+
+/*
+ * The parent crumb above the page title on a phone is a 44px target on its own; the desktop
+ * trail is a compact inline list. Both are the same DOM, so the accessible name is identical.
+ */
+.wc-crumbs {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+  flex-wrap: wrap;
+  margin-bottom: var(--serein-space-3);
+}
+
+@media (max-width: 820px) {
+  .wc-crumbs {
+    margin-bottom: var(--serein-space-2);
+  }
+  .wc-crumbs .serein-breadcrumb__link,
+  .wc-crumbs .serein-breadcrumb__current {
+    min-height: var(--serein-touch-min);
+    display: inline-flex;
+    align-items: center;
+    font-size: calc(12.5px * var(--serein-text-scale));
+  }
+  /* Only the immediate parent survives on a phone: the trail is what pushed the title down. */
+  .wc-crumbs__ancestor {
+    display: none;
+  }
+}
+
+/* ---------------------------------------------------------------- switches --- */
+
+/*
+ * Phone hit areas for the controls the framework keeps compact on purpose.
+ *
+ * Serein raises buttons, icon buttons and tabs to 44px at ≤820px, but a segmented control's
+ * options stay 34×28 because its own demo sizes them as a view switch inside a tool row. Here
+ * the view switch IS the only control in that row, so its options must meet WCAG 2.5.8 like
+ * every other control. The visible art is unchanged: only the box grows.
+ */
+@media (max-width: 820px) {
+  .serein-seg {
+    padding: 2px;
+  }
+  .serein-seg__btn {
+    min-width: 44px;
+    /* 44, not 40: the segment's own 2px padding would otherwise leave the visible button at
+       40px, which is below the 2.5.8 minimum even though the group's box is larger. */
+    height: 44px;
+    padding: 0 10px;
+  }
+  /* The action bar's row is 44px tall in the reference; the segment needs to fit inside it
+     without pushing the filter strip down. */
+  .serein-actionbar .serein-seg {
+    align-self: center;
+  }
+}
+
+/*
+ * A settings row: label and description on one side, its control on the other. Used by the
+ * account menu's appearance section and by the admin settings table.
+ */
+.wc-setting {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--serein-space-6);
+  min-height: 52px;
+  padding: var(--serein-space-4) 0;
+  border-bottom: 1px solid var(--serein-divider);
+}
+
+.wc-setting:last-child {
+  border-bottom: 0;
+}
+
+.wc-setting__main {
+  min-width: 0;
+}
+
+.wc-setting__label {
+  color: var(--serein-text);
+  font: var(--serein-type-small-strong);
+}
+
+.wc-setting__description {
+  margin-top: 2px;
+  color: var(--serein-text-tertiary);
+  font: var(--serein-type-meta);
+}
+
+.wc-setting__control {
+  display: flex;
+  align-items: center;
+  gap: var(--serein-space-3);
+  flex: none;
+}
+
+@media (max-width: 520px) {
+  .wc-setting {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: var(--serein-space-3);
+  }
+}
+
+/* ------------------------------------------------------------------ misc ---- */
+
+/* Native `<progress>` replaced by the framework's meter, but a few places still need the
+   element itself (the browser announces it correctly) — this makes it agree with the tokens. */
+.wc-meter {
+  appearance: none;
+  width: 100%;
+  height: 6px;
+  border: 0;
+  border-radius: var(--serein-radius-pill);
+  background: var(--serein-meter-track);
+  overflow: hidden;
+}
+
+.wc-meter::-webkit-progress-bar {
+  background: var(--serein-meter-track);
+}
+
+.wc-meter::-webkit-progress-value {
+  border-radius: inherit;
+  background: var(--serein-accent);
+}
+
+.wc-meter::-moz-progress-bar {
+  border-radius: inherit;
+  background: var(--serein-accent);
+}
+
+.wc-meter--warning::-webkit-progress-value {
+  background: var(--serein-warning);
+}
+.wc-meter--warning::-moz-progress-bar {
+  background: var(--serein-warning);
+}
+.wc-meter--danger::-webkit-progress-value {
+  background: var(--serein-danger);
+}
+.wc-meter--danger::-moz-progress-bar {
+  background: var(--serein-danger);
+}
+
+/* The viewer's own scroll surface: the canvas scrolls, the chrome does not. */
+.wc-viewer-host {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: flex;
+  flex-direction: column;
+  background: var(--serein-viewer-bg);
+}
+
+.wc-viewer-host > .serein-viewer {
+  flex: 1;
+  min-height: 0;
+  height: 100dvh;
+}
+
+/* Anything the viewer shows replaces the page; scrolling the page behind it would move the
+   chrome under the modal. */
+.wc-root[data-view="viewer"] body,
+.wc-root[data-view="viewer"] {
+  overflow: hidden;
+}
