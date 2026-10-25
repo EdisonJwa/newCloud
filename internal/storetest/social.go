@@ -17,6 +17,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1361,6 +1362,48 @@ func filteredSearchSuite(t *testing.T, factory Factory) {
 func ownerPurgeSuite(t *testing.T, factory Factory) {
 	t.Helper()
 
+	t.Run("APurgeDeletesAFileThatCarriesAnOperationJournalRow", func(t *testing.T) {
+		// The real-world sequence, and the one the demo found: a file is deleted through the API,
+		// which writes an ADR-0013 operation row naming it, and the user then empties the trash.
+		//
+		// On PostgreSQL this failed with a foreign-key violation
+		// (`operations_staged_root_fkey` was the only FK to `nodes` that did not cascade), so the
+		// purge answered 500 for exactly the files a user most wants gone. The suite missed it because
+		// it trashed through the store, which writes no journal row — this case writes one.
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+		f := mkfile(t, s, owner, r.ID, "journalled.txt", 24)
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			_, oerr := tx.StartOp(ctx, store.Op{
+				OwnerID:    owner,
+				Kind:       "delete",
+				State:      store.OpStaging,
+				StagedRoot: &f.ID,
+			})
+			return oerr
+		}); err != nil {
+			t.Fatalf("start the operation, which is what the delete path does: %v", err)
+		}
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			return tx.Trash(ctx, f.ID)
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+			_, perr := tx.PurgeTrashFor(ctx, owner, 500)
+			return perr
+		}); err != nil {
+			t.Fatalf("purging a file that carries a journal row failed: %v. The journal must follow "+
+				"the node it describes; a purged node can never be recovered, so its operation row "+
+				"has nothing left to name.", err)
+		}
+		if after := trashBytesOf(t, s, owner); after != 0 {
+			t.Fatalf("the retained counter is %d after purging a journalled file, want 0", after)
+		}
+	})
+
 	t.Run("AnOwnerCanPurgeTheirWholeBinRegardlessOfRetention", func(t *testing.T) {
 		// §3: the user has decided, so the retention window that protects them from an accident is
 		// exactly what they are overriding.
@@ -1546,6 +1589,108 @@ func ownerPurgeSuite(t *testing.T, factory Factory) {
 		if after := trashBytesOf(t, s, owner); after != 0 {
 			t.Fatalf("the retained counter is %d after an empty-trash, want 0: the user would "+
 				"still be told their storage is full", after)
+		}
+	})
+
+	t.Run("APurgeRacingADeleteNeverDoubleReleases", func(t *testing.T) {
+		// §3's last acceptance criterion: "concurrent purge + delete cannot double-release refcounts
+		// (the guarded-delete semantics already enforce this — pin it with a user-path test)".
+		//
+		// The dangerous shape is one transaction releasing the retained bytes of a node while the
+		// other is still deciding whether to, and the symptom is not an error: it is a counter that
+		// goes NEGATIVE (or drifts permanently lower than the bytes actually retained), which reads
+		// as "this account has more room than it does" until the disk disagrees.
+		//
+		// Both goroutines run the operations a user would: PURGE the bin while TRASHING another file.
+		// The assertion is the invariant rather than a specific interleaving, because the point is
+		// that no interleaving can break it — a test that pinned one ordering would pass against an
+		// implementation that is wrong in the other.
+		s, owner := factory(t)
+		r := rootOf(t, s, owner)
+
+		// A bin with content to purge, and a file outside it to delete during the purge.
+		for i := 0; i < 4; i++ {
+			f := mkfile(t, s, owner, r.ID, "racing-"+itoa(i)+".txt", 16)
+			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				return tx.Trash(ctx, f.ID)
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		outside := mkfile(t, s, owner, r.ID, "racing-outside.txt", 16)
+
+		var wg sync.WaitGroup
+		// Buffered to the exact number of goroutines, so a sender never blocks and the test cannot
+		// deadlock on its own reporting.
+		errs := make(chan error, 8)
+		for i := 0; i < 4; i++ {
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+					_, perr := tx.PurgeTrashFor(ctx, owner, 2)
+					return perr
+				}); err != nil {
+					errs <- err
+				}
+			}()
+			go func() {
+				defer wg.Done()
+				// A purge is deleting the node this trash is about to move, so "already gone" is a
+				// legitimate race outcome rather than a defect. What must never happen is a counter
+				// that breaks, which is what the assertions below read.
+				err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+					return tx.Trash(ctx, outside.ID)
+				})
+				if err != nil && !errors.Is(err, store.ErrNotFound) {
+					errs <- err
+				}
+			}()
+		}
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			t.Fatalf("an operation failed during a purge racing deletes: %v. Neither the purge nor "+
+				"the trash may error here; a lock conflict or a missing node are the only acceptable "+
+				"outcomes and both are handled.", err)
+		}
+
+		// The invariant: the retained counter accounts for exactly what is still in the bin, read
+		// back through the same question the quota check asks.
+		retained := trashBytesOf(t, s, owner)
+		if retained < 0 {
+			t.Fatalf("the retained counter is %d after a purge racing deletes; a negative counter "+
+				"means a byte was released twice, and it reads as free space that does not exist",
+				retained)
+		}
+
+		// A full purge must leave the counter at exactly zero.
+		//
+		// This, rather than "the purge freed what the counter said", is the property §3 asks for.
+		// The equality would be the wrong question here: concurrent purges each report the bytes of
+		// the nodes THEY selected, and a racing trash can add a node after another purge already read
+		// its list — so the two numbers are answers to different questions and their sum is not an
+		// identity. What must hold, and what a double-release or a leak both break, is that once the
+		// bin is empty the counter is empty: too many releases leave it negative (caught above), too
+		// few leave it stuck above zero (caught here), and either way the account is told the wrong
+		// thing about its own storage.
+		for round := 0; round < 8; round++ {
+			var more bool
+			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+				res, perr := tx.PurgeTrashFor(ctx, owner, 1000)
+				more = res.More
+				return perr
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if !more {
+				break
+			}
+		}
+		if after := trashBytesOf(t, s, owner); after != 0 {
+			t.Fatalf("the retained counter is %d after a complete purge, want 0: a counter stuck "+
+				"above zero tells the account it is full while holding nothing, which is the same "+
+				"bug as a negative one from the other side", after)
 		}
 	})
 }

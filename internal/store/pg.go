@@ -761,6 +761,18 @@ func (t *pgTx) markTrashed(ctx context.Context, id uuid.UUID, expect *Preconditi
 		UPDATE nodes
 		SET trashed_at = now(), trashed_from = parent_id
 		WHERE id IN (SELECT id FROM subtree)
+		  -- The live check is repeated in the OUTER statement, and that repetition is the
+		  -- difference between "trash once" and "trash once per concurrent caller".
+		  --
+		  -- Under READ COMMITTED this UPDATE can block on a row lock and then re-evaluate, and
+		  -- PostgreSQL's re-check only re-reads predicates in the outer WHERE — the CTE was
+		  -- already materialised. With the guard only inside the CTE, a second transaction that
+		  -- waited on the first then updated the row anyway, reported RowsAffected()==1, and
+		  -- Trash charged the retained counter again for a node that had already been charged.
+		  -- The counter then sits permanently above the bytes actually retained, telling the
+		  -- account it is full while its bin is empty. Found by
+		  -- TestPGConformance/OwnerTrashPurge/APurgeRacingADeleteNeverDoubleReleases.
+		  AND trashed_at IS NULL
 		  AND ($2 = '' OR (SELECT etag FROM nodes WHERE id = $1) = $2)`
 	etag := ""
 	if expect != nil {
