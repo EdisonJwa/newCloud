@@ -57,16 +57,9 @@ func (s *Server) handleRecent(w http.ResponseWriter, r *http.Request) {
 		nodes = append(nodes, recent.Node)
 	}
 
-	// The same provenance marks the file listing carries, so a recent file that is shared
-	// says so here too.
-	if markers := s.nodeMarkers(r.Context(), actor.ID(), nodes); markers != nil {
-		for i, recent := range recents {
-			if m, ok := markers[recent.Node.ID]; ok {
-				items[i].ShareCount = m.ShareCount
-				items[i].HasVersions = m.HasVersions
-			}
-		}
-	}
+	// The same provenance and social markers the listing carries, so a recent file that is shared,
+	// starred or tagged says so here too — one batch call, not one per row.
+	s.annotate(r.Context(), actor.ID(), items, nodes, nil)
 
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }

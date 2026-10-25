@@ -91,7 +91,7 @@ func (t *pgTx) FavoritesAfter(ctx context.Context, userID uuid.UUID, cursor stri
 	// A variable, not a const: nodeColumnsQualified is a function, and the column list must be the
 	// same one every other node query scans or the Scan below silently reads the wrong fields.
 	q := `
-		WITH hits AS (
+		WITH RECURSIVE hits AS (
 		    SELECT f.node_id, f.created_at
 		    FROM favorites f
 		    JOIN nodes n ON n.id = f.node_id AND n.trashed_at IS NULL
@@ -342,6 +342,13 @@ func (t *pgTx) CreateComment(ctx context.Context, c Comment, limit CommentLimit)
 		return Comment{}, err
 	}
 	c.Body = body
+	// The id is assigned here rather than left to the column default, because the INSERT is a
+	// guarded SELECT: passing a nil uuid for a non-null column inserts the all-zero value the first
+	// time and collides with itself the second. The in-memory backend assigns one the same way, so
+	// both answer "a stored comment has an id".
+	if c.ID == uuid.Nil {
+		c.ID = uuid.New()
+	}
 
 	if limit.Limit > 0 && limit.Window > 0 {
 		if _, err := t.tx.Exec(ctx,

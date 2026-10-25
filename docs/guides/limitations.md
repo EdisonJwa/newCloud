@@ -27,10 +27,18 @@ These are product decisions, not backlog items.
   for content. S3 server-side encryption (SSE) can be enabled by the bucket policy.
 - **No online Office, real-time collaboration, or AI file analysis.**
 - **No multi-region active-active.** The database is the source of truth, and there is one writer.
-- **No comments, activity feed, or notification system.**
-- **No full-text content search.** Search matches file names only, across the account's tree. An
-  index maintained on write would be a larger feature, and a search that silently misses files is
-  worse than an honest name search.
+- **Full-text content search is OPTIONAL, and off by default** (core-scope §7.2, ADR-0016).
+  Name-and-filter search is always available: kind, MIME prefix, size and date bounds, tag, favorite,
+  three sort orders and cursor pagination. Content search — matching a phrase *inside* a document —
+  requires `search.engine: elasticsearch` and a cluster. Without one, a `mode=content` request
+  answers `mode: name` with `degraded: true` and a reason, because a confident empty result would tell
+  a user their document does not exist. Extraction covers text, markdown and PDF (uncompressed and
+  Flate-compressed text streams); Office formats are absent because they need an extractor service,
+  and a scanned PDF has no text to lift (no OCR).
+- **The content index is best-effort telemetry, not evidence.** It is a cache of content the server
+  can already read. A write never fails because the index is down, the index can lag, and every query
+  is filtered by live grants with every result re-checked — so a stale index can at worst return
+  nothing, never something the caller may not see.
 - **No import from Nextcloud or other file services.** Migration tooling between `blob` and `tree`
   layouts is designed, not implemented.
 - **Account export covers files and metadata, not the whole account.** `newcloud export --user <name>
@@ -79,9 +87,10 @@ These are capabilities the requirements call for that are not implemented today.
 | **Account deletion** | Deletion moves files to trash, revokes shares and credentials, releases locks, keeps audit events, and leaves an irreversible tombstone. | Restoring a deleted account: an administrator must recover files and create a new account. |
 | **`tree` layout** | Filesystem mirror, inspectable with `ls`, `rsync`-friendly. | No S3 backend, no deduplication, Windows reserved names apply, and `blobs.size` cannot be backfilled because the layout is not content-addressed. **Version history is recorded but not retained**: the layout overwrites the bytes at the path instead of copying the superseded version, so `GET /api/files/version` and `POST /api/files/restore-version` answer `409 no_version_content` rather than reporting a success they cannot perform, and the version list reports `version_content_available: false` so the UI does not offer a Restore action that cannot work. Treat the rows as a record of changes, not as recoverable content. |
 | **Break-glass** | Login endpoint, CIDR restriction, auditing, alerts, and hash generator exist. | No web UI (deliberate) and no terminal no-echo prompt; the password is read from stdin. |
-| **Grafana** | Prometheus endpoint, 20 alert rules, runbook. | No bundled dashboard JSON. Dashboards depend on the Grafana version and go stale. |
-| **Job types** | The queue has leases, retries, backoff, and three registered job kinds. | More business job kinds. The infrastructure is complete; the catalog is small. |
-| **Metrics thresholds** | Alerts cover process, errors, database, audit, GC, jobs, uploads, DAV, break-glass, WAL, and blob integrity. | Thresholds are starting values, not measured conclusions. Revisit after two weeks of traffic. |
+| **Grafana** | Prometheus endpoint, 22 alert rules, runbook. | No bundled dashboard JSON. Dashboards depend on the Grafana version and go stale. |
+| **Job types** | The queue has leases, retries, backoff, and four registered job kinds (`blob.collect`, `thumbnail.warm`, `user.purge_credentials`, `search.index`). | More business job kinds. The infrastructure is complete; the catalog is small. |
+| **Metrics thresholds** | Alerts cover process, errors, database, audit, GC, jobs, uploads, DAV, break-glass, WAL, blob integrity, and search-index lag. | Thresholds are starting values, not measured conclusions. Revisit after two weeks of traffic. |
+| **Core file-service functions** | Seven are core scope and every deployment has them, each pinned by tests: tus resumable uploads (with the spec's creation, defer-length, expiration, termination, checksum and concatenation extensions), content checksums exposed on JSON, WebDAV and `OC-Checksum`, user-initiated empty trash, favorites, tags, comments, and search with name matching, filters, sort, cursor pagination and an optional content engine. | The tus **checksum extension covers `sha256` only** — the one hash this server computes and stores — and concatenation is byte-wise joining of partials, so a client that sends a partial in a different destination directory is refused rather than guessed at. Comments have **no edit history** (an edit overwrites and stamps `edited_at`) and **no notifications**. Tags have **no rename propagation** into search until the re-index job runs. The bespoke `/api/files/uploads` protocol is **deprecated** and stays for one release; responses carry `Deprecation`/`Sunset`. |
 
 ## Verification limits
 

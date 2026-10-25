@@ -66,9 +66,13 @@ func (r *ContentReader) ReadContent(ctx context.Context, node store.Node, maxByt
 	// Open through the layout abstraction rather than the filesystem: the two layouts differ in how
 	// bytes are addressed, and an extractor that assumed one of them would silently index nothing on
 	// the other.
+	//
+	// Owner + Path, not Hash: both shipped layouts resolve a node through the metadata by that pair
+	// (the blob layout's Open asks its resolver for the address, the tree layout builds the path),
+	// so this one call is correct on both. Setting a fabricated Hash here would be worse than
+	// leaving it zero — it would look like an address and be one nobody computed.
 	rc, err := r.content.Open(ctx, layout.Node{
-		Owner: node.OwnerID.String(), Path: path,
-		Hash: blobHashOf(node), Size: node.Size,
+		Owner: node.OwnerID.String(), Path: path, Size: node.Size,
 	})
 	if err != nil {
 		return "", err
@@ -93,6 +97,48 @@ func (r *ContentReader) ReadContent(ctx context.Context, node store.Node, maxByt
 		return extractPDFText(raw), nil
 	}
 	return normaliseText(raw), nil
+}
+
+// PathOfNodeForIndex is the content-path resolver the indexer needs.
+//
+// It is exported because the worker lives in another package and the resolution has to be the
+// SERVER's: the content path is derived from the metadata by the same walk the download path uses,
+// and a second implementation in the worker would be a second answer to "where are this node's
+// bytes" — which is exactly the class of divergence that made an earlier version index nothing on
+// the tree layout.
+//
+// The store is a parameter rather than a Server field so the worker's own wiring can call it
+// without constructing a Server.
+func PathOfNodeForIndex(meta store.Store) func(ctx context.Context, node store.Node) (string, error) {
+	return func(ctx context.Context, node store.Node) (string, error) {
+		var chain []store.Node
+		cur := node
+		for depth := 0; depth < 256; depth++ {
+			chain = append([]store.Node{cur}, chain...)
+			if cur.ParentID == nil {
+				break
+			}
+			var parent store.Node
+			if err := meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+				got, gerr := tx.NodeIncludingTrashed(ctx, *cur.ParentID)
+				parent = got
+				return gerr
+			}); err != nil {
+				return "", err
+			}
+			cur = parent
+		}
+		// The owner's root has an empty name; including it would produce a leading slash, which the
+		// tree layout refuses outright.
+		segs := make([]string, 0, len(chain))
+		for _, n := range chain {
+			if n.Name == "" {
+				continue
+			}
+			segs = append(segs, n.Name)
+		}
+		return strings.Join(segs, "/"), nil
+	}
 }
 
 // isPDF reports whether a document is a PDF.
@@ -255,12 +301,4 @@ func isMostlyPrintable(s string) bool {
 		}
 	}
 	return total > 0 && printable*10 >= total*8
-}
-
-// blobHashOf returns a node's content address when the store knows one.
-func blobHashOf(node store.Node) [32]byte {
-	var out [32]byte
-	// The blob layout resolves content through the metadata rather than through this field, so a
-	// zero hash here is correct: ContentStore.Open consults the resolver for that layout.
-	return out
 }

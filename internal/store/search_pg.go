@@ -79,31 +79,38 @@ func (s *PG) SearchNodes(ctx context.Context, ownerID uuid.UUID, q SearchQuery) 
 
 	// The keyset predicate, expressed per ordering. `>` for an ascending walk, `<` for a descending
 	// one, with the id as the tie-break in the same direction as the ordering.
+	//
+	// The key is passed as TEXT and cast inside the statement, for one specific reason: when there
+	// is no cursor the predicate is absent, and an unreferenced parameter leaves PostgreSQL unable
+	// to infer its type. A text parameter with an explicit cast in each form means the no-cursor
+	// case binds an unused NULL of a known type rather than a placeholder of none.
 	var keyset string
-	var cursorKey, cursorID any
+	var cursorKey *string
+	var cursorID any
 	if cursor.ID != "" {
 		cursorID = uuid.MustParse(cursor.ID)
+		key := cursor.Key
 		switch sortKey {
 		case SearchSortName:
 			keyset = `AND (lower(n.name), n.id) > ($10::text, $11::uuid)`
-			cursorKey = cursor.Key
+			cursorKey = &key
 		case SearchSortSize:
 			keyset = `AND (n.size, n.id) < ($10::bigint, $11::uuid)`
-			cursorKey, err = strconv.ParseInt(cursor.Key, 10, 64)
-			if err != nil {
+			if _, perr := strconv.ParseInt(key, 10, 64); perr != nil {
 				return SearchPage{}, errInvalidCursorValue()
 			}
+			cursorKey = &key
 		default:
 			keyset = `AND (n.modified_at, n.id) < ($10::timestamptz, $11::uuid)`
-			nanos, perr := strconv.ParseInt(cursor.Key, 10, 64)
-			if perr != nil {
+			if _, perr := strconv.ParseInt(key, 10, 64); perr != nil {
 				return SearchPage{}, errInvalidCursorValue()
 			}
-			cursorKey = time.Unix(0, nanos).UTC()
+			cursorKey = &key
 		}
 	} else {
-		// Parameters 10 and 11 still have to be bound, even unused, or the driver rejects the
-		// statement for a missing argument. NULL makes every clause a no-op.
+		// Parameters 10 and 11 must still be bound AND typed, or the driver rejects the statement.
+		// The clauses below are always true, so an absent cursor changes no result.
+		keyset = `AND ($10::text IS NULL OR TRUE) AND ($11::uuid IS NULL OR TRUE)`
 		cursorKey, cursorID = nil, nil
 	}
 
@@ -122,15 +129,16 @@ func (s *PG) SearchNodes(ctx context.Context, ownerID uuid.UUID, q SearchQuery) 
 	}
 
 	query := `
-		WITH hit AS (
-		    SELECT n.id
+		WITH RECURSIVE hit AS (
+		    SELECT n.id AS hit_id
 		    FROM nodes n
 		    WHERE n.owner_id = $1
 		      AND n.trashed_at IS NULL
 		      -- A namespace root has no name and cannot be opened, so it is never a result. It only
 		      -- became reachable once an empty q started meaning "list what the filters allow".
 		      AND n.parent_id IS NOT NULL
-		      AND (strpos(lower(n.name), lower($2)) > 0)		      AND ($3::text IS NULL OR n.kind = $3)
+		      AND (strpos(lower(n.name), lower($2)) > 0)
+		      AND ($3::text IS NULL OR n.kind = $3)
 		      AND ($4::text IS NULL OR (n.kind = 'file' AND lower(n.mime) LIKE $4 || '%'))
 		      AND ($5::bigint <= 0 OR n.size >= $5)
 		      AND ($6::bigint <= 0 OR n.size <= $6)
@@ -144,8 +152,10 @@ func (s *PG) SearchNodes(ctx context.Context, ownerID uuid.UUID, q SearchQuery) 
 		    ` + orderBy + `
 		    LIMIT $13
 		), up(origin, id, parent_id, name, depth) AS (
-		    SELECT id, n.id, n.parent_id, n.name, 0
-		    FROM nodes n JOIN hit h ON h.id = n.id
+		    -- The origin is the HIT id; the id column is the ancestor's. Naming both explicitly is
+		    -- what stops the recursive arm from being ambiguous with the CTE above.
+		    SELECT h.hit_id, n.id, n.parent_id, n.name, 0
+		    FROM nodes n JOIN hit h ON h.hit_id = n.id
 		    UNION ALL
 		    SELECT up.origin, p.id, p.parent_id, p.name, up.depth + 1
 		    FROM nodes p JOIN up ON p.id = up.parent_id
@@ -159,7 +169,7 @@ func (s *PG) SearchNodes(ctx context.Context, ownerID uuid.UUID, q SearchQuery) 
 		SELECT ` + nodeColumnsQualified("n") + `,
 		       COALESCE(chains.dirs || '/', '') || n.name AS path
 		FROM nodes n
-		JOIN hit h ON h.id = n.id
+		JOIN hit h ON h.hit_id = n.id
 		LEFT JOIN chains ON chains.origin = n.id
 		` + orderBy + ``
 

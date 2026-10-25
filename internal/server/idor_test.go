@@ -118,6 +118,10 @@ type idorVictim struct {
 	commentID   uuid.UUID
 	commentBody string
 	tagID       uuid.UUID
+
+	// A tus session the victim started (core-scope §1), for the same reason as uploadID: the
+	// manager is in-memory, so the harness has to hold the reference.
+	tusID string
 }
 
 // jsonReader encodes a body for a case that needs one.
@@ -198,6 +202,14 @@ func buildVictim(t *testing.T, h *harness) *idorVictim {
 		t.Fatalf("victim upload session: %v", err)
 	}
 	v.uploadID = sess.ID
+
+	// A tus session (core-scope §1), created through the same manager. It is a different session
+	// from uploadID because the two protocols have their own verbs, and the table probes both.
+	tus, terr := h.uploads.Create(v.user.ID, "", "tus-in-progress.bin", 4096)
+	if terr != nil {
+		t.Fatalf("victim tus session: %v", terr)
+	}
+	v.tusID = tus.ID
 
 	// A comment the victim wrote on their own file, and a personal tag they defined. Both are
 	// addressed by id like everything else, so the table above must prove the intruder cannot reach
@@ -563,6 +575,63 @@ func TestIDORIsRefusedOnEveryRouteThatTakesAnID(t *testing.T) {
 				}
 			},
 		},
+
+		// The tus endpoints (core-scope §1). They address a session by id, and a session is a
+		// half-written file: reaching somebody else's is both a denial of service and a way to
+		// publish bytes into their namespace. Every verb is in the table because the manager's
+		// ownership check is per call, and one verb that forgot it would be enough.
+		{
+			name:   "read another account's tus session",
+			method: http.MethodHead,
+			path:   func(v *idorVictim) string { return "/api/files/tus/" + v.tusID },
+			headers: func(v *idorVictim) map[string]string {
+				return map[string]string{"Tus-Resumable": "1.0.0"}
+			},
+			secrets: func(v *idorVictim) []string {
+				return append(priv, "tus-in-progress.bin")
+			},
+		},
+		{
+			name:   "append to another account's tus session",
+			method: http.MethodPatch,
+			path:   func(v *idorVictim) string { return "/api/files/tus/" + v.tusID },
+			body:   func() io.Reader { return strings.NewReader("intruder bytes") },
+			headers: func(v *idorVictim) map[string]string {
+				return map[string]string{
+					"Tus-Resumable": "1.0.0",
+					"Upload-Offset": "0",
+					"Content-Type":  "application/offset+octet-stream",
+				}
+			},
+			secrets: func(v *idorVictim) []string {
+				return append(priv, "tus-in-progress.bin")
+			},
+			stillIntact: func(t *testing.T, h *harness, v *idorVictim) {
+				sess, err := h.uploads.Get(v.user.ID, v.tusID)
+				if err != nil {
+					t.Fatalf("the victim's tus session vanished: %v", err)
+				}
+				if sess.Offset != 0 {
+					t.Fatalf("the intruder appended %d bytes to the victim's tus session", sess.Offset)
+				}
+			},
+		},
+		{
+			name:   "terminate another account's tus session",
+			method: http.MethodDelete,
+			path:   func(v *idorVictim) string { return "/api/files/tus/" + v.tusID },
+			headers: func(v *idorVictim) map[string]string {
+				return map[string]string{"Tus-Resumable": "1.0.0"}
+			},
+			secrets: func(v *idorVictim) []string {
+				return append(priv, "tus-in-progress.bin")
+			},
+			stillIntact: func(t *testing.T, h *harness, v *idorVictim) {
+				if _, err := h.uploads.Get(v.user.ID, v.tusID); err != nil {
+					t.Fatalf("the intruder destroyed the victim's tus session: %v", err)
+				}
+			},
+		},
 	}
 
 	for _, tc := range cases {
@@ -631,6 +700,11 @@ func TestIDORTableCoversEveryIdRoute(t *testing.T) {
 		"DELETE /api/comments/{id}":     true,
 		"PATCH /api/tags/{id}":          true,
 		"DELETE /api/tags/{id}":         true,
+		// tus (core-scope §1). The session manager enforces ownership per verb, so each one is a
+		// separate case rather than an exemption: one verb that forgot the check would be enough.
+		"HEAD /api/files/tus/{id}":   true,
+		"PATCH /api/files/tus/{id}":  true,
+		"DELETE /api/files/tus/{id}": true,
 	}
 
 	// Id-addressed routes deliberately not in the table, each with the reason. An exemption has

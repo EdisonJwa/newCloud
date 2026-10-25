@@ -2,7 +2,10 @@ package dav
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"net/http"
 	"path"
 	"strings"
@@ -100,13 +103,46 @@ func (h *Handler) handleProppatch(w http.ResponseWriter, r *http.Request, a auth
 		return
 	}
 
+	// The one LIVE property a client may set: oc:favorite (core-scope §4).
+	//
+	// It is handled here rather than stored as a dead property because a favorite is per VIEWER —
+	// two people sharing a folder star independently — and a dead property is per node. Storing it
+	// as one would make the first client to press the star star it for everybody, which is the
+	// behaviour §4 exists to avoid.
+	//
+	// The rest of the oc: vocabulary (checksums, tags) stays read-only: a checksum is derived from
+	// the bytes and a tag assignment is a metadata write with its own permission rule, so a
+	// PROPPATCH that rewrote either would be a write path with a weaker check than the JSON API's.
+	var live []deadProp
 	var rejected []string
 	for _, p := range props {
-		if strings.EqualFold(p.Space, "DAV:") {
+		switch {
+		case strings.EqualFold(p.Space, "DAV:"):
 			// Reserved properties are computed from the node's own state; letting a
 			// client set them would let it lie about size or modification time,
 			// which breaks every caching client.
 			rejected = append(rejected, p.Name)
+		case strings.EqualFold(p.Space, ownCloudNS) && strings.EqualFold(p.Name, "favorite"):
+			live = append(live, p)
+		case strings.EqualFold(p.Space, ownCloudNS) && isLiveOwnCloudProp(p.Name):
+			// Read-only by decision, refused with a propstat note rather than silently dropped —
+			// §5 asks for exactly this for oc:tags, and consistency says the same for oc:checksums.
+			rejected = append(rejected, p.Name)
+		}
+	}
+
+	// The star write, in its own transaction, before the dead properties.
+	var liveErr error
+	if len(live) > 0 {
+		star := false
+		for _, p := range live {
+			if isTrue(p.Value) {
+				star = true
+			}
+		}
+		liveErr = h.setFavorite(r.Context(), node.ID, star)
+		if liveErr != nil {
+			h.logf("proppatch: setting oc:favorite failed for %s: %v", r.URL.Path, liveErr)
 		}
 	}
 
@@ -117,7 +153,7 @@ func (h *Handler) handleProppatch(w http.ResponseWriter, r *http.Request, a auth
 	// PROPPATCH succeeding to keep Win32LastModifiedTime and friends; a silent failure shows up
 	// later as properties that mysteriously do not persist across a reconnect.
 	var storeErr error
-	if len(rejected) == 0 {
+	if len(rejected) == 0 && len(live) == 0 {
 		storeErr = h.meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
 			for _, p := range props {
 				if err := tx.SetDeadProp(ctx, node.ID, p.Space, p.Name, p.Value); err != nil {
@@ -128,6 +164,26 @@ func (h *Handler) handleProppatch(w http.ResponseWriter, r *http.Request, a auth
 		})
 		if storeErr != nil {
 			h.logf("proppatch: storing dead properties failed for %s: %v", r.URL.Path, storeErr)
+		}
+	} else if len(rejected) == 0 && len(live) > 0 {
+		// The live properties were handled above; the remaining ones are dead properties that must
+		// still be stored, or a request that sets both would silently lose half of itself.
+		var deadOnly []deadProp
+		for _, p := range props {
+			if strings.EqualFold(p.Space, ownCloudNS) && isLiveOwnCloudProp(p.Name) {
+				continue
+			}
+			deadOnly = append(deadOnly, p)
+		}
+		if len(deadOnly) > 0 {
+			storeErr = h.meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
+				for _, p := range deadOnly {
+					if err := tx.SetDeadProp(ctx, node.ID, p.Space, p.Name, p.Value); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
 		}
 	}
 
@@ -148,6 +204,11 @@ func (h *Handler) handleProppatch(w http.ResponseWriter, r *http.Request, a auth
 			b.WriteString("<D:" + p.Name + "/>")
 		}
 		b.WriteString("</D:prop><D:status>HTTP/1.1 500 Internal Server Error</D:status></D:propstat>")
+	case liveErr != nil:
+		// The star could not be written. Reporting it in its own propstat is what tells the client
+		// which property failed rather than that "something" did.
+		b.WriteString(`<D:propstat><D:prop><oc:favorite xmlns:oc="` + ownCloudNS +
+			`"/></D:prop><D:status>HTTP/1.1 500 Internal Server Error</D:status></D:propstat>`)
 	case len(rejected) > 0:
 		b.WriteString("<D:propstat><D:prop>")
 		for _, name := range rejected {
@@ -174,6 +235,67 @@ type deadProp struct {
 // that matters and keeps the storage simple.
 func parseProppatchBody(body interface{ Read([]byte) (int, error) }) ([]deadProp, error) {
 	return parsePropUpdate(body)
+}
+
+// setChecksumHeader publishes a node's content address on a response (core-scope §2).
+//
+// Absent rather than zeroed when the address is unknown: a header of "SHA256:000…0" would be a
+// checksum nobody computed, and a client comparing against it would "verify" a corrupt file.
+func (h *Handler) setChecksumHeader(w http.ResponseWriter, ctx context.Context, node store.Node) {
+	reader, ok := h.meta.(store.SocialReader)
+	if !ok {
+		return
+	}
+	social, err := reader.SocialFor(ctx, node.OwnerID, []uuid.UUID{node.ID})
+	if err != nil {
+		return
+	}
+	sum := social[node.ID].SHA256
+	if len(sum) != sha256.Size {
+		return
+	}
+	w.Header().Set("OC-Checksum", "SHA256:"+hex.EncodeToString(sum))
+}
+
+// setFavorite stars or un-stars a node for the WebDAV caller (core-scope §4).
+//
+// The verb is a PROPPATCH on oc:favorite, which is how every NC-ecosystem client expresses a star.
+// The row is per VIEWER, so this writes the caller's own favorite and never touches anybody else's.
+func (h *Handler) setFavorite(ctx context.Context, nodeID uuid.UUID, star bool) error {
+	viewer, ok := actorFromContext(ctx)
+	if !ok {
+		return fmt.Errorf("dav: no actor for a favorite write")
+	}
+	return h.meta.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		if star {
+			return tx.SetFavorite(ctx, viewer, nodeID)
+		}
+		return tx.UnsetFavorite(ctx, viewer, nodeID)
+	})
+}
+
+// actorFromContext returns the caller recorded for this request.
+func actorFromContext(ctx context.Context) (uuid.UUID, bool) {
+	viewer, ok := ctx.Value(davActorKey{}).(uuid.UUID)
+	return viewer, ok
+}
+
+// davActorKey carries the authenticated account into the transaction callbacks that need it.
+//
+// The handler is stateless across requests by design (a stored "current user" would leak one
+// request's identity into another's), so the identity travels in the context instead.
+type davActorKey struct{}
+
+// isTrue reads the boolean a client wrote into a property value.
+//
+// Every spelling a client might use, because "true" and "1" both appear in the wild and a star that
+// silently did not stick is a bug report with no reproduction.
+func isTrue(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }
 
 // handleCopyMove implements COPY and MOVE.

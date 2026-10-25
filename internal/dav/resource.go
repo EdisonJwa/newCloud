@@ -2,6 +2,7 @@ package dav
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -64,6 +65,10 @@ func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request, a authz.Acto
 	w.Header().Set("ETag", etag)
 	w.Header().Set("Last-Modified", node.ModifiedAt.UTC().Format(http.TimeFormat))
 	w.Header().Set("Accept-Ranges", "bytes")
+	// The content address, so a WebDAV client can verify a download (core-scope §2: "GET/HEAD
+	// responses carry OC-Checksum"). Same header spelling the ownCloud/Nextcloud clients already
+	// understand, so a third-party verifier works here without knowing this server.
+	h.setChecksumHeader(w, r.Context(), node)
 	w.Header().Set("Content-Type", contentTypeFor(node))
 	// Content is never rendered as a document, even on this origin: the download
 	// path is the same one the content origin uses.
@@ -460,6 +465,10 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request, a authz.Acto
 	}
 
 	w.Header().Set("ETag", etag)
+	// A PUT response carries the checksum of what was actually stored (core-scope §2), so a client
+	// can verify its own upload without a second request. It is the hash of the STREAMED bytes, not
+	// of what the client claimed, which is what makes it evidence.
+	w.Header().Set("OC-Checksum", "SHA256:"+hex.EncodeToString(res.Hash[:]))
 	// RFC 4918 §9.7.1: a replaced resource answers 204, a created one 201. Saying 201 for both
 	// makes a client believe every save created a new file.
 	if existing != nil {

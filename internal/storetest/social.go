@@ -314,14 +314,13 @@ func tagSuite(t *testing.T, factory Factory) {
 			return nil
 		})
 
-		var err error
-		if werr := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+		// A failed statement aborts the PostgreSQL transaction, so the refusal has to travel as the
+		// WithTx error rather than being captured and swallowed — capturing it reports a healthy
+		// transaction that the server rolled back.
+		err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
 			_, cerr := tx.CreateTag(ctx, store.Tag{OwnerID: &owner, Name: "FINANCE", Color: "red"})
-			err = cerr
-			return nil
-		}); werr != nil {
-			t.Fatal(werr)
-		}
+			return cerr
+		})
 		if !errors.Is(err, store.ErrConflict) {
 			t.Fatalf("a tag differing only in case returned %v, want ErrConflict", err)
 		}
@@ -1760,6 +1759,11 @@ func backfillSuite(t *testing.T, factory Factory) {
 	t.Run("NodesAfterWalksEveryRowExactlyOnce", func(t *testing.T) {
 		// The backfill's whole correctness argument: id is immutable, so a keyset on it neither
 		// repeats nor skips a row across a walk that spans many passes.
+		//
+		// The walk is over the WHOLE table, not just this account's rows, because that is what the
+		// backfill is: a global pass so a fresh engine converges. PostgreSQL shares its table across
+		// subtests, so the assertion is "the order is total and strictly increasing, and each of MY
+		// rows appears exactly once" rather than "the walk returns exactly five rows".
 		s, owner := factory(t)
 		r := rootOf(t, s, owner)
 		want := map[uuid.UUID]bool{}
@@ -1769,8 +1773,9 @@ func backfillSuite(t *testing.T, factory Factory) {
 		}
 
 		seen := map[uuid.UUID]int{}
+		prev := uuid.Nil
 		cursor := uuid.Nil
-		for pass := 0; pass < 10; pass++ {
+		for pass := 0; pass < 2000; pass++ {
 			var got []store.Node
 			if err := s.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
 				list, err := tx.NodesAfter(ctx, cursor, 2)
@@ -1783,7 +1788,14 @@ func backfillSuite(t *testing.T, factory Factory) {
 				break
 			}
 			for _, n := range got {
+				// Strictly increasing is the whole contract: a repeated or out-of-order id is what
+				// makes a keyset cursor return a row twice or skip one.
+				if n.ID.String() <= prev.String() && pass > 0 {
+					t.Fatalf("the walk returned %s after %s: the order is not strictly increasing",
+						n.ID, prev)
+				}
 				seen[n.ID]++
+				prev = n.ID
 			}
 			cursor = got[len(got)-1].ID
 		}

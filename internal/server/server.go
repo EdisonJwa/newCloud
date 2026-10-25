@@ -340,6 +340,10 @@ func (s *Server) Handler() http.Handler {
 				r.Post("/restore", s.handleRestore)
 				r.Get("/thumbnail", s.handleThumbnail)
 				r.Route("/uploads", func(r chi.Router) {
+					// DEPRECATION (core-scope §1): the bespoke protocol below stays for exactly
+					// one release, marked deprecated, then is removed. The header pair is what a
+					// client can act on; a changelog entry is not.
+					r.Use(s.deprecateUploads)
 					r.Post("/", s.handleUploadCreate)
 					// Status is what makes resume correct once chunks can be acknowledged out of
 					// order: the contiguous offset alone cannot name the holes.
@@ -348,6 +352,18 @@ func (s *Server) Handler() http.Handler {
 					r.Post("/{id}/complete", s.handleUploadComplete)
 					r.Delete("/{id}", s.handleUploadAbort)
 				})
+				// tus 1.0.0 (core-scope §1, ADR-0015). The durability machinery is the same session
+				// manager the routes above use; only the wire protocol changed.
+				//
+				// OPTIONS is answered without a session: a client has to discover the endpoint before
+				// it has any reason to authenticate, and the answer says nothing about the caller's
+				// data. It sits inside this group anyway, because every other tus verb needs one and
+				// a probe from an anonymous caller is not worth a second route group.
+				r.Options("/tus", s.handleTusOptions)
+				r.Post("/tus", s.handleTusCreate)
+				r.Head("/tus/{id}", s.handleTusHead)
+				r.Patch("/tus/{id}", s.handleTusPatch)
+				r.Delete("/tus/{id}", s.handleTusDelete)
 				r.Get("/versions", s.handleVersions)
 				// Historical content: §8.1 lists 版本下载 among the entry points that must follow the same
 				// authorization as everything else.

@@ -66,6 +66,14 @@ var drillTables = []string{
 	// ADR-0013 Phase 1: the operation journal, durable content references and the
 	// singleton lease are part of a consistent restore, not transient cache.
 	"operations", "content_refs", "consistency_lease",
+	// ADR-0014 and ADR-0015: external mounts and the login-flow handshake. Both tables existed and
+	// neither was being checked — the same gap this list has now closed three times, each time found
+	// by TestDrillCoversEveryTable rather than by anybody noticing.
+	"mounts", "login_flows",
+	// Core-scope §4, §5, §6: the social substrate. These are USER DATA rather than cache. A restore
+	// that lost a favorite, a label or a discussion would lose things people wrote, and the row
+	// counts are what proves a backup carried them.
+	"favorites", "tags", "node_tags", "comments",
 }
 
 // drillAuditTables are the partitioned audit tables, counted via their parent.

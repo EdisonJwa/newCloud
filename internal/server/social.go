@@ -334,7 +334,7 @@ func (s *Server) handleTagCreate(w http.ResponseWriter, r *http.Request) {
 		})
 	})
 	if err != nil {
-		s.writeStoreError(w, err)
+		s.writeTagRefusal(w, err, "no such tag")
 		return
 	}
 	writeJSON(w, http.StatusCreated, toTagJSON(created))
@@ -508,9 +508,18 @@ func (s *Server) handleNodeTagChange(w http.ResponseWriter, r *http.Request, ass
 			return store.ErrNotFound
 		}
 		if assign {
-			return tx.AssignTag(ctx, nodeID, tagID, actor.ID())
+			if aerr := tx.AssignTag(ctx, nodeID, tagID, actor.ID()); aerr != nil {
+				return aerr
+			}
+		} else {
+			if uerr := tx.UnassignTag(ctx, nodeID, tagID); uerr != nil {
+				return uerr
+			}
 		}
-		return tx.UnassignTag(ctx, nodeID, tagID)
+		// The tag set is an indexed field (core-scope §7.2), so a change to it re-indexes the
+		// document — in the same transaction, or a tag filter would keep matching a node that no
+		// longer carries the tag.
+		return enqueueSearchIndex(ctx, tx, nodeID)
 	})
 	if err != nil {
 		s.writeTagRefusal(w, err, "no such tag")

@@ -45,6 +45,7 @@ import (
 	"github.com/EdisonJwa/newCloud/internal/metrics"
 	"github.com/EdisonJwa/newCloud/internal/mount"
 	"github.com/EdisonJwa/newCloud/internal/password"
+	"github.com/EdisonJwa/newCloud/internal/search"
 	"github.com/EdisonJwa/newCloud/internal/server"
 	"github.com/EdisonJwa/newCloud/internal/share"
 	"github.com/EdisonJwa/newCloud/internal/storage/blobstore"
@@ -632,6 +633,37 @@ func serve() error {
 			"user_mounts", cfg.Mounts.AllowUserMounts)
 	}
 
+	// The OPTIONAL content-search engine (core-scope §7.2, ADR-0016).
+	//
+	// Built only when search.engine says so, and it performs no I/O at construction: an engine that
+	// is down at startup must not stop the process, because name-and-filter search works without it
+	// and content queries answer `degraded: true` rather than failing. The same decision as external
+	// mounts — a deployment that did not opt in carries no client, no credential and no routes.
+	var searchEngine search.Engine
+	if cfg.SearchEnabled() {
+		es := search.NewES(search.ESConfig{
+			URLs:               cfg.Search.Elasticsearch.URLs,
+			Username:           cfg.Search.Elasticsearch.Username,
+			Password:           cfg.Search.Elasticsearch.Password,
+			IndexPrefix:        cfg.Search.Elasticsearch.IndexPrefix,
+			InsecureSkipVerify: cfg.Search.Elasticsearch.InsecureSkipVerify,
+			Timeout:            cfg.Search.Elasticsearch.Timeout(),
+		}, func(format string, args ...any) { log.Debug(fmt.Sprintf(format, args...)) })
+		searchEngine = es
+		log.Info("content search enabled",
+			"engine", "elasticsearch",
+			"urls", strings.Join(cfg.Search.Elasticsearch.URLs, ","),
+			"index", es.IndexName(),
+			"content_types", strings.Join(cfg.Search.ContentTypes, ","),
+			"index_bytes", cfg.Search.IndexBytes)
+	} else {
+		// Named at startup for the same reason the scrub's absence is: an operator who believes
+		// full-text search is on and one who never configured it look identical from outside, and
+		// the difference is the thing a user complains about.
+		log.Info("content search disabled: name and filter search are available; content queries " +
+			"answer with mode=name and degraded=true")
+	}
+
 	deps := server.Deps{
 		Config:  cfg,
 		Meta:    meta,
@@ -654,6 +686,7 @@ func serve() error {
 		Uploads:      uploads,
 		Metrics:      reg,
 		Mounts:       mounts,
+		Search:       searchEngine,
 		Log:          log,
 		Version:      version,
 	}
@@ -677,6 +710,17 @@ func serve() error {
 	// anything here; the queries are written to tolerate it.
 	wk := worker.New(meta, log).WithRetention(cfg.Limits.VersionRetention(), cfg.Limits.TrashRetention())
 	wk.WithMetrics(reg)
+
+	// The content indexer (core-scope §7.2). Wired whenever an engine exists, because a deployment
+	// that turned the engine on must not also have to remember a second switch to make it fill.
+	//
+	// The reader is the server's own text extractor over the configured content store, so the
+	// extractor and the download path agree about where a node's bytes live — the two-layout
+	// addressing problem that made an earlier version index nothing on the tree layout.
+	if searchEngine != nil {
+		wk.WithContentSearch(searchEngine, server.NewContentReader(content,
+			server.PathOfNodeForIndex(meta)), cfg.Search.ContentTypes, cfg.Search.IndexBytes)
+	}
 
 	// §4.3's retained-history cap is a CONFIGURED limit, not only a runtime setting.
 	//

@@ -22,8 +22,8 @@ func TestLimitationsJobKindCountMatchesTheWorker(t *testing.T) {
 	w := worker.NewForTest()
 	kinds := w.JobKinds()
 
-	if len(kinds) != 3 {
-		t.Fatalf("docs/guides/limitations.md says three registered job kinds; the worker has %d: %v",
+	if len(kinds) != 4 {
+		t.Fatalf("docs/guides/limitations.md says four registered job kinds; the worker has %d: %v",
 			len(kinds), kinds)
 	}
 	// Named, so a replacement that keeps the count but changes the catalogue still shows up in the
@@ -32,6 +32,9 @@ func TestLimitationsJobKindCountMatchesTheWorker(t *testing.T) {
 		"blob.collect":           true,
 		"thumbnail.warm":         true,
 		"user.purge_credentials": true,
+		// core-scope §7.2: the incremental index write. Registered even when no engine is
+		// configured, so a queued job is completed rather than dead-lettered.
+		"search.index": true,
 	}
 	for _, k := range kinds {
 		if !want[k] {

@@ -170,17 +170,15 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 		next = children[len(children)-1].Name
 	}
 
-	markers := s.nodeMarkers(r.Context(), actor.ID(), children)
-
 	out := make([]fileJSON, 0, len(children))
 	for _, c := range children {
-		item := toFileJSON(c, path.Join(rel, c.Name))
-		if m, ok := markers[c.ID]; ok {
-			item.ShareCount = m.ShareCount
-			item.HasVersions = m.HasVersions
-		}
-		out = append(out, item)
+		out = append(out, toFileJSON(c, path.Join(rel, c.Name)))
 	}
+	// The provenance and social markers (share count, versions, star, tags, checksum) in one batch
+	// for the whole page. Going through annotate rather than setting them inline is what keeps the
+	// listing and every other row-rendering endpoint from drifting apart — the star and the checksum
+	// were each added to one caller at a time before this.
+	s.annotate(r.Context(), actor.ID(), out, children, nil)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"path":     path.Join("/", rel),
@@ -395,17 +393,48 @@ func (s *Server) publishFile(
 		node = n
 
 		bytes := res.Size
-		return tx.Audit(ctx, store.AuditEntry{
+		if aerr := tx.Audit(ctx, store.AuditEntry{
 			ActorKind: "user", ActorUserID: actor.Ptr(), ActorEmail: actor.Email(),
 			ActorIP: clientIP(r), UserAgent: r.UserAgent(),
 			Action: "file.write", TargetKind: "node", TargetID: node.ID.String(),
 			Result: "ok", Bytes: &bytes, Metadata: map[string]any{"name": name},
-		})
+		}); aerr != nil {
+			return aerr
+		}
+		// The index follows the write, in the same transaction (core-scope §7.2).
+		//
+		// In the SAME transaction because the enqueue is part of the change: a publish that commits
+		// without its index job would leave the document unfindable until a backfill pass reached it,
+		// and a publish that rolls back with its job would ask the indexer to index a document that
+		// never existed. Enqueue only — nothing here waits for the engine, which is what keeps a
+		// broken index from failing a write.
+		return enqueueSearchIndex(ctx, tx, node.ID)
 	})
 	if err != nil {
 		return store.Node{}, err
 	}
 	return node, nil
+}
+
+// enqueueSearchIndex asks the worker to bring one document's index entry up to date.
+//
+// It is a no-op that reports success when no engine is configured, because the caller must not have
+// to know whether the deployment has one: a write path with an "if engine != nil" around its
+// indexing would be a write path with a branch nobody exercises.
+//
+// The dedupe key is the node id, so ten rapid saves of one file collapse into one pending job. That
+// is what makes the queue bounded by the number of FILES rather than by the number of writes.
+func enqueueSearchIndex(ctx context.Context, tx store.Tx, nodeID uuid.UUID) error {
+	return tx.Enqueue(ctx, store.Job{
+		Kind: "search.index",
+		Payload: map[string]any{
+			"node_id": nodeID.String(),
+		},
+		DedupeKey: "search:" + nodeID.String(),
+		// One attempt beyond the default is not warranted: the handler reads current state, so a
+		// retry after a transient engine outage is already covered by the backfill.
+		MaxAttempts: 5,
+	})
 }
 
 // nodeFor builds the content-store node a path maps to.
@@ -578,6 +607,18 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Verify-on-upload (core-scope §2): a client-supplied `X-OC-Checksum: SHA256:<hex>` is compared
+	// against the streamed hash HERE, before publish.
+	//
+	// Before, not after, and that is the whole point: the acceptance criterion is "verify-on-upload
+	// refusal leaves the previous file untouched". A check after publishFile would have already
+	// replaced the file and kept a version of it, so a corrupt transfer would destroy the good copy
+	// it was supposed to protect. The bytes are staged and nothing references them yet, so refusing
+	// here leaves the namespace exactly as it was.
+	if !s.verifyUploadChecksum(w, r, res) {
+		return
+	}
+
 	mime := header.Header.Get("Content-Type")
 	if mime == "" || strings.HasPrefix(mime, "application/octet-stream") {
 		mime = guessType(name)
@@ -594,6 +635,10 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The checksum goes on the RESPONSE too (core-scope §2: "PUT responses carry OC-Checksum"), so a
+	// client that did not send X-OC-Checksum still learns the address of what it just stored and can
+	// compare it against its local copy without a second request.
+	setChecksumHeaders(w, res.Hash[:])
 	writeJSON(w, http.StatusCreated, toFileJSON(node, rel))
 }
 
@@ -862,6 +907,9 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("ETag", node.ETag)
 	w.Header().Set("Accept-Ranges", "bytes")
+	// The content address, so a client can verify what it received (core-scope §2). Set here rather
+	// than per route because this is the one place every download passes through.
+	setChecksumHeaders(w, s.nodeChecksum(r.Context(), node))
 
 	// ServeContent handles Range, If-Range, If-None-Match and If-Modified-Since against
 	// the seekable reader. The previous code advertised Accept-Ranges but streamed
@@ -1107,6 +1155,12 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 			if terr := tx.TrashCappedExpect(ctx, retired.ID, s.maxTrashBytes(ctx), expect); terr != nil {
 				return terr
 			}
+			// The index must forget it, in the same transaction (core-scope §7.2). The handler reads
+			// the node's CURRENT state, so a restore that lands before the job runs keeps the
+			// document indexed — the job is a reconciliation, not an instruction.
+			if ierr := enqueueSearchIndex(ctx, tx, retired.ID); ierr != nil {
+				return ierr
+			}
 			return tx.Audit(ctx, store.AuditEntry{
 				ActorKind: "user", ActorUserID: actor.Ptr(), ActorEmail: actor.Email(),
 				ActorIP: clientIP(r), UserAgent: r.UserAgent(),
@@ -1324,6 +1378,10 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 			return rerr
 		}
 		restored = n
+		// A restored document has to come back into the index; the trash job removed it.
+		if ierr := enqueueSearchIndex(ctx, tx, id); ierr != nil {
+			return ierr
+		}
 		return tx.Audit(ctx, store.AuditEntry{
 			ActorKind: "user", ActorUserID: actor.Ptr(), ActorEmail: actor.Email(),
 			ActorIP: clientIP(r), UserAgent: r.UserAgent(),
@@ -1524,6 +1582,106 @@ func (s *Server) handleRestoreVersion(w http.ResponseWriter, r *http.Request) {
 // adapter to the active storage layout.
 func (s *Server) maxVersions() int {
 	return s.deps.Config.Limits.MaxVersionsFor(s.deps.Content.Capabilities().CheapVersions)
+}
+
+// verifyUploadChecksum compares a client-supplied checksum against the bytes that were stored.
+//
+// Two header spellings are accepted, because two conventions exist in the wild:
+//
+//	X-OC-Checksum: SHA256:<hex>   the ownCloud/Nextcloud header (core-scope §2 names this one)
+//	OC-Checksum:   SHA256:<hex>   the response header this server emits, sent back by some clients
+//
+// A client that sends NO checksum is not refused: verification is opt-in, and demanding it would
+// break every existing upload. A client that sends a MALFORMED one is refused, because "I could not
+// read your checksum" is different from "you did not send one", and silently ignoring it would make
+// the feature look like it worked.
+//
+// Returns false when the caller must not continue (the response has been written).
+func (s *Server) verifyUploadChecksum(w http.ResponseWriter, r *http.Request, res layout.PutResult) bool {
+	raw := strings.TrimSpace(r.Header.Get("X-OC-Checksum"))
+	if raw == "" {
+		raw = strings.TrimSpace(r.Header.Get("OC-Checksum"))
+	}
+	if raw == "" {
+		return true
+	}
+
+	want, err := parseOCChecksum(raw)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_checksum", err.Error())
+		return false
+	}
+
+	if want != res.Hash {
+		// 422, and the code is `checksum_mismatch` so a client can distinguish "your bytes are
+		// wrong" from "your request was malformed". The staged content is unreferenced and the
+		// collector reclaims it; the file that was there before is untouched.
+		if s.deps.Metrics != nil {
+			s.deps.Metrics.ObserveUpload("checksum_mismatch")
+		}
+		writeError(w, http.StatusUnprocessableEntity, "checksum_mismatch",
+			fmt.Sprintf("the bytes do not match the declared checksum (server computed SHA256:%x)",
+				res.Hash[:]))
+		return false
+	}
+	return true
+}
+
+// parseOCChecksum reads an ownCloud-style "SHA256:<hex>" checksum.
+//
+// sha256 only, because it is the only hash this server computes and stores (core-scope §2). A
+// client that asks for md5 gets a clear refusal rather than a silent "verified" that verified
+// nothing.
+func parseOCChecksum(raw string) ([32]byte, error) {
+	var zero [32]byte
+	algo, hexPart, ok := strings.Cut(raw, ":")
+	if !ok {
+		return zero, fmt.Errorf(`the checksum must look like "SHA256:<hex>"`)
+	}
+	if !strings.EqualFold(strings.TrimSpace(algo), "sha256") {
+		return zero, fmt.Errorf("only SHA256 checksums are supported, got %q", algo)
+	}
+	hexPart = strings.TrimSpace(hexPart)
+	decoded, err := hex.DecodeString(hexPart)
+	if err != nil || len(decoded) != sha256.Size {
+		return zero, fmt.Errorf("a SHA256 checksum is %d hex characters", sha256.Size*2)
+	}
+	var out [32]byte
+	copy(out[:], decoded)
+	return out, nil
+}
+
+// setChecksumHeaders publishes the content address on a response (core-scope §2).
+//
+// `OC-Checksum` is the ownCloud/Nextcloud response header, so a third-party client that verifies a
+// download finds it without knowing anything about this server. It is set on GET, HEAD and PUT
+// responses — the three places a client receives or sends bytes.
+//
+// Absent rather than zeroed when the address is unknown: a header of
+// "SHA256:000…0" would be a checksum nobody computed, and a client comparing against it would
+// "verify" a corrupt file.
+func setChecksumHeaders(w http.ResponseWriter, sha []byte) {
+	if len(sha) != sha256.Size {
+		return
+	}
+	w.Header().Set("OC-Checksum", "SHA256:"+hex.EncodeToString(sha))
+}
+
+// nodeChecksum returns a node's content address, when the metadata store can supply it.
+//
+// One node, one lookup: this is used by the download path, which already has the node and needs the
+// hash for the response header. A batch listing uses SocialFor instead, so a directory of five
+// hundred files is one query rather than five hundred.
+func (s *Server) nodeChecksum(ctx context.Context, node store.Node) []byte {
+	reader, ok := s.deps.Meta.(store.SocialReader)
+	if !ok {
+		return nil
+	}
+	social, err := reader.SocialFor(ctx, node.OwnerID, []uuid.UUID{node.ID})
+	if err != nil {
+		return nil
+	}
+	return social[node.ID].SHA256
 }
 
 // writeStoreError maps metadata and storage errors onto HTTP status codes.

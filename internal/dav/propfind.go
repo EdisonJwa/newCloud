@@ -3,6 +3,8 @@ package dav
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -16,6 +18,14 @@ import (
 	"github.com/EdisonJwa/newCloud/internal/authz"
 	"github.com/EdisonJwa/newCloud/internal/store"
 )
+
+// ownCloudNS is the ownCloud/Nextcloud property namespace.
+//
+// The checksum, favorite and tag properties live here because that is where the ecosystem's clients
+// look for them (core-scope §2: "the ownCloud/Nextcloud property, so third-party clients find it").
+// A property this server invents in its own namespace would be discoverable only by a client
+// written for it, which defeats the interoperability reason for exposing them at all.
+const ownCloudNS = "http://owncloud.org/ns"
 
 // propfindRequest is the parsed request body.
 //
@@ -126,6 +136,25 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request, a authz
 		}
 	}
 
+	// One batch for the live social properties (core-scope §2, §4, §5): the checksum, the viewer's
+	// star and the node's tags. Asking per entry would be three queries per child on a listing of a
+	// thousand, which is the N+1 the dead-property batch above exists to avoid.
+	socialByNode := map[uuid.UUID]store.NodeSocial{}
+	if h.propfindWantsSocial(req) {
+		ids := make([]uuid.UUID, 0, len(children)+1)
+		ids = append(ids, node.ID)
+		for _, c := range children {
+			ids = append(ids, c.ID)
+		}
+		if social, serr := h.socialOfMany(r.Context(), cap.Actor().ID(), ids); serr == nil {
+			socialByNode = social
+		} else {
+			// A cosmetic loss, not a failed listing: a client that asked for the checksum gets it
+			// in the 404 propstat, which is the RFC-correct answer for "this server cannot say".
+			h.logf("propfind: social properties unavailable for %q: %v", r.URL.Path, serr)
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 	w.Header().Set("DAV", daClasses(h.cfg))
 	w.WriteHeader(http.StatusMultiStatus)
@@ -137,7 +166,7 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request, a authz
 	_, _ = bw.WriteString(`<D:multistatus xmlns:D="DAV:" xmlns:oc="http://owncloud.org/ns" xmlns:nc="http://nextcloud.org/ns">` + "\n")
 
 	writeEntry := func(n store.Node, href string, isRoot bool) {
-		h.writePropEntry(bw, req, n, href, cap, isRoot, locks, deadByNode[n.ID])
+		h.writePropEntry(bw, req, n, href, cap, isRoot, locks, deadByNode[n.ID], socialByNode[n.ID])
 	}
 
 	href := resourceHref(r, node)
@@ -178,7 +207,7 @@ func (h *Handler) listChildren(ctx context.Context, dir store.Node) ([]store.Nod
 // turned a large listing into one transaction per child.
 func (h *Handler) writePropEntry(w io.Writer, req propfindRequest, n store.Node,
 	href string, cap authz.Cap, isRoot bool, locks map[uuid.UUID][]store.Lock,
-	dead []store.DeadProp) {
+	dead []store.DeadProp, social store.NodeSocial) {
 
 	// A blank displayname is for the NAMESPACE ROOT, which genuinely has no name. Using the
 	// "is this the addressee" flag for it blanked the name of whatever was asked about, so a
@@ -291,6 +320,44 @@ func (h *Handler) writePropEntry(w io.Writer, req propfindRequest, n store.Node,
 		b.WriteString("</D:lockdiscovery>")
 	}
 
+	// The live social properties (core-scope §2, §4, §5), in the ownCloud/Nextcloud namespaces so
+	// third-party clients find them without a mapping table.
+	//
+	//   oc:checksums   "SHA256:<hex>" — the ownCloud property. The blob address IS the content hash,
+	//                  so this is surface plumbing rather than new hashing, and it is the reason the
+	//                  hash is computed identically on both layouts.
+	//   oc:favorite    "0"/"1" — a LIVE property, not a dead one: it is per viewer and derived from
+	//                  the favorites table, so storing it as a dead property would make it a
+	//                  per-NODE flag, which is exactly what §4 says it must not be.
+	//   oc:tags        space-separated names — read-only here. Assignment stays JSON because it is
+	//                  a metadata write with its own permission rule, and a PROPPATCH that silently
+	//                  rewrote somebody's labels would be a write path with a weaker check.
+	if req.AllProp || hasProp(req.Props, ownCloudNS, "checksums") {
+		// A directory has no content, so the property is omitted and lands in the 404 propstat.
+		if !n.IsDir() && len(social.SHA256) == sha256.Size {
+			b.WriteString("<oc:checksums><oc:checksum>SHA256:")
+			b.WriteString(hex.EncodeToString(social.SHA256))
+			b.WriteString("</oc:checksum></oc:checksums>")
+		}
+	}
+	if req.AllProp || hasProp(req.Props, ownCloudNS, "favorite") {
+		b.WriteString("<oc:favorite>")
+		if social.Starred {
+			b.WriteString("1")
+		} else {
+			b.WriteString("0")
+		}
+		b.WriteString("</oc:favorite>")
+	}
+	if req.AllProp || hasProp(req.Props, ownCloudNS, "tags") {
+		// An empty element is the correct answer for "no tags": omitting it makes "none" and "this
+		// server cannot say" indistinguishable, which is the state the dead-property emitter was in
+		// before it was fixed.
+		b.WriteString("<oc:tags>")
+		b.WriteString(xmlEscape(tagNames(social.Tags)))
+		b.WriteString("</oc:tags>")
+	}
+
 	// Dead properties come back, because otherwise PROPPATCH is write-only.
 	//
 	// The store has kept them (Windows Explorer and macOS Finder write per-file metadata there
@@ -343,6 +410,23 @@ func (h *Handler) writePropEntry(w io.Writer, req propfindRequest, n store.Node,
 // property is only emitted when the node actually HAS it, so "never set" lands in the 404
 // bucket where a client can see it.
 func (h *Handler) propIsEmitted(p propName, dead []store.DeadProp) bool {
+	// The live social properties are answered in the ownCloud namespace (core-scope §2, §4, §5).
+	//
+	// oc:checksums is claimed only when a value can be produced — a directory, or a file whose
+	// address is unknown, answers in the 404 propstat. oc:favorite and oc:tags are always answered
+	// because "0" and "" are meaningful values, and a client that asked for them must not see them
+	// vanish.
+	if strings.EqualFold(p.Space, ownCloudNS) {
+		switch strings.ToLower(p.Name) {
+		case "favorite", "tags":
+			return true
+		case "checksums":
+			// Claimed unconditionally here and emitted only when known; the caller's 404 propstat is
+			// what tells a client the value is unavailable, and a property that is sometimes listed
+			// and sometimes not is worse than one that is consistently answered.
+			return true
+		}
+	}
 	if !strings.EqualFold(p.Space, "DAV:") {
 		for _, d := range dead {
 			if strings.EqualFold(d.Name, p.Name) && strings.EqualFold(d.Space, p.Space) {
@@ -371,11 +455,70 @@ func (h *Handler) propfindWantsDead(req propfindRequest) bool {
 		return true
 	}
 	for _, p := range req.Props {
+		// The live social properties are NOT dead properties: they are answered from the metadata
+		// batch, so a request that names one of them must not trigger the dead-property query.
+		if strings.EqualFold(p.Space, ownCloudNS) && isLiveOwnCloudProp(p.Name) {
+			continue
+		}
 		if !strings.EqualFold(p.Space, "DAV:") {
 			return true
 		}
 	}
 	return false
+}
+
+// propfindWantsSocial reports whether a request could be asking for the live social properties.
+//
+// allprop asks for everything, and the three social properties are part of "everything a client may
+// see" — so they are fetched for a plain allprop too. They are one batch query, so the cost is a
+// constant, not a per-entry lookup.
+func (h *Handler) propfindWantsSocial(req propfindRequest) bool {
+	if req.AllProp {
+		return true
+	}
+	for _, p := range req.Props {
+		if strings.EqualFold(p.Space, ownCloudNS) && isLiveOwnCloudProp(p.Name) {
+			return true
+		}
+	}
+	return false
+}
+
+// isLiveOwnCloudProp reports whether a property in the ownCloud namespace is answered from metadata
+// rather than from the dead-property table.
+func isLiveOwnCloudProp(name string) bool {
+	switch strings.ToLower(name) {
+	case "checksums", "favorite", "tags":
+		return true
+	}
+	return false
+}
+
+// socialOfMany reads the live social properties of several nodes in one batch.
+func (h *Handler) socialOfMany(ctx context.Context, viewer uuid.UUID,
+	nodeIDs []uuid.UUID) (map[uuid.UUID]store.NodeSocial, error) {
+
+	reader, ok := h.meta.(store.SocialReader)
+	if !ok {
+		// A backend without the capability answers "cannot say" for every entry, which is what the
+		// empty map produces. Losing a decoration must never fail a listing.
+		return map[uuid.UUID]store.NodeSocial{}, nil
+	}
+	return reader.SocialFor(ctx, viewer, nodeIDs)
+}
+
+// tagNames renders a tag list as the space-separated form oc:tags uses.
+//
+// A tag name may contain a space (nothing forbids it), so a space-separated value is lossy in
+// principle. It is the format Nextcloud clients parse, and the lossy case is a tag with a space in
+// its name — which a client then shows as two tags. That is stated rather than hidden: the JSON API
+// is the authoritative surface for tags, and oc:tags is the compatibility read.
+func tagNames(tags []store.Tag) string {
+	names := make([]string, 0, len(tags))
+	for _, t := range tags {
+		names = append(names, t.Name)
+	}
+	return strings.Join(names, " ")
 }
 
 // deadPropsOfMany reads the dead properties of several nodes in one query, for a listing.

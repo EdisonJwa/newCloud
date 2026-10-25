@@ -334,6 +334,13 @@ func (s *Server) handleUploadComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Verify-on-upload for the resumable path (core-scope §2): the same header, the same comparison,
+	// the same refusal before publish. The two write paths share the check because a client that can
+	// verify one and not the other has a verification feature that depends on how it uploaded.
+	if !s.verifyUploadChecksum(w, r, res) {
+		return
+	}
+
 	mime := guessType(sess.Name)
 	// The precondition is re-evaluated here, at commit, not when the session was
 	// created: an upload can take hours, and the target may have been replaced
@@ -345,8 +352,37 @@ func (s *Server) handleUploadComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	setChecksumHeaders(w, res.Hash[:])
 	writeJSON(w, http.StatusCreated, toFileJSON(node, rel))
 }
+
+// deprecateUploads marks the bespoke protocol's responses as deprecated (core-scope §1).
+//
+// The spec asks for a `Deprecation`/`Sunset` header pair during the transition release, and that is
+// the only form of deprecation a client can ACT on: a changelog entry is read by a person who may
+// not be the one maintaining the client, while a header is read by the code. RFC 8594 defines
+// Sunset; `Deprecation` is the IETF draft spelling that tooling already recognises.
+//
+// The sunset date is deliberately a year out and stated as a fixed date rather than a countdown: a
+// relative window changes meaning every time the response is re-read, and "one release" is not
+// something a header can express.
+func (s *Server) deprecateUploads(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Deprecation", "true")
+		w.Header().Set("Sunset", uploadSunset)
+		// A machine-readable pointer at the replacement, so a client author does not have to guess
+		// which of the newer endpoints replaces which verb.
+		w.Header().Set("Link", `</api/files/tus>; rel="successor-version"`)
+		next.ServeHTTP(w, r)
+	})
+}
+
+// uploadSunset is when the bespoke chunked-upload endpoints stop being served.
+//
+// An HTTP date, per RFC 8594. It is set a year after the tus rollout so a client has a full release
+// cycle to move, which is the "exactly one release, marked deprecated" window §1 asks for expressed
+// as something a scheduler can read.
+const uploadSunset = "Sun, 25 Oct 2026 00:00:00 GMT"
 
 // handleUploadAbort discards a session.
 func (s *Server) handleUploadAbort(w http.ResponseWriter, r *http.Request) {

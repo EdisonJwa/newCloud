@@ -20,6 +20,7 @@ package upload
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -49,6 +50,15 @@ var (
 	// exceed limits.max_pending_upload_bytes. Distinct from ErrTooMany: one is "too many sessions",
 	// the other "too much outstanding data", and a client should react to them differently.
 	ErrPendingFull = errors.New("upload: pending uploads exceed the account limit")
+
+	// ErrChecksumMismatch is returned when a chunk does not match the client's declared digest
+	// (tus's checksum extension, core-scope §1).
+	//
+	// The chunk's bytes are written but NOT acknowledged: the range is removed from the session
+	// again, so the offset does not advance and a retry sends the same range. That ordering is the
+	// whole requirement — an acknowledged range that failed verification would tell the client the
+	// corrupt chunk is already there.
+	ErrChecksumMismatch = errors.New("upload: chunk checksum does not match")
 )
 
 // ConflictError reports that the chunk overlaps bytes the server already holds. Offset is the
@@ -105,7 +115,18 @@ type Session struct {
 	closing bool
 	// broken records a local staging-file failure that makes the session unusable. Such a session
 	// is reaped rather than offered for resume, because its bytes are of unknown provenance.
-	broken  bool
+	broken bool
+	// lengthSet records that a deferred length has been declared (tus creation-defer-length).
+	// Without it a client could re-declare the total after every chunk, making the per-file limit a
+	// suggestion rather than a bound.
+	lengthSet bool
+	// partial marks a tus concatenation part (core-scope §1).
+	//
+	// A partial is COMPLETE when it reaches its declared length, but complete is not the same as
+	// finished: it is one piece of a file whose final request has not arrived, so it must stay
+	// resumable and publishable by the join. Without this flag the PATCH that completed the part
+	// would publish it as a file of its own — a stray artefact per parallel chunk.
+	partial bool
 	touched time.Time
 	closed  bool
 }
@@ -140,6 +161,37 @@ type record struct {
 	Ranges  []Range   `json:"ranges"`
 	Created time.Time `json:"created"`
 	Touched time.Time `json:"touched"`
+	// LengthSet records a declared deferred length, so a restart does not let a client re-declare
+	// the total after bytes have landed (tus creation-defer-length, core-scope §1).
+	LengthSet bool `json:"length_set,omitempty"`
+	// Partial marks a tus concatenation part, so a restart does not turn one into a published file.
+	Partial bool `json:"partial,omitempty"`
+}
+
+// SetPartial marks a session as a tus concatenation part (core-scope §1).
+//
+// It is set right after creation and before any byte is written, and it is persisted so a restart
+// does not lose the distinction: a partial that came back as an ordinary session would be published
+// as its own file the moment it filled.
+func (m *Manager) SetPartial(owner uuid.UUID, id string) error {
+	s, err := m.Get(owner, id)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.closing {
+		return ErrNotFound
+	}
+	s.partial = true
+	return m.persist(s)
+}
+
+// IsPartial reports whether a session is a concatenation part.
+func (s *Session) IsPartial() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.partial
 }
 
 // Manager owns the sessions and their staging files.
@@ -355,6 +407,8 @@ func (m *Manager) recoverOne(id string, present map[string]bool) bool {
 	s := newSession(id, owner, r.Dir, r.Name, r.Total, r.Created, r.Touched, file)
 	s.Offset = offset
 	s.received = received
+	s.lengthSet = r.LengthSet
+	s.partial = r.Partial
 	m.sessions[id] = s
 	m.byOwner[owner]++
 	return true
@@ -722,7 +776,7 @@ func (m *Manager) persist(s *Session) error {
 	rec := record{
 		ID: s.ID, Owner: s.Owner.String(), Dir: s.Dir, Name: s.Name,
 		Total: s.Total, Offset: s.Offset, Ranges: cloneRanges(s.received),
-		Created: s.Created, Touched: s.touched,
+		Created: s.Created, Touched: s.touched, LengthSet: s.lengthSet, Partial: s.partial,
 	}
 	body, err := json.Marshal(rec)
 	if err != nil {
@@ -1147,4 +1201,239 @@ func (m *Manager) SetMaxPendingBytes(n int64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.maxPendingBytes = n
+}
+
+// SetLength records the size of a session whose length was deferred (tus creation-defer-length,
+// core-scope §1).
+//
+// The size arrives with the LAST chunk instead of at creation, so it is bounded here rather than by
+// the caller: a deferred session that could name any total afterwards would make the per-file limit
+// advisory. It may only be set ONCE and only before any byte is written — a session whose declared
+// length changed after bytes landed would have ranges that no longer mean anything.
+func (m *Manager) SetLength(owner uuid.UUID, id string, total int64) error {
+	if total < 0 {
+		return errors.New("upload: total size must not be negative")
+	}
+	s, err := m.Get(owner, id)
+	if err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed || s.closing {
+		return ErrNotFound
+	}
+	if s.Offset > 0 || len(s.received) > 0 {
+		// Bytes have been written against the cap. Shrinking the total below them would strand
+		// acknowledged ranges outside the file, and growing it would make the deferred declaration a
+		// suggestion.
+		return fmt.Errorf("upload: the length can only be set before any byte is written")
+	}
+	if s.lengthSet {
+		return fmt.Errorf("upload: the length is already set")
+	}
+	s.Total = total
+	s.lengthSet = true
+	if err := m.persist(s); err != nil {
+		return fmt.Errorf("upload: record the declared length: %w", err)
+	}
+	return nil
+}
+
+// AppendWithChecksum writes one chunk and verifies a client-supplied digest before acknowledging it.
+//
+// The verification is the tus checksum extension (core-scope §1). The ordering it must implement:
+//
+//	write the bytes → compute the digest → compare → ACKNOWLEDGE ONLY IF IT MATCHES
+//
+// A mismatch leaves the range unacknowledged, which is what makes the client's retry correct: the
+// server's reported offset is still the one before the chunk, so the retry sends the same range
+// rather than skipping a chunk that was never accepted.
+//
+// have is whether a digest was supplied at all: verification is opt-in, and a client that sent no
+// checksum is not a client whose chunk failed verification.
+func (m *Manager) AppendWithChecksum(ctx context.Context, owner uuid.UUID, id string, start int64,
+	r io.Reader, size int64, want [32]byte, have bool) (int64, error) {
+
+	if !have {
+		return m.Append(ctx, owner, id, start, r, size)
+	}
+
+	s, err := m.Get(owner, id)
+	if err != nil {
+		return 0, err
+	}
+
+	// The same admission checks Append makes, in the same order, so the two cannot disagree about
+	// which ranges are acceptable.
+	s.mu.Lock()
+	if s.closed || s.closing {
+		s.mu.Unlock()
+		return 0, ErrNotFound
+	}
+	if size < 0 {
+		s.mu.Unlock()
+		return s.Offset, errors.New("upload: chunk size is required")
+	}
+	if start < 0 || start > s.Total {
+		s.mu.Unlock()
+		return s.Offset, fmt.Errorf("upload: chunk starts outside the declared size %d", s.Total)
+	}
+	if size > s.Total-start {
+		s.mu.Unlock()
+		return s.Offset, fmt.Errorf("upload: chunk would exceed the declared size %d", s.Total)
+	}
+	if size == 0 {
+		offset := s.Offset
+		s.mu.Unlock()
+		return offset, nil
+	}
+
+	span := Range{Start: start, End: start + size}
+	if overlapsAny(s.received, span) || overlapsAny(s.inflight, span) {
+		offset, ranges := s.Offset, cloneRanges(s.received)
+		s.mu.Unlock()
+		return offset, &ConflictError{Offset: offset, Ranges: ranges}
+	}
+	s.inflight = append(s.inflight, span)
+	s.writers++
+	s.mu.Unlock()
+
+	hasher := sha256.New()
+	written, copyErr := s.writeChunk(ctx, span, io.TeeReader(r, hasher))
+
+	var syncErr error
+	if copyErr == nil && written == size {
+		syncErr = s.file.Sync()
+	}
+
+	s.mu.Lock()
+	s.removeInflightLocked(span)
+	s.writers--
+	if s.writers == 0 {
+		s.cond.Broadcast()
+	}
+
+	localErr := copyErr
+	if localErr == nil {
+		localErr = syncErr
+	}
+	if localErr != nil {
+		if errors.Is(localErr, os.ErrClosed) {
+			s.broken = true
+			s.closing = true
+		}
+		offset := s.Offset
+		s.mu.Unlock()
+		if s.broken {
+			m.reapBroken(s)
+		}
+		return offset, fmt.Errorf("upload: write chunk: %w", localErr)
+	}
+	if written != size {
+		offset := s.Offset
+		s.mu.Unlock()
+		return offset, fmt.Errorf("upload: short read: got %d of %d bytes", written, size)
+	}
+
+	// The comparison, BEFORE the range is acknowledged. The bytes are in the file either way; what
+	// the mismatch withholds is the ACKNOWLEDGEMENT, and a retry overwrites them.
+	var got [32]byte
+	copy(got[:], hasher.Sum(nil))
+	if got != want {
+		offset := s.Offset
+		s.mu.Unlock()
+		return offset, ErrChecksumMismatch
+	}
+
+	before := cloneRanges(s.received)
+	prevOffset, prevTouched := s.Offset, s.touched
+	s.addRangeLocked(span)
+	s.touched = m.now()
+	if err := m.persist(s); err != nil {
+		s.received = before
+		s.Offset = prevOffset
+		s.touched = prevTouched
+		offset := s.Offset
+		s.mu.Unlock()
+		return offset, fmt.Errorf("upload: record offset: %w", err)
+	}
+	offset := s.Offset
+	s.mu.Unlock()
+	return offset, nil
+}
+
+// Concatenate copies the bytes of finished partial sessions into one target session.
+//
+// This is the tus concatenation extension (core-scope §1): parallelism comes from several partial
+// uploads joined at the end, which replaces the out-of-order chunking the bespoke protocol offered.
+// The parts are read from their staging files and appended to the target's, so the target ends up
+// with the same bytes a sequential upload of the whole file would have produced — which is what
+// makes the existing publish path and its ETag invariant apply unchanged.
+func (m *Manager) Concatenate(owner uuid.UUID, targetID string, partIDs []string) error {
+	target, err := m.Get(owner, targetID)
+	if err != nil {
+		return err
+	}
+
+	// The parts are opened for reading and the target for writing, in that order, so a failure to
+	// read a part leaves the target untouched rather than half-written.
+	parts := make([]*os.File, 0, len(partIDs))
+	defer func() {
+		for _, f := range parts {
+			_ = f.Close()
+		}
+	}()
+
+	var total int64
+	for _, id := range partIDs {
+		sess, gerr := m.Get(owner, id)
+		if gerr != nil {
+			return gerr
+		}
+		sess.mu.Lock()
+		// A partial that is not complete would concatenate a hole into the middle of the file, which
+		// is worse than refusing: the result would look like a valid upload of the wrong bytes.
+		offset, _ := sess.Offset, sess.received
+		complete := sess.Total == 0 || offset == sess.Total
+		path := sess.stagingPath(m.dir)
+		sess.mu.Unlock()
+		if !complete {
+			return fmt.Errorf("upload: partial %s is not complete", id)
+		}
+		f, oerr := os.Open(path)
+		if oerr != nil {
+			return fmt.Errorf("upload: open partial %s: %w", id, oerr)
+		}
+		parts = append(parts, f)
+		total += offset
+	}
+
+	target.mu.Lock()
+	defer target.mu.Unlock()
+	if target.closed || target.closing {
+		return ErrNotFound
+	}
+	if target.Total != total {
+		return fmt.Errorf("upload: the joined parts hold %d bytes but the target declared %d",
+			total, target.Total)
+	}
+
+	for i, f := range parts {
+		written, cerr := io.Copy(&chunkWriter{file: target.file, off: target.Offset},
+			&ctxReader{ctx: context.Background(), r: f})
+		if cerr != nil {
+			return fmt.Errorf("upload: join part %d: %w", i, cerr)
+		}
+		target.addRangeLocked(Range{Start: target.Offset, End: target.Offset + written})
+	}
+	if err := target.file.Sync(); err != nil {
+		return fmt.Errorf("upload: sync the joined upload: %w", err)
+	}
+	if err := m.persist(target); err != nil {
+		return fmt.Errorf("upload: record the joined upload: %w", err)
+	}
+	return nil
 }

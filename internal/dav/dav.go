@@ -130,6 +130,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The actor's id travels in the context so a transaction callback can attribute a per-viewer
+	// write (the oc:favorite property, core-scope §4) without the handler holding per-request state.
+	// A field on the Handler would leak one request's identity into another's, which is the reason
+	// every other per-request value here is already in the context.
+	r = r.WithContext(context.WithValue(r.Context(), davActorKey{}, actor.ID()))
+
 	// The external fork (ADR-0014): a URL below a mount point never reaches the local
 	// handlers. Everything else — the whole local surface — is byte-for-byte unchanged
 	// when no mount service is wired.
