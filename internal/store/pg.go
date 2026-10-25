@@ -1248,28 +1248,52 @@ func (s *PG) Resolve(ctx context.Context, ownerID uuid.UUID, p string) ([]Node, 
 		return nil, err
 	}
 
-	root, err := s.Root(ctx, ownerID)
-	if err != nil {
-		return nil, err
-	}
-	out := []Node{root}
-	cur := root
+	// One round trip for the whole path. The per-segment loop this replaced paid the
+	// connection latency once per component, and resolution runs before every file
+	// operation: a six-deep path was seven queries. The recursive part joins only the
+	// child whose name matches the segment at its depth, so the walk visits at most one
+	// node per level; a missing or trashed segment simply stops the recursion, and the
+	// count check turns that into the same ErrNotFound the loop returned. The depth
+	// bound stops the iteration at the last segment, so a pathological name cycle
+	// cannot spin it. Empty segs still returns the root: the anchor row alone.
+	q := `
+		WITH RECURSIVE walk AS (
+		    SELECT n.*, 0 AS depth
+		    FROM nodes n
+		    WHERE n.owner_id = $1 AND n.parent_id IS NULL AND n.trashed_at IS NULL
+		    UNION ALL
+		    SELECT c.*, w.depth + 1
+		    FROM nodes c
+		    JOIN walk w ON c.parent_id = w.id
+		    WHERE c.trashed_at IS NULL
+		      AND w.depth < array_length($2::text[], 1)
+		      AND c.name = ($2::text[])[w.depth + 1]
+		)
+		SELECT ` + nodeColumnsQualified("walk") + ` FROM walk ORDER BY depth`
 
-	for _, seg := range segs {
-		child, err := s.childByName(ctx, cur.ID, seg)
-		if err != nil {
-			return nil, err
+	rows, err := s.pool.Query(ctx, q, ownerID, segs)
+	if err != nil {
+		return nil, translate(err)
+	}
+	defer rows.Close()
+
+	out := make([]Node, 0, len(segs)+1)
+	for rows.Next() {
+		// pgx.Rows satisfies pgx.Row, so the single-row scanner serves both shapes and
+		// the column list cannot drift between them.
+		n, serr := scanNode(rows)
+		if serr != nil {
+			return nil, serr
 		}
-		out = append(out, child)
-		cur = child
+		out = append(out, n)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, translate(err)
+	}
+	if len(out) != len(segs)+1 {
+		return nil, ErrNotFound
 	}
 	return out, nil
-}
-
-func (s *PG) childByName(ctx context.Context, parentID uuid.UUID, name string) (Node, error) {
-	const q = `SELECT ` + nodeColumns + ` FROM nodes
-		WHERE parent_id = $1 AND name = $2 AND trashed_at IS NULL`
-	return scanNode(s.pool.QueryRow(ctx, q, parentID, name))
 }
 
 func (s *PG) Usage(ctx context.Context, ownerID uuid.UUID) (int64, error) {

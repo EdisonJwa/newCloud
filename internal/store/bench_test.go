@@ -196,10 +196,10 @@ func BenchmarkListChildren(b *testing.B) { benchList(b, benchEnv) }
 // query plan.
 func BenchmarkListChildrenPostgreSQL(b *testing.B) { benchList(b, benchEnvPG) }
 
-// BenchmarkResolvePath measures the resolution a client does before every request, on a path
+// benchResolve measures the resolution a client does before every request, on a path
 // six segments deep.
-func BenchmarkResolvePath(b *testing.B) {
-	st, dir, owner := benchEnv(b, 100)
+func benchResolve(b *testing.B, env func(*testing.B, int) (store.Store, store.Node, uuid.UUID)) {
+	st, dir, owner := env(b, 100)
 	ctx := context.Background()
 
 	parent := dir.ID
@@ -207,11 +207,16 @@ func BenchmarkResolvePath(b *testing.B) {
 		next := mkdirBench(b, st, owner, parent, fmt.Sprintf("level-%d", i))
 		parent = next.ID
 	}
+	// The leaf references a real blob row: the memory backend would accept any UUID, but
+	// the PostgreSQL fixture would fault on nodes_blob_id_fkey, and the two variants must
+	// build the same tree. BlobIDFor is the entry point the upload path itself uses.
+	leafHash := [32]byte{9}
+	leafBlob := st.BlobIDFor(ctx, leafHash, 8)
 	if err := st.WithTx(ctx, func(ctx context.Context, tx store.Tx) error {
 		_, cerr := tx.CreateFile(ctx, store.NewFile{
 			OwnerID: owner, ParentID: parent, Name: "leaf.bin",
 			Size: 8, Mime: "text/plain", ETag: `"e"`,
-			BlobID: uuidPtr(), BlobHash: [32]byte{9},
+			BlobID: leafBlob, BlobHash: leafHash,
 		})
 		return cerr
 	}); err != nil {
@@ -226,6 +231,15 @@ func BenchmarkResolvePath(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkResolvePath is the six-segment resolution in memory.
+func BenchmarkResolvePath(b *testing.B) { benchResolve(b, benchEnv) }
+
+// BenchmarkResolvePathPostgreSQL is the same resolution on the backend a deployment runs.
+// The two differ by the round trip: the in-memory backend walks a map, while PostgreSQL pays
+// network latency per query, which is exactly the cost a path-walking resolver multiplies by
+// depth.
+func BenchmarkResolvePathPostgreSQL(b *testing.B) { benchResolve(b, benchEnvPG) }
 
 // BenchmarkCreateFile measures the write path a sync client hits hardest: one new file in one
 // transaction, the way the upload route does it. The fixture is rebuilt each iteration because a
