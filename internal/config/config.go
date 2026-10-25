@@ -294,6 +294,19 @@ type LimitsConfig struct {
 	// unlimited. Enforced by a sweep, not on the write path: refusing a save because the HISTORY is
 	// full would lose the content the user is trying to write.
 	MaxRetainedVersionBytes int64 `yaml:"max_retained_version_bytes"`
+	// Share policy (T1c, competitiveness-analysis): the deployment's sharing posture.
+	//
+	// All three default to zero = no policy, which is today's behaviour: a deployment that
+	// has not decided a sharing policy must not find one applied to it. Each key is also a
+	// runtime setting, so an administrator tightens the posture without a restart.
+	//
+	// ShareMaxExpirySeconds caps how long a share may live (0 = no cap). ShareDefaultExpirySeconds
+	// is applied when a share is created without an expiry (0 = leave it open). ShareRequirePassword
+	// is 0/1: when 1, link and email shares must carry a password — upload-only request shares are
+	// exempt, because a drop box posted publicly is a deliberate shape the password would defeat.
+	ShareMaxExpirySeconds     int64 `yaml:"share_max_expiry_seconds"`
+	ShareDefaultExpirySeconds int64 `yaml:"share_default_expiry_seconds"`
+	ShareRequirePassword      int64 `yaml:"share_require_password"`
 	// BlobScrubIntervalSeconds is how often the scrub runs. Zero uses the sweep cadence (6h).
 	//
 	// Separate from the sweep because corrupted content is urgent in a way unreferenced content is

@@ -132,6 +132,12 @@ limits:
   default_file_quota_bytes: 10737418240 # 10 GiB default per-user soft cap
   max_propfind_children: 100000        # protects a single huge directory
   upload_chunk_bytes: 268435456        # 256 MiB chunks
+  # Sharing posture (T1c). All three are also runtime settings (changeable without a
+  # restart) and all three default to 0 = no policy, so an unconfigured deployment keeps
+  # the behaviour it has today.
+  share_max_expiry_seconds: 0          # cap on how long any share may live (0 = no cap)
+  share_default_expiry_seconds: 0      # applied when a share is created without one (0 = none)
+  share_require_password: 0            # 1 = link and email shares must carry a password (drop boxes exempt)
   # Retained-usage caps (§4.3), separate from a user's logical quota. 0 means
   # unlimited, which is the safe default: a deployment that never set one must
   # not discover it by being unable to delete a file.

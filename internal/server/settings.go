@@ -42,6 +42,12 @@ const (
 	// accounts; changing those is the per-user quota endpoint, and conflating the two would make
 	// "change the default" quietly rewrite people's limits.
 	settingKeyDefaultQuota = "limits.default_file_quota_bytes"
+	// Share policy (T1c): the sharing posture keys. Grouped with the limits because they take
+	// effect on the next request, like every other runtime setting, and because an operator
+	// tightening a sharing posture mid-incident is exactly the case the runtime path exists for.
+	settingKeyShareMaxExpiry     = "limits.share_max_expiry_seconds"
+	settingKeyShareDefaultExpiry = "limits.share_default_expiry_seconds"
+	settingKeyShareRequirePass   = "limits.share_require_password"
 )
 
 // runtimeSetting is one key that takes effect without a restart.
@@ -84,6 +90,28 @@ var runtimeSettings = []runtimeSetting{
 		key:        settingKeyDefaultQuota,
 		configured: func(c config.Config) int64 { return c.Limits.DefaultFileQuotaBytes },
 		validate:   validateNonNegative,
+	},
+	{
+		key:        settingKeyShareMaxExpiry,
+		configured: func(c config.Config) int64 { return c.Limits.ShareMaxExpirySeconds },
+		validate:   validateNonNegative,
+	},
+	{
+		key:        settingKeyShareDefaultExpiry,
+		configured: func(c config.Config) int64 { return c.Limits.ShareDefaultExpirySeconds },
+		validate:   validateNonNegative,
+	},
+	{
+		key: settingKeyShareRequirePass,
+		configured: func(c config.Config) int64 {
+			return c.Limits.ShareRequirePassword
+		},
+		validate: func(v int64) error {
+			if v != 0 && v != 1 {
+				return fmt.Errorf("share_require_password is 0 or 1")
+			}
+			return nil
+		},
 	},
 }
 

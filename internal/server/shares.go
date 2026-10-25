@@ -212,9 +212,28 @@ func (s *Server) handleShareCreate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// The deployment's sharing posture (T1c), applied at the two places a share's exposure is
+	// decided: creation and the PATCH that can extend it. Refusals are decided BEFORE the
+	// share exists, in the same spirit as every other precondition here.
+	maxExpiry, defaultExpiry, requirePassword := s.sharePolicy(r.Context())
+	if requirePassword && kind != store.ShareRequest && body.Password == "" {
+		writeError(w, http.StatusUnprocessableEntity, "share_policy",
+			"this deployment requires a password on link and email shares")
+		return
+	}
+
 	var ttl time.Duration
 	if body.ExpiresIn > 0 {
+		if maxExpiry > 0 && time.Duration(body.ExpiresIn)*time.Second > maxExpiry {
+			writeError(w, http.StatusUnprocessableEntity, "share_policy",
+				fmt.Sprintf("this deployment caps share expiry at %s", maxExpiry))
+			return
+		}
 		ttl = time.Duration(body.ExpiresIn) * time.Second
+	} else if defaultExpiry > 0 {
+		// The default is the floor the deployment wants every share to have; the caller can
+		// still choose a SHORTER life explicitly, so it is applied only when they chose none.
+		ttl = defaultExpiry
 	}
 
 	created, err := s.deps.Shares.Create(r.Context(), share.NewShare{
@@ -287,6 +306,16 @@ func (s *Server) handleShareUpdate(w http.ResponseWriter, r *http.Request) {
 		MaxUploads   *int    `json:"max_uploads"`
 	}
 	if !decodeJSON(w, r, &body) {
+		return
+	}
+
+	// The max-expiry cap applies to an EXTENSION too (T1c): a share created under the policy
+	// could otherwise be stretched past it afterwards. Decided before the transaction, like
+	// every other refusal on this route — it needs only the requested value, not the row.
+	if patchMax, _, _ := s.sharePolicy(r.Context()); patchMax > 0 && body.ExpiresIn != nil &&
+		*body.ExpiresIn > 0 && time.Duration(*body.ExpiresIn)*time.Second > patchMax {
+		writeError(w, http.StatusUnprocessableEntity, "share_policy",
+			fmt.Sprintf("this deployment caps share expiry at %s", patchMax))
 		return
 	}
 
@@ -457,6 +486,27 @@ func (s *Server) pathOfShare(ctx context.Context, sh store.Share) string {
 
 func (s *Server) shareURL(token string) string {
 	return strings.TrimSuffix(s.deps.Config.Server.PublicURL, "/") + "/s/" + token
+}
+
+// sharePolicy reads the deployment's sharing posture (T1c): the three runtime settings that
+// govern what a share may look like. Every value defaults to off, which is the posture of a
+// deployment that has not decided one — the config file's zero and the settings table's
+// absence both mean "no policy", so tightening is always an explicit act.
+func (s *Server) sharePolicy(ctx context.Context) (maxExpiry, defaultExpiry time.Duration, requirePassword bool) {
+	max := s.deps.Settings.Int(ctx, s.deps.Meta, settingKeyShareMaxExpiry,
+		s.deps.Config.Limits.ShareMaxExpirySeconds)
+	def := s.deps.Settings.Int(ctx, s.deps.Meta, settingKeyShareDefaultExpiry,
+		s.deps.Config.Limits.ShareDefaultExpirySeconds)
+	req := s.deps.Settings.Int(ctx, s.deps.Meta, settingKeyShareRequirePass,
+		s.deps.Config.Limits.ShareRequirePassword)
+	if max > 0 {
+		maxExpiry = time.Duration(max) * time.Second
+	}
+	if def > 0 {
+		defaultExpiry = time.Duration(def) * time.Second
+	}
+	requirePassword = req == 1
+	return
 }
 
 // handleAppPasswordList lists the caller's credentials.
