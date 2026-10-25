@@ -1071,25 +1071,122 @@ func TestContentSearchDegradesHonestly(t *testing.T) {
 	}
 }
 
-// TestSearchCarriesTheListingMarkers is §7.1's "results carry the same markers as listings".
+// TestSearchCarriesTheListingMarkers is §7.1's "results carry the same markers as listings
+// (share_count, has_versions, starred, tags)".
+//
+// All four at once, because the requirement is that the search result and the listing row are the
+// SAME shape: a client that renders a file from either should not have to know which endpoint
+// produced it. Testing them one at a time would let one of them be dropped from the search path and
+// the others still pass — which is how a search result starts looking subtly poorer than a listing.
 func TestSearchCarriesTheListingMarkers(t *testing.T) {
 	h := newHarness(t)
 	h.uploadFile(t, "marked.txt", "bytes")
 	node := h.resolveNode(t, "marked.txt")
 
+	// starred
 	star := h.do(http.MethodPut, "/api/files/favorite?path=marked.txt", nil, nil)
 	star.Body.Close()
-	_ = node
 
-	resp := h.do(http.MethodGet, "/api/files/search?q=marked", nil, nil)
-	body := readBody(resp)
-	resp.Body.Close()
-	if !strings.Contains(body, `"starred":true`) {
-		t.Fatalf("a search hit does not carry its star marker: %s", body)
+	// tags
+	created := h.do(http.MethodPost, "/api/tags/",
+		jsonBody(t, map[string]any{"name": "marked-label"}),
+		map[string]string{"Content-Type": "application/json"})
+	tagBody := readBody(created)
+	created.Body.Close()
+	var tag struct {
+		ID string `json:"id"`
 	}
-	if !strings.Contains(body, `"sha256":"`) {
-		t.Fatalf("a search hit does not carry its content address: %s", body)
+	_ = json.Unmarshal([]byte(tagBody), &tag)
+	assign := h.do(http.MethodPost, "/api/nodes/"+node.ID.String()+"/tags",
+		jsonBody(t, map[string]any{"tag_id": tag.ID}),
+		map[string]string{"Content-Type": "application/json"})
+	assign.Body.Close()
+
+	// share_count
+	share := h.do(http.MethodPost, "/api/shares",
+		jsonBody(t, map[string]any{"path": "/marked.txt", "kind": "link"}),
+		map[string]string{"Content-Type": "application/json"})
+	shareBody := readBody(share)
+	share.Body.Close()
+	if share.StatusCode != http.StatusCreated && share.StatusCode != http.StatusOK {
+		t.Fatalf("creating a link to build the fixture: %d %s", share.StatusCode, shareBody)
 	}
+
+	// has_versions: a second upload of the same name creates a superseded version, on the blob
+	// layout the default harness uses.
+	h.uploadFile(t, "marked.txt", "bytes, revised")
+
+	// The SAME request answered twice: once through the listing, once through search. Comparing the
+	// two is what makes this an assertion about agreement rather than about one endpoint.
+	fromSearch := searchItem(t, h, "/api/files/search?q=marked")
+	fromList := listingItem(t, h, "marked.txt")
+
+	for _, field := range []string{"starred", "tags", "share_count", "has_versions"} {
+		if _, ok := fromSearch[field]; !ok {
+			t.Fatalf("a search hit does not carry %q, which the listing row does; a client "+
+				"rendering the two would draw a poorer row for a search result.\nsearch: %v\nlist: %v",
+				field, fromSearch, fromList)
+		}
+	}
+	// And the values agree, not merely the presence: the star and the tags are the viewer's, so a
+	// search result that reported another account's would be a leak rather than a cosmetic gap.
+	for _, field := range []string{"starred", "share_count", "has_versions"} {
+		if fromSearch[field] != fromList[field] {
+			t.Fatalf("%q is %v in a search result and %v in the listing for the same file",
+				field, fromSearch[field], fromList[field])
+		}
+	}
+	if !strings.Contains(mustJSONString(t, fromSearch["tags"]), "marked-label") {
+		t.Fatalf("the search result's tags are %v, want the label that was applied",
+			fromSearch["tags"])
+	}
+}
+
+// searchItem runs a search and returns the one decoded item.
+func searchItem(t *testing.T, h *harness, url string) map[string]any {
+	t.Helper()
+	resp := h.do(http.MethodGet, url, nil, nil)
+	defer resp.Body.Close()
+	var out struct {
+		Items []map[string]any `json:"items"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode search: %v", err)
+	}
+	if len(out.Items) != 1 {
+		t.Fatalf("the search returned %d items, want 1", len(out.Items))
+	}
+	return out.Items[0]
+}
+
+// listingItem returns one row of the root listing, by name.
+func listingItem(t *testing.T, h *harness, name string) map[string]any {
+	t.Helper()
+	resp := h.do(http.MethodGet, "/api/files/?path=", nil, nil)
+	defer resp.Body.Close()
+	var out struct {
+		Children []map[string]any `json:"children"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode listing: %v", err)
+	}
+	for _, item := range out.Children {
+		if item["name"] == name {
+			return item
+		}
+	}
+	t.Fatalf("the listing has no row named %q", name)
+	return nil
+}
+
+// mustJSONString renders a value for a failure message.
+func mustJSONString(t *testing.T, v any) string {
+	t.Helper()
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return ""
+	}
+	return string(raw)
 }
 
 // ------------------------------------------------------------------ §1 tus --

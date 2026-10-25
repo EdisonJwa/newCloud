@@ -864,7 +864,7 @@ func (c *Config) Validate() error {
 			// An engine reached over plain HTTP on a public address hands the credentials and the
 			// document bodies to anyone on the path. On a private network, which is where most
 			// single-host deployments put it, that is a normal choice; saying so is not.
-			if u.Scheme == "http" && !isLoopbackHost(u.Hostname()) {
+			if u.Scheme == "http" && !isLocallyRouted(u.Hostname()) {
 				c.warnings = append(c.warnings, fmt.Sprintf(
 					"search.elasticsearch.urls[%q] uses plain http; document text and the engine "+
 						"credential travel unencrypted", raw))
@@ -885,6 +885,14 @@ func (c *Config) Validate() error {
 			return invalid("search.elasticsearch.index_prefix must be lowercase letters, digits, "+
 				"- or _, got %q", prefix)
 		}
+	default:
+		// Refused, not defaulted. The whole reason this switch is validated is that a key which is
+		// accepted and ignored is worse than one that does not exist: `engine: opensearch` would
+		// otherwise start cleanly, report content search as disabled, and be indistinguishable from
+		// an operator who chose `none` — with the user-facing symptom being "my document is not
+		// there". (Found by TestAnUnknownEngineIsRefused.)
+		return invalid("search.engine must be %q or %q, got %q", "none", "elasticsearch",
+			c.Search.Engine)
 	}
 
 	if c.Search.IndexBytes < 0 {
@@ -1055,17 +1063,27 @@ func canonicalHost(u *url.URL) string {
 //
 // Used by the search-engine warning: plain HTTP to localhost is a normal single-host choice, and
 // plain HTTP to a public address is credentials and document text on the wire.
-func isLoopbackHost(host string) bool {
+//
+// The name says "locally routed" rather than "loopback" because the distinction the caller needs is
+// not "is this the same host" but "can somebody off this machine read the traffic". A cluster at
+// 10.0.0.5, or inside a container network at 172.17.0.2, is reached over a link nobody else is on —
+// which is why plain HTTP to it is a normal choice, and why the earlier loopback-only version of
+// this function contradicted the comment above its own call site.
+//
+// The ranges are IPv4 private (RFC 1918), IPv6 unique-local (RFC 4193) and link-local, because a
+// container is routinely reached at 169.254.x.x or fe80::.
+func isLocallyRouted(host string) bool {
 	if host == "" {
 		return false
 	}
 	if strings.EqualFold(host, "localhost") {
 		return true
 	}
-	if ip := net.ParseIP(host); ip != nil {
-		return ip.IsLoopback()
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
 	}
-	return false
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
 }
 
 // validIndexPrefix reports whether a string is a legal Elasticsearch index-name prefix.
