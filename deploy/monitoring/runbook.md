@@ -1,7 +1,7 @@
 # Runbook
 
 Each section is what an alert links to. The rule is that a page should arrive with enough context
-that the person receiving it does not have to reconstruct the design at 3 a.m. — so every section says
+that the person receiving it does not have to reconstruct the design at 3 a.m. ??so every section says
 what the signal means, what is *not* the problem, and the first three things to check.
 
 The metrics named here are the ones the server actually publishes. `internal/metrics/metrics.go`
@@ -32,7 +32,7 @@ the database is not. Almost every alarming metric resolves to that pair.
 1. Is the process running? `systemctl status newcloud` or `docker compose ps web`.
 2. If it is running but not answering scrapes, check what port it bound and whether the scrape
    target is right. A container bound to `127.0.0.1` inside its namespace is not reachable from a
-   scraper on another host — the commonest false alarm.
+   scraper on another host ??the commonest false alarm.
 3. If it is not running, read the log. Startup fails loudly on a bad config or an unreachable
    database, and the message names which. `newcloud migrate` is the usual companion if the schema
    is behind.
@@ -46,12 +46,12 @@ More than 5% of responses are 5xx for 10 minutes.
 
 5xx means the server broke, not that the caller did. Distinguish the two cases before doing anything else:
 
-1. **All routes failing** → almost certainly the database. Check `/readyz`. See
+1. **All routes failing** ??almost certainly the database. Check `/readyz`. See
    [database-degraded](#database-degraded).
-2. **One route failing** → read the log lines around it; `newcloud_http_requests_total` does not
+2. **One route failing** ??read the log lines around it; `newcloud_http_requests_total` does not
    carry a route label by design (the route set is large and the cardinality would be unbounded),
    so the log is where the route comes from.
-3. **Only WebDAV failing** → `newcloud_dav_conflicts_total` alongside it shows whether these are
+3. **Only WebDAV failing** ??`newcloud_dav_conflicts_total` alongside it shows whether these are
    lock conflicts being miscounted as errors. Conflicts are 409/412 and are normal in a
    multi-client deployment.
 
@@ -60,11 +60,11 @@ More than 5% of responses are 5xx for 10 minutes.
 The process answers scrapes while producing frequent 5xx. This combination is the signature of a
 database problem: a healthy process with a dead database stays alive and fails queries.
 
-1. `curl http://newcloud.internal:8080/readyz` — it exists to answer this.
+1. `curl http://newcloud.internal:8080/readyz` ??it exists to answer this.
 2. Check the connection count. Every request path takes a connection, and a leak shows up here
    before it shows up anywhere else.
 3. Check the database's own log for `too many connections`, `deadlock detected`, or disk full. A
-   full disk manifests as 5xx on every write path, and reads keep working — which looks like a
+   full disk manifests as 5xx on every write path, and reads keep working ??which looks like a
    code bug until the disk is checked.
 
 ## audit-stalled
@@ -72,13 +72,12 @@ database problem: a healthy process with a dead database stays alive and fails q
 `newcloud_audit_chain_head_age_seconds > 3600` **and** recent write traffic, for 15 minutes.
 
 The audit chain is the integrity claim. Its head age growing means no new audit event has been
-written — but that alone does not distinguish a quiet deployment from a broken one, so the rule also
+written ??but that alone does not distinguish a quiet deployment from a broken one, so the rule also
 requires POST/PUT/PATCH/DELETE traffic in the last hour. A quiet instance therefore does not page.
 
 Until 2026-10-24 the gauge was written with a hard-coded `0` (once a day, and only when anchoring was
 configured), so this rule could not fire at all; see `docs/reference/review-2026-10-24.md`, H6. If you
-run an instance with no write traffic by design, raise the threshold rather than silencing the rule —
-the gauge is now real.
+run an instance with no write traffic by design, raise the threshold rather than silencing the rule ??the gauge is now real.
 
 1. **Is there write traffic?** The rule already requires it, so assume yes. Compare
    `sum(rate(newcloud_http_requests_total{method=~"POST|PUT|PATCH|DELETE"}[1h]))` against the event
@@ -95,7 +94,7 @@ the gauge is now real.
 
 The series comes from `deploy/backup/backup-all.sh` through node_exporter's textfile collector
 (`BACKUP_METRICS_FILE`), not from the application: the backup runs from cron and the app never sees
-it. If the series is absent the alert is silent — that is why the collection must be configured
+it. If the series is absent the alert is silent ??that is why the collection must be configured
 before the backup is relied on.
 
 1. Run the backup by hand and read the exit code. `pg-backup.sh` exits `3` when the dump is valid but
@@ -116,7 +115,7 @@ means the restore path is a rumour (INV-08). Run it: `deploy/backup/restore-dril
 `increase(newcloud_audit_anchor_verify_total{result="failed"}[15m]) > 0`.
 
 This is the signal the whole audit design exists to produce. **Do not restart anything and do not
-run another migration** — capture the state first, because a restart can roll the chain forward and
+run another migration** ??capture the state first, because a restart can roll the chain forward and
 destroy the evidence.
 
 1. `newcloud drill` reports the chain verdict; run it against a copy, not the live database.
@@ -133,7 +132,7 @@ destroy the evidence.
 `increase(newcloud_blob_gc_errors_total[1h]) > 0`.
 
 1. Blobs were meant to be deleted and were not, so disk usage will exceed what the accounting says.
-   Check free space first — a full disk is a much more urgent problem than the GC error that
+   Check free space first ??a full disk is a much more urgent problem than the GC error that
    revealed it.
 2. If the backend is S3: credentials, bucket policy, and whether the endpoint is reachable. A
    credential rotation that only updated one of the two roles shows up here.
@@ -149,7 +148,7 @@ destroy the evidence.
 2. **A large pending count is only a problem if it is not shrinking.** The alert is a count, not a
    rate, precisely because it waits 30 minutes: a backlog draining from 5000 to 100 is healthy.
 3. If the backlog is growing and nothing is running, the worker is not scheduled. Check
-   `newcloud_uptime_seconds` — a small value means the process restarted, which is consistent with
+   `newcloud_uptime_seconds` ??a small value means the process restarted, which is consistent with
    a crash loop that also stops the worker.
 
 ## uploads
@@ -160,7 +159,7 @@ Upload failure is about storage far more than about clients.
 
 1. Check the disk. `newcloud_blob_gc_errors_total` alongside this is a strong hint.
 2. If the backend is S3, the 5xx rate on the upload routes and the GC error count usually move
-   together — both are the same credential or endpoint problem.
+   together ??both are the same credential or endpoint problem.
 3. Quota exhaustion is not an upload failure: it is a 403 with its own error code, and it does not
    count here. If the numbers disagree, read one failing request's response body.
 
@@ -184,7 +183,7 @@ Break-glass is the local administrator that works when the IdP does not (§3.3).
 deployment can be recovered during an outage, which also makes it the credential an attacker most
 wants: it bypasses the IdP entirely and cannot be revoked there.
 
-**Use is expected to be rare and planned.** Investigate immediately — this is the one alert here
+**Use is expected to be rare and planned.** Investigate immediately ??this is the one alert here
 that is worth waking someone for.
 
 1. Identify who and from where. The audit log has both:
@@ -204,7 +203,7 @@ that is worth waking someone for.
 
 For a burst of `breakglass_denied`:
 
-1. The `metadata.reason` field separates the cases — `network_denied` means the caller was outside
+1. The `metadata.reason` field separates the cases ??`network_denied` means the caller was outside
    the allowed range (which is the control working), `bad_password` means someone knew the account
    name.
 2. Repeated `bad_password` from one address is a guessing attempt. Confirm the source network
@@ -224,7 +223,7 @@ WAL archiving is failing, backing up, or has stalled.
 
 This is the quietest way for a deployment to lose its disaster-recovery guarantee. When
 `archive_command` fails, PostgreSQL **keeps serving**. It logs, it retries, and it keeps accepting
-writes — so the service looks perfectly healthy while the recovery point slides backward and
+writes ??so the service looks perfectly healthy while the recovery point slides backward and
 `pg_wal` grows.
 
 1. Look at the numbers first:
@@ -244,15 +243,15 @@ writes — so the service looks perfectly healthy while the recovery point slide
    SELECT count(*) FROM pg_ls_waldir();     -- each segment is 16 MB
    ```
    These segments cannot be recycled until they are archived. A backlog that keeps growing will
-   fill the data disk, and *then* PostgreSQL stops accepting writes — an outage whose cause is an
+   fill the data disk, and *then* PostgreSQL stops accepting writes ??an outage whose cause is an
    archive command that failed hours earlier.
 
 4. After fixing the cause, do nothing further: the archiver retries on its own and the backlog
    drains. Confirm by watching `archived_count` rise.
 
 **What is lost while this alert is firing:** every write since the last successfully
-archived segment is not recoverable by point-in-time recovery. It is still in the database — this
-is not data loss yet — but if the disk dies now, the restore point is wherever the archive stops.
+archived segment is not recoverable by point-in-time recovery. It is still in the database ??this
+is not data loss yet ??but if the disk dies now, the restore point is wherever the archive stops.
 Take a fresh `pg_basebackup` once archiving is healthy again, so the base stops depending on a
 long replay.
 
@@ -260,7 +259,7 @@ long replay.
 
 - **A single failed archive attempt.** PostgreSQL retries by design; one failure followed by a
   success is a flaky NFS mount, not an incident. The alert needs a sustained increase.
-- **`pending > 0`.** A handful of segments waiting is normal — a segment is archived when it fills
+- **`pending > 0`.** A handful of segments waiting is normal ??a segment is archived when it fills
   or when `archive_timeout` fires. Only a backlog that is not draining is worth waking someone.
 
 ## blob storage operations
@@ -270,13 +269,13 @@ Two things only an operator can do, because they are outside what the process se
 ### Stranded multipart uploads
 
 A multipart upload claims storage for its parts as they arrive, and that storage returns only when
-the upload completes or is explicitly aborted. A client that gives up — dropped connection, crash, a
-5xx from the endpoint — leaves the parts behind. On S3 they are billed and reclaimed only by a
+the upload completes or is explicitly aborted. A client that gives up ??dropped connection, crash, a
+5xx from the endpoint ??leaves the parts behind. On S3 they are billed and reclaimed only by a
 lifecycle rule; on a self-hosted backend they are simply leaked disk, invisible in any object
 listing.
 
 **Measured (round 46):** with every part upload failing, `Put` returned an error and left **zero**
-stranded multipart uploads — minio-go aborts its own upload before returning. So the common case is handled,
+stranded multipart uploads ??minio-go aborts its own upload before returning. So the common case is handled,
 and this section exists for the cases it is not: a process killed mid-upload, or a client that
 disappears between parts.
 
@@ -289,7 +288,7 @@ aws s3api list-multipart-uploads --bucket <bucket>
 mc admin trace --verbose <alias>
 ```
 
-Remedy: abort them. They are unreferenced by definition — nothing has a key for them yet — so
+Remedy: abort them. They are unreferenced by definition ??nothing has a key for them yet ??so
 aborting is always safe and never loses a committed file.
 
 ```sh
@@ -315,14 +314,14 @@ Write at ... by goroutine N:
 ```
 
 **Reachable in production**, not just in tests: it needs an object larger than the 16 MiB part size
-and one retried part — that is, a normal large upload crossing a transient S3 error. `NumThreads: 1`
+and one retried part ??that is, a normal large upload crossing a transient S3 error. `NumThreads: 1`
 does not avoid it; the race is in the retry path, not in concurrency.
 
 **What it means in practice.** Two goroutines race on the same buffer, so the bytes sent on a retried
 part may not be the bytes that were read from the file.
 
 **A correction to what this section said first.** The earlier version claimed the local hash check
-contained the damage — that a corrupt transfer would be rejected with `ErrHashMismatch` and never
+contained the damage ??that a corrupt transfer would be rejected with `ErrHashMismatch` and never
 stored. That is not what the check does. `Put` hashes the **input reader** and compares it to the
 expected address *before* handing anything to minio; it never looks at what minio actually sent, and
 there is no read-back afterwards. So the hash check protects against a corrupt *source*, not against
@@ -331,16 +330,16 @@ would notice: the object would land under a valid address with the wrong bytes.
 
 **Measured (round 47), and the honest conclusion.** Under `-race`, 48 MiB uploads with four injected
 part failures reproduce the race reliably, and in twelve attempts the stored bytes hashed correctly
-every time. So the window is narrow enough that it has not produced corruption in this test — which
+every time. So the window is narrow enough that it has not produced corruption in this test ??which
 is not the same as proving it cannot. The residual risk is real and unquantified.
 
 **What actually limits it.** Content addressing bounds the blast radius rather than preventing it: a
-corrupted blob sits under an address it does not match, so `newcloud drill` — which compares restored
-bytes against the hash recorded in `blobs.sha256` — reports it as a failure rather than serving it
+corrupted blob sits under an address it does not match, so `newcloud drill` ??which compares restored
+bytes against the hash recorded in `blobs.sha256` ??reports it as a failure rather than serving it
 silently. That is detection after the fact, not prevention.
 
 **What to do about it.** Track upstream; v7.4.1 is the current release and this is not fixable from
-the call site (hiding `io.Seeker` to suppress retries does not help — minio buffers and retries
+the call site (hiding `io.Seeker` to suppress retries does not help ??minio buffers and retries
 anyway, measured). A deployment that sees repeated `ErrHashMismatch`, or a drill failure naming a
 blob, on large uploads against an unstable endpoint should treat it as this race and re-upload from
 the client rather than investigate the file.
@@ -350,7 +349,7 @@ the client rather than investigate the file.
 Restoring blobs before the database (see `deploy/backup/restore-drill.md` §2.6) is the safe order,
 and its cost is blobs with no row: the window's writes land as bytes that no metadata references.
 
-These are reclaimed by the normal collector, because it is metadata-driven — it selects rows from
+These are reclaimed by the normal collector, because it is metadata-driven ??it selects rows from
 `blobs` and deletes those that are unreferenced and past their grace period. **A blob file with no
 row at all is invisible to it**, which is exactly why the restore order is safe, and also why an
 orphan from *outside* the database's knowledge is never collected automatically.
@@ -369,13 +368,13 @@ a mismatch needs no interpretation. The scrub logs both hashes.
 
 **Corrupted (`newcloud_blob_scrub_corrupt`).**
 
-Storage damaged the data — a bad sector, a failed disk, or a transfer that wrote the wrong bytes.
+Storage damaged the data ??a bad sector, a failed disk, or a transfer that wrote the wrong bytes.
 (A known upstream minio-go race can garble a retried multipart part; see
 [above](#a-known-upstream-race-in-minio-gos-multipart-retry).)
 
 1. **Do not delete the blob.** The metadata references it, so deleting turns corruption into data
    loss and removes the evidence.
-2. Restore that blob from a backup — `restic restore` for a specific path, or the dump for the
+2. Restore that blob from a backup ??`restic restore` for a specific path, or the dump for the
    database side.
 3. Verify after restoring: its hash must equal its name, which is a one-line check and needs no
    tooling.
@@ -385,19 +384,19 @@ Storage damaged the data — a bad sector, a failed disk, or a transfer that wro
 **Missing (`newcloud_blob_scrub_missing`).**
 
 Something removed content the database still points at. The usual causes, in order: an interrupted
-restore (blobs are restored before the database — see
-`deploy/backup/restore-drill.md` §2.6 — so a restore that stopped halfway leaves rows without
+restore (blobs are restored before the database ??see
+`deploy/backup/restore-drill.md` §2.6 ??so a restore that stopped halfway leaves rows without
 bytes); a collector run against the wrong database; or manual deletion.
 
 Restoring the blob is always safe. Deleting the row is not: it discards the file.
 
 **Why the scrub samples rather than sweeps.** Reading every byte of a 40 TiB store on a timer is a
 second full-time workload. The scrub verifies a bounded number of blobs per pass and logs the total
-it read, so its cost is visible. A pass that finds nothing is not proof of health — it is the absence
+it read, so its cost is visible. A pass that finds nothing is not proof of health ??it is the absence
 of evidence in that sample, which is why the interval matters more than the limit.
 ## Content missing
 
-**Alert:** `NewCloudContentMissing` — `increase(newcloud_content_missing_total[15m]) > 0`.
+**Alert:** `NewCloudContentMissing` ??`increase(newcloud_content_missing_total[15m]) > 0`.
 
 A file's metadata row exists, the caller was allowed to read it, and the storage backend could not
 produce the bytes. This is **not** a missing file: the product answers `500 content_missing` for it
@@ -427,3 +426,64 @@ destroyed or moved content that the database still believes in.
    volume. The second is far more common than the first, and the fix is configuration.
 
 Do not silence this alert. A `content_missing` that is expected is a file somebody has lost.
+
+## Search index
+
+**Alerts:** `NewCloudSearchIndexLagging` ? `newcloud_search_index_lag_seconds > 900`;
+`NewCloudSearchIndexErrors` ? `increase(newcloud_search_index_errors_total[15m]) > 5`.
+
+Both are **warnings**, and that severity is a decision rather than an oversight. Content search is
+an optional convenience (core-scope ��7.2, ADR-0016): the index is a cache of content the server can
+already read, no write ever waits on it, and name-and-filter search keeps working the whole time.
+A deployment with `search.engine: none` publishes both series at zero and never fires either rule.
+
+What the two numbers mean:
+
+- `newcloud_search_index_lag_seconds` is measured from the **queue**, not from the engine. It is
+  how long the oldest pending `search.index` job has been waiting, which is the number that grows
+  during an engine outage. The engine can only report that it answered.
+- `newcloud_search_index_errors_total` counts failed index **reads and writes** together: a failed
+  write is why the index is stale, and a failed read is why a search answered `degraded: true`.
+
+1. Check that the worker is running. The `search-index` duty is what drains the queue and the
+   backfill:
+
+   ```sh
+   journalctl -u newcloud | grep -E 'indexed documents|search backfill'
+   ```
+
+   If the duty is not running, the lag grows with no errors at all ? that combination (lag
+   climbing, error counter flat) is the signature of a worker that is down rather than an engine
+   that is unreachable.
+
+2. Check that the engine is reachable from the server:
+
+   ```sh
+   curl -sS http://127.0.0.1:9200/_cluster/health
+   ```
+
+   A refusal from the server's own network namespace but not from your shell is usually a firewall
+   or a container network boundary, not an Elasticsearch problem.
+
+3. Look for the reason in the log:
+
+   ```sh
+   journalctl -u newcloud | grep -E 'content search degraded|ensure the search mapping'
+   ```
+
+   `ensure the search mapping` failing means the index could not be created ? check that the
+   credential may create indices, or create it by hand with the mapping the runbook's
+   `EnsureMapping` uses.
+
+4. **Do not re-index by hand.** The backfill duty walks nodes by cursor on every pass, so the index
+   converges on its own once the engine answers. Re-indexing during an outage only adds load to the
+   thing that is already failing.
+
+5. If the index is beyond saving, deleting it is safe and cheap to reconstruct:
+
+   ```sh
+   curl -XDELETE http://127.0.0.1:9200/newcloud-files
+   ```
+
+   The next backfill pass recreates it with the mapping and fills it. Nothing user-visible is lost:
+   the index holds no data the metadata store does not.

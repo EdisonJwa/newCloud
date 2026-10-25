@@ -182,6 +182,45 @@ limits:
   version_count_limit: 0               # per-file version count cap; 0 = layout default (10 blob / 3 tree)
   upload_session_ttl_hours: 24         # how long an unfinished resumable upload may sit idle
 
+  # Comments (core-scope §6): how many one account may post in a rolling hour. 0 disables
+  # the limit.
+  #
+  # A rate rather than a total, because the failure is a BURST — a total cap would either be
+  # too low for a normal year or too high to stop a spam run. 60 is a comment a minute,
+  # which is generous for a human and far below what a script needs.
+  comment_rate_per_hour: 60
+
+# Content search (core-scope §7.2, ADR-0016). DISABLED by default, and that is a decision
+# rather than an omission: a deployment without an engine still has name-and-filter search,
+# and a content query answers `mode: name` with `degraded: true` rather than returning a
+# confident empty result. The single binary stays the default; this is what a deployment adds
+# when it wants full-text.
+search:
+  engine: "none"                       # "none" or "elasticsearch"
+  # The largest body the indexer reads. A document above it keeps its METADATA in the index,
+  # so it stays findable by name, kind, tag and date; its text is simply not searched.
+  index_bytes: 10485760                # 10 MiB
+  # Which document types have their text extracted. Office formats are deliberately absent:
+  # they need an extractor service, and promising them without one is worse than not offering
+  # them. A file whose type is not here is still indexed by its metadata.
+  content_types:
+    - text
+    - markdown
+    - pdf
+  elasticsearch:
+    # Tried in order. Plain http is fine to a localhost cluster and logs a warning otherwise,
+    # because document text and the credential travel on the wire.
+    urls: []
+    # urls:
+    #   - "http://127.0.0.1:9200"
+    username: ""
+    password: ""
+    # Preferred in a container: a mounted secret never appears in `docker inspect`.
+    password_file: ""
+    # Namespaces this deployment's index, so two deployments can share one cluster.
+    index_prefix: "newcloud"
+    timeout_seconds: 5
+
 # External storage mounts (ADR-0014): SMB/SFTP/FTP/WebDAV remotes as top-level folders,
 # browsed in place, never copied. Disabled by default — enabling it is the decision to let
 # the file service talk to hosts it did not choose itself.

@@ -1,6 +1,6 @@
 # Prometheus alerting rules for newCloud.
 #
-# Every rule here is derived from a metric this server actually publishes — see
+# Every rule here is derived from a metric this server actually publishes ??see
 # internal/metrics/metrics.go for the full list and internal/server/metricsroute_test.go for the
 # proof that the route is wired. A rule naming a metric that does not exist is worse than no rule:
 # it sits in "pending" forever, looks like coverage on a dashboard, and never fires.
@@ -71,7 +71,7 @@ groups:
     rules:
       # The audit chain is the product's integrity claim. A head that stops advancing has two
       # causes with opposite responses: nothing is being written (a quiet deployment, fine), or
-      # writes are happening and their audit events are not landing (not fine — that is the
+      # writes are happening and their audit events are not landing (not fine ??that is the
       # fail-closed path in deploy/audit-failure-policy.md behaving as data loss).
       #
       # The rule therefore requires BOTH a stale head and recent write-method traffic. Head age
@@ -134,7 +134,7 @@ groups:
           description: >-
             Failed jobs are terminal; they do not retry. Whatever they were doing is not happening.
             The queue is inspectable in the database, and the drill covers it, so the cause is
-            recoverable — but nothing will change on its own.
+            recoverable ??but nothing will change on its own.
           runbook: "deploy/monitoring/runbook.md#jobs"
 
       - alert: NewCloudJobBacklogGrowing
@@ -190,7 +190,7 @@ groups:
   - name: newcloud-security
     interval: 30s
     rules:
-      # §3.3 requires "使用后告警" — an alert when the local administrator is used.
+      # §3.3 requires "使用?�告�? ??an alert when the local administrator is used.
       #
       # This is the one rule here that should reach a human quickly: break-glass exists for
       # IdP-down recovery, and legitimate use is rare and planned. Use that nobody announced is
@@ -208,7 +208,7 @@ groups:
             address and user agent for this event (action auth.breakglass.used).
           runbook: "deploy/monitoring/runbook.md#breakglass"
 
-      # Failures are not page-worthy on their own — a wrong password happens — but a burst is
+      # Failures are not page-worthy on their own ??a wrong password happens ??but a burst is
       # someone working through guesses against the one account that does not need the IdP.
       - alert: NewCloudBreakglassAttemptsFailing
         expr: increase(newcloud_auth_events_total{kind="breakglass_denied"}[15m]) > 5
@@ -219,8 +219,7 @@ groups:
           summary: "repeated failed break-glass attempts ({{ $value }} in 15m)"
           description: >-
             Someone is trying the local administrator repeatedly. Check whether the credential
-            needs rotating, and whether the allowed source network is as tight as intended —
-            auth.breakglass.denied rows carry the reason (network_denied, bad_password,
+            needs rotating, and whether the allowed source network is as tight as intended ??            auth.breakglass.denied rows carry the reason (network_denied, bad_password,
             unknown_user).
           runbook: "deploy/monitoring/runbook.md#breakglass"
   - name: newcloud-wal
@@ -238,7 +237,7 @@ groups:
         labels:
           severity: critical
         annotations:
-          summary: "WAL archiving is failing — the point-in-time recovery guarantee has stopped"
+          summary: "WAL archiving is failing ??the point-in-time recovery guarantee has stopped"
           description: >-
             {{ $value }} archive attempts failed in the last 15 minutes. The database is still
             serving, which is what makes this dangerous: writes continue while the recovery point
@@ -258,12 +257,12 @@ groups:
           description: >-
             Unarchived segments accumulate in pg_wal and cannot be recycled until they are
             archived. At the default 16 MB per segment this is over a gigabyte of growth that will
-            not stop. When the disk fills, PostgreSQL stops accepting writes — and the cause will
+            not stop. When the disk fills, PostgreSQL stops accepting writes ??and the cause will
             be an archive command that has been failing for hours.
           runbook: "deploy/monitoring/runbook.md#wal"
 
       # archived_count is a counter that should keep rising on any deployment with archiving on.
-      # Flat means the archiver is not running at all — a different fault from a failing command.
+      # Flat means the archiver is not running at all ??a different fault from a failing command.
       - alert: NewCloudWALArchiveStalled
         expr: >-
           increase(newcloud_wal_archived_total[1h]) == 0
@@ -321,7 +320,7 @@ groups:
           description: >-
             Either the scrub is disabled (it needs an explicit limit and the content store), or it
             is failing. Both mean nothing is checking that stored bytes still match their
-            addresses — which is the one thing that catches silent corruption before a user does.
+            addresses ??which is the one thing that catches silent corruption before a user does.
           runbook: "deploy/monitoring/runbook.md#blob-corruption"
 
       # The backup is the one thing whose failure is invisible until it is needed. backup-all.sh
@@ -361,7 +360,48 @@ groups:
       summary: "a file's content is missing on the storage backend"
       description: |
         The metadata row exists and the caller was allowed to read it, but the storage layer could
-        not produce the bytes. This is not a missing file — it is damage, and 404 vs 500 is the
+        not produce the bytes. This is not a missing file ??it is damage, and 404 vs 500 is the
         difference the failure table insists on. Check the storage backend for the files named in
         the server log ("content missing for"), then restore them from a backup.
       runbook: "deploy/monitoring/runbook.md#content-missing"
+
+  # ---------------------------------------------------------------- search index --
+  #
+  # Content search is an OPTIONAL convenience (core-scope ��7.2, ADR-0016), so these two do not page.
+  # That is a deliberate severity choice rather than an oversight: a lagging index means a search
+  # returns fewer results, and naming-and-filter search keeps working the whole time. A deployment
+  # with no engine configured never fires either rule, because both series stay at zero ? which is
+  # the honest value ("there is no index to be behind") rather than a missing series.
+  #
+  # The lag is measured from the QUEUE, not from the engine. The engine can only say that it
+  # answered; the queue says how long the oldest unprocessed change has been waiting, which is the
+  # number that grows during an outage.
+  - alert: NewCloudSearchIndexLagging
+    expr: newcloud_search_index_lag_seconds > 900
+    for: 10m
+    labels:
+      severity: warning
+    annotations:
+      summary: "the content index is more than 15 minutes behind"
+      description: |
+        The oldest pending search.index job has been waiting more than fifteen minutes, so a
+        content search is answering from a stale cache. Search still works ? it just may not find a
+        document stored in the last quarter hour. Check that the worker is running and that the
+        engine is reachable at search.elasticsearch.urls; newcloud_search_index_errors_total says
+        whether writes are failing. The backfill duty catches up on its own once the engine is back,
+        so no manual re-index is needed.
+      runbook: "deploy/monitoring/runbook.md#search-index"
+
+  - alert: NewCloudSearchIndexErrors
+    expr: increase(newcloud_search_index_errors_total[15m]) > 5
+    labels:
+      severity: warning
+    annotations:
+      summary: "writing to the content index is failing"
+      description: |
+        More than five index writes or reads failed in fifteen minutes. Either the engine is
+        unreachable or it is rejecting documents (a mapping conflict answers 400 and stops retrying,
+        so it does not inflate this counter indefinitely). Content search is degraded, not broken:
+        name-and-filter search is unaffected and no write fails because of it. Check the engine's
+        own health and the server log for "content search degraded".
+      runbook: "deploy/monitoring/runbook.md#search-index"

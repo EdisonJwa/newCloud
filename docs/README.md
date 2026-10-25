@@ -34,6 +34,7 @@ document was written.
 | [Interface design](reference/interface-design.md) | The Atlas direction: layout, tokens, components, and interaction rules |
 | [Interface redesign: Atrium](reference/interface-atrium.md) | Why the first two directions failed, and the structure that replaced them |
 | [Cirrus 9.1 integration plan](reference/cirrus-9.1-integration-plan.md) | Freeze record, gap matrix, API/database changes, and phased plan for adopting the approved Cirrus 9.1 design |
+| [Cirrus 9.1 UI implementation record](reference/cirrus-9.1-ui-implementation.md) | What the client now implements on Serein UI: the shell, routing, surfaces, the differences the server contract forced, and the evidence |
 | [Browser-only failures](reference/browser-only-failures.md) | Two defects that only appeared in a real browser, and the guards added afterward |
 | [Full review and competitive assessment, 2026-10-24](reference/review-2026-10-24.md) | An independent review of the current tree: verified state, defect register, and how the product compares with Nextcloud, ownCloud/OpenCloud, Seafile, SFTPGo and the single-binary field |
 
@@ -49,10 +50,12 @@ the old one stays in the repository with its original date.
 | [0003](adr/0003-storage-layout.md) | Optional `blob` and `tree` storage layouts behind one interface | Accepted |
 | [0004](adr/0004-metadata-store.md) | Metadata store contract and transaction boundaries | Accepted |
 | [0007](adr/0007-s3-storage.md) | S3-compatible object storage as a second backend | Accepted |
-| [0008](adr/0008-resumable-uploads.md) | Resumable chunked uploads without tus or S3 multipart | Accepted |
+| [0008](adr/0008-resumable-uploads.md) | Resumable chunked uploads without tus or S3 multipart | Accepted, wire protocol superseded by ADR-0016 |
 | [0012](adr/0012-cursor-contract.md) | Cursor pagination for directory listings | Accepted |
 | [0013](adr/0013-file-operation-consistency.md) | Operation-private staging, conditional publish, and the file-operation correctness contract | Accepted (v2.1.1) |
 | [0015](adr/0015-nextcloud-client-compatibility.md) | Nextcloud client compatibility as a protocol subset, and the login-flow credential handshake | Accepted |
+| [0016](adr/0016-tus-upload-protocol.md) | tus 1.0.0 as the resumable upload protocol; ADR-0008's durability machinery kept | Proposed |
+| [0017](adr/0017-search-engine-posture.md) | Optional content-search engine; the index is a cache and never authorises | Proposed |
 
 ## Conventions
 

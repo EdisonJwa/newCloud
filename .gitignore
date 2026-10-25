@@ -42,3 +42,9 @@ config.yml
 # Review-session scratch: subsystem notes, screenshots and a HEAD snapshot copy.
 /.review-notes/
 dist/
+
+# Screenshots and results from web/scripts/ui-verify.mjs: regenerable evidence, not source.
+/web/artifacts/
+# Vite/esbuild scratch inside the client.
+/web/.tmp/
+

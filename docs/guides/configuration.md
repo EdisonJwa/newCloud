@@ -137,6 +137,7 @@ a slowdown. Startup performs a real rename probe and refuses to start if it fail
 | `max_pending_upload_bytes` | `0` | Declared size of one account's unfinished uploads. `0` is unlimited. |
 | `max_retained_version_bytes` | `0` | Retained version history per account. `0` is unlimited. Enforced by a sweep, not on the write path. |
 | `thumbnail_isolation` | `process` | `process` decodes images in a child process that the deadline can kill; `inline` decodes in the server process, where a goroutine cannot be cancelled. |
+| `comment_rate_per_hour` | `60` | Comments one account may post in a rolling hour. `0` disables the limit. A rate rather than a total because the failure is a burst. |
 
 Retention is the one place where the safe default is "keep everything". A deployment that has not
 decided a policy must not silently delete recoverable data. When both retention values are `0`,
@@ -146,6 +147,27 @@ from outside until the disk fills.
 The integrity scrub is opt-in because its cost is real: each pass reads stored blobs in full. A few
 hundred blobs per cycle covers a multi-terabyte store over days. Without it, a blob corrupted in
 place is discovered by a user, or by a restore drill months later.
+
+## `search`
+
+Content search is **optional and off by default** (core-scope §7.2, [ADR-0017](../adr/0017-search-engine-posture.md)).
+Name-and-filter search works without it; a content request on a deployment without an engine answers
+`mode: name` with `degraded: true` rather than an empty result.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `engine` | `none` | `none` or `elasticsearch`. Validated: an engine named without URLs fails at startup rather than never being reached. |
+| `index_bytes` | `10485760` (10 MiB) | Largest body the indexer reads. A document above it keeps its metadata in the index, so it stays findable by name, kind, tag and date. |
+| `content_types` | `text`, `markdown`, `pdf` | Which document types have their text extracted. **An unsupported type is refused at startup**, because accepting `docx` and ignoring it would make an operator believe Office documents are searchable. |
+| `elasticsearch.urls` | empty | Cluster endpoints, tried in order. Required when `engine` is `elasticsearch`. Plain `http` to a non-loopback host logs a warning: document text and the credential travel on the wire. |
+| `elasticsearch.username` / `password` | empty | Basic authentication. `password_file` is preferred in a container. |
+| `elasticsearch.index_prefix` | `newcloud` | Namespaces this deployment's index, so two deployments can share a cluster. Lowercase letters, digits, `-`, `_`, `.`. |
+| `elasticsearch.insecure_skip_verify` | `false` | For a self-signed certificate on a private network. Startup logs it, because it removes the only protection against an active attacker on that path. |
+| `elasticsearch.timeout_seconds` | `5` | Bound on every engine request. A search that hangs is a page that hangs. |
+
+The index is a cache, never a source of truth: no write fails because the engine is down, every query
+is filtered by live grants, and every result is re-checked before it is returned. Deleting the index
+is safe and the backfill rebuilds it.
 
 ## `audit`
 
