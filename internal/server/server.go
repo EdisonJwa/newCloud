@@ -352,13 +352,15 @@ func (s *Server) Handler() http.Handler {
 					r.Post("/{id}/complete", s.handleUploadComplete)
 					r.Delete("/{id}", s.handleUploadAbort)
 				})
-				// tus 1.0.0 (core-scope §1, ADR-0015). The durability machinery is the same session
+				// tus 1.0.0 (core-scope §1, ADR-0016). The durability machinery is the same session
 				// manager the routes above use; only the wire protocol changed.
 				//
-				// OPTIONS is answered without a session: a client has to discover the endpoint before
-				// it has any reason to authenticate, and the answer says nothing about the caller's
-				// data. It sits inside this group anyway, because every other tus verb needs one and
-				// a probe from an anonymous caller is not worth a second route group.
+				// OPTIONS requires a session like every other verb. tus does not demand otherwise,
+				// and the alternative leaks limits.max_file_bytes (through Tus-Max-Size) to an
+				// unauthenticated caller — small, but this server answers nothing about a deployment
+				// without a session, and a discovery endpoint is not worth the exception. An earlier
+				// comment here claimed the opposite and the OpenAPI document inherited the claim;
+				// running the demo and reading the 401 is what caught it.
 				r.Options("/tus", s.handleTusOptions)
 				r.Post("/tus", s.handleTusCreate)
 				r.Head("/tus/{id}", s.handleTusHead)

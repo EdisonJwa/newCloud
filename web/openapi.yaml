@@ -706,8 +706,10 @@ paths:
     options:
       summary: tus capability probe
       description: |
-        Core-scope §1. Answered without a session: a client discovers the endpoint before it has any
-        reason to authenticate, and the answer says nothing about the caller's data.
+        Core-scope §1. Requires a session like every other verb: tus does not demand otherwise, and
+        answering anonymously would disclose `limits.max_file_bytes` through `Tus-Max-Size`. The
+        answer names the protocol version, the extensions this build implements and the largest file
+        it accepts — a client that sees an extension here may rely on it.
       responses:
         "204":
           description: ok
@@ -715,6 +717,7 @@ paths:
             Tus-Version: { schema: { type: string } }
             Tus-Extension: { schema: { type: string } }
             Tus-Max-Size: { schema: { type: integer } }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
     post:
       summary: Create a tus upload (creation, creation-with-upload, creation-defer-length, final concat)
       description: |

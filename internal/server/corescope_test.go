@@ -1532,3 +1532,186 @@ func (h *harness) revokeGrantsOn(t *testing.T, nodeID, userID uuid.UUID) {
 		t.Fatal(err)
 	}
 }
+
+/* ------------------------------------- §1 finalization guards (acceptance) --- */
+
+// TestTusFinalizationRechecksTheLock is the acceptance criterion that matters most in §1: "finalization
+// honors locks ... refused before bytes when knowable at creation, re-checked in-statement at
+// finalization".
+//
+// The re-check is the half a shortcut would drop, and it is the half that protects anything: an upload
+// can take an hour, and a lock taken one second after the session was created has to stop the publish.
+// Testing only the creation-time refusal would pass against an implementation that never looks again.
+func TestTusFinalizationRechecksTheLock(t *testing.T) {
+	h := newHarness(t)
+	h.mkdir(t, "locked")
+	dir := h.resolveNode(t, "locked")
+
+	// The session is created while the folder is unlocked, and its length is reached in one PATCH.
+	loc := h.tusCreateIn(t, "locked", "contested.txt", "the bytes")
+
+	// The lock arrives AFTER creation and before the bytes do.
+	h.lockNodeDepth(t, dir.ID, "infinity")
+
+	patch := h.do(http.MethodPatch, loc, strings.NewReader("the bytes"), map[string]string{
+		"Tus-Resumable": "1.0.0",
+		"Upload-Offset": "0",
+		"Content-Type":  "application/offset+octet-stream",
+	})
+	body := readBody(patch)
+	patch.Body.Close()
+	if patch.StatusCode == http.StatusNoContent || patch.StatusCode == http.StatusCreated {
+		t.Fatalf("a tus upload into a folder locked after creation answered %d (%s); the publish is "+
+			"a write, and a lock taken while an upload was in flight must stop it. Without the "+
+			"finalization re-check, the only protection is the check at creation, which is "+
+			"already stale by the time the bytes arrive.", patch.StatusCode, body)
+	}
+
+	// And nothing was published: the refusal has to come before the row appears, not after.
+	list := h.do(http.MethodGet, "/api/files/?path=locked", nil, nil)
+	listBody := readBody(list)
+	list.Body.Close()
+	if strings.Contains(listBody, "contested.txt") {
+		t.Fatalf("the locked publish left the file behind: %s", listBody)
+	}
+}
+
+// TestTusCreationRefusesALockedDestination is the creation-time half of the same criterion: a lock
+// that is knowable before the first byte must be refused before it.
+func TestTusCreationRefusesALockedDestination(t *testing.T) {
+	h := newHarness(t)
+	h.mkdir(t, "locked")
+	dir := h.resolveNode(t, "locked")
+	h.lockNodeDepth(t, dir.ID, "infinity")
+
+	resp := h.do(http.MethodPost, "/api/files/tus", nil, map[string]string{
+		"Tus-Resumable": "1.0.0",
+		"Upload-Length": "4",
+		"Upload-Metadata": tusMetadata(map[string]string{
+			"filename": "nope.txt", "destination": "locked",
+		}),
+	})
+	body := readBody(resp)
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusCreated {
+		t.Fatalf("tus creation into a locked folder succeeded (%s); the spec asks for the refusal "+
+			"before bytes when it is knowable at creation", body)
+	}
+}
+
+// TestTusFinalizationRefusesAFoldNameCollision covers the other finalization guard.
+//
+// The fold-name check is the one that stops "Report.txt" and "report.txt" becoming two files on a
+// case-insensitive mount, and it has to run at publish time: whether the name is taken can change
+// between creation and the last byte.
+func TestTusFinalizationRefusesAFoldNameCollision(t *testing.T) {
+	h := newHarness(t)
+	h.uploadFile(t, "Report.txt", "the original")
+
+	loc := h.tusCreate(t, "report.txt", len("the usurper"))
+
+	patch := h.do(http.MethodPatch, loc, strings.NewReader("the usurper"), map[string]string{
+		"Tus-Resumable": "1.0.0",
+		"Upload-Offset": "0",
+		"Content-Type":  "application/offset+octet-stream",
+		// No overwrite grant is offered, so the collision must be refused rather than resolved to
+		// "report (2).txt" ? silently renaming means the client cannot tell which file it got.
+	})
+	body := readBody(patch)
+	patch.Body.Close()
+	if patch.StatusCode == http.StatusNoContent || patch.StatusCode == http.StatusCreated {
+		t.Fatalf("a tus publish that collides with \"Report.txt\" ignoring case answered %d (%s); "+
+			"on a case-insensitive mount that is one file where the user sees two", patch.StatusCode, body)
+	}
+
+	// The original is untouched.
+	get := h.do(http.MethodGet, "/api/files/download?path=Report.txt", nil, nil)
+	content := readBody(get)
+	get.Body.Close()
+	if content != "the original" {
+		t.Fatalf("the refused collision overwrote the existing file: it now serves %q", content)
+	}
+}
+
+// TestTusFinalizationRefusesOverQuota covers the third finalization guard.
+//
+// The length is DEFERRED, and that is the point rather than a convenience: with a known length the
+// refusal happens at creation — §1's "refused before bytes when knowable at creation" — and the
+// creation path answers 413 for it. What this covers is the case where the size genuinely is not
+// knowable until the last byte, so the check can only run at finalization; skipping it there would
+// stage a file the account can never publish and fail at the end anyway.
+func TestTusFinalizationRefusesOverQuota(t *testing.T) {
+	h := newHarness(t)
+
+	// The quota is set at the store level and is BELOW max_file_bytes (which the harness pins at
+	// 1 MiB). That ordering is what makes this the quota check rather than the size cap: 600 KiB
+	// passes the per-file limit and fails the allowance, so the only thing that can refuse it is
+	// quotaHasRoomFor. Done through the store rather than the admin route because the harness account
+	// is not an administrator, and because what is under test is the upload path, not the admin one.
+	if err := h.meta.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+		return tx.SetUserQuota(ctx, h.user.ID, 512<<10)
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	create := h.do(http.MethodPost, "/api/files/tus", nil, map[string]string{
+		"Tus-Resumable":   "1.0.0",
+		"Upload-Length":   "deferred",
+		"Upload-Metadata": tusMetadata(map[string]string{"filename": "oversized.txt"}),
+	})
+	createBody := readBody(create)
+	create.Body.Close()
+	if create.StatusCode != http.StatusCreated {
+		t.Fatalf("deferred creation with an unknown size was refused: %d %s",
+			create.StatusCode, createBody)
+	}
+	loc := create.Header.Get("Location")
+
+	// The final chunk declares a length the account cannot hold, and it is under the per-file cap.
+	big := strings.Repeat("x", 600<<10)
+	patch := h.do(http.MethodPatch, loc, strings.NewReader(big), map[string]string{
+		"Tus-Resumable": "1.0.0",
+		"Upload-Offset": "0",
+		"Upload-Length": fmt.Sprint(len(big)),
+		"Content-Type":  "application/offset+octet-stream",
+	})
+	body := readBody(patch)
+	patch.Body.Close()
+	if patch.StatusCode != http.StatusInsufficientStorage {
+		t.Fatalf("a deferred upload whose declared size exceeds the quota answered %d (%s), "+
+			"want 507: with a deferred length this is the ONLY place the quota can be checked",
+			patch.StatusCode, body)
+	}
+
+	// And nothing was published.
+	list := h.do(http.MethodGet, "/api/files/?path=", nil, nil)
+	listBody := readBody(list)
+	list.Body.Close()
+	if strings.Contains(listBody, "oversized.txt") {
+		t.Fatalf("the over-quota upload was published anyway: %s", listBody)
+	}
+}
+
+/* ------------------------------------------------- helpers for those tests --- */
+
+// tusCreateIn starts a session whose destination is a directory.
+func (h *harness) tusCreateIn(t *testing.T, dir, name, content string) string {
+	t.Helper()
+	resp := h.do(http.MethodPost, "/api/files/tus", nil, map[string]string{
+		"Tus-Resumable": "1.0.0",
+		"Upload-Length": fmt.Sprint(len(content)),
+		"Upload-Metadata": tusMetadata(map[string]string{
+			"filename": name, "destination": dir,
+		}),
+	})
+	body := readBody(resp)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("tus create in %q: %d %s", dir, resp.StatusCode, body)
+	}
+	loc := resp.Header.Get("Location")
+	if loc == "" {
+		t.Fatal("tus create returned no Location")
+	}
+	return loc
+}

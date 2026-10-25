@@ -1324,8 +1324,10 @@ export interface paths {
         delete?: never;
         /**
          * tus capability probe
-         * @description Core-scope §1. Answered without a session: a client discovers the endpoint before it has any
-         *     reason to authenticate, and the answer says nothing about the caller's data.
+         * @description Core-scope §1. Requires a session like every other verb: tus does not demand otherwise, and
+         *     answering anonymously would disclose `limits.max_file_bytes` through `Tus-Max-Size`. The
+         *     answer names the protocol version, the extensions this build implements and the largest file
+         *     it accepts — a client that sees an extension here may rely on it.
          */
         options: {
             parameters: {
@@ -1346,6 +1348,7 @@ export interface paths {
                     };
                     content?: never;
                 };
+                401: components["responses"]["Unauthenticated"];
             };
         };
         head?: never;

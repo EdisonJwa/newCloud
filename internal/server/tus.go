@@ -173,6 +173,48 @@ func (s *Server) handleTusCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	contentDir := relOfChain(chain)
 
+	// The lock consultation at CREATION, before a byte is accepted (core-scope §1: "refused before
+	// bytes when knowable at creation, re-checked in-statement at finalization").
+	//
+	// Both halves are needed and neither substitutes for the other. This one tells a client
+	// immediately that the destination is locked rather than after an hour of upload; the one in
+	// tusFinalize catches a lock taken while the upload was in flight. Only the second existed
+	// before, which meant a locked folder accepted a session and every chunk of it — found by
+	// TestTusCreationRefusesALockedDestination.
+	parent := chain[len(chain)-1]
+	if !s.guardParentUnlocked(w, r, actor, parent.ID) {
+		return
+	}
+
+	// The fold-name collision, with the same shape: "Report.txt" exists and this is "report.txt".
+	// Refused now if it is already true, re-checked at finalization because the name can be taken in
+	// between.
+	//
+	// The sibling is nil when the name is free, which is the common case. It is ALSO the value
+	// quotaHasRoomFor wants: a nil sibling means "this upload adds bytes rather than replacing a
+	// file", and passing a zero struct instead would make the quota delta wrong by the old file's size.
+	sibling, xerr := s.childAtTarget(r.Context(), parent.ID, name)
+	if xerr != nil {
+		s.writeStoreError(w, xerr)
+		return
+	}
+	if sibling != nil {
+		if !s.guardParentUnlocked(w, r, actor, parent.ID) {
+			return
+		}
+		if !s.guardUnlocked(w, r, actor, sibling.ID) {
+			return
+		}
+	}
+
+	// The quota, when the length is known: staging bytes the account can never publish fills a disk
+	// for an upload that fails at the end. A deferred length cannot be checked here, and tusFinalize
+	// does it.
+	if !deferred && !s.quotaHasRoomFor(r.Context(), actor.ID(), length, sibling) {
+		s.tusError(w, http.StatusInsufficientStorage, "your storage quota is full")
+		return
+	}
+
 	// The same staging caps the bespoke endpoint applies, from the effective settings.
 	s.deps.Uploads.SetMaxPendingBytes(s.maxPendingUploadBytes(r.Context()))
 	sess, cerr := s.deps.Uploads.Create(actor.ID(), contentDir, name, length)
