@@ -432,8 +432,26 @@ try {
     await page.keyboard.press("Escape");
 
     // 14. A CSV opens as a real table, not as raw commas.
-    await page.goto(BASE + "/?screen=viewer&file=%2Fdata.csv&from=folder%3A", { waitUntil: "networkidle" });
-    await page.waitForTimeout(700);
+    //
+    // The name is DISCOVERED rather than hardcoded, because the two demo binaries seed different
+    // sample sets (tools/demoinmem ships `data.csv`, tools/demo ships `数据.csv`). A hardcoded name
+    // made this check silently inapplicable on the PostgreSQL demo — it reported "0 rows x 0 cols"
+    // for a viewer that was never opened, which reads as a broken table rather than a broken check.
+    await page.goto(BASE + "/?screen=files", { waitUntil: "networkidle" });
+    await page.waitForTimeout(400);
+    const csvName = await page.evaluate(() => {
+      const row = [...document.querySelectorAll(".serein-file-row")].find((r) =>
+        (r.textContent ?? "").toLowerCase().includes(".csv"),
+      );
+      return row?.querySelector(".serein-file-row__title")?.textContent?.trim() ?? "";
+    });
+    if (csvName) {
+      await page.goto(
+        BASE + "/?screen=viewer&file=%2F" + encodeURIComponent(csvName) + "&from=folder%3A",
+        { waitUntil: "networkidle" },
+      );
+      await page.waitForTimeout(700);
+    }
     const sheet = await page.evaluate(() => {
       const table = document.querySelector(".wc-sheet table");
       if (!table) return { rows: 0, cols: 0 };
@@ -442,7 +460,11 @@ try {
         cols: table.querySelectorAll("tbody tr:first-child td").length,
       };
     });
-    record("a CSV renders as a table", sheet.rows > 1 && sheet.cols > 1, `${sheet.rows} rows × ${sheet.cols} cols`);
+    record(
+      "a CSV renders as a table",
+      sheet.rows > 1 && sheet.cols > 1,
+      csvName ? `${csvName}: ${sheet.rows} rows × ${sheet.cols} cols` : "no CSV in the seed",
+    );
     await page.screenshot({ path: resolve(OUT, "26-viewer-csv.png") });
 
     // 15. Selecting a row fills the inspector, and Versions never offers an impossible restore.
@@ -472,7 +494,163 @@ try {
       record("versions never offer an impossible restore", restoreState !== "restore enabled", restoreState);
     }
 
-    // 16. The fixed phone tab bar never covers the end of a page.
+    // 16. The seven core-scope functions, driven the way a person drives them.
+    //
+    // These are the only checks in this script that MUTATE: they star a file, label it, discuss it,
+    // trash it and empty the bin. That is deliberate — the social surfaces have no read-only state
+    // worth inspecting, and a check that only looked at the empty case would pass against a server
+    // that refuses every write. The demo instance is throwaway, so the destruction is free.
+    //
+    // Each step reads its result back from the SERVER through the UI (a reload, or a fresh query),
+    // never from the component's own state: an optimistic update the server rejected is exactly the
+    // bug this is built to catch.
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto(BASE + "/?screen=files&inspector=1", { waitUntil: "networkidle" });
+
+    const targetRow = page.locator('.serein-file-row:not([data-folder="true"])').first();
+    if ((await targetRow.count()) > 0) {
+      await targetRow.locator(".serein-file-row__size").click();
+      await page.waitForTimeout(500);
+      const targetName = (await page.locator(".serein-inspector__name").innerText()).trim();
+
+      // §4 — star, then reload and require the star to still be there.
+      //
+      // The selection is component state rather than a URL parameter, so a reload empties the
+      // inspector; the row is re-selected before the star is read. That is the honest form of this
+      // check anyway — it asserts what the SERVER holds, not what the panel remembered.
+      const starBtn = page.locator(".serein-inspector__actions .wc-star").first();
+      await starBtn.click();
+      await page.waitForTimeout(600);
+      const starPressed = await starBtn.getAttribute("aria-pressed");
+      await page.reload({ waitUntil: "networkidle" });
+      await page.waitForTimeout(600);
+      await page
+        .locator('.serein-file-row:not([data-folder="true"])')
+        .first()
+        .locator(".serein-file-row__size")
+        .click();
+      await page.waitForTimeout(500);
+      const starAfterReload = await page
+        .locator(".serein-inspector__actions .wc-star")
+        .first()
+        .getAttribute("aria-pressed");
+      record(
+        "a star survives a reload",
+        starPressed === "true" && starAfterReload === "true",
+        `${targetName}: pressed=${starPressed}, after reload=${starAfterReload}`,
+      );
+
+      // The favorites filter is the other half of §4: a star with no surface is a bit nobody sees.
+      await page.goto(BASE + "/?screen=files&starred=1", { waitUntil: "networkidle" });
+      await page.waitForTimeout(700);
+      const starredRows = await page.locator(".serein-file-row").count();
+      record("the starred filter lists the star", starredRows >= 1, `${starredRows} starred row(s)`);
+
+      // §5 — create a label, apply it, and require the chip to appear.
+      await page.goto(BASE + "/?screen=files&inspector=1", { waitUntil: "networkidle" });
+      await page
+        .locator('.serein-file-row:not([data-folder="true"])')
+        .first()
+        .locator(".serein-file-row__size")
+        .click();
+      await page.waitForTimeout(500);
+      const label = `verify-${Date.now().toString(36)}`;
+      await page.locator(".wc-tageditor__add").first().click();
+      await page.waitForTimeout(300);
+      await page.locator(".wc-tageditor__new input").fill(label);
+      await page.locator(".wc-tageditor__new button[type=submit]").click();
+      await page.waitForTimeout(800);
+      const chips = await page.locator(".serein-inspector .wc-tagchip").allInnerTexts();
+      record(
+        "a label can be created and applied",
+        chips.some((c) => c.includes(label)),
+        `chips: ${chips.join(", ") || "none"}`,
+      );
+
+      // The chip has to reach the ROW too, or the listing does not show what a file is labelled.
+      // The row shows at most three and counts the rest: a row with nine chips is a row whose file
+      // name is invisible, so the truncation is the contract and "+N" is how it says so.
+      await page.reload({ waitUntil: "networkidle" });
+      await page.waitForTimeout(700);
+      const rowChips = await page.locator(".serein-file-row .wc-tagchip").allInnerTexts();
+      const counted = rowChips.filter((c) => /^\+\d+$/.test(c.trim()));
+      record(
+        "a label reaches the row, truncated with a count",
+        rowChips.length > 0 && (rowChips.length <= 3 || counted.length > 0),
+        `row chips: ${rowChips.join(", ") || "none"}`,
+      );
+
+      // §6 — post a comment, and require it to come back from the server.
+      //
+      // Same re-selection as above: the row must be picked before a pane can render anything about
+      // it, and picking it is what a person does after a reload too.
+      await page
+        .locator('.serein-file-row:not([data-folder="true"])')
+        .first()
+        .locator(".serein-file-row__size")
+        .click();
+      await page.waitForTimeout(500);
+      await page.locator("#insp-tab-comments").click();
+      await page.waitForTimeout(700);
+      const body = `verified at ${new Date().toISOString()}`;
+      await page.locator(".wc-comments__input").fill(body);
+      await page.locator(".wc-comments__compose-actions button[type=submit]").click();
+      await page.waitForTimeout(900);
+      const thread = await page.locator(".wc-comment__text").allInnerTexts();
+      record(
+        "a comment is posted and read back",
+        thread.some((c) => c.includes(body)),
+        `thread: ${thread.join(" | ") || "empty"}`,
+      );
+      await page.screenshot({ path: resolve(OUT, "28-inspector-comments.png") });
+
+      // §2 — the checksum is shown in FULL, not truncated: its only use is comparison. It lives in
+      // the Info pane, so the pane is switched back before it is read.
+      await page.locator("#insp-tab-info").click();
+      await page.waitForTimeout(600);
+      const hash = await page
+        .locator(".wc-checksum__value")
+        .innerText()
+        .catch(() => "");
+      record(
+        "the inspector shows the content address",
+        /^[0-9a-f]{64}$/.test(hash.trim()),
+        hash ? `${hash.trim().slice(0, 16)}… (${hash.trim().length} chars)` : "not shown",
+      );
+
+      // §3 — trash the file, then empty the bin and require it to be gone.
+      await page.locator(".serein-inspector__actions .serein-menu summary").click();
+      await page.waitForTimeout(200);
+      await page.locator(".serein-inspector__actions .serein-menu__item--danger").click();
+      await page.waitForTimeout(400);
+      await page
+        .locator(".serein-dialog .serein-btn--danger")
+        .last()
+        .click();
+      await page.waitForTimeout(900);
+
+      await page.goto(BASE + "/?screen=settings&settings=trash", { waitUntil: "networkidle" });
+      await page.waitForTimeout(600);
+      const trashBefore = await page.locator(".wc-list__row").count();
+      const emptyBtn = page.locator(".wc-trash-actions > .serein-btn").first();
+      if ((await emptyBtn.count()) > 0) {
+        await emptyBtn.click();
+        await page.waitForTimeout(300);
+        await page.locator(".wc-trash-actions__confirm .serein-btn--danger").click();
+        await page.waitForTimeout(1600);
+        const trashAfter = await page.locator(".wc-list__row").count();
+        record(
+          "emptying the trash removes every entry",
+          trashAfter === 0,
+          `${trashBefore} before, ${trashAfter} after`,
+        );
+        await page.screenshot({ path: resolve(OUT, "29-trash-emptied.png") });
+      } else {
+        record("emptying the trash removes every entry", trashBefore === 0, `${trashBefore} in the bin`);
+      }
+    }
+
+    // 17. The fixed phone tab bar never covers the end of a page.
     //
     // Serein fixes the tab bar to the bottom edge and the page reserves its height; reserving
     // too little hides the last row's controls behind it. This is measured at maximum scroll on

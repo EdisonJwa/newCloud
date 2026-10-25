@@ -1071,7 +1071,7 @@ export function Files({
               sort={route.sort}
               dir={route.dir}
               shares={shares}
-              onTagFilter={(tag) => {
+              onFilterTag={(tag) => {
                 // Filtering by a label is a SEARCH, not a listing filter: the tagged files may live
                 // anywhere in the tree, and a client-side filter over the current folder would show
                 // an empty list for a label that exists on files one level away.
@@ -1230,7 +1230,7 @@ function ListView({
   shares,
   t,
   fmt,
-  onTagFilter,
+  onFilterTag,
 }: {
   rows: FileNode[];
   picked: string[];
@@ -1251,8 +1251,9 @@ function ListView({
   sort: SortKey;
   dir: SortDir;
   shares: Share[] | null;
-  /** onTagFilter narrows the view to one label, which is what clicking a chip means. */
-  onTagFilter: (tag: { id: string }) => void;
+  /** onFilterTag narrows the whole tree to one label. Called from the row's menu, where the target
+   *  is a full-size menu item rather than an 18px chip. */
+  onFilterTag: (tag: { id: string; name: string }) => void;
   t: (key: string, params?: Record<string, string | number>) => string;
   fmt: { size: (bytes: number) => string; relative: (iso: string) => string };
 }) {
@@ -1389,10 +1390,16 @@ function ListView({
                     ) : null}
                     {/* Labels sit in the metadata line rather than beside the name: the name is the
                         one thing on a row that must not be truncated further, and a chip is a hint
-                        about a file rather than part of its identity. */}
+                        about a file rather than part of its identity.
+
+                        They are NOT interactive here. A chip is 18px tall, which is a third of the
+                        44px touch target a phone needs (WCAG 2.5.8), and the row around it is
+                        already a click target — nesting a small button inside a clickable row gives
+                        a tap two possible meanings. Filtering by a label is done from the search
+                        palette's picker, where the control is a full-size select. */}
                     {entry.tags && entry.tags.length > 0 ? (
                       <span className="wc-row-tags">
-                        <TagChips tags={entry.tags} max={3} onClick={(tag) => onTagFilter(tag)} />
+                        <TagChips tags={entry.tags} max={3} />
                       </span>
                     ) : null}
                   </span>
@@ -1477,6 +1484,26 @@ function ListView({
                       </a>
                     ) : null}
                     <div className="serein-menu__sep" role="separator" />
+                    {/* One item per label, so "show me everything with this label" has a target a
+                        finger can hit. The list is capped: a file with nine labels would otherwise
+                        push the destructive item off the menu. */}
+                    {(entry.tags ?? []).slice(0, 5).map((tag) => (
+                      <button
+                        key={tag.id}
+                        type="button"
+                        className="serein-menu__item"
+                        role="menuitem"
+                        onClick={() => onFilterTag(tag)}
+                      >
+                        <span className="serein-menu__icon">
+                          <Icon name="tag" size={13} />
+                        </span>
+                        {tag.name}
+                      </button>
+                    ))}
+                    {(entry.tags ?? []).length > 0 ? (
+                      <div className="serein-menu__sep" role="separator" />
+                    ) : null}
                     <button
                       type="button"
                       className="serein-menu__item"

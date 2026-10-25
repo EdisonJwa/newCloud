@@ -267,7 +267,7 @@ export function TagEditor({ node }: { node: { id: string; tags?: Tag[] } }) {
         <TagChips tags={assigned} onRemove={(tag) => void remove(tag)} />
         <button
           type="button"
-          className="serein-btn serein-btn--sm serein-btn--ghost wc-tageditor__add"
+          className="serein-btn serein-btn--sm serein-btn--quiet wc-tageditor__add"
           aria-expanded={open}
           onClick={() => setOpen((v) => !v)}
           disabled={busy}
@@ -665,14 +665,14 @@ function CommentBody({
           {/* Editing is the author's alone ??the server enforces it, and offering the control to a
               moderator would suggest they can change what somebody said. */}
           {mine ? (
-            <button type="button" className="serein-btn serein-btn--sm serein-btn--ghost" onClick={onStartEdit}>
+            <button type="button" className="serein-btn serein-btn--sm serein-btn--quiet" onClick={onStartEdit}>
               {t("social.edit")}
             </button>
           ) : null}
           {onReply ? (
             <button
               type="button"
-              className="serein-btn serein-btn--sm serein-btn--ghost"
+              className="serein-btn serein-btn--sm serein-btn--quiet"
               aria-expanded={replyOpen}
               onClick={onReply}
             >
@@ -680,7 +680,7 @@ function CommentBody({
             </button>
           ) : null}
           {canRemove ? (
-            <button type="button" className="serein-btn serein-btn--sm serein-btn--ghost" onClick={onRemove}>
+            <button type="button" className="serein-btn serein-btn--sm serein-btn--quiet" onClick={onRemove}>
               {t("social.remove")}
             </button>
           ) : null}

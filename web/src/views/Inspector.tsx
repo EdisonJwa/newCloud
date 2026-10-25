@@ -493,7 +493,7 @@ function InfoPane({
             <code className="wc-checksum__value">{entry.sha256}</code>
             <button
               type="button"
-              className="serein-btn serein-btn--sm serein-btn--ghost"
+              className="serein-btn serein-btn--sm serein-btn--quiet"
               onClick={() => void copyChecksum()}
             >
               {copied ? t("detail.copiedChecksum") : t("detail.copyChecksum")}
