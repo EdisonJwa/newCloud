@@ -23,7 +23,7 @@ keys with inline rationale.
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `addr` | `:8080` | Listen address. TLS terminates in front of the process. |
-| `public_url` | required | Absolute URL of the authenticated application. Used for OIDC redirects and share links. |
+| `public_url` | required | Absolute URL of the authenticated application. Used for OIDC redirects and share links. An `http://` scheme switches the deployment to plain-HTTP cookie rules (see below). |
 | `usercontent_url` | required | Absolute URL of the content origin. Must use a **different hostname** from `public_url`, not merely a different port or scheme. |
 | `usercontent_addr` | empty | Listen address for the content origin (NC-RR-006). Setting it makes the split real inside the process: the content routes (`/content/*`, `/s/{token}/download`, `/s/{token}/thumbnail`) move to this listener and the main listener answers 404 to all three. Empty means the proxy does the routing, and startup warns that the boundary is then the proxy's job alone. The reference deployment sets `":8081"`. |
 | `trusted_proxies` | `[]` | CIDRs allowed to set `X-Forwarded-For` (§9.4). Empty means no peer is trusted and the header is ignored, which is correct without a reverse proxy. |
@@ -48,6 +48,18 @@ Use a separate hostname, ideally a separate registrable domain (`usercontent.exa
 `allow_same_host_content: true`, strip `Cookie` on the content paths at the proxy, and record the
 exception — the process logs a warning on every boot while it is set. The opt-in does **not** permit
 an identical origin: `https://cloud.example.com` for both is still rejected.
+
+### Plain HTTP
+
+An `http://` `public_url` declares that TLS is terminated upstream — by your own reverse proxy —
+or disabled outright, and the process adapts the one thing it must: cookies. The
+`__Host-`/`__Secure-` prefixes and the `Secure` flag are legal only on a secure origin; a browser
+drops a cookie that violates that without an error anywhere, which looks exactly like a broken
+login. In this mode the server issues the same cookies — same names modulo the prefix, same paths,
+same per-share scoping — without the prefixes and without `Secure`. Nothing else relaxes: the
+usercontent hostname split still applies, and OIDC redirect URIs and share links follow
+`public_url` exactly as configured. The demo's `-no-tls` mode runs this way; a deployment that is
+reachable by other people should still serve `https://`.
 
 ## `auth`
 

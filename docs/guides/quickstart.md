@@ -28,6 +28,12 @@ Open `https://localhost:8443`. The fake IdP signs in as `alice`. The demo seeds 
 open share link, a password-protected share, and a drop-box link, and prints their URLs in the
 terminal.
 
+`go run ./tools/demo -no-tls` serves the same walkthrough over plain HTTP at
+`http://localhost:8080` — no generated certificate, no TLS proxy. That is for browsers that
+refuse a self-signed certificate and for putting your own reverse proxy in front; the server
+then issues its cookies without the `__Host-`/`__Secure-` prefixes and without `Secure`
+(see [configuration](configuration.md#plain-http)).
+
 The demo is intentionally not configurable into a production system:
 
 - the IdP accepts every login;

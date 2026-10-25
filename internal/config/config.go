@@ -108,6 +108,21 @@ type ServerConfig struct {
 	AllowSameHostContent bool `yaml:"allow_same_host_content"`
 }
 
+// PlainHTTP reports whether this deployment serves browsers over plain HTTP: public_url
+// carries an http:// scheme, meaning TLS is terminated upstream by the caller's own
+// reverse proxy, or disabled outright. It is not a separate knob, because public_url is
+// already the single source of truth for the externally visible origin — the OIDC redirect
+// URI, share links and host canonicalisation all derive from it, so a deployment that
+// wants plain HTTP says so exactly once, here.
+//
+// What follows from it: the __Host- and __Secure- cookie prefixes and the Secure flag are
+// legal only on a secure origin, so in this mode the server issues the same cookies without
+// them rather than having every browser silently drop them. Everything else — including the
+// requirement that usercontent_url use a different hostname — is unchanged.
+func (s ServerConfig) PlainHTTP() bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(s.PublicURL)), "http://")
+}
+
 type AuthConfig struct {
 	Issuer           string          `yaml:"issuer"`
 	ClientID         string          `yaml:"client_id"`

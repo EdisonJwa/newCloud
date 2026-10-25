@@ -44,16 +44,16 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	// SameSite=Lax on the state cookie: the IdP will redirect back with a
 	// top-level GET, which Lax permits, while a cross-site POST would not carry it.
 	http.SetCookie(w, &http.Cookie{
-		Name: stateCookie, Value: state, Path: "/", MaxAge: 600,
-		HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode,
+		Name: s.hostCookieName(stateCookieName), Value: state, Path: "/", MaxAge: 600,
+		HttpOnly: true, Secure: s.cookieSecure(), SameSite: http.SameSiteLaxMode,
 	})
 	http.SetCookie(w, &http.Cookie{
-		Name: pkceCookie, Value: verifier, Path: "/", MaxAge: 600,
-		HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode,
+		Name: s.hostCookieName(pkceCookieName), Value: verifier, Path: "/", MaxAge: 600,
+		HttpOnly: true, Secure: s.cookieSecure(), SameSite: http.SameSiteLaxMode,
 	})
 	http.SetCookie(w, &http.Cookie{
-		Name: nonceCookie, Value: nonce, Path: "/", MaxAge: 600,
-		HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode,
+		Name: s.hostCookieName(nonceCookieName), Value: nonce, Path: "/", MaxAge: 600,
+		HttpOnly: true, Secure: s.cookieSecure(), SameSite: http.SameSiteLaxMode,
 	})
 
 	// Next is restricted to same-site paths: an open redirect after login is a
@@ -63,8 +63,8 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		next = "/"
 	}
 	http.SetCookie(w, &http.Cookie{
-		Name: "__Host-wc_next", Value: next, Path: "/", MaxAge: 600,
-		HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode,
+		Name: s.hostCookieName(nextCookieName), Value: next, Path: "/", MaxAge: 600,
+		HttpOnly: true, Secure: s.cookieSecure(), SameSite: http.SameSiteLaxMode,
 	})
 
 	provider, perr := s.oidcProvider(r)
@@ -97,7 +97,7 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stateCookieVal, err := r.Cookie(stateCookie)
+	stateCookieVal, err := r.Cookie(s.hostCookieName(stateCookieName))
 	// Constant time, like the nonce comparison below: the state is not secret once
 	// it has been used, but the comparison is free and the habit should not depend
 	// on remembering which cookie values are worth the care.
@@ -105,7 +105,7 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_state", "state mismatch")
 		return
 	}
-	pkceCookieVal, err := r.Cookie(pkceCookie)
+	pkceCookieVal, err := r.Cookie(s.hostCookieName(pkceCookieName))
 	if err != nil || pkceCookieVal.Value == "" {
 		writeError(w, http.StatusBadRequest, "bad_state", "missing pkce verifier")
 		return
@@ -114,7 +114,7 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 	// The nonce cookie is required: a callback without one did not start a
 	// nonce-bearing flow, and accepting it would leave the replay window this check
 	// exists to close.
-	nonceCookieVal, err := r.Cookie(nonceCookie)
+	nonceCookieVal, err := r.Cookie(s.hostCookieName(nonceCookieName))
 	if err != nil || nonceCookieVal.Value == "" {
 		writeError(w, http.StatusBadRequest, "bad_state", "missing nonce")
 		return
@@ -386,15 +386,15 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 	s.setSessionCookie(w, token)
 
 	// Clear the one-shot flow cookies.
-	for _, name := range []string{stateCookie, pkceCookie, nonceCookie} {
+	for _, name := range []string{stateCookieName, pkceCookieName, nonceCookieName} {
 		http.SetCookie(w, &http.Cookie{
-			Name: name, Value: "", Path: "/", MaxAge: -1,
-			HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode,
+			Name: s.hostCookieName(name), Value: "", Path: "/", MaxAge: -1,
+			HttpOnly: true, Secure: s.cookieSecure(), SameSite: http.SameSiteLaxMode,
 		})
 	}
 
 	next := "/"
-	if c, err := r.Cookie("__Host-wc_next"); err == nil && isSameSitePath(c.Value) {
+	if c, err := r.Cookie(s.hostCookieName(nextCookieName)); err == nil && isSameSitePath(c.Value) {
 		next = c.Value
 	}
 	http.Redirect(w, r, next, http.StatusFound)
@@ -405,7 +405,7 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 // Clearing the cookie alone leaves a valid token that anyone who copied it can
 // keep using.
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
-	if c, err := r.Cookie(sessionCookie); err == nil && c.Value != "" {
+	if c, err := r.Cookie(s.hostCookieName(sessionCookieName)); err == nil && c.Value != "" {
 		if claims, verr := s.deps.Sessions.Verify(r.Context(), c.Value); verr == nil {
 			_ = s.deps.Sessions.Revoke(r.Context(), claims.ID)
 			_ = s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {

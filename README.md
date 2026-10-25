@@ -93,6 +93,7 @@ git clone https://github.com/EdisonJwa/newCloud.git
 cd newCloud
 go run ./tools/demo
 # open https://localhost:8443 (self-signed certificate)
+# add -no-tls to serve plain HTTP at http://localhost:8080 instead
 ```
 
 The demo is for evaluation only. It uses a fake IdP that accepts any login and a self-signed

@@ -389,9 +389,9 @@ func (s *Server) handleShareDownload(w http.ResponseWriter, r *http.Request) {
 // client's Range requests on one session.
 func (s *Server) downloadGrantHash(r *http.Request, sh store.Share) []byte {
 	grant := ""
-	if c, err := r.Cookie(shareCookieName(sh.ID.String())); err == nil && c.Value != "" {
+	if c, err := r.Cookie(s.shareCookieName(sh.ID.String())); err == nil && c.Value != "" {
 		grant = "pw:" + c.Value
-	} else if c, err := r.Cookie(recipientCookieName(sh.ID.String())); err == nil && c.Value != "" {
+	} else if c, err := r.Cookie(s.recipientCookieName(sh.ID.String())); err == nil && c.Value != "" {
 		grant = "rcpt:" + c.Value
 	} else {
 		grant = "anon:" + clientIP(r) + ":" + r.UserAgent()
@@ -614,9 +614,10 @@ func (s *Server) renderShareError(w http.ResponseWriter, r *http.Request, err er
 // The __Secure- prefix, not __Host-: the cookie is deliberately scoped to "/s/<token>", and
 // __Host- requires Path=/ ??a browser silently drops such a cookie, which looks exactly like a
 // wrong password. The per-share scoping therefore lives in the name and in the signed value,
-// both of which the server checks, rather than in the prefix.
-func shareCookieName(shareID string) string {
-	return "__Secure-wc_share_" + shareID
+// both of which the server checks, rather than in the prefix. A plain-HTTP deployment
+// (ServerConfig.PlainHTTP) drops the prefix for the same reason: a browser refuses it there.
+func (s *Server) shareCookieName(shareID string) string {
+	return s.scopedCookieName("wc_share_" + shareID)
 }
 
 // mintShareCookie issues the access grant.
@@ -630,7 +631,7 @@ func (s *Server) mintShareCookie(sh store.Share) (string, error) {
 
 // shareCookieValid reports whether the visitor has proven access to this share.
 func (s *Server) shareCookieValid(r *http.Request, sh store.Share) bool {
-	c, err := r.Cookie(shareCookieName(sh.ID.String()))
+	c, err := r.Cookie(s.shareCookieName(sh.ID.String()))
 	if err != nil || c.Value == "" {
 		return false
 	}

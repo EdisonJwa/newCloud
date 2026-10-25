@@ -13,6 +13,13 @@
 // sibling subdomain from overwriting the cookie, so the demo satisfies it rather than
 // weakening it. In production Caddy occupies the same position in the stack.
 //
+// -no-tls turns that proxy off for environments where a self-signed certificate is the
+// obstacle rather than the point — a locked-down browser, a container that cannot trust
+// the generated CA, or an evaluator who wants to put their own reverse proxy in front.
+// The server sees an http:// public_url and issues its cookies without the __Host-/
+// __Secure- prefixes and without Secure, which is the same trade a real plain-HTTP or
+// proxy-terminated deployment makes (see ServerConfig.PlainHTTP).
+//
 // Nothing here ships: it is a launcher, and it is the only place in the tree that
 // deliberately uses a self-signed certificate.
 package main
@@ -56,6 +63,7 @@ var (
 	dataDir    = flag.String("data", "", "state directory (default: a temp directory)")
 	skipDocker = flag.Bool("no-docker", false, "use an existing PostgreSQL via -database")
 	database   = flag.String("database", "", "DATABASE_URL to use instead of starting a container")
+	noTLS      = flag.Bool("no-tls", false, "serve over plain HTTP with no TLS proxy (cookies drop their __Host- prefixes)")
 )
 
 func main() {
@@ -107,14 +115,24 @@ func run() error {
 	defer idp.Close()
 
 	// ---- 3. TLS proxy ----
-	proxy, err := startTLSProxy(fmt.Sprintf("localhost:%d", *tlsPort),
-		fmt.Sprintf("http://127.0.0.1:%d", *appPort))
-	if err != nil {
-		return fmt.Errorf("start TLS proxy: %w", err)
-	}
-	defer proxy.Close()
-
+	//
+	// -no-tls skips it: the app's own loopback listener becomes the public one, and the
+	// content origin keeps its separate hostname — *.localhost resolves to the same
+	// loopback address, so the single listener serves both origins exactly as the proxy
+	// did. The http:// public_url then switches the server to plain-HTTP cookies.
 	publicURL := fmt.Sprintf("https://localhost:%d", *tlsPort)
+	userContentURL := fmt.Sprintf("https://content.localhost:%d", *tlsPort)
+	if !*noTLS {
+		proxy, err := startTLSProxy(fmt.Sprintf("localhost:%d", *tlsPort),
+			fmt.Sprintf("http://127.0.0.1:%d", *appPort))
+		if err != nil {
+			return fmt.Errorf("start TLS proxy: %w", err)
+		}
+		defer proxy.Close()
+	} else {
+		publicURL = fmt.Sprintf("http://localhost:%d", *appPort)
+		userContentURL = fmt.Sprintf("http://content.localhost:%d", *appPort)
+	}
 
 	// ---- 4. Configuration ----
 	cfgPath := filepath.Join(dir, "config.yml")
@@ -139,7 +157,7 @@ storage:
   upload_dir: %q
 mail:
   enabled: false
-`, *appPort, publicURL, fmt.Sprintf("https://content.localhost:%d", *tlsPort),
+`, *appPort, publicURL, userContentURL,
 		idp.URL(), filepath.Join(dir, "blobs"), filepath.Join(dir, "uploads"))
 
 	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {

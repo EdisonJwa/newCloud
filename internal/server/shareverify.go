@@ -62,12 +62,12 @@ func (s *Server) handleShareVerify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.SetCookie(w, &http.Cookie{
-		Name:     shareCookieName(sh.ID.String()),
+		Name:     s.shareCookieName(sh.ID.String()),
 		Value:    cookie,
 		Path:     "/s/" + token,
 		MaxAge:   int(sharePageTimeout.Seconds()),
 		HttpOnly: true,
-		Secure:   true,
+		Secure:   s.cookieSecure(),
 		SameSite: http.SameSiteLaxMode,
 	})
 	writeJSON(w, http.StatusOK, map[string]any{"verified": true})

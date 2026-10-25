@@ -20,11 +20,40 @@ import (
 // sibling-subdomain attack, where a compromised other host sets a cookie this
 // origin would then send.
 const (
-	sessionCookie = "__Host-wc_session"
-	stateCookie   = "__Host-wc_state"
-	pkceCookie    = "__Host-wc_pkce"
-	nonceCookie   = "__Host-wc_nonce"
+	sessionCookieName = "wc_session"
+	stateCookieName   = "wc_state"
+	pkceCookieName    = "wc_pkce"
+	nonceCookieName   = "wc_nonce"
+	nextCookieName    = "wc_next"
 )
+
+// hostCookieName names a root-scoped cookie for this deployment: __Host- prefixed on a
+// secure origin, bare in a plain-HTTP deployment (ServerConfig.PlainHTTP — TLS terminated
+// by an upstream reverse proxy, or disabled). A browser refuses a prefixed cookie on an
+// http:// origin without an error anywhere, so keeping the prefix there would turn every
+// login into a silent redirect loop. The prefix's guarantees only exist on a secure origin,
+// which is why the same switch also clears the Secure flag rather than weakening anything.
+func (s *Server) hostCookieName(name string) string {
+	if s.deps.Config.Server.PlainHTTP() {
+		return name
+	}
+	return "__Host-" + name
+}
+
+// scopedCookieName names a cookie deliberately scoped to a path (/s/<token>), where __Host-
+// is not allowed because it requires Path=/: __Secure- on a secure origin, bare in a
+// plain-HTTP deployment, for the same reason as hostCookieName.
+func (s *Server) scopedCookieName(name string) string {
+	if s.deps.Config.Server.PlainHTTP() {
+		return name
+	}
+	return "__Secure-" + name
+}
+
+// cookieSecure is the Secure attribute for every cookie this process sets.
+func (s *Server) cookieSecure() bool {
+	return !s.deps.Config.Server.PlainHTTP()
+}
 
 type ctxKey int
 
@@ -85,7 +114,7 @@ func (s *Server) requireSession(next http.Handler) http.Handler {
 // has already refused: the consent page mints an App Password, so it has to apply the same
 // revocation and IdP-revalidation checks, not a weaker subset of them.
 func (s *Server) sessionUser(r *http.Request) (store.User, error) {
-	c, err := r.Cookie(sessionCookie)
+	c, err := r.Cookie(s.hostCookieName(sessionCookieName))
 	if err != nil || c.Value == "" {
 		return store.User{}, errNoSession
 	}
@@ -194,23 +223,23 @@ func (s *Server) userByID(ctx context.Context, subject string) (store.User, erro
 
 func (s *Server) setSessionCookie(w http.ResponseWriter, token string) {
 	http.SetCookie(w, &http.Cookie{
-		Name:     sessionCookie,
+		Name:     s.hostCookieName(sessionCookieName),
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   true,
+		Secure:   s.cookieSecure(),
 		SameSite: http.SameSiteLaxMode,
 	})
 }
 
 func (s *Server) clearSessionCookie(w http.ResponseWriter) {
 	http.SetCookie(w, &http.Cookie{
-		Name:     sessionCookie,
+		Name:     s.hostCookieName(sessionCookieName),
 		Value:    "",
 		Path:     "/",
 		MaxAge:   -1,
 		HttpOnly: true,
-		Secure:   true,
+		Secure:   s.cookieSecure(),
 		SameSite: http.SameSiteLaxMode,
 	})
 }

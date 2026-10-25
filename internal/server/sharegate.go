@@ -72,9 +72,10 @@ func (g gateResult) allowed() bool {
 }
 
 // recipientCookieName scopes a verified-address grant to one share.
-func recipientCookieName(shareID string) string {
-	// Same reasoning as shareCookieName: a path-scoped cookie cannot carry the __Host- prefix.
-	return "__Secure-wc_rcpt_" + shareID
+func (s *Server) recipientCookieName(shareID string) string {
+	// Same reasoning as shareCookieName: a path-scoped cookie cannot carry the __Host-
+	// prefix, and a bare name is all a plain-HTTP deployment can keep.
+	return s.scopedCookieName("wc_rcpt_" + shareID)
 }
 
 // mintRecipientCookie issues the grant for a verified address.
@@ -88,7 +89,7 @@ func (s *Server) mintRecipientCookie(sh store.Share, email string) (string, erro
 
 // recipientCookieEmail returns the verified address for this share, or "".
 func (s *Server) recipientCookieEmail(r *http.Request, sh store.Share) string {
-	c, err := r.Cookie(recipientCookieName(sh.ID.String()))
+	c, err := r.Cookie(s.recipientCookieName(sh.ID.String()))
 	if err != nil || c.Value == "" {
 		return ""
 	}
@@ -108,12 +109,12 @@ func (s *Server) recipientCookieEmail(r *http.Request, sh store.Share) string {
 // setRecipientCookie stores the grant.
 func (s *Server) setRecipientCookie(w http.ResponseWriter, token string, sh store.Share, value string) {
 	http.SetCookie(w, &http.Cookie{
-		Name:     recipientCookieName(sh.ID.String()),
+		Name:     s.recipientCookieName(sh.ID.String()),
 		Value:    value,
 		Path:     "/s/" + token,
 		MaxAge:   int(share.RecipientAccessTTL.Seconds()),
 		HttpOnly: true,
-		Secure:   true,
+		Secure:   s.cookieSecure(),
 		SameSite: http.SameSiteLaxMode,
 	})
 }
