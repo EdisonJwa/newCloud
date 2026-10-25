@@ -392,15 +392,6 @@ func (s *Server) publishFile(
 		}
 		node = n
 
-		bytes := res.Size
-		if aerr := tx.Audit(ctx, store.AuditEntry{
-			ActorKind: "user", ActorUserID: actor.Ptr(), ActorEmail: actor.Email(),
-			ActorIP: clientIP(r), UserAgent: r.UserAgent(),
-			Action: "file.write", TargetKind: "node", TargetID: node.ID.String(),
-			Result: "ok", Bytes: &bytes, Metadata: map[string]any{"name": name},
-		}); aerr != nil {
-			return aerr
-		}
 		// The index follows the write, in the same transaction (core-scope §7.2).
 		//
 		// In the SAME transaction because the enqueue is part of the change: a publish that commits
@@ -415,9 +406,23 @@ func (s *Server) publishFile(
 		// that commits without its scan job is a file nobody will ever look at, and a rolled
 		// back publish with a queued job would ask the scanner about a file that does not
 		// exist. The dedupe key is the node id, so rapid saves collapse like index jobs do.
-		return tx.Enqueue(ctx, store.Job{
+		if err := tx.Enqueue(ctx, store.Job{
 			Kind: "av.scan", DedupeKey: "av:" + node.ID.String(),
 			Payload: map[string]any{"node_id": node.ID.String()},
+		}); err != nil {
+			return err
+		}
+
+		// Last statement in the transaction, on purpose. The audit append takes the global
+		// chain advisory lock, which is held until commit and serialises every audited write
+		// in the deployment; the enqueues above are indexed INSERTs that belong outside that
+		// window. Nothing in the transaction depends on the order of these statements.
+		bytes := res.Size
+		return tx.Audit(ctx, store.AuditEntry{
+			ActorKind: "user", ActorUserID: actor.Ptr(), ActorEmail: actor.Email(),
+			ActorIP: clientIP(r), UserAgent: r.UserAgent(),
+			Action: "file.write", TargetKind: "node", TargetID: node.ID.String(),
+			Result: "ok", Bytes: &bytes, Metadata: map[string]any{"name": name},
 		})
 	})
 	if err != nil {
