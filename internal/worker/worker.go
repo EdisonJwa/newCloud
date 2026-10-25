@@ -18,7 +18,10 @@ import (
 
 	"github.com/EdisonJwa/newCloud/internal/audit"
 	"github.com/EdisonJwa/newCloud/internal/auditverify"
+	"github.com/EdisonJwa/newCloud/internal/av"
 	"github.com/EdisonJwa/newCloud/internal/blob"
+	"github.com/EdisonJwa/newCloud/internal/config"
+	"github.com/EdisonJwa/newCloud/internal/mail"
 	"github.com/EdisonJwa/newCloud/internal/metrics"
 	"github.com/EdisonJwa/newCloud/internal/search"
 	"github.com/EdisonJwa/newCloud/internal/store"
@@ -120,6 +123,20 @@ type Worker struct {
 	// searchCursor is where the last backfill pass stopped. In-process on purpose: it decides where
 	// THIS worker resumes, and losing it costs a redundant idempotent pass rather than correctness.
 	searchCursor uuid.UUID
+
+	// mailer delivers the queued message types (M4). Nil means no transport: the mail.send
+	// handler completes such jobs with a warning instead of retrying, because a message nobody
+	// can send does not become sendable by waiting.
+	mailer mail.Sender
+	// notify is the notification policy (M4): the expiry-reminder window and the inbox
+	// retention bound. Zero values keep the pass quiet, matching the config's "0 disables".
+	notify config.NotifyConfig
+
+	// scanner is the antivirus daemon (M5). Nil means no daemon: av.scan jobs complete with a
+	// warning, the same shape mail.send takes.
+	scanner av.Scanner
+	// avMaxBytes caps how much of one file is streamed to the daemon.
+	avMaxBytes int64
 
 	// runMu guards done, which is closed exactly once, when Run finishes. Run must be
 	// started once per process: a second call must not start a second set of duty
@@ -387,6 +404,17 @@ func (w *Worker) duties() []duty {
 		}},
 		{name: "rate-limit-prune", interval: w.purgeInterval, run: func(ctx context.Context) error {
 			w.pruneRateLimitRows(ctx)
+			return nil
+		}},
+		// Notifications (M4): expiry reminders for links inside the window, and the inbox
+		// retention bound. The purge family's cadence fits both — a reminder a few hours
+		// late is still before the link dies, and an inbox row a few hours past its window
+		// is noise nobody is reading anyway. Both halves no-op on their "0 disables" knobs,
+		// so the duty costs two queries per pass in a deployment that turned both off.
+		{name: "notify", interval: w.purgeInterval, run: func(ctx context.Context) error {
+			if err := w.NotifyPass(ctx); err != nil {
+				return err
+			}
 			return nil
 		}},
 		// Session rows are one per login, and nothing read a dead one again: expiry and

@@ -229,6 +229,34 @@ func (s *Server) handleShareCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// An email share's invitation (M4): the recipients are addresses, not accounts, so there
+	// is no inbox to write to — the mail IS the notification. Queued rather than sent inline
+	// (a relay that is down must not fail a share that already exists), and skipped when no
+	// transport is configured for the same reason the code path above refuses to invite.
+	if s.deps.Mailer != nil && kind == store.ShareEmail && len(body.Recipients) > 0 {
+		label := body.Label
+		if label == "" {
+			label = node.Name
+		}
+		qerr := s.deps.Meta.WithTx(r.Context(), func(ctx context.Context, tx store.Tx) error {
+			for _, addr := range body.Recipients {
+				// Per-recipient dedupe key: a retried create against the same share cannot
+				// invite the same mailbox twice.
+				if err := enqueueMail(ctx, tx, "share_notice", addr, map[string]string{
+					"actor": actor.Username(), "label": label,
+				}, "invite:"+created.Share.ID.String()+":"+addr); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		if qerr != nil {
+			// The share exists; a lost invitation mail is a logged defect, not a failed create.
+			s.deps.Log.Error("share created but its invitation mail could not be queued",
+				"share", created.Share.ID, "error", qerr)
+		}
+	}
+
 	// The plaintext token is returned exactly once, here.
 	// The share exists; a failure to decorate the response must not tell the client the creation
 	// failed. It is logged instead, and the recipient list is the only field affected.

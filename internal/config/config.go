@@ -36,6 +36,8 @@ type Config struct {
 	Mail    MailConfig    `yaml:"mail"`
 	Mounts  MountsConfig  `yaml:"mounts"`
 	Search  SearchConfig  `yaml:"search"`
+	Notify  NotifyConfig  `yaml:"notify"`
+	AV      AVConfig      `yaml:"antivirus"`
 
 	// warnings collects the non-fatal findings Validate produces (a legal but
 	// discouraged configuration, such as an http:// public URL). They are reported by
@@ -505,6 +507,43 @@ type MountsConfig struct {
 // DefaultMountSchemes are the schemes a provider exists for out of the box (ADR-0014).
 var DefaultMountSchemes = []string{"webdav", "ftp", "sftp"}
 
+// NotifyConfig governs the in-app inbox and its outbound mail (competitiveness-analysis M4).
+//
+// The two thresholds are "0 disables" knobs for the same reason trash retention is: a policy an
+// operator cannot switch off is a policy that pages somebody at 3am about a link they renew
+// every Monday anyway. The retention bound exists because an inbox is a table: without a window
+// it grows for the life of the account, read rows included.
+type NotifyConfig struct {
+	// QuotaWarningPercent is the usage percentage at (or above) which an upload warns its
+	// owner. 90 by default; 0 disables the warning.
+	QuotaWarningPercent int `yaml:"quota_warning_percent"`
+	// ShareExpiryDays is how many days before a link expires its owner is reminded. 3 by
+	// default; 0 disables the reminder.
+	ShareExpiryDays int `yaml:"share_expiry_days"`
+	// RetentionDays prunes notifications older than the window, read or not. 90 by default;
+	// 0 keeps them forever (the operator's choice, not a silent default).
+	RetentionDays int `yaml:"retention_days"`
+}
+
+// AVConfig governs malware scanning through a ClamAV clamd daemon (M5).
+//
+// Disabled by default, for the same reason the search engine is: the daemon is a second
+// service, and a deployment that did not start one must not fail uploads trying to reach it.
+// Enabled, the posture is quarantine: a scan that names a signature moves the file to the
+// owner's trash, notifies the owner, and writes an audit row — never a silent deletion.
+type AVConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// Host is the clamd TCP address (host:port). Empty means the loopback default, which is
+	// where a beside-the-binary daemon listens.
+	Host string `yaml:"host"`
+	// TimeoutSec bounds one scan session, both directions.
+	TimeoutSec int `yaml:"timeout_seconds"`
+	// MaxScanBytes caps how much of a file is streamed to the daemon. A file above the cap is
+	// NOT scanned and the job says so in the log — skipped is a state an operator can query,
+	// while a scan that silently never finishes is one they cannot.
+	MaxScanBytes int64 `yaml:"max_scan_bytes"`
+}
+
 // SearchConfig governs the OPTIONAL content-search engine (core-scope §7.2, ADR-0016).
 //
 // The default is `none`, and that is a decision rather than an omission: a deployment without
@@ -591,6 +630,11 @@ func Default() Config {
 			CommentRatePerHour: 60,
 		},
 		Audit: AuditConfig{RetentionDays: 365},
+		Notify: NotifyConfig{
+			QuotaWarningPercent: 90,
+			ShareExpiryDays:     3,
+			RetentionDays:       90,
+		},
 		Mounts: MountsConfig{
 			// Private-address refusal is the safe default for the day user mounts are
 			// turned on; it is only reachable then, but a default that must be remembered
@@ -854,6 +898,28 @@ func (c *Config) Validate() error {
 		default:
 			return invalid("auth.group_role_map[%q]: unknown role %q", name, role)
 		}
+	}
+
+	// Notifications (M4). The thresholds are bounds, not requests: a percent above 100 or a
+	// negative day count is a typo in a file someone will copy, and refusing it at startup is
+	// cheaper than discovering it from a warning that never arrives.
+	if c.Notify.QuotaWarningPercent < 0 || c.Notify.QuotaWarningPercent > 100 {
+		return invalid("notify.quota_warning_percent must be 0-100, got %d", c.Notify.QuotaWarningPercent)
+	}
+	if c.Notify.ShareExpiryDays < 0 {
+		return invalid("notify.share_expiry_days cannot be negative, got %d", c.Notify.ShareExpiryDays)
+	}
+	if c.Notify.RetentionDays < 0 {
+		return invalid("notify.retention_days cannot be negative, got %d", c.Notify.RetentionDays)
+	}
+
+	// Antivirus (M5). A timeout of zero is legal (the client applies its default); a negative
+	// one, like every other bound here, is a typo in a file somebody will copy.
+	if c.AV.TimeoutSec < 0 {
+		return invalid("antivirus.timeout_seconds cannot be negative, got %d", c.AV.TimeoutSec)
+	}
+	if c.AV.MaxScanBytes < 0 {
+		return invalid("antivirus.max_scan_bytes cannot be negative, got %d", c.AV.MaxScanBytes)
 	}
 
 	// The search engine (§7.2). Validated here for the same reason mail is: a key that is accepted,

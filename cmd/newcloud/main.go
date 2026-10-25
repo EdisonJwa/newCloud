@@ -34,6 +34,7 @@ import (
 	"github.com/EdisonJwa/newCloud/internal/auditverify"
 	"github.com/EdisonJwa/newCloud/internal/auth"
 	"github.com/EdisonJwa/newCloud/internal/authz"
+	"github.com/EdisonJwa/newCloud/internal/av"
 	"github.com/EdisonJwa/newCloud/internal/blob"
 	"github.com/EdisonJwa/newCloud/internal/blob/local"
 	s3blob "github.com/EdisonJwa/newCloud/internal/blob/s3"
@@ -681,6 +682,7 @@ func serve() error {
 		AppPass:      auth.NewAppPasswords(meta),
 		Shares:       shares,
 		Mailer:       mailer,
+		Notify:       cfg.Notify,
 		Provider:     provider,
 		Providers:    providers,
 		Uploads:      uploads,
@@ -710,6 +712,23 @@ func serve() error {
 	// anything here; the queries are written to tolerate it.
 	wk := worker.New(meta, log).WithRetention(cfg.Limits.VersionRetention(), cfg.Limits.TrashRetention())
 	wk.WithMetrics(reg)
+
+	// Notifications and their mail (M4) ride the worker: the mailer is what the queued
+	// messages are delivered through, and the policy carries the two "0 disables" knobs the
+	// expiry duty and the inbox prune consult. Attached whether or not mail is configured —
+	// the in-app half does not depend on a transport.
+	wk.WithMailer(mailer)
+	wk.WithNotify(cfg.Notify)
+
+	// Antivirus (M5): the daemon is optional and wired only when enabled, but the blob reader
+	// the scanner needs is attached either way — it is the scrub's reader, and one attachment
+	// point keeps the two consumers from drifting.
+	if cfg.AV.Enabled {
+		timeout := time.Duration(cfg.AV.TimeoutSec) * time.Second
+		wk.WithAntivirus(av.NewClamd(cfg.AV.Host, timeout), cfg.AV.MaxScanBytes)
+		log.Info("antivirus scanning enabled", "host", cfg.AV.Host,
+			"max_scan_bytes", cfg.AV.MaxScanBytes)
+	}
 
 	// The content indexer (core-scope §7.2). Wired whenever an engine exists, because a deployment
 	// that turned the engine on must not also have to remember a second switch to make it fill.

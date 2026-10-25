@@ -221,6 +221,29 @@ search:
     index_prefix: "newcloud"
     timeout_seconds: 5
 
+# Notifications (M4): the in-app inbox and its outbound mail. The in-app half needs no
+# configuration; these keys govern when the emitters speak and how long the inbox remembers.
+notify:
+  # Warn an owner whose storage crosses this percentage of their quota (0 disables).
+  quota_warning_percent: 90
+  # Remind a share owner this many days before a link expires (0 disables).
+  share_expiry_days: 3
+  # Prune notifications older than this window, read or not (0 keeps them forever).
+  retention_days: 90
+
+# Antivirus (M5): asynchronous scanning through a ClamAV clamd daemon. Disabled by default —
+# enabling it is the decision to run a second service beside the binary. A detection
+# quarantines: the file moves to the owner's trash, the owner is notified, and the action is
+# audited. Never a silent deletion, and never a refusal that waits on a daemon.
+antivirus:
+  enabled: false
+  # clamd TCP address (the loopback default is where a beside-the-binary daemon listens).
+  host: "127.0.0.1:3310"
+  # Bounds one scan session, both directions.
+  timeout_seconds: 30
+  # A file larger than this is not scanned; the job says so in the log rather than hanging.
+  max_scan_bytes: 104857600            # 100 MiB
+
 # External storage mounts (ADR-0014): SMB/SFTP/FTP/WebDAV remotes as top-level folders,
 # browsed in place, never copied. Disabled by default — enabling it is the decision to let
 # the file service talk to hosts it did not choose itself.

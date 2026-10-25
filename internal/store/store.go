@@ -507,6 +507,9 @@ type Tx interface {
 	// Embedded rather than folded into this block because the three arrived together and share the
 	// node-id addressing rule; keeping them in their own file is what lets that rule be stated once.
 	SocialTx
+	// NotificationTx is the in-app inbox (competitiveness-analysis M4). Not hash-chained — the
+	// audit chain records accountability, and telemetry in it would dilute exactly that.
+	NotificationTx
 	ExpireVersions(ctx context.Context, retention time.Duration) (int, error)
 
 	// Enqueue adds an asynchronous job in the same transaction.

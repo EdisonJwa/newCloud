@@ -145,6 +145,41 @@ func (w *Worker) registerJobs() {
 				return rerr
 			})
 		},
+
+		// One asynchronous malware scan (M5). Enqueued by the publish path in the same
+		// transaction as the file it describes; the verdict's consequence — quarantine, notify,
+		// audit — is the handler's, in one transaction (see internal/worker/av.go).
+		"av.scan": w.scanNode,
+
+		// One queued outbound message (M4). The retry and backoff the queue already has are
+		// the point: a flaky relay is a retried job, not a request that hangs or a message
+		// that quietly never went. Delivery errors are returned RETRYABLE — a relay being
+		// restarted is the common failure — while a malformed payload is permanent, because
+		// waiting will not fix a payload nobody produced correctly.
+		"mail.send": func(ctx context.Context, payload map[string]any) error {
+			to, _ := payload["to"].(string)
+			template, _ := payload["template"].(string)
+			if to == "" || template == "" {
+				return Permanent(fmt.Errorf("mail.send: payload needs to and template"))
+			}
+			if w.mailer == nil {
+				w.log.Warn("mail.send completed without delivery: no transport configured",
+					"to", to, "template", template)
+				return nil
+			}
+			switch template {
+			case "share_notice":
+				actor, _ := payload["actor"].(string)
+				label, _ := payload["label"].(string)
+				return w.mailer.SendShareNotice(to, actor, label)
+			case "expiry_reminder":
+				label, _ := payload["label"].(string)
+				expires, _ := payload["expires"].(string)
+				return w.mailer.SendExpiryReminder(to, label, expires)
+			default:
+				return Permanent(fmt.Errorf("mail.send: unknown template %q", template))
+			}
+		},
 	}
 	// The content-search index job (core-scope §7.2). Registered in its own function because the
 	// handler reads a node, its tags and optionally its bytes — a different dependency set from

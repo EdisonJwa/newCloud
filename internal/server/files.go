@@ -408,11 +408,25 @@ func (s *Server) publishFile(
 		// and a publish that rolls back with its job would ask the indexer to index a document that
 		// never existed. Enqueue only — nothing here waits for the engine, which is what keeps a
 		// broken index from failing a write.
-		return enqueueSearchIndex(ctx, tx, node.ID)
+		if err := enqueueSearchIndex(ctx, tx, node.ID); err != nil {
+			return err
+		}
+		// The malware scan rides the same transaction (M5), for the same reason: a publish
+		// that commits without its scan job is a file nobody will ever look at, and a rolled
+		// back publish with a queued job would ask the scanner about a file that does not
+		// exist. The dedupe key is the node id, so rapid saves collapse like index jobs do.
+		return tx.Enqueue(ctx, store.Job{
+			Kind: "av.scan", DedupeKey: "av:" + node.ID.String(),
+			Payload: map[string]any{"node_id": node.ID.String()},
+		})
 	})
 	if err != nil {
 		return store.Node{}, err
 	}
+	// After the commit, on purpose: the warning is telemetry and must never be able to fail a
+	// publish that already happened (M4, and see maybeWarnQuota for why the reads are racy by
+	// design rather than accidental).
+	s.maybeWarnQuota(ctx, actor.ID())
 	return node, nil
 }
 

@@ -342,6 +342,37 @@ func TestEveryJobKindIsIdempotent(t *testing.T) {
 			},
 			after: func(t *testing.T, m *store.Memory, first, second int) error { return nil },
 		},
+		// av.scan (M5). This harness wires no scanner, so the run takes the
+		// completes-with-warning path and the queue must end empty. The verdict path — that a
+		// re-run after a quarantine cannot double-quarantine — is pinned in av_test.go with a
+		// scanner fake (Trash is idempotent via ErrNotFound-tolerance and the notification's
+		// dedupe key is the node id).
+		"av.scan": {
+			job: func(t *testing.T, m *store.Memory) store.Job {
+				return store.Job{Kind: "av.scan", DedupeKey: "av:" + uuid.New().String(),
+					Payload: map[string]any{"node_id": uuid.New().String()}, MaxAttempts: 2}
+			},
+			after: func(t *testing.T, m *store.Memory, first, second int) error {
+				return drainQueue(t, m)
+			},
+		},
+		// mail.send (M4). This harness has no transport wired, so both runs take the
+		// completes-with-warning path and the queue must end empty — which is the re-run
+		// guarantee this test exists for. The OTHER idempotency question, "a message that was
+		// already delivered must not be delivered twice", is answered by the queue's dedupe key
+		// and is pinned in notify_test.go with a real transport fake.
+		"mail.send": {
+			job: func(t *testing.T, m *store.Memory) store.Job {
+				return store.Job{Kind: "mail.send",
+					Payload: map[string]any{
+						"to": "idempotent@example.test", "template": "expiry_reminder",
+						"label": "Re-run probe", "expires": "soon",
+					}, MaxAttempts: 2}
+			},
+			after: func(t *testing.T, m *store.Memory, first, second int) error {
+				return drainQueue(t, m)
+			},
+		},
 		"user.purge_credentials": {
 			job: func(t *testing.T, m *store.Memory) store.Job {
 				u := m.AddUser(store.User{Username: "purge-" + uuid.New().String()[:8],

@@ -96,6 +96,9 @@ type Memory struct {
 	// comments is the discussion table. Soft-deleted rows stay: the thread has to remain readable,
 	// and "a comment was deleted" is a moderation fact worth keeping.
 	comments []*Comment
+	// notifications is the in-app inbox (M4). Appended only, except mark-read — which is why the
+	// snapshot clones each row: a transaction that rolls back must not dismiss somebody's bell.
+	notifications []*Notification
 	// nextCommentSeq is the in-memory equivalent of the comments.seq identity column.
 	//
 	// It is a counter rather than a timestamp for a reason measured on this platform: two
@@ -280,6 +283,7 @@ func (m *Memory) WithTx(ctx context.Context, fn func(ctx context.Context, tx Tx)
 	m.nodeTags = work.nodeTags
 	m.comments = work.comments
 	m.nextCommentSeq = work.nextCommentSeq
+	m.notifications = work.notifications
 	m.groupMembers = work.groupMembers
 	m.otpAttempts = work.otpAttempts
 	m.shareUploadEvents = work.shareUploadEvents
@@ -421,6 +425,15 @@ func (m *Memory) snapshot() *Memory {
 	}
 	for _, c := range m.comments {
 		work.comments = append(work.comments, cloneComment(c))
+	}
+	// Notifications are cloned for the same reason comments are: mark-read mutates the row.
+	for _, n := range m.notifications {
+		cp := *n
+		if n.ReadAt != nil {
+			r := *n.ReadAt
+			cp.ReadAt = &r
+		}
+		work.notifications = append(work.notifications, &cp)
 	}
 	for k, v := range m.mounts {
 		work.mounts[k] = v

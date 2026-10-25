@@ -3948,6 +3948,9 @@ func Run(t *testing.T, factory Factory, opts Options) {
 	// implemented twice — a SQL statement and a Go loop — and a case that only one backend runs
 	// proves nothing about the other.
 	t.Run("Favorites", func(t *testing.T) { favoriteSuite(t, factory) })
+	// Notifications (M4): same shared-suite reason as the social block above — SQL and a Go loop
+	// must keep the same answers, including the unread dedupe and the cursor tiebreak.
+	t.Run("Notifications", NotificationCases(factory))
 	t.Run("Tags", func(t *testing.T) { tagSuite(t, factory) })
 	t.Run("Comments", func(t *testing.T) { commentSuite(t, factory) })
 	t.Run("FilteredSearch", func(t *testing.T) { filteredSearchSuite(t, factory) })

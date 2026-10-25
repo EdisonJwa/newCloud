@@ -83,6 +83,10 @@ type Deps struct {
 	// configured: email shares still exist, but the server logs a warning each time a
 	// code is generated rather than pretending it was sent.
 	Mailer mail.Sender
+	// Notify is the notification policy (M4): the thresholds the emitters consult and the
+	// retention bound. Zero values keep every emitter quiet, which is what a deployment that
+	// wants no inbox gets without a separate toggle.
+	Notify config.NotifyConfig
 	// Thumbs renders image previews. Nil disables the endpoint, which then answers 415 and
 	// the client falls back to a type badge.
 	Thumbs *thumbnail.Generator
@@ -386,6 +390,15 @@ func (s *Server) Handler() http.Handler {
 			// contract. The toggle above lives with the file routes because it is addressed like
 			// a file (?path= or ?id=).
 			r.Get("/favorites", s.handleFavorites)
+
+			// The notification inbox (M4). Read routes only: notifications are written by the
+			// features that have something to say — a grant, an upload against a quota, a link
+			// nearing its expiry — never posted to directly.
+			r.Route("/notifications", func(r chi.Router) {
+				r.Get("/", s.handleNotifications)
+				r.Post("/read-all", s.handleNotificationsReadAll)
+				r.Post("/{id}/read", s.handleNotificationRead)
+			})
 
 			// Tags (core-scope §5). Personal tags belong to their owner; system tags are the
 			// deployment's shared vocabulary and only an administrator may change one.

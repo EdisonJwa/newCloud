@@ -1,9 +1,14 @@
 // Package mail sends the few messages this product needs.
 //
-// There is exactly one message type — a share recipient's verification code — and the
-// design reflects that. A general templating system would be more code than the thing
-// it renders, and every added feature is another place a recipient address or a share
-// label can end up somewhere it should not.
+// There are three message types: a share recipient's verification code, a share notice, and a
+// share-expiry reminder. The design reflects that count — a general templating system would be
+// more code than the thing it renders, and every added feature is another place a recipient
+// address or a share label can end up somewhere it should not.
+//
+// The two rule shapes that matter: the verification code is fire-and-forget because its caller
+// is an unauthenticated request that must not be able to observe delivery; the notice and the
+// reminder return their error because they travel through the job queue, whose retry and
+// backoff exist to make a flaky relay a logged, retried event rather than a lost message.
 //
 // SMTP is the transport because it is what a self-hosted deployment already has: a
 // relay, or a local agent on loopback. Nothing here reaches a third-party API.
@@ -53,6 +58,12 @@ type Config struct {
 // Sender delivers messages.
 type Sender interface {
 	SendRecipientCode(to, shareLabel, code, ttl string)
+	// SendShareNotice tells an account holder a folder was shared with them (M4). The error
+	// is returned because the caller is the job queue: a failed send is a retryable job
+	// failure, not a log line.
+	SendShareNotice(to, actorName, label string) error
+	// SendExpiryReminder tells a share owner a link is about to expire (M4).
+	SendExpiryReminder(to, label, expires string) error
 }
 
 // SMTP delivers over SMTP.
@@ -133,6 +144,52 @@ func (s *SMTP) composeRecipientCode(shareLabel, code, ttl string) []byte {
 	fmt.Fprintf(&b, "It expires in %s and can be used once.\r\n\r\n", ttl)
 	b.WriteString("If you were not expecting this, you can ignore this message.\r\n")
 	return []byte(b.String())
+}
+
+// SendShareNotice tells an account holder a folder was shared with them.
+//
+// Like every message here it carries no link: "sign in as usual" cannot be phished, and the
+// recipient's inbox already knows where the service lives.
+func (s *SMTP) SendShareNotice(to, actorName, label string) error {
+	if s == nil {
+		return nil
+	}
+	if label == "" {
+		label = "a folder"
+	}
+	if actorName == "" {
+		actorName = "someone"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "From: %s\r\n", s.cfg.From)
+	b.WriteString("Subject: A folder was shared with you\r\n")
+	b.WriteString("MIME-Version: 1.0\r\n")
+	b.WriteString("Content-Type: text/plain; charset=utf-8\r\n")
+	b.WriteString("\r\n")
+	fmt.Fprintf(&b, "%s shared %q with you.\r\n\r\n", actorName, label)
+	b.WriteString("Sign in as usual to see it under Shared with me.\r\n\r\n")
+	b.WriteString("If you were not expecting this, you can ignore this message.\r\n")
+	return s.send(to, []byte(b.String()))
+}
+
+// SendExpiryReminder tells an owner one of their links stops working soon, so extending it is a
+// decision made before the breakage rather than after.
+func (s *SMTP) SendExpiryReminder(to, label, expires string) error {
+	if s == nil {
+		return nil
+	}
+	if label == "" {
+		label = "a shared link"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "From: %s\r\n", s.cfg.From)
+	b.WriteString("Subject: A shared link expires soon\r\n")
+	b.WriteString("MIME-Version: 1.0\r\n")
+	b.WriteString("Content-Type: text/plain; charset=utf-8\r\n")
+	b.WriteString("\r\n")
+	fmt.Fprintf(&b, "Your share %q expires %s.\r\n\r\n", label, expires)
+	b.WriteString("Sign in as usual and extend it from the Shares view if it should stay.\r\n")
+	return s.send(to, []byte(b.String()))
 }
 
 // send delivers one message.

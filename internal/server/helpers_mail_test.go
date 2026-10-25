@@ -20,8 +20,10 @@ import (
 
 // recordingMailer captures messages instead of sending them.
 type recordingMailer struct {
-	mu   sync.Mutex
-	msgs []capturedMail
+	mu        sync.Mutex
+	msgs      []capturedMail
+	notices   []capturedNotice
+	reminders []capturedReminder
 }
 
 type capturedMail struct {
@@ -31,10 +33,41 @@ type capturedMail struct {
 	TTL   string
 }
 
+// capturedNotice and capturedReminder record the two queued message types (M4).
+type capturedNotice struct {
+	To    string
+	Actor string
+	Label string
+}
+
+type capturedReminder struct {
+	To      string
+	Label   string
+	Expires string
+}
+
 func (m *recordingMailer) SendRecipientCode(to, shareLabel, code, ttl string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.msgs = append(m.msgs, capturedMail{To: to, Label: shareLabel, Code: code, TTL: ttl})
+}
+
+// SendShareNotice records a share notice (M4). The notices the server emits are queued as
+// mail.send jobs rather than sent inline, so this recorder is what a worker-side test reads;
+// it lives with the code recorder because it is the same seam.
+func (m *recordingMailer) SendShareNotice(to, actorName, label string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.notices = append(m.notices, capturedNotice{To: to, Actor: actorName, Label: label})
+	return nil
+}
+
+// SendExpiryReminder records an expiry reminder (M4).
+func (m *recordingMailer) SendExpiryReminder(to, label, expires string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.reminders = append(m.reminders, capturedReminder{To: to, Label: label, Expires: expires})
+	return nil
 }
 
 // codeFor returns the most recent code sent to an address.

@@ -122,6 +122,11 @@ type idorVictim struct {
 	// A tus session the victim started (core-scope §1), for the same reason as uploadID: the
 	// manager is in-memory, so the harness has to hold the reference.
 	tusID string
+
+	// A notification the victim received (M4): the read route is id-addressed, so dismissing
+	// somebody else's bell — or even learning whose bell rang — is an enumeration surface.
+	notificationID    uuid.UUID
+	notificationLabel string
 }
 
 // jsonReader encodes a body for a case that needs one.
@@ -228,6 +233,23 @@ func buildVictim(t *testing.T, h *harness) *idorVictim {
 			return terr
 		}
 		v.tagID = tag.ID
+
+		// A notification only the victim is entitled to see or dismiss (M4).
+		v.notificationLabel = "victim's confidential folder"
+		if nerr := tx.Notify(ctx, store.NewNotification{
+			UserID: v.user.ID, Kind: store.NotifyShareReceived,
+			DedupeKey: "idor:" + uuid.NewString(),
+			Meta:      map[string]any{"label": v.notificationLabel},
+		}); nerr != nil {
+			return nerr
+		}
+		items, _, _, lerr := tx.Notifications(ctx, v.user.ID, "", 10)
+		if lerr != nil {
+			return lerr
+		}
+		if len(items) > 0 {
+			v.notificationID = items[0].ID
+		}
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -462,6 +484,29 @@ func TestIDORIsRefusedOnEveryRouteThatTakesAnID(t *testing.T) {
 			path:    func(v *idorVictim) string { return "/api/nodes/" + v.nodeID.String() + "/tags" },
 			body:    func() io.Reader { return jsonReader(map[string]string{"tag_id": uuid.New().String()}) },
 			secrets: func(v *idorVictim) []string { return priv },
+		},
+		{
+			// M4: the inbox's read route. A stranger must not dismiss — or confirm the
+			// existence of — anybody else's notification; the refusal is the same 404 for a
+			// foreign id and an absent one, and the victim's bell must still be ringing.
+			name:   "dismiss another account's notification",
+			method: http.MethodPost,
+			path:   func(v *idorVictim) string { return "/api/notifications/" + v.notificationID.String() + "/read" },
+			secrets: func(v *idorVictim) []string {
+				return append(priv, v.notificationLabel)
+			},
+			stillIntact: func(t *testing.T, h *harness, v *idorVictim) {
+				_ = h.meta.WithTx(context.Background(), func(ctx context.Context, tx store.Tx) error {
+					n, err := tx.UnreadNotificationCount(ctx, v.user.ID)
+					if err != nil {
+						return err
+					}
+					if n != 1 {
+						t.Fatalf("victim has %d unread notifications after the intrusion, want the original 1", n)
+					}
+					return nil
+				})
+			},
 		},
 		{
 			name:    "untag another account's file",
@@ -705,6 +750,8 @@ func TestIDORTableCoversEveryIdRoute(t *testing.T) {
 		"HEAD /api/files/tus/{id}":   true,
 		"PATCH /api/files/tus/{id}":  true,
 		"DELETE /api/files/tus/{id}": true,
+		// M4: dismissing somebody else's notification must be the same 404 as an absent id.
+		"POST /api/notifications/{id}/read": true,
 	}
 
 	// Id-addressed routes deliberately not in the table, each with the reason. An exemption has

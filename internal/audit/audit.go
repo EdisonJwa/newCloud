@@ -130,6 +130,12 @@ const (
 
 	// Anomalies.
 	ActionAnomaly Action = "security.anomaly"
+
+	// Antivirus (M5): a scan found a signature and the file was quarantined. Audited because
+	// quarantine is a privileged action against somebody's file — the actor is the scanner's
+	// worker, the target is the node, and the signature travels in the metadata so the event
+	// explains itself without the daemon's logs.
+	ActionAVQuarantine Action = "av.quarantine"
 )
 
 // Result is the outcome of the attempted action.

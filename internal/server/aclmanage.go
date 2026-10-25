@@ -158,19 +158,19 @@ func (s *Server) handleACLGrant(w http.ResponseWriter, r *http.Request) {
 			if u, uerr := tx.UserByUsername(ctx, body.Subject); uerr == nil {
 				entry.UserID = &u.ID
 				subjectName = u.Username
-				return applyGrant(ctx, tx, entry, actor, r, node.Name, subjectName)
+				return applyGrant(ctx, tx, entry, actor, r, node.Name, subjectName, &u)
 			}
 			if u, uerr := tx.UserByEmail(ctx, body.Subject); uerr == nil {
 				entry.UserID = &u.ID
 				subjectName = u.Username
-				return applyGrant(ctx, tx, entry, actor, r, node.Name, subjectName)
+				return applyGrant(ctx, tx, entry, actor, r, node.Name, subjectName, &u)
 			}
 		}
 		g, gerr := tx.GroupByName(ctx, body.Subject)
 		if gerr == nil {
 			entry.GroupID = &g.ID
 			subjectName = "group:" + g.Name
-			return applyGrant(ctx, tx, entry, actor, r, node.Name, subjectName)
+			return applyGrant(ctx, tx, entry, actor, r, node.Name, subjectName, nil)
 		}
 		return store.ErrNotFound
 	})
@@ -193,18 +193,22 @@ func (s *Server) handleACLGrant(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// applyGrant stores the grant and its audit row in the caller's transaction.
+// applyGrant stores the grant, its audit row and — when the subject is a user — the
+// share.received notification, all in the caller's transaction.
 //
 // Extracted so the create path cannot accidentally commit a grant without the record
-// that explains it — the one change an owner would otherwise be unable to account for.
+// that explains it — the one change an owner would otherwise be unable to account for. The
+// notification rides the same transaction for the same reason: a grant the grantee never
+// hears about is a folder that appears in "shared with me" with no explanation, which is
+// indistinguishable from a mistake.
 func applyGrant(ctx context.Context, tx store.Tx, entry store.ACLEntry,
-	actor authz.Actor, r *http.Request, nodeName, subjectName string) error {
+	actor authz.Actor, r *http.Request, nodeName, subjectName string, grantee *store.User) error {
 
 	saved, err := tx.Grant(ctx, entry)
 	if err != nil {
 		return err
 	}
-	return tx.Audit(ctx, store.AuditEntry{
+	if err := tx.Audit(ctx, store.AuditEntry{
 		ActorKind: "user", ActorUserID: actor.Ptr(), ActorEmail: actor.Email(),
 		ActorIP: clientIP(r), UserAgent: r.UserAgent(),
 		Action: "acl.grant", TargetKind: "node", TargetID: entry.NodeID.String(),
@@ -216,7 +220,12 @@ func applyGrant(ctx context.Context, tx store.Tx, entry store.ACLEntry,
 			"inherit":     saved.Inherit,
 			"entry_id":    saved.ID.String(),
 		},
-	})
+	}); err != nil {
+		return err
+	}
+	// The grantee's bell, in the same transaction: see notifyShareReceived for why groups
+	// stay quiet.
+	return notifyShareReceived(ctx, tx, grantee, actor, saved.ID, nodeName)
 }
 
 // handleACLRevoke removes one grant by id.
