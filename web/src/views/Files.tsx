@@ -411,6 +411,12 @@ export function Files({
       }
       const bytesTotal = files.reduce((sum, f) => sum + f.size, 0);
       setUpload({ done: 0, total: files.length, bytesDone: 0, bytesTotal });
+      // Set here rather than in an effect: the guard must exist for exactly as long as an
+      // upload can be in flight, including between the last byte and the reload below.
+      const onBeforeUnload = (e: BeforeUnloadEvent) => {
+        e.preventDefault();
+      };
+      window.addEventListener("beforeunload", onBeforeUnload);
       let done = 0;
       let failed = 0;
       let bytesDone = 0;
@@ -430,6 +436,7 @@ export function Files({
         setUpload({ done: done + failed, total: files.length, bytesDone, bytesTotal });
       }
       setUpload(null);
+      window.removeEventListener("beforeunload", onBeforeUnload);
       reload();
       setPending(readPending());
       if (failed === 0) {
