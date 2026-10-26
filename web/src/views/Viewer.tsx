@@ -157,8 +157,11 @@ export function Viewer(props: Props) {
   useEffect(() => {
     // Focus lands on Close rather than the body: the viewer replaces the page, so a keyboard
     // user needs one predictable place to start from that also announces where they are.
-    closeRef.current?.focus();
-  }, []);
+    // The dependency matters: the component mounts while the collection is still loading,
+    // when Close is not rendered, so a run-once effect focuses nothing and focus stays on
+    // <body> — which is also how the Escape key stops feeling like it works.
+    if (!props.collection.loading) closeRef.current?.focus();
+  }, [props.collection.loading]);
 
   useEffect(() => {
     setZoom(1);

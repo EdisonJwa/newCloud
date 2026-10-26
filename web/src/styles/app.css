@@ -750,8 +750,9 @@
 }
 
 /* Anything the viewer shows replaces the page; scrolling the page behind it would move the
-   chrome under the modal. */
-.wc-root[data-view="viewer"] body,
+   chrome under the modal. `.wc-root` is a descendant of <body>, so the lock applies to the
+   app's own scroll surface (the listing) rather than selecting body — which the previous
+   `body`-descendant form could never match. */
 .wc-root[data-view="viewer"] {
   overflow: hidden;
 }

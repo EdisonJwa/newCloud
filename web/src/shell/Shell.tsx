@@ -79,7 +79,15 @@ export function Shell(props: ShellProps) {
           : t("nav.home");
 
   return (
-    <div className="serein-shell wc-root-shell">
+    // `wc-root` carries the fixed-chrome geometry vars (`--wc-topbar`, `--wc-tabbar`, …) the
+    // sticky inspector, page fill and timeline day chips compute against, and `data-view`
+    // marks the screens that replace the page — the viewer locks the scroll behind it. A
+    // rename of either class is a silent layout break on every view, which is why both live
+    // on the outermost element the shell renders.
+    <div
+      className="serein-shell wc-root-shell wc-root"
+      data-view={props.route.screen === "viewer" ? "viewer" : undefined}
+    >
       <a className="serein-skip-link" href="#main">
         {t("shell.skip")}
       </a>
@@ -355,6 +363,7 @@ function BrandGlyph() {
 
 function AccountMenu({
   me,
+  route,
   prefs,
   lang,
   onLang,
@@ -364,6 +373,7 @@ function AccountMenu({
   onSignOut,
 }: {
   me: Me | null;
+  route: Route;
   prefs: Prefs;
   lang: Lang;
   onLang: (lang: Lang) => void;
@@ -482,6 +492,9 @@ function AccountMenu({
           </span>
           {t("nav.signout")}
         </button>
+        <p className="wc-accountmenu__note" aria-hidden="true">
+          {route.screen === "settings" ? "" : ""}
+        </p>
       </div>
     </>
   );
