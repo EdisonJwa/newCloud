@@ -24,6 +24,7 @@ import type { Me } from "../types";
 import type { Prefs } from "../appearance";
 import { TEXT_SIZES, resolveContrast, resolveTheme } from "../appearance";
 import type { Route, Screen, SettingsTab } from "../route";
+import { serialize } from "../route";
 import { isMac, shortcut } from "../platform";
 
 export interface ShellProps {
@@ -100,18 +101,24 @@ export function Shell(props: ShellProps) {
           </a>
           <nav className="serein-nav" aria-label={t("nav.sections")}>
             {DESTINATIONS.map((d) => (
-              <button
+              // Real anchors, not buttons: middle-click, ⌘/Ctrl-click and "copy link" are
+              // how people keep two folders side by side. The click handler still routes
+              // through the SPA so the sheet state survives.
+              <a
                 key={d.screen}
-                type="button"
                 className="serein-nav__item"
+                href={serialize({ ...props.route, screen: d.screen, inspector: false })}
                 aria-current={active === d.screen ? "page" : undefined}
-                onClick={() => props.onNavigate(d.screen)}
+                onClick={(e) => {
+                  e.preventDefault();
+                  props.onNavigate(d.screen);
+                }}
               >
                 <span className="serein-nav__icon">
                   <Icon name={d.icon} size={13} />
                 </span>
                 <span>{t(d.key)}</span>
-              </button>
+              </a>
             ))}
           </nav>
         </div>
@@ -275,23 +282,25 @@ export function Shell(props: ShellProps) {
 
       <nav className="serein-tabbar" aria-label={t("nav.sections")}>
         {DESTINATIONS.map((d) => (
-          <button
+          <a
             key={d.screen}
-            type="button"
             className="serein-tabbar__item"
+            href={serialize({ ...props.route, screen: d.screen, inspector: false })}
             aria-current={active === d.screen ? "page" : undefined}
-            onClick={() => props.onNavigate(d.screen)}
+            onClick={(e) => {
+              e.preventDefault();
+              props.onNavigate(d.screen);
+            }}
           >
             <Icon name={d.icon} size={19} />
             <span>{t(d.key)}</span>
-          </button>
+          </a>
         ))}
       </nav>
 
       {account ? (
         <AccountMenu
           me={props.me}
-          route={props.route}
           prefs={props.prefs}
           lang={props.lang}
           onLang={props.onLang}
@@ -346,7 +355,6 @@ function BrandGlyph() {
 
 function AccountMenu({
   me,
-  route,
   prefs,
   lang,
   onLang,
@@ -356,7 +364,6 @@ function AccountMenu({
   onSignOut,
 }: {
   me: Me | null;
-  route: Route;
   prefs: Prefs;
   lang: Lang;
   onLang: (lang: Lang) => void;
@@ -475,9 +482,6 @@ function AccountMenu({
           </span>
           {t("nav.signout")}
         </button>
-        <p className="wc-accountmenu__note" aria-hidden="true">
-          {route.screen === "settings" ? "" : ""}
-        </p>
       </div>
     </>
   );

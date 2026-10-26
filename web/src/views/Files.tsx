@@ -57,6 +57,7 @@ import { Inspector } from "./Inspector";
 import { TagChips } from "../components/Social";
 import type { FileNode, Share } from "../types";
 import type { KindFilter, Route, SortDir, SortKey, ViewMode } from "../route";
+import { serialize } from "../route";
 
 interface Props {
   route: Route;
@@ -716,13 +717,16 @@ export function Files({
                   key={crumb.path || "root"}
                   className={`serein-breadcrumb__item${hide ? " wc-crumbs__ancestor" : ""}`}
                 >
-                  <button
-                    type="button"
+                  <a
                     className="serein-breadcrumb__link"
-                    onClick={() => go(crumb.path)}
+                    href={serialize({ ...route, screen: "files", space: crumb.path, at: 0 })}
+                    onClick={(e) => {
+                      e.preventDefault();
+                      go(crumb.path);
+                    }}
                   >
                     {crumb.name}
-                  </button>
+                  </a>
                   <span className="serein-breadcrumb__sep" aria-hidden="true">
                     <Icon name="chevron" size={11} />
                   </span>

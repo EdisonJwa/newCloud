@@ -13,6 +13,19 @@
   min-height: 100dvh;
 }
 
+/* The skip link jumps to #main; without this margin the sticky topbar covers the target,
+   so the first thing a keyboard user "skips to" is the back of the toolbar. */
+.serein-shell__main {
+  scroll-margin-top: calc(var(--serein-topbar-height) + var(--serein-space-2));
+}
+
+/* The menu and the search results scroll on their own; the wheel should not chain through
+   to the page underneath while a panel is open. */
+.wc-accountmenu,
+.wc-search__list {
+  overscroll-behavior: contain;
+}
+
 /* ------------------------------------------------------------ account menu --- */
 
 .wc-scrim-clear {
