@@ -332,7 +332,12 @@ function Access({ reloadKey }: { reloadKey: number }) {
                     <button
                       type="button"
                       className="serein-btn serein-btn--sm serein-btn--quiet"
-                      onClick={() => void revoke(pw.id)}
+                      onClick={() => {
+                        // Revoking signs out every client using this password with no way
+                        // back; ask before acting, not after.
+                        if (!window.confirm(t("access.revokeConfirm"))) return;
+                        void revoke(pw.id);
+                      }}
                     >
                       {t("shared.revoke")}
                     </button>

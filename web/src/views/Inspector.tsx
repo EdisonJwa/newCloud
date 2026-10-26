@@ -826,8 +826,14 @@ function SharePane({
                   type="button"
                   className="serein-btn serein-btn--sm serein-btn--danger"
                   disabled={busy}
-                  onClick={() => void revoke()}
+                  onClick={() => {
+                    // Revoking kills a link that may already be in someone's hands; there is
+                    // no undo, so the click asks before it acts.
+                    if (!window.confirm(t("inspector.revokeConfirm"))) return;
+                    void revoke();
+                  }}
                 >
+                  {busy ? <span className="serein-spinner" aria-hidden="true" /> : null}
                   {t("shared.revoke")}
                 </button>
               </div>

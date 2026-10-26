@@ -680,7 +680,16 @@ function CommentBody({
             </button>
           ) : null}
           {canRemove ? (
-            <button type="button" className="serein-btn serein-btn--sm serein-btn--quiet" onClick={onRemove}>
+            <button
+              type="button"
+              className="serein-btn serein-btn--sm serein-btn--quiet"
+              onClick={() => {
+                // Removing is immediate and permanent; the quiet button style must not mean
+                // the action is quiet too.
+                if (!window.confirm(t("social.removeConfirm"))) return;
+                onRemove();
+              }}
+            >
               {t("social.remove")}
             </button>
           ) : null}

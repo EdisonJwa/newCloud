@@ -149,7 +149,10 @@ export function FolderAccess() {
                 <button
                   type="button"
                   className="serein-btn serein-btn--sm serein-btn--quiet"
-                  onClick={() => void revoke(g)}
+                  onClick={() => {
+                    if (!window.confirm(t("acl.revokeConfirm", { name: g.display || g.subject }))) return;
+                    void revoke(g);
+                  }}
                 >
                   {t("common.revoke")}
                 </button>

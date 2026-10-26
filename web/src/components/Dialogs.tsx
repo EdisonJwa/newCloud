@@ -80,7 +80,7 @@ function Dialog({ title, description, children, footer, onClose, size = "normal"
       <button
         type="button"
         className="serein-icon-btn serein-icon-btn--sm serein-dialog__close"
-        aria-label="Close"
+        aria-label={t("dlg.close")}
         onClick={onClose}
       >
         <Icon name="close" size={13} />

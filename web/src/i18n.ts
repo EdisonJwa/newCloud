@@ -215,6 +215,8 @@ const en: Table = {
   "uploads.fileChanged": "{name} has changed since the upload started, so its staged bytes cannot be reused.",
   "uploads.resumeFailed": "Could not resume {name}; the unfinished upload is still listed.",
   "uploads.discarded": "Discarded the unfinished uploads",
+  "uploads.discardConfirm":
+    "Discard {n} unfinished upload session(s)? The parts already sent are deleted and the upload must start over.",
 
   /* ---- detail / inspector ---- */
   "detail.title": "Details",
@@ -287,6 +289,8 @@ const en: Table = {
   "inspector.expires": "expires {date}",
   "inspector.created": "Created",
   "inspector.previewAsRecipient": "Preview as recipient",
+  "inspector.revokeConfirm":
+    "Revoke this link? Anyone holding it loses access immediately. This cannot be undone.",
   "inspector.linkNote":
     "Password verification, expiry and download limits are enforced by the server. This panel shows what it recorded.",
   "inspector.receivedTitle": "Shared with you",
@@ -430,6 +434,8 @@ const en: Table = {
   "access.newPasswordHint": "The secret is shown once, when it is created.",
   "access.unlabelled": "Unnamed",
   "access.revoked": "revoked",
+  "access.revokeConfirm":
+    "Revoke this app password? Every client signed in with it stops working immediately.",
   "access.label": "Label",
   "access.labelPlaceholder": "laptop, rclone, phone",
   "access.scope": "Scope",
@@ -461,6 +467,7 @@ const en: Table = {
   "acl.permissionsHint":
     "write allows creating and overwriting but not deleting; delete is separate on purpose. manage_permissions lets the grantee re-share the folder.",
   "acl.inherit": "This folder and everything inside",
+  "acl.revokeConfirm": "Revoke {name}'s access? They lose it on their next request.",
   "acl.thisOnly": "This folder only",
   "acl.grant": "Grant access",
   "acl.granted": "Access granted",
@@ -497,6 +504,7 @@ const en: Table = {
   "social.save": "Save",
   "social.cancel": "Cancel",
   "social.remove": "Delete",
+  "social.removeConfirm": "Delete this comment? This cannot be undone.",
   "social.replyAction": "Reply",
   "social.editComment": "Edit the comment",
   "social.commentRemoved": "This comment was removed",
@@ -953,6 +961,7 @@ const zh: Table = {
   "uploads.fileChanged": "{name} 自上传开始后已改变，暂存的字节无法复用。",
   "uploads.resumeFailed": "无法继续 {name}；未完成的上传仍在列表中。",
   "uploads.discarded": "已放弃未完成的上传",
+  "uploads.discardConfirm": "放弃 {n} 个未完成的上传会话？已发送的分片将被删除，上传需要重新开始。",
 
   "detail.title": "详情",
   "detail.close": "关闭详情",
@@ -1020,6 +1029,7 @@ const zh: Table = {
   "inspector.expires": "{date} 过期",
   "inspector.created": "创建时间",
   "inspector.previewAsRecipient": "以接收者身份预览",
+  "inspector.revokeConfirm": "撤销此链接？持有它的人将立即失去访问权限，且无法恢复。",
   "inspector.linkNote": "密码校验、过期与下载次数限制由服务端执行。此面板显示的是服务端记录的内容。",
   "inspector.receivedTitle": "与你共享",
 
@@ -1142,6 +1152,7 @@ const zh: Table = {
   "access.newPasswordHint": "密钥只在创建时显示一次。",
   "access.unlabelled": "未命名",
   "access.revoked": "已吊销",
+  "access.revokeConfirm": "吊销此应用密码？所有使用它登录的客户端将立即失效。",
   "access.label": "标签",
   "access.labelPlaceholder": "笔记本、rclone、手机",
   "access.scope": "范围",
@@ -1168,6 +1179,7 @@ const zh: Table = {
   "acl.permissions": "权限",
   "acl.permissionsHint": "write 允许创建与覆盖但不允许删除；delete 刻意单独列出。manage_permissions 允许被授权者再次分享该文件夹。",
   "acl.inherit": "此文件夹及其内部所有内容",
+  "acl.revokeConfirm": "撤销 {name} 的访问权限？对方下一次请求时即失效。",
   "acl.thisOnly": "仅此文件夹",
   "acl.grant": "授予访问权限",
   "acl.granted": "已授予访问权限",
@@ -1200,6 +1212,7 @@ const zh: Table = {
   "social.save": "保存",
   "social.cancel": "取消",
   "social.remove": "删除",
+  "social.removeConfirm": "删除这条评论？删除后无法恢复。",
   "social.replyAction": "回复",
   "social.editComment": "编辑评论",
   "social.commentRemoved": "这条评论已被删除",

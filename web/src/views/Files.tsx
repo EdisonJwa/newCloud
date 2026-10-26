@@ -807,6 +807,9 @@ export function Files({
             className="serein-btn serein-btn--sm serein-btn--quiet"
             disabled={resuming}
             onClick={() => {
+              // Discard throws away every resumable session at once, and the files on the
+              // caller's disk are the only copy of what was half-uploaded — confirm first.
+              if (!window.confirm(t("uploads.discardConfirm", { n: pending.length }))) return;
               void discardPending().then(() => {
                 setPending([]);
                 toast.info(t("uploads.discarded"));
