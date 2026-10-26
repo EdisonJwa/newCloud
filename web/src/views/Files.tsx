@@ -1125,6 +1125,7 @@ export function Files({
             onDelete={(entries) => setDialog({ kind: "delete", entries })}
             onShare={(entry) => setDialog({ kind: "share", entry })}
             onTransfer={(op, entries) => setDialog({ kind: "transfer", op, entries })}
+            onTransferSelection={(op) => setDialog({ kind: "transfer", op, entries: pickedEntries })}
             // The star is stored per user and the row beside the panel draws the same bit, so the
             // panel asks for a reload rather than keeping a private copy: two components that each
             // hold their own "is this starred" disagree after exactly one click.

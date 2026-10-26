@@ -49,6 +49,10 @@ interface FileInspectorProps {
   onRefresh: () => void;
   onSelectAll: () => void;
   onClearSelection: () => void;
+  // The multi-selection view cannot pass entries it does not own, so it asks the listing —
+  // the only place the picked rows exist — to open the transfer dialog on its behalf. The
+  // previous shape, onTransfer("move", []), opened a dialog with nothing to move.
+  onTransferSelection: (op: "copy" | "move") => void;
 }
 
 interface ShareInspectorProps {
@@ -289,7 +293,7 @@ function FilePane(props: FileInspectorProps) {
                     <button
                       type="button"
                       className="serein-btn serein-btn--sm serein-btn--outline"
-                      onClick={() => props.onTransfer("move", [])}
+                      onClick={() => props.onTransferSelection("move")}
                     >
                       {t("transfer.move")}
                     </button>
@@ -353,6 +357,7 @@ function InfoPane({
   onStar: (starred: boolean) => void;
 }) {
   const { t, fmt } = useI18n();
+  const toast = useToast();
   const [broken, setBroken] = useState(false);
   const [copied, setCopied] = useState(false);
   const isImage = entry.preview === "image" && entry.kind === "file";
@@ -367,7 +372,10 @@ function InfoPane({
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1600);
     } catch {
+      // The failure is told, not swallowed: without this a user on an insecure origin clicks
+      // "copy" and the button simply does nothing, which reads as a broken panel.
       setCopied(false);
+      toast.info(t("inspector.copyFailed"));
     }
   };
 
@@ -545,6 +553,10 @@ function VersionsPane({
   }
   if (versions === null) {
     return (
+      // The skeleton is decorative; the polite status line is what a screen reader hears,
+      // so the swap to real rows is announced as a change rather than happening silently.
+      <>
+      <p className="serein-sr-only" role="status">{t("state.loading")}</p>
       <div className="wc-skeleton-rows" aria-hidden="true">
         {[0, 1, 2].map((i) => (
           <div className="wc-skeleton-row" key={i}>
@@ -556,6 +568,7 @@ function VersionsPane({
           </div>
         ))}
       </div>
+      </>
     );
   }
   if (versions.length === 0) {
@@ -579,6 +592,7 @@ function VersionsPane({
               title={state?.restorable ? undefined : t("detail.versionsNoContent")}
               onClick={() => onRestore(v.version)}
             >
+              {restoring ? <span className="serein-spinner" aria-hidden="true" /> : null}
               {t("detail.restore")}
             </button>
           </div>
