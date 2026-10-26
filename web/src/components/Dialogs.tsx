@@ -445,8 +445,14 @@ export function ShareDialog({ entry, onClose }: { entry: FileNode; onClose: () =
 
       const res = await api.createShare(body);
       const url = `${location.origin}/s/${res.token}`;
-      await navigator.clipboard.writeText(url).catch(() => {});
-      setCopied(true);
+      // Copy is best-effort, but "copied" must not claim a copy that failed: the one-shot
+      // link is only shown in this dialog, and a user who trusts a false "copied" loses it.
+      await navigator.clipboard.writeText(url).then(
+        () => setCopied(true),
+        () => {
+          /* the dialog still shows the URL to copy by hand */
+        },
+      );
       setCreated({ url, recipients: res.share?.recipients ?? [], share: res.share ?? null });
       setBusy(false);
     } catch (err) {

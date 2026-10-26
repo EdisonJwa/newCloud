@@ -772,7 +772,14 @@ function SharePane({
                     className="serein-btn serein-btn--sm serein-btn--outline"
                     onClick={() => {
                       const url = share.url ?? "";
-                      void navigator.clipboard?.writeText(url).then(
+                      // Optional chaining on writeText itself: on an insecure origin
+                      // navigator.clipboard is undefined, and `?.writeText(...).then` would
+                      // still throw on the .then of undefined.
+                      if (!navigator.clipboard?.writeText) {
+                        toast.error(t("inspector.copyFailed"));
+                        return;
+                      }
+                      void navigator.clipboard.writeText(url).then(
                         () => toast.success(t("toast.linkCopied")),
                         () => toast.error(t("inspector.copyFailed")),
                       );
