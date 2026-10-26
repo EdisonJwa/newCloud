@@ -267,13 +267,15 @@ function Application({
         setSearch((open) => !open);
       } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "i") {
         e.preventDefault();
-        go({ inspector: !router.route.inspector }, "push");
+        // A panel toggle is a view adjustment, not a destination: replace, or every press of
+        // the shortcut becomes one more press of Back to get out of the same screen.
+        go({ inspector: !router.route.inspector }, "replace");
       } else if (e.key === "/" && !typing) {
         e.preventDefault();
         setSearch(true);
       } else if (e.key === "?" && !typing) {
         e.preventDefault();
-        go({ inspector: true, pane: "info" }, "push");
+        go({ inspector: true, pane: "info" }, "replace");
       }
     };
     window.addEventListener("keydown", onKey);
@@ -496,7 +498,7 @@ function Application({
           }}
           onClose={closeViewer}
           onRetry={() => setReloadKey((k) => k + 1)}
-          onToggleInspector={() => go({ inspector: !route.inspector }, "push")}
+          onToggleInspector={() => go({ inspector: !route.inspector }, "replace")}
           inspectorOpen={route.inspector}
         />
       ) : null}

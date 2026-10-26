@@ -191,6 +191,24 @@ export function parse(params: URLSearchParams): Route {
 }
 
 /**
+ * hasInvalidKnownParam reports whether a known parameter carries a value parse would never
+ * produce — an unknown parameter is left alone (tracking parameters are not this app's to
+ * rewrite), but a known one with a dead value means the URL and the view disagree.
+ */
+function hasInvalidKnownParam(params: URLSearchParams): boolean {
+  const checks: Array<[string | null, readonly string[]]> = [
+    [params.get("screen"), SCREENS],
+    [params.get("tab"), SHARE_TABS],
+    [params.get("settings"), SETTINGS_TABS],
+    [params.get("pane"), PANES],
+    [params.get("sort"), SORTS],
+    [params.get("kind"), KINDS],
+  ];
+  return checks.some(([value, allowed]) =>
+    value !== null && !(allowed as readonly string[]).includes(value));
+}
+
+/**
  * serialize writes only what differs from a default.
  *
  * A URL that restates every default is unreadable and, worse, gives the browser two different
@@ -254,8 +272,16 @@ export class Router {
   private lastUrl: string;
 
   constructor() {
-    this.current = parse(new URLSearchParams(location.search));
+    const params = new URLSearchParams(location.search);
+    this.current = parse(params);
     this.lastUrl = location.pathname + location.search;
+    // A URL whose known parameters carry values parse would never produce (a typo'd screen
+    // name, a stale tab id) renders the fallback view but keeps lying in the address bar.
+    // Replace it with the canonical form once, on load, so a copied link opens what it shows.
+    if (hasInvalidKnownParam(params)) {
+      this.lastUrl = serialize(this.current);
+      history.replaceState(null, "", this.lastUrl);
+    }
     window.addEventListener("popstate", this.onPop);
   }
 
