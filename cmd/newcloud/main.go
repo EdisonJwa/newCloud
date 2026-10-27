@@ -11,6 +11,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -337,6 +338,10 @@ func auditVerify(args []string) error {
 	flags := flag.NewFlagSet("audit verify", flag.ContinueOnError)
 	batch := flags.Int("batch", 1000, "events to read per round trip")
 	jsonOut := flags.Bool("json", false, "emit the report as JSON")
+	anchorsDir := flags.String("anchors", "",
+		"anchor directory to compare against; defaults to audit.anchor_dir from the config")
+	pubKey := flags.String("pubkey", "",
+		"base64 or hex Ed25519 public key; verifies checkpoint signatures when given")
 	exportPath := flags.String("export", "",
 		"verify an exported file (JSON export, prune archive or CSV) instead of the database")
 	if err := flags.Parse(args); err != nil {
@@ -423,6 +428,66 @@ func auditVerify(args []string) error {
 	if !report.OK() {
 		return fmt.Errorf("audit verify: chain is broken: %w", report.Err)
 	}
+
+	// The chain above proves the log is internally consistent. It cannot prove the log is
+	// COMPLETE: delete the newest events and what remains still chains correctly. That is the
+	// attack the anchors exist to catch, so a "verified" answer that never looked at them is
+	// the single most misleading thing this command could print.
+	//
+	// The directory defaults to the configured one, because the operator running the weekly
+	// check should not have to remember a path for the check to be meaningful.
+	if *anchorsDir == "" {
+		if cfg, cerr := config.Load(configPath()); cerr == nil {
+			*anchorsDir = cfg.Audit.AnchorDir
+		}
+	}
+
+	var pub ed25519.PublicKey
+	if *pubKey != "" {
+		pub, err = auditverify.ParsePublicKey(*pubKey)
+		if err != nil {
+			return fmt.Errorf("audit verify: %w", err)
+		}
+	}
+	var chain auditverify.Chain = auditverify.NewStoreChain(pg)
+	return compareAnchors(log, *anchorsDir, chain, pub)
+}
+
+// compareAnchors is the second half of `audit verify`, split out so its decision is testable
+// without a database. A chain that verifies but was never compared against an anchor set is the
+// state that shipped for weeks: the command said "verified", the docs said it compared anchors,
+// and a deleted tail was undetectable.
+func compareAnchors(log *slog.Logger, dir string, chain auditverify.Chain, pub ed25519.PublicKey) error {
+	if dir == "" {
+		log.Warn("audit chain verified, but no anchors were compared: a deleted tail would " +
+			"still verify. Set audit.anchor_dir, or pass -anchors")
+		return nil
+	}
+	anchor, err := auditverify.NewFileAnchor(dir)
+	if err != nil {
+		return fmt.Errorf("audit verify: open anchors: %w", err)
+	}
+	ares, err := auditverify.VerifySigned(anchor, chain, pub)
+	if err != nil {
+		return fmt.Errorf("audit verify: compare anchors: %w", err)
+	}
+	if !ares.OK() {
+		for _, p := range ares.Problems {
+			log.Error("anchor mismatch", "problem", p)
+		}
+		return fmt.Errorf("audit verify: %d of %d checkpoints disagree with the chain: "+
+			"events have been removed or the anchor was rewritten",
+			ares.Checkpoints-ares.Matched, ares.Checkpoints)
+	}
+	// Zero checkpoints is not agreement. An empty anchor set means nothing has been published
+	// yet, so the completeness claim is unproven and saying "agree" would repeat the bug.
+	if ares.Checkpoints == 0 {
+		log.Warn("audit chain verified, but the anchor set is empty: nothing has been published " +
+			"yet, so a deleted tail would still verify")
+		return nil
+	}
+	log.Info("anchors agree with the chain",
+		"dir", dir, "checkpoints", ares.Checkpoints, "signed", pub != nil)
 	return nil
 }
 

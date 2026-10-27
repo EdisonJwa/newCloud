@@ -390,6 +390,38 @@ Then, in the UI: upload a file, download it, create a link share, open the share
 window, and delete a file and restore it from the trash. A share that downloads is the single best
 end-to-end check, because it crosses both origins.
 
+### Prove the audit log is tamper-evident, in this environment
+
+The chain is verified by `newcloud audit verify`, which also compares it against the anchor
+checkpoints. Do this once on the real host, because it is the only way to know the property holds
+where you run it — and it takes a throwaway database, not this one:
+
+```sh
+# 1. a disposable database for the experiment
+docker run --rm -d --name audit-proof -e POSTGRES_PASSWORD=x -e POSTGRES_DB=nc \
+  -p 5550:5432 postgres:17
+export PROOF_DB="postgres://postgres:x@127.0.0.1:5550/nc?sslmode=disable"
+DATABASE_URL="$PROOF_DB" newcloud migrate
+
+# 2. append real events, publish an anchor, then delete the newest ones
+go run ./tools/auditsmoke  -database "$PROOF_DB" -events 25
+go run ./tools/anchorsmoke -database "$PROOF_DB" -dir /tmp/anchors -sign -truncate 5
+
+# 3. the check must now FAIL, naming the truncation
+DATABASE_URL="$PROOF_DB" newcloud audit verify -anchors /tmp/anchors -pubkey <printed above>
+# audit verify: 1 of 1 checkpoints disagree with the chain: events have been removed …
+
+docker rm -f audit-proof
+```
+
+A word about what this proves: without the `-anchors` comparison the same truncated log reports
+`audit chain verified` and exits `0`, because a shortened hash chain is internally consistent.
+That is not a defect in the chain — it is why anchors exist, and why the check compares them.
+
+On the live deployment, set `audit.anchor_dir` and `audit.anchor_signing_key_file` (section 7a).
+The first checkpoint appears after the first completed UTC day; until then `audit verify` warns
+that it compared nothing, which is the honest answer.
+
 Optional but recommended for a release:
 
 ```sh

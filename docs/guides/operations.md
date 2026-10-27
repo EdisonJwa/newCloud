@@ -86,17 +86,55 @@ the metric names and the runbook are the stable interface.
 newcloud audit verify
 ```
 
-The command walks the chain, recomputes every hash, and compares the recorded daily anchors. Exit
-code `0` means intact; `1` means broken. That contract makes it usable from cron or CI without
-parsing output.
+The command walks the chain, recomputes every hash, and compares the chain against the recorded
+daily anchors. Exit code `0` means intact; `1` means broken. That contract makes it usable from
+cron or CI without parsing output.
 
 The chain alone detects edits and mid-chain rewrites. It cannot detect deletion of the newest
 events, because the remaining chain still verifies. Anchors close that gap: a checkpoint of the
 chain head and event count is written to `audit.anchor_dir` once per completed day.
 
+**The anchor comparison is part of `audit verify`, and it is what makes the weekly check mean
+something.** The directory defaults to `audit.anchor_dir` from the config; `-anchors <dir>`
+overrides it, and `-pubkey <key>` additionally verifies Ed25519 signatures on each checkpoint
+(the third-party check, which needs only the anchor directory and the public key). When no anchor
+directory is configured the command still verifies the chain but warns in as many words:
+
+```
+audit chain verified, but no anchors were compared: a deleted tail would still verify
+```
+
+Treat that warning as a failed check. A truncated log verifies perfectly on its own — that is the
+whole reason the anchors exist — so a deployment whose weekly `audit verify` never compares them
+has a tamper-evidence claim it cannot support.
+
 The anchor directory must be writable by the application but not rewritable with the database
 credentials. A WORM bucket, an append-only volume, or a mounted share the application user cannot
 modify is appropriate. A directory on the metadata volume makes the anchor decorative.
+
+**Anchors appear after the first completed day.** The worker publishes a checkpoint for
+yesterday, so a deployment that started today has none yet and `audit verify` will warn about it
+until the next UTC midnight passes. That is expected; it is not a reason to skip the check.
+
+### Proving the check catches tampering
+
+On a throwaway database, the repository ships two harnesses for exactly this:
+
+```sh
+# append real events through the production audit writer
+go run ./tools/auditsmoke -database "$DATABASE_URL" -events 25
+
+# publish an anchor, then delete the newest events to simulate tampering
+go run ./tools/anchorsmoke -database "$DATABASE_URL" -dir /tmp/anchors -sign -truncate 5
+
+# now the check must fail, naming what happened
+newcloud audit verify -anchors /tmp/anchors -pubkey <printed at publish>
+# audit verify: 1 of 1 checkpoints disagree with the chain: events have been removed …
+```
+
+Without the anchor comparison the same truncated chain reports `audit chain verified` and exits
+`0`. Run this once when you deploy: it is the only way to confirm the property in the environment
+you actually run, rather than in a test.
 
 Export events for investigation:
 
