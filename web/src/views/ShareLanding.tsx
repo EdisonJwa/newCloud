@@ -148,8 +148,14 @@ export function ShareLanding({
             onSubmit={async (e) => {
               e.preventDefault();
               setBusy(true);
-              const ok = await verifySharePassword(token, password);
-              setBusy(false);
+              // try/finally, not a trailing setBusy(false): a network rejection would leave
+              // the gate permanently "busy", which reads as a broken Continue button.
+              let ok = false;
+              try {
+                ok = await verifySharePassword(token, password);
+              } finally {
+                setBusy(false);
+              }
               if (ok) {
                 setWrong("");
                 load();
@@ -213,8 +219,12 @@ export function ShareLanding({
             onSubmit={async (e) => {
               e.preventDefault();
               setBusy(true);
-              const ok = await verifyShareCode(token, email, code);
-              setBusy(false);
+              let ok = false;
+              try {
+                ok = await verifyShareCode(token, email, code);
+              } finally {
+                setBusy(false);
+              }
               if (ok) {
                 setWrong("");
                 load();
@@ -289,10 +299,15 @@ export function ShareLanding({
                   disabled={busy || !email}
                   onClick={async () => {
                     setBusy(true);
-                    await requestShareCode(token, email);
-                    setBusy(false);
-                    setCodeSent(true);
-                    toast.info(t("share.codeSent"));
+                    try {
+                      await requestShareCode(token, email);
+                      setCodeSent(true);
+                      toast.info(t("share.codeSent"));
+                    } catch (err) {
+                      toast.error(err instanceof APIError ? err.message || err.code : String(err));
+                    } finally {
+                      setBusy(false);
+                    }
                   }}
                 >
                   {t("share.sendCode")}
