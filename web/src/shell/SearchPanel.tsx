@@ -200,6 +200,8 @@ export function SearchPanel({ commands, onClose, onOpenFile, onOpenFolder }: Pro
           aria-activedescendant={items[active] ? `search-item-${active}` : undefined}
           placeholder={t("search.placeholder")}
           aria-label={t("search.placeholder")}
+          autoComplete="off"
+          spellCheck={false}
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === "Escape") {

@@ -853,9 +853,12 @@ export function Files({
               </span>
               <input
                 className="serein-input"
-                type="text"
+                type="search"
+                name="wc-filter"
                 value={filter}
                 placeholder={t("files.filter")}
+                autoComplete="off"
+                spellCheck={false}
                 onChange={(e) => setFilter(e.target.value)}
                 onKeyDown={(e) => {
                   if (e.key === "Enter") {

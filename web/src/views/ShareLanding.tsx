@@ -180,6 +180,7 @@ export function ShareLanding({
                       type="password"
                       value={password}
                       autoComplete="current-password"
+                      spellCheck={false}
                       autoFocus
                       aria-describedby={wrong ? "gate-error" : undefined}
                       onChange={(e) => setPassword(e.target.value)}
@@ -243,7 +244,9 @@ export function ShareLanding({
                     type="email"
                     value={email}
                     autoComplete="email"
+                    spellCheck={false}
                     autoFocus
+                    aria-describedby={wrong ? "email-error" : undefined}
                     onChange={(e) => setEmail(e.target.value)}
                   />
                 </div>
@@ -260,6 +263,8 @@ export function ShareLanding({
                       value={code}
                       inputMode="numeric"
                       autoComplete="one-time-code"
+                      spellCheck={false}
+                      aria-describedby={wrong ? "email-error" : undefined}
                       onChange={(e) => setCode(e.target.value)}
                     />
                   </div>
@@ -267,7 +272,7 @@ export function ShareLanding({
               ) : null}
 
               {wrong ? (
-                <p className="serein-field__error" role="alert">
+                <p className="serein-field__error" id="email-error" role="alert">
                   <Icon name="alert" size={12} />
                   {wrong}
                 </p>
