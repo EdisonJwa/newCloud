@@ -24,7 +24,7 @@ const ROOT = new URL("../", import.meta.url);
  * duplicate the package manifest without adding a check anyone would read.
  */
 const VENDORED = [
-  { path: "src/serein/serein-ui.css", sha256: "9ef00c4f5fe4454cfc13b3cf451dd004bd84ee23df161c4459d29d7394775db3" },
+  { path: "src/serein/serein-ui.css", sha256: "432a72713924f50838a793915a3fe2dde695cb6cdab2278b09cbf200e1dcb6d9" },
   { path: "src/serein/tokens.css", sha256: "069f3f2b751ce0e5cc7939749eaf432b454c5182655aa4ec25afa7dea968a3ee" },
   { path: "src/serein/fonts.css", sha256: null },
   { path: "src/serein/assets/fonts/Inter-latin.woff2", sha256: null },

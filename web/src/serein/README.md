@@ -4,7 +4,7 @@ These files are copied verbatim from the approved design system, not edited here
 
 | File | Source | SHA-256 |
 | --- | --- | --- |
-| `serein-ui.css` | `cirrus-ui/dist/serein-ui.css` | `9ef00c4f5fe4454cfc13b3cf451dd004bd84ee23df161c4459d29d7394775db3` |
+| `serein-ui.css` | `cirrus-ui/dist/serein-ui.css` | `432a72713924f50838a793915a3fe2dde695cb6cdab2278b09cbf200e1dcb6d9` |
 | `tokens.css` | `cirrus-ui/dist/tokens.css` | `069f3f2b751ce0e5cc7939749eaf432b454c5182655aa4ec25afa7dea968a3ee` |
 | `fonts.css` | `cirrus-ui/dist/fonts.css` | copied unmodified |
 | `assets/fonts/*.woff2` | `cirrus-ui/dist/assets/fonts/` | copied unmodified |
