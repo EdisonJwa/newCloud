@@ -11,6 +11,7 @@ document was written.
 | [Architecture](reference/architecture.md) | Components and request flow |
 | [Configuration](guides/configuration.md) | Each configuration key and its default |
 | [Deployment](guides/deployment.md) | A production deployment that does not lose data |
+| [Docker deployment runbook](guides/docker-deployment.md) | Step-by-step: a fresh host to a working instance behind your own reverse proxy |
 | [Nextcloud desktop and mobile clients](guides/nextcloud-clients.md) | Connecting the official clients, and the boundaries they meet |
 | [Limitations](guides/limitations.md) | What is deliberately not implemented |
 
