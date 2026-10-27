@@ -51,7 +51,7 @@ func (t *pgTx) Notifications(ctx context.Context, userID uuid.UUID, cursor strin
 		limit = 50
 	}
 	args := []any{userID}
-	q := `SELECT id, kind, dedupe_key, meta, read_at, created_at
+	q := `SELECT id, user_id, kind, dedupe_key, meta, read_at, created_at
 		FROM notifications WHERE user_id = $1`
 	if cursor != "" {
 		at, id, err := decodeNotificationCursor(cursor)
@@ -166,7 +166,7 @@ func (t *pgTx) ExpiringShares(ctx context.Context, now time.Time, window time.Du
 		JOIN users u ON u.id = s.owner_id
 		WHERE s.revoked_at IS NULL
 		  AND s.expires_at > $1
-		  AND s.expires_at <= $1 + $2::interval
+		  AND s.expires_at <= $1 + make_interval(secs => $2 / 1000000.0)
 		ORDER BY s.expires_at ASC
 		LIMIT $3`,
 		now, window.Microseconds(), limit)
@@ -217,7 +217,7 @@ func scanNotification(rows interface {
 	var n Notification
 	var meta []byte
 	var key *string
-	if err := rows.Scan(&n.ID, &n.Kind, &key, &meta, &n.ReadAt, &n.CreatedAt); err != nil {
+	if err := rows.Scan(&n.ID, &n.UserID, &n.Kind, &key, &meta, &n.ReadAt, &n.CreatedAt); err != nil {
 		return Notification{}, translate(err)
 	}
 	if key != nil {

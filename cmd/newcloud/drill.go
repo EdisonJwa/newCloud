@@ -74,6 +74,9 @@ var drillTables = []string{
 	// that lost a favorite, a label or a discussion would lose things people wrote, and the row
 	// counts are what proves a backup carried them.
 	"favorites", "tags", "node_tags", "comments",
+	// The notification inbox: user data, and the row counts are what prove a restore carried it.
+	// Found by TestDrillCoversEveryTable on the first CI run after the table landed.
+	"notifications",
 }
 
 // drillAuditTables are the partitioned audit tables, counted via their parent.

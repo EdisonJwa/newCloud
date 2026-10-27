@@ -100,18 +100,43 @@ func (t *pgTx) DeleteMount(ctx context.Context, id uuid.UUID) error {
 	if err != nil {
 		return translate(err)
 	}
-	tag, err := t.tx.Exec(ctx, `DELETE FROM nodes WHERE id = $1
-		AND NOT EXISTS (SELECT 1 FROM nodes c WHERE c.parent_id = nodes.id AND c.trashed_at IS NULL)`,
-		nodeID)
+	// The mount row goes first: mounts.node_id references nodes(id) with NO ACTION, so
+	// deleting the node while the row still points at it raises a foreign-key violation
+	// that translate() reports as a referential-integrity fault rather than the no-op it
+	// would be (2026-10-27 CI, TestPGConformance/Mounts). Both statements stay in this
+	// transaction, so a refused node delete rolls the mount row back with it.
+	tag, err := t.tx.Exec(ctx, `DELETE FROM mounts WHERE id = $1 AND node_id = $2`, id, nodeID)
 	if err != nil {
 		return translate(err)
 	}
 	if tag.RowsAffected() == 0 {
-		// The node grew children, or the pairing changed underneath the read. Both are
-		// "stop and look", not "delete something else".
+		// The pairing changed underneath the read. "Stop and look", not "delete something else".
+		return ErrNotFound
+	}
+	// The mount point may still hold TRASHED children: trashing keeps parent_id, so those
+	// rows reference the mount node and a plain delete would raise nodes_parent_id_fkey.
+	// They are invisible to every listing and are part of what the mount owned, so the
+	// subtree delete takes them. LIVE children are still a refusal — the check below names
+	// them before anything is removed, and it is the same predicate as the guard above.
+	var liveChildren bool
+	if err := t.tx.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM nodes c WHERE c.parent_id = $1 AND c.trashed_at IS NULL)`,
+		nodeID).Scan(&liveChildren); err != nil {
+		return translate(err)
+	}
+	if liveChildren {
+		// "Stop and look", not "delete something else"; the mount-row delete rolls back.
 		return errors.New("mount node has live children; refusing to delete")
 	}
-	if _, err := t.tx.Exec(ctx, `DELETE FROM mounts WHERE id = $1 AND node_id = $2`, id, nodeID); err != nil {
+	// One recursive statement for the whole (now all-trashed) subtree, the same shape
+	// purgeSubtree uses: a per-level delete could stop half-way with a dangling parent.
+	if _, err := t.tx.Exec(ctx, `
+		WITH RECURSIVE subtree AS (
+		    SELECT id FROM nodes WHERE id = $1
+		    UNION ALL
+		    SELECT n.id FROM nodes n JOIN subtree s ON n.parent_id = s.id
+		)
+		DELETE FROM nodes WHERE id IN (SELECT id FROM subtree)`, nodeID); err != nil {
 		return translate(err)
 	}
 	return nil

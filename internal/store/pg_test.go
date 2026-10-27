@@ -38,6 +38,13 @@ func TestPGConformance(t *testing.T) {
 		if _, err := pool.Exec(context.Background(), `DELETE FROM jobs`); err != nil {
 			t.Fatalf("clear jobs: %v", err)
 		}
+		// Notifications are per-user, but the table outlives the subtest that filled it. A
+		// paging walk then reads another subtest's user row and reports it as a foreign row
+		// in the inbox — which is test contamination, not the leak the assertion is for
+		// (2026-10-27 CI, TestPGConformance/Notifications).
+		if _, err := pool.Exec(context.Background(), `DELETE FROM notifications`); err != nil {
+			t.Fatalf("clear notifications: %v", err)
+		}
 		// Groups are global, like jobs, and the conformance suite creates several
 		// across subtests. Without this the Groups ordering case sees rows from an
 		// earlier subtest and reports "5 groups, want 2" — a test-isolation failure,

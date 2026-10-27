@@ -306,6 +306,16 @@ func (t *pgTx) CreateFile(ctx context.Context, n NewFile) (Node, error) {
 		return Node{}, err
 	}
 
+	// The containing directory changed (M1), exactly as CreateDir and UpdateFile do for
+	// their own mutations. Without it a backend stamps on create-dir but not create-file, and
+	// a sync client sees a collection whose children appeared without the collection's ETag
+	// moving — the walk-everything case M1 exists to remove. The in-memory backend always
+	// stamped here; the divergence was found by TestDirETagPropagation on PostgreSQL
+	// (2026-10-27 CI).
+	if err := t.bumpDirAndUp(ctx, n.ParentID); err != nil {
+		return Node{}, err
+	}
+
 	// Reference the blob row for referential integrity and refcount.
 	const q = `INSERT INTO nodes (parent_id, owner_id, owner_group_id, name, name_key, kind, size, mime, etag, blob_id, retain_until, modified_at)
 		VALUES ($1, $2, $3, $4, $5, 'file', $6, $7, $8, $9, $10, COALESCE($11, now()))

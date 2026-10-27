@@ -55,6 +55,11 @@ func rewriteFile(t *testing.T, s store.Store, f store.Node) {
 			NewFile: store.NewFile{
 				OwnerID: f.OwnerID, ParentID: *f.ParentID, Name: f.Name,
 				Size: 9, Mime: f.Mime, ETag: `"rewritten"`,
+				// A rewrite replaces content, so it has a blob like any other write. The
+				// in-memory backend tolerates a nil blob_id; PostgreSQL enforces the column's
+				// foreign key, and a fixture that only works on one backend hides real errors
+				// (2026-10-27, TestPGConformance/DirETagPropagation).
+				BlobID: newBlobHook(t), BlobHash: [32]byte{2},
 			},
 		})
 		return err
