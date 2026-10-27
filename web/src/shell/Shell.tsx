@@ -363,7 +363,6 @@ function BrandGlyph() {
 
 function AccountMenu({
   me,
-  route,
   prefs,
   lang,
   onLang,
@@ -373,7 +372,6 @@ function AccountMenu({
   onSignOut,
 }: {
   me: Me | null;
-  route: Route;
   prefs: Prefs;
   lang: Lang;
   onLang: (lang: Lang) => void;
@@ -384,6 +382,13 @@ function AccountMenu({
 }) {
   const { t } = useI18n();
   const panel = useRef<HTMLDivElement>(null);
+  const firstItem = useRef<HTMLButtonElement>(null);
+
+  // The menu surface is the last thing in the DOM, so without this a keyboard user tabs
+  // through the whole page before the menu they just opened.
+  useEffect(() => {
+    firstItem.current?.focus();
+  }, []);
 
   // A menu that only closes on its own button strands a keyboard user. Escape and a click
   // outside are the two exits people expect, and focus returns to where it came from.
@@ -410,7 +415,7 @@ function AccountMenu({
 
         <div className="serein-menu__sep" role="separator" />
         <div className="serein-menu__label">{t("account.workspace")}</div>
-        <button type="button" className="serein-menu__item" role="menuitem" onClick={onOpenAppearance}>
+        <button ref={firstItem} type="button" className="serein-menu__item" role="menuitem" onClick={onOpenAppearance}>
           <span className="serein-menu__icon">
             <Icon name="palette" size={13} />
           </span>
@@ -492,9 +497,6 @@ function AccountMenu({
           </span>
           {t("nav.signout")}
         </button>
-        <p className="wc-accountmenu__note" aria-hidden="true">
-          {route.screen === "settings" ? "" : ""}
-        </p>
       </div>
     </>
   );

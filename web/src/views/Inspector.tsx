@@ -383,7 +383,13 @@ function InfoPane({
     <>
       <div className="serein-inspector__hero">
         {isImage && !broken ? (
-          <img src={thumbnailURL(entry.path)} alt="" onError={() => setBroken(true)} />
+          <img
+            src={thumbnailURL(entry.path)}
+            alt=""
+            width={96}
+            height={72}
+            onError={() => setBroken(true)}
+          />
         ) : (
           <FileTile entry={entry} size={180} />
         )}
@@ -691,13 +697,17 @@ function SharedPane({
               <span className="serein-link-hero__main">
                 <span className="serein-link-hero__title">{link.label || link.node_path}</span>
                 <span className="serein-link-hero__sub">
-                  {link.kind === "request"
-                    ? t("home.request")
-                    : link.kind === "email"
-                      ? t("home.email")
-                      : t("home.link")}
-                  {link.has_password ? ` · ${t("inspector.protected")}` : ""}
-                  {link.expires_at ? ` · ${t("inspector.expires", { date: fmt.date(link.expires_at) })}` : ""}
+                  <span className="wc-meta-item">
+                    {link.kind === "request"
+                      ? t("home.request")
+                      : link.kind === "email"
+                        ? t("home.email")
+                        : t("home.link")}
+                  </span>
+                  {link.has_password ? <span className="wc-meta-item">{t("inspector.protected")}</span> : ""}
+                  {link.expires_at ? (
+                    <span className="wc-meta-item">{t("inspector.expires", { date: fmt.date(link.expires_at) })}</span>
+                  ) : ""}
                 </span>
               </span>
             </div>

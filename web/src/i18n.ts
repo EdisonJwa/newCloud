@@ -400,7 +400,6 @@ const en: Table = {
 
   /* ---- settings ---- */
   "settings.title": "Settings",
-  "settings.eyebrow": "Workspace",
   "settings.tabs": "Settings sections",
   "settings.trash": "Trash",
   "settings.activity": "Activity",
@@ -1126,7 +1125,6 @@ const zh: Table = {
   "kind.file": "文件",
 
   "settings.title": "设置",
-  "settings.eyebrow": "工作区",
   "settings.tabs": "设置分区",
   "settings.trash": "回收站",
   "settings.activity": "活动",

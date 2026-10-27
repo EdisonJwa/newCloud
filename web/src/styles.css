@@ -1,3 +1,15 @@
+/* Hallmark · checked: 2026-10-27 · genre: modern-minimal (app scope, inferred)
+ * fixed: 27 reduced motion · 63 glued arrows and mid-dot chains · 67 tracked-caps labels ·
+ * 54 two eyebrows folded into their headings · 39a disabled cursors · 10a width tweens ·
+ * 34 one in-flow 100vw width · 64 mono label · 11 image hover · F3 head balance · F5 icon coin ·
+ * F24 toast edge
+ * dismissed: 56 (the sticky sheet head is scoped to .wc-sheet__scroll, its own scroll
+ * container, and never meets the topbar) · 19 (the em dash is a table-cell placeholder, not
+ * copy) · 25 (one-sentence captions sit legally under the 45ch prose floor)
+ * waived: 24b (the project's own 3px optical scale, self-consistent) · 29 (overlay backdrops
+ * are the system's chosen elevation) · 28b (video opens on demand, never the LCP)
+ * built: the project · redesign: polish · v2.0.0 */
+
 /*
  * WebCloud styles.
  *

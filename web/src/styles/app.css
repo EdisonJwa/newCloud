@@ -351,12 +351,12 @@
   border-radius: 3px;
   background: color-mix(in srgb, var(--serein-surface) 82%, transparent);
   color: var(--serein-text-secondary);
-  font-family: var(--serein-font-mono);
+  font-family: var(--serein-font-ui);
   font-size: calc(7px * var(--serein-text-scale));
   font-weight: 600;
   line-height: 1;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
+  letter-spacing: 0.01em;
+  text-transform: none;
 }
 
 /* --------------------------------------------------------------- inspector -- */
@@ -409,7 +409,7 @@
     inset-inline-end: 0;
     bottom: 0;
     top: auto;
-    width: min(380px, 100vw);
+    width: min(380px, 100%);
     max-height: 82dvh;
     padding: 0;
   }
@@ -755,4 +755,89 @@
    `body`-descendant form could never match. */
 .wc-root[data-view="viewer"] {
   overflow: hidden;
+}
+
+
+/* ----------------------------------------------------------------------------
+ * Hallmark polish sweep (2026-10-27). The framework above is vendored unchanged,
+ * so its findings are answered here, unlayered, where they outrank every layer.
+ * ------------------------------------------------------------------------- */
+
+/* 67: labels, table heads and section titles are the body face, sentence case, untracked. */
+.serein-page-header__eyebrow,
+.serein-resume__eyebrow,
+.serein-menu__label,
+.serein-command__group,
+.serein-table th,
+.serein-filelist__header,
+.serein-form-section__title {
+  text-transform: none;
+  letter-spacing: 0.01em;
+}
+
+/* F3: display heads balance their last line. */
+.serein-root :where(h1, h2, h3) {
+  text-wrap: balance;
+}
+
+/* 39a: a disabled control says so through opacity, the cursor and the native attribute. */
+.serein-icon-btn:disabled,
+.serein-check__input:disabled + .serein-check__box,
+.serein-switch__input:disabled + .serein-switch__track,
+.serein-radio__input:disabled + .serein-radio__dot,
+.serein-slider__input:disabled,
+.serein-number__btn:disabled,
+.serein-pagination__item[aria-disabled="true"],
+.serein-pagination__item:disabled,
+.serein-viewer__step:disabled {
+  cursor: not-allowed;
+}
+
+/* 10a: width is never animated; the bar moves between states without tweening geometry. */
+.serein-progress__bar,
+.serein-meter__bar,
+.serein-upload-item__bar {
+  transition: none;
+}
+
+/* 11: imagery sits still on hover; the tile's surface already carries the feedback. */
+.serein-file-tile:hover .serein-file-tile__preview img {
+  transform: none;
+}
+
+/* F24: the toast keeps its defined edge and drops the competing elevation shadow. */
+.serein-toast {
+  box-shadow: none;
+}
+
+/* F5: no tinted coin behind the lock; the icon stands at its own size in the line colour. */
+.serein-password__icon {
+  background: none;
+  color: var(--serein-text-secondary);
+}
+
+/* 63: meta facts are separated by hairlines, not joined with middle dots. */
+.wc-meta-item + .wc-meta-item {
+  border-inline-start: 1px solid var(--serein-divider);
+  margin-inline-start: 6px;
+  padding-inline-start: 6px;
+}
+
+/* 34: nothing may scroll the page sideways. `clip`, never `hidden`: a clip element is not
+   a scroll container, so the sticky topbar and the sheet's sticky row keep working. */
+html,
+body {
+  overflow-x: clip;
+}
+
+/* 27: honour prefers-reduced-motion across the whole client, framework animations included. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

@@ -192,7 +192,7 @@ export function SearchPanel({ commands, onClose, onOpenFile, onOpenFolder }: Pro
           ref={inputRef}
           className="serein-input"
           value={query}
-          type="text"
+          type="search"
           role="combobox"
           aria-expanded="true"
           aria-controls="search-listbox"

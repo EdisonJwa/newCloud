@@ -37,6 +37,7 @@ interface ShellProps {
  * happen exactly once on unmount regardless of which control closed it.
  */
 function Dialog({ title, description, children, footer, onClose, size = "normal", tone = "neutral" }: ShellProps) {
+  const { t } = useI18n();
   const ref = useRef<HTMLDialogElement>(null);
   const opener = useRef<Element | null>(null);
   const base = useId().replace(/[^a-zA-Z0-9]/g, "");

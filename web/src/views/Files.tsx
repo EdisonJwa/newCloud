@@ -1160,7 +1160,12 @@ export function Files({
       ) : null}
 
       {moving ? (
-        <div className="wc-dragghost" style={{ left: moving.x, top: moving.y }}>
+        // Positioned with transform, not left/top: the ghost follows the pointer on every
+        // pointermove, and transform is the one property that moves without layout.
+        <div
+          className="wc-dragghost"
+          style={{ transform: `translate(${moving.x}px, ${moving.y}px)` }}
+        >
           <Icon name="move" size={11} />
           {moving.entry.name}
         </div>
@@ -1385,6 +1390,9 @@ function ListView({
                   <button
                     type="button"
                     className="serein-file-row__title"
+                    // The truncated middle is often what distinguishes two files; the full
+                    // name rides along so hover can still see it.
+                    title={entry.name}
                     onClick={(e) => {
                       e.stopPropagation();
                       onOpen(entry);
@@ -1680,7 +1688,15 @@ function GridView({
             <button
               type="button"
               className="serein-file-tile serein-file-tile--interactive"
-              onClick={(e) => onPick(entry, e)}
+              onClick={(e) => {
+                onPick(entry, e);
+                // A plain click on the tile that is already selected opens it — the same
+                // two-stage model as the rows view (click selects, click again opens), so a
+                // pointer user is not forced into a double-click to open a file.
+                if (!e.shiftKey && !e.metaKey && !e.ctrlKey && picked.includes(entry.id)) {
+                  onOpen(entry);
+                }
+              }}
               onDoubleClick={() => onOpen(entry)}
             >
               <span className="serein-file-tile__preview">

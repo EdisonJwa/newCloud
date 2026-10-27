@@ -204,8 +204,7 @@ export function Home({
     <div className="serein-page serein-page--home">
       <div className="serein-page-header">
         <div className="serein-page-header__main">
-          <p className="serein-page-header__eyebrow">{t(greeting)}</p>
-          <h1 className="serein-page-header__title">{displayNameOf(me)}</h1>
+          <h1 className="serein-page-header__title">{`${t(greeting)}, ${displayNameOf(me)}`}</h1>
           <p className="serein-page-header__description">
             {quota > 0
               ? t("home.headerQuota", { used: fmt.size(used), quota: fmt.size(quota) })
@@ -280,7 +279,7 @@ export function Home({
               className="wc-section__link"
               onClick={() => onRoute({ screen: "files", space: "", kind: "all" }, "push")}
             >
-              {t("home.allFiles")} →
+              {t("home.allFiles")}
             </button>
           </div>
 
@@ -339,7 +338,7 @@ export function Home({
               // manager, so it promised received files and delivered public links.
               onClick={() => onRoute({ screen: "sharing", tab: "received" }, "push")}
             >
-              {t("home.seeAll")} →
+              {t("home.seeAll")}
             </button>
           </div>
 
@@ -399,7 +398,7 @@ export function Home({
             className="wc-section__link"
             onClick={() => onRoute({ screen: "sharing", tab: "managed" }, "push")}
           >
-            {t("home.manageLinks")} →
+            {t("home.manageLinks")}
           </button>
         </div>
 
@@ -426,13 +425,17 @@ export function Home({
                     <span className="wc-list__main">
                       <span className="wc-list__title">{share.label || share.node_path}</span>
                       <span className="wc-list__meta">
-                        {share.kind === "request"
-                          ? t("home.request")
-                          : share.kind === "email"
-                            ? t("home.email")
-                            : t("home.link")}
-                        {share.has_password ? ` · ${t("inspector.protected")}` : ""}
-                        {share.expires_at ? ` · ${t("home.expires", { date: fmt.date(share.expires_at) })}` : ""}
+                        <span className="wc-meta-item">
+                          {share.kind === "request"
+                            ? t("home.request")
+                            : share.kind === "email"
+                              ? t("home.email")
+                              : t("home.link")}
+                        </span>
+                        {share.has_password ? <span className="wc-meta-item">{t("inspector.protected")}</span> : ""}
+                        {share.expires_at ? (
+                          <span className="wc-meta-item">{t("home.expires", { date: fmt.date(share.expires_at) })}</span>
+                        ) : ""}
                       </span>
                     </span>
                     <span className="wc-list__end">
@@ -457,7 +460,7 @@ export function Home({
             className="wc-section__link"
             onClick={() => onRoute({ screen: "settings", settingsTab: "activity" }, "push")}
           >
-            {t("home.seeAll")} →
+            {t("home.seeAll")}
           </button>
         </div>
 
@@ -510,8 +513,8 @@ export function Home({
                 <span className="serein-meter__bar" style={{ width: `${percent}%` }} />
               </div>
               <p className="serein-hint wc-storage-note">
-                {t("home.storagePercent", { percent })}
-                {percent >= 90 ? ` · ${t("home.storageFull")}` : ""}
+                <span className="wc-meta-item">{t("home.storagePercent", { percent })}</span>
+                {percent >= 90 ? <span className="wc-meta-item">{t("home.storageFull")}</span> : ""}
               </p>
             </>
           ) : (

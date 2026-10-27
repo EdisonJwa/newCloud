@@ -56,7 +56,6 @@ export function Settings({ route, me, reloadKey, onRoute }: Props) {
     <div className="serein-page serein-page--narrow">
       <div className="serein-page-header">
         <div className="serein-page-header__main">
-          <p className="serein-page-header__eyebrow">{t("settings.eyebrow")}</p>
           <h1 className="serein-page-header__title">{t("settings.title")}</h1>
           <p className="serein-page-header__description">{t(`settings.subtitle.${active}`)}</p>
         </div>
