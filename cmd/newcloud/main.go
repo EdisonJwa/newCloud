@@ -523,7 +523,18 @@ func serve() error {
 
 	cfg, err := config.Load(configPath())
 	if err != nil {
-		return err
+		// The default path missing is the file-free deployment mode: docker run with
+		// NEWCLOUD_* variables and no mounted YAML. An explicitly named config that is
+		// missing is still an error, exactly as in migrate — the operator named a file
+		// the process cannot read, and pretending defaults were intended would hide it.
+		if os.Getenv("NEWCLOUD_CONFIG") != "" || !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		log.Warn("config file not found; using defaults plus environment", "path", configPath())
+		cfg, err = config.Load("")
+		if err != nil {
+			return err
+		}
 	}
 
 	warnAboutUnusedConfig(log, cfg)

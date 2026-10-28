@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -690,7 +691,9 @@ func Load(path string) (Config, error) {
 		}
 	}
 
-	applyEnv(&cfg)
+	if err := applyEnv(&cfg); err != nil {
+		return cfg, fmt.Errorf("environment override: %w", err)
+	}
 
 	if cfg.Auth.ClientSecret == "" && cfg.Auth.ClientSecretFile != "" {
 		secret, err := os.ReadFile(cfg.Auth.ClientSecretFile)
@@ -733,7 +736,20 @@ func Load(path string) (Config, error) {
 	return cfg, nil
 }
 
-func applyEnv(c *Config) {
+// applyEnv overlays NEWCLOUD_* variables on the file-or-default configuration.
+//
+// The purpose is the file-free deployment: `docker run` with environment variables and
+// no mounted YAML. A value here wins over the file because an operator overriding one
+// key from the environment is correcting the file, not racing it. A variable that is
+// set but unparsable — a port that is not a number — is an error rather than a silent
+// skip, for the same reason an unknown YAML key is: accepted-and-ignored is the failure
+// mode this package exists to refuse.
+//
+// The names are flat and hand-written rather than reflected from the yaml tags:
+// NEWCLOUD_OIDC_ISSUER is what an operator types from memory, and a generated scheme
+// would also have to explain the fields with no honest string form (group_role_map is
+// a map; session_ttl is a duration).
+func applyEnv(c *Config) error {
 	set := func(dst *string, key string) {
 		if v, ok := os.LookupEnv(key); ok {
 			*dst = v
@@ -742,20 +758,89 @@ func applyEnv(c *Config) {
 	set(&c.Server.Addr, "NEWCLOUD_ADDR")
 	set(&c.Server.PublicURL, "NEWCLOUD_PUBLIC_URL")
 	set(&c.Server.UserContentURL, "NEWCLOUD_USERCONTENT_URL")
+	set(&c.Server.UserContentAddr, "NEWCLOUD_USERCONTENT_ADDR")
 	set(&c.Auth.Issuer, "NEWCLOUD_OIDC_ISSUER")
 	set(&c.Auth.ClientID, "NEWCLOUD_OIDC_CLIENT_ID")
 	set(&c.Auth.ClientSecret, "NEWCLOUD_OIDC_CLIENT_SECRET")
 	set(&c.Auth.SessionSecret, "NEWCLOUD_SESSION_SECRET")
 	set(&c.Auth.LocalAdmin.Username, "NEWCLOUD_BREAKGLASS_USER")
 	set(&c.Auth.SCIMToken, "NEWCLOUD_SCIM_TOKEN")
+	set(&c.Storage.Local.Root, "NEWCLOUD_STORAGE_ROOT")
+	set(&c.Storage.UploadDir, "NEWCLOUD_STORAGE_UPLOAD_DIR")
+	set(&c.Mail.Host, "NEWCLOUD_MAIL_HOST")
+	set(&c.Mail.Username, "NEWCLOUD_MAIL_USERNAME")
+	set(&c.Mail.Password, "NEWCLOUD_MAIL_PASSWORD")
+	set(&c.Mail.From, "NEWCLOUD_MAIL_FROM")
+	set(&c.AV.Host, "NEWCLOUD_ANTIVIRUS_HOST")
 
+	if v, ok := os.LookupEnv("NEWCLOUD_TRUSTED_PROXIES"); ok {
+		// Comma-separated, the way every CIDR list an operator has typed before reads.
+		c.Server.TrustedProxies = splitCSV(v)
+	}
 	if v := os.Getenv("NEWCLOUD_STORAGE_LAYOUT"); v != "" {
 		c.Storage.Layout = Layout(v)
 	}
-
+	// Not ParseBool on purpose: this one is a flag people flip from a compose file,
+	// where "1" is the idiom; anything but 1/true leaves it off, as before.
 	if v := os.Getenv("NEWCLOUD_ALLOW_LOCAL_ADMIN"); v == "1" || strings.EqualFold(v, "true") {
 		c.Auth.AllowLocalAdmin = true
 	}
+
+	bools := []struct {
+		dst *bool
+		key string
+	}{
+		{&c.Mail.Enabled, "NEWCLOUD_MAIL_ENABLED"},
+		{&c.AV.Enabled, "NEWCLOUD_ANTIVIRUS_ENABLED"},
+	}
+	ints := []struct {
+		dst *int
+		key string
+	}{
+		{&c.Mail.Port, "NEWCLOUD_MAIL_PORT"},
+		{&c.Notify.QuotaWarningPercent, "NEWCLOUD_NOTIFY_QUOTA_WARNING_PERCENT"},
+		{&c.Notify.ShareExpiryDays, "NEWCLOUD_NOTIFY_SHARE_EXPIRY_DAYS"},
+		{&c.Notify.RetentionDays, "NEWCLOUD_NOTIFY_RETENTION_DAYS"},
+		{&c.AV.TimeoutSec, "NEWCLOUD_ANTIVIRUS_TIMEOUT_SECONDS"},
+	}
+	for _, b := range bools {
+		if v, ok := os.LookupEnv(b.key); ok {
+			parsed, err := strconv.ParseBool(v)
+			if err != nil {
+				return fmt.Errorf("%s: %w", b.key, err)
+			}
+			*b.dst = parsed
+		}
+	}
+	for _, i := range ints {
+		if v, ok := os.LookupEnv(i.key); ok {
+			parsed, err := strconv.Atoi(v)
+			if err != nil {
+				return fmt.Errorf("%s: %w", i.key, err)
+			}
+			*i.dst = parsed
+		}
+	}
+	if v, ok := os.LookupEnv("NEWCLOUD_ANTIVIRUS_MAX_SCAN_BYTES"); ok {
+		parsed, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return fmt.Errorf("NEWCLOUD_ANTIVIRUS_MAX_SCAN_BYTES: %w", err)
+		}
+		c.AV.MaxScanBytes = parsed
+	}
+	return nil
+}
+
+// splitCSV splits a comma-separated env list: spaces around entries are noise and an
+// empty entry is a typo, and neither belongs in a CIDR table.
+func splitCSV(v string) []string {
+	var out []string
+	for _, part := range strings.Split(v, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // ErrInvalidConfig wraps every validation failure so callers can distinguish
