@@ -12,6 +12,69 @@ certificate (or Caddy's automatic one), and an OIDC identity provider. You own t
 the shipped `deploy/Caddyfile` is the reference implementation of what that proxy must do, and
 section 7 explains how to translate it to nginx or Apache.
 
+## Quick path: env-only, one directory
+
+For a pilot or a homelab box, `deploy/docker-compose.simple.yml` collapses the runbook into one
+directory and one `.env` file — no mounted config.yml, no hand-run migration step:
+
+```sh
+cd deploy
+cp env.simple.example .env        # fill in domains, OIDC, secrets
+mkdir -p newcloud-data newcloud-pg
+sudo chown -R 65532:65532 newcloud-data   # the distroless nonroot uid must own the data
+
+docker compose -f docker-compose.simple.yml up -d --build
+```
+
+The `migrate` and `app-role` services bootstrap the database (migrations as the owner, then the
+application role's password) and exit; `web` starts after they succeed. The Caddyfile reads the
+two domains from the environment, so nothing in `deploy/` needs editing.
+
+Every knob the file sets is a `NEWCLOUD_*` variable the server understands natively — the same
+variables work with a plain `docker run`, and a mounted config.yml still wins for anything not
+set in the environment (a set variable overrides the file, one key at a time). The full list is
+in `internal/config/config.go` (`applyEnv`).
+
+What this stack keeps on purpose: the database-role split, the two-origin rule, and one
+filesystem for blobs. What it gives up: WAL archiving, disk separation, capacity planning — move
+to the reference stack below before the data matters.
+
+### One container, no compose
+
+The image also runs bare, linuxserver-style — every setting is an environment variable, and the
+database is one you already run. TLS is not baked into the image (a self-signed certificate in the
+container would train every browser to click through a warning): your proxy terminates it, in
+front of both origins.
+
+```sh
+docker build -f deploy/Dockerfile -t newcloud:latest .
+
+# Once, as the database owner — migrations create the application role and leave it
+# passwordless; set its password before starting the server (see the reference runbook).
+docker run --rm \
+  -e DATABASE_URL="postgres://newcloud:OWNER_PASSWORD@db.internal:5432/newcloud?sslmode=disable" \
+  newcloud:latest migrate
+
+mkdir -p /srv/newcloud && chown 65532:65532 /srv/newcloud   # the distroless nonroot uid
+
+docker run -d --name newcloud --restart unless-stopped \
+  -p 127.0.0.1:8080:8080 -p 127.0.0.1:8081:8081 \
+  -v /srv/newcloud:/var/lib/newcloud \
+  -e DATABASE_URL="postgres://newcloud_app:APP_PASSWORD@db.internal:5432/newcloud?sslmode=disable" \
+  -e NEWCLOUD_PUBLIC_URL=https://cloud.example.com \
+  -e NEWCLOUD_USERCONTENT_URL=https://usercontent.example.com \
+  -e NEWCLOUD_USERCONTENT_ADDR=:8081 \
+  -e NEWCLOUD_OIDC_ISSUER=https://idp.example.com \
+  -e NEWCLOUD_OIDC_CLIENT_ID=newcloud \
+  -e NEWCLOUD_OIDC_CLIENT_SECRET=change-me \
+  -e NEWCLOUD_SESSION_SECRET=change-me \
+  -e NEWCLOUD_STORAGE_ROOT=/var/lib/newcloud/blobs \
+  newcloud:latest
+```
+
+Loopback port bindings assume the proxy runs on the same host; point it at `8080` for the
+application origin and `8081` for the content origin.
+
 ---
 
 ## 0. Before you start

@@ -1,0 +1,136 @@
+# newCloud — env-only single-directory deployment.
+#
+# The reference docker-compose.yml mounts /etc/newcloud/config.yml and assumes the
+# operator has read docs/guides/deployment.md. This file is for the deployment that
+# wants none of that: every knob is an environment variable from .env, all state lives
+# in ./newcloud-data, and `docker compose -f docker-compose.simple.yml up -d` is the
+# whole ceremony.
+#
+# What is deliberately NOT traded away, even here:
+#
+#   * The database-role split. Migrations run as the owner (newcloud); the server
+#     connects as newcloud_app, which cannot rewrite the audit log. The migrate and
+#     app-role services below bootstrap this automatically — the step the reference
+#     runbook does by hand.
+#   * The origin split. Two hostnames are still required; cookies and user content
+#     stay on different origins.
+#   * One filesystem for blobs. Everything lands under ./newcloud-data, a single bind
+#     mount, so publishing a blob stays a rename.
+#
+# What IS traded away, knowingly: no WAL archiving, no disk separation between database
+# and blobs, no capacity planning. Fine for a pilot; move to the reference compose
+# before the data matters.
+
+name: newcloud-simple
+
+x-web-image: &web-image
+  image: newcloud:latest
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile
+    args:
+      VERSION: ${NEWCLOUD_VERSION:-dev}
+
+services:
+  # One-shot: applies migrations as the OWNER role, then exits. Runs on every
+  # `up`; migrations are versioned and already-applied ones are a no-op.
+  migrate:
+    <<: *web-image
+    restart: "no"
+    command: ["migrate"]
+    environment:
+      # The owner, not newcloud_app: migrations create roles and grant.
+      DATABASE_URL: postgres://newcloud:${PG_PASSWORD}@postgres:5432/newcloud?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # One-shot: sets the application role's password. The migration creates
+  # newcloud_app WITHOUT one on purpose (a password in a migration file would live in
+  # version control forever); this step is where it gets set, once per environment.
+  app-role:
+    image: postgres:17
+    restart: "no"
+    entrypoint: ["psql", "postgres://newcloud:${PG_PASSWORD}@postgres:5432/newcloud?sslmode=disable", "-c"]
+    command:
+      - ALTER ROLE newcloud_app PASSWORD '${PG_APP_PASSWORD}';
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  web:
+    <<: *web-image
+    restart: unless-stopped
+    stop_grace_period: 45s
+    environment:
+      # ---- Everything a config.yml would carry, as environment. ----
+      NEWCLOUD_PUBLIC_URL: https://${PUBLIC_DOMAIN}
+      NEWCLOUD_USERCONTENT_URL: https://${USERCONTENT_DOMAIN}
+      NEWCLOUD_USERCONTENT_ADDR: ":8081"
+      NEWCLOUD_OIDC_ISSUER: ${OIDC_ISSUER}
+      NEWCLOUD_OIDC_CLIENT_ID: ${OIDC_CLIENT_ID}
+      # A secret in an environment variable is visible in `docker inspect` and in the
+      # host's process table. Acceptable for a pilot; the reference deployment reads
+      # it from a mounted file (auth.client_secret_file) instead.
+      NEWCLOUD_OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET}
+      NEWCLOUD_SESSION_SECRET: ${SESSION_SECRET}
+      NEWCLOUD_STORAGE_ROOT: /var/lib/newcloud/blobs
+      NEWCLOUD_STORAGE_UPLOAD_DIR: /var/lib/newcloud/uploads
+      # Caddy proxies from the compose network; without this the server logs its IP
+      # instead of the client's and rate limits one address for everybody.
+      NEWCLOUD_TRUSTED_PROXIES: "172.16.0.0/12,192.168.0.0/16"
+      # ---- Database ----
+      DATABASE_URL: postgres://newcloud_app:${PG_APP_PASSWORD}@postgres:5432/newcloud?sslmode=disable
+    volumes:
+      # ONE bind mount: blobs/ and uploads/ share a filesystem, so publishing stays a
+      # rename. Splitting this into per-purpose mounts is how that silently breaks.
+      - ./newcloud-data:/var/lib/newcloud
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:8081:8081"
+    depends_on:
+      app-role:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/newcloud", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: newcloud
+      POSTGRES_USER: newcloud
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+    volumes:
+      - ./newcloud-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U newcloud -d newcloud"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    volumes:
+      - ./Caddyfile.simple:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    environment:
+      PUBLIC_DOMAIN: ${PUBLIC_DOMAIN}
+      USERCONTENT_DOMAIN: ${USERCONTENT_DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - web
+
+volumes:
+  caddy_data:
+  caddy_config:

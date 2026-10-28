@@ -56,3 +56,6 @@ config.yml
 .demo-ui/
 .mimosa/
 web/.mimosa/
+
+# Env files for the simple compose stack: secrets, never committed.
+deploy/.env

@@ -161,6 +161,10 @@ Three details are load-bearing:
 The full deployment guide covers the application database role, TLS, backups, retention, and
 capacity planning: [docs/guides/deployment.md](docs/guides/deployment.md).
 
+For a pilot there is also an env-only stack — one `.env` file, no mounted config.yml, migrations
+bootstrapped automatically: see the quick path in
+[docs/guides/docker-deployment.md](docs/guides/docker-deployment.md).
+
 ## Documentation
 
 | Start here | |

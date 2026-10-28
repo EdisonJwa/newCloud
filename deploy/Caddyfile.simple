@@ -1,0 +1,44 @@
+# The env-only twin of the reference Caddyfile: identical headers and routing, with the
+# two hostnames supplied by the environment ({$VAR} is Caddy's own substitution, read at
+# start). The reference file spells the domains out because a deployment's proxy config
+# is something you read; this one exists so `docker compose up` needs no edits.
+{
+	{$PUBLIC_DOMAIN} {
+		encode zstd gzip
+		header {
+			Strict-Transport-Security "max-age=31536000; includeSubDomains"
+			X-Content-Type-Options "nosniff"
+			X-Frame-Options "DENY"
+			Referrer-Policy "no-referrer"
+			Permissions-Policy "geolocation=(), microphone=(), camera=()"
+			-Server
+		}
+		@content path /content/*
+		handle @content {
+			respond "Not Found" 404
+		}
+		@ops path /metrics /readyz
+		handle @ops {
+			respond "Not Found" 404
+		}
+		handle {
+			reverse_proxy web:8080
+		}
+	}
+	{$USERCONTENT_DOMAIN} {
+		encode zstd gzip
+		header {
+			Strict-Transport-Security "max-age=31536000; includeSubDomains"
+			X-Content-Type-Options "nosniff"
+			Content-Security-Policy "sandbox; default-src 'none'; img-src 'self'; media-src 'self'"
+			Content-Disposition "attachment"
+			X-Frame-Options "DENY"
+			Referrer-Policy "no-referrer"
+			X-Robots-Tag "noindex, nofollow, noarchive"
+			-Server
+		}
+		reverse_proxy web:8081 {
+			header_up -Cookie
+		}
+	}
+}
